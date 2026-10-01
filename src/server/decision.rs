@@ -13,6 +13,8 @@
 
 use serde::Serialize;
 
+use crate::model::Level;
+
 /// The budget applied when a caller names none: this server's own operating
 /// point.
 ///
@@ -36,7 +38,7 @@ pub(crate) fn default_budget(server_level: Option<u16>) -> u16 {
 /// `min(grid_max, SUSPICIOUS_LEVEL_CEILING)`. A stored verdict does not carry
 /// the grid it came from, and production grids run to 25000, so the ceiling is
 /// the constant. `agrees_with_the_model_grid` pins the two together.
-const SUSPICIOUS_CEILING: i32 = 3000;
+const SUSPICIOUS_CEILING: u16 = 3000;
 
 /// What a caller should do about this package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -83,31 +85,19 @@ pub(crate) enum Severity {
 /// million the caller will tolerate. Mirrors `verdict_for_level(fired_level,
 /// level, ..)`, whose two parameters are that same pair.
 ///
-/// `None` is manual-threshold mode and answers [`Decision::Unanalyzed`] rather
-/// than guessing: no level table applies to such a verdict, so no budget can be
-/// evaluated against it, and saying so is honest where allowing it would not.
-pub(crate) fn decide(fires_at: Option<i32>, budget: u16) -> (Decision, Severity) {
-    let Some(lvl) = fires_at else {
-        return (Decision::Unanalyzed, Severity::Benign);
-    };
-    // The sentinel is not a level: it is the absence of one, and it is negative
-    // precisely so it cannot be compared as though it were the tightest budget
-    // of all. Ordering it against `budget` numerically would invert the scale
-    // and block every clean artifact we have.
-    if lvl < 0 {
-        return (Decision::Allow, Severity::Benign);
-    }
-    if lvl <= i32::from(budget) {
-        (Decision::Block, Severity::Hostile)
-    } else if lvl <= SUSPICIOUS_CEILING {
-        (Decision::Allow, Severity::Suspicious)
-    } else {
-        (Decision::Allow, Severity::Benign)
+/// [`Level::Manual`] answers [`Decision::Unanalyzed`] rather than guessing: no
+/// level table applies to such a verdict, so no budget can be evaluated against
+/// it, and saying so is honest where allowing it would not.
+pub(crate) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
+    match fires_at {
+        Level::Manual => (Decision::Unanalyzed, Severity::Benign),
+        Level::At(lvl) if lvl <= budget => (Decision::Block, Severity::Hostile),
+        Level::At(lvl) if lvl <= SUSPICIOUS_CEILING => (Decision::Allow, Severity::Suspicious),
+        Level::Clean | Level::At(_) => (Decision::Allow, Severity::Benign),
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -115,32 +105,31 @@ mod tests {
     #[test]
     fn lower_levels_are_worse() {
         assert_eq!(
-            decide(Some(2), 25).0,
+            decide(Level::At(2), 25).0,
             Decision::Block,
             "a tight firing level is hostile"
         );
         assert_eq!(
-            decide(Some(25), 25).0,
+            decide(Level::At(25), 25).0,
             Decision::Block,
             "the budget is inclusive"
         );
         assert_eq!(
-            decide(Some(26), 25).0,
+            decide(Level::At(26), 25).0,
             Decision::Allow,
             "one past the budget is not"
         );
-        assert_eq!(decide(Some(20000), 25).0, Decision::Allow);
+        assert_eq!(decide(Level::At(20000), 25).0, Decision::Allow);
     }
 
-    /// `-1` means "fires at no level". Compared numerically it is lower than
-    /// every budget, so a naive `lvl <= budget` blocks every clean package in
-    /// the corpus. This is the bug the sentinel invites and the reason `decide`
-    /// tests the sign before the threshold.
+    /// Clean means "fires at no level". Its wire form, `-1`, compared
+    /// numerically is lower than every budget, so a naive `lvl <= budget`
+    /// blocks every clean package in the corpus.
     #[test]
     fn the_clean_sentinel_is_not_the_tightest_level() {
         for budget in [0, 1, 25, 25_000] {
             assert_eq!(
-                decide(Some(-1), budget),
+                decide(Level::Clean, budget),
                 (Decision::Allow, Severity::Benign),
                 "the clean sentinel was read as a firing level at budget={budget}",
             );
@@ -151,24 +140,27 @@ mod tests {
     /// hands the choice to the caller's policy; allow would make it for them.
     #[test]
     fn manual_threshold_mode_is_unanalyzed_not_allowed() {
-        assert_eq!(decide(None, 25).0, Decision::Unanalyzed);
-        assert_eq!(decide(None, 25_000).0, Decision::Unanalyzed);
+        assert_eq!(decide(Level::Manual, 25).0, Decision::Unanalyzed);
+        assert_eq!(decide(Level::Manual, 25_000).0, Decision::Unanalyzed);
     }
 
     #[test]
     fn severity_is_independent_of_the_budget() {
         // Same artifact, two callers: the decision moves, the severity does not.
         assert_eq!(
-            decide(Some(500), 25),
+            decide(Level::At(500), 25),
             (Decision::Allow, Severity::Suspicious)
         );
         assert_eq!(
-            decide(Some(500), 1000),
+            decide(Level::At(500), 1000),
             (Decision::Block, Severity::Hostile)
         );
-        assert_eq!(decide(Some(3001), 25), (Decision::Allow, Severity::Benign));
         assert_eq!(
-            decide(Some(3000), 25),
+            decide(Level::At(3001), 25),
+            (Decision::Allow, Severity::Benign)
+        );
+        assert_eq!(
+            decide(Level::At(3000), 25),
             (Decision::Allow, Severity::Suspicious)
         );
     }
@@ -189,8 +181,14 @@ mod tests {
         // The shipped default is strict on purpose: this number decides whether
         // a build breaks, and a firewall that cries wolf gets switched off.
         assert_eq!(crate::model::DEFAULT_SEVERITY_LEVEL, 25);
-        assert_eq!(decide(Some(50), default_budget(None)).0, Decision::Allow);
-        assert_eq!(decide(Some(25), default_budget(None)).0, Decision::Block);
+        assert_eq!(
+            decide(Level::At(50), default_budget(None)).0,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(Level::At(25), default_budget(None)).0,
+            Decision::Block
+        );
     }
 
     /// This layer restates a rule that already exists in the model, so it can
@@ -202,7 +200,7 @@ mod tests {
         const GRID_MAX: u16 = 25_000;
         for level in [0_u16, 1, 2, 25, 26, 500, 2999, 3000, 3001, 20_000, 25_000] {
             for budget in [0_u16, 25, 500, 3000] {
-                let (decision, severity) = decide(Some(i32::from(level)), budget);
+                let (decision, severity) = decide(Level::At(level), budget);
                 let expected = verdict_for_level(level, budget, GRID_MAX);
                 let blocked = decision == Decision::Block;
                 assert_eq!(

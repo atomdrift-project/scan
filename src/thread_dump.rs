@@ -12,20 +12,37 @@
 //! which signals each registered thread with `SIGUSR2`; the `on_capture`
 //! handler — running on the target thread — walks its own stack with
 //! [`backtrace::trace_unsynchronized`] and stores raw instruction pointers into a
-//! preallocated slot (no allocation, no locks: async-signal-safe). The
-//! coordinator then symbolizes those pointers (allocation is fine here, off the
-//! signal path) and writes them to stderr.
+//! preallocated slot. The coordinator then symbolizes those pointers
+//! (allocation is fine there, off the signal path) and writes them to stderr.
+//!
+//! **This is best effort, not async-signal-safe.** The handler's own stores are
+//! atomics into preallocated memory, but the stack walk goes through the
+//! platform unwinder, which may take locks or allocate; a thread interrupted
+//! inside the allocator or the unwinder can deadlock or crash the process. On
+//! FreeBSD a `SIGUSR1` dump has aborted a worker. So the dump is only ever
+//! taken on a process that is already wedged or about to exit, never as
+//! routine telemetry.
 //!
 //! Triggered two ways, both on an already-wedged process so the blast radius is
 //! the same: by an operator sending `SIGUSR1`, and automatically by the worker's
-//! stall abort immediately before it exits (see `STALL_ABORT_EXIT_CODE`) — the
+//! stall abort immediately before it exits (see `worker::Exit::Stalled`) — the
 //! stacks are the artifact that names the runaway leaf, and a process about to
 //! die is exactly when they are worth capturing. It is never called on a healthy
 //! process. On platforms without per-thread signalling (macOS) it prints a
 //! pointer to the breadcrumb/wait-channel census instead.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Set once the capture handler is in place. `SIGUSR2`'s default action
+/// terminates the process, so a dump must never signal a thread without it.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Held for the length of one dump: the `SIGUSR1` thread and the stall abort
+/// can both ask for one, and two would trample each other's capture slots.
+static DUMPING: AtomicBool = AtomicBool::new(false);
 
 /// Registry of analysis-thread OS ids to signal during a dump. Rayon pool
 /// threads live for the process; tokio `spawn_blocking` threads are recycled
@@ -59,7 +76,7 @@ thread_local! {
 /// and idempotent; call it from each rayon worker's start handler and at the top
 /// of each blocking analysis. The registration is dropped automatically when the
 /// thread exits.
-pub fn register_self() {
+pub(crate) fn register_self() {
     let tid = os_thread_id();
     REGISTERED.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -167,9 +184,9 @@ mod capture {
 
     /// `SIGUSR2` handler: records the interrupted thread's own stack.
     ///
-    /// Async-signal-safe by construction: it only does atomic operations and a
-    /// frame-pointer/unwind walk into preallocated storage — no allocation, no
-    /// locks, no stdio.
+    /// Its own work is atomics into preallocated storage — no allocation, no
+    /// stdio. The stack walk is the exception: see the module docs for why
+    /// that makes the whole dump best effort.
     pub(super) extern "C" fn on_capture(_sig: libc::c_int) {
         if !CAPTURING.load(Ordering::Acquire) {
             return;
@@ -181,9 +198,12 @@ mod capture {
         }
         SLOT_TID[idx].store(super::os_thread_id(), Ordering::Relaxed);
         let mut frames = 0usize;
-        // SAFETY: `trace_unsynchronized` is the documented primitive for capturing
-        // the current thread's stack from a signal handler; the closure only
-        // stores integers into preallocated atomics.
+        // SAFETY: `trace_unsynchronized` requires that no other thread run
+        // `backtrace` concurrently with it in a way that races its caches;
+        // `DUMPING` admits one dump at a time and each target thread walks
+        // only its own stack. The closure only stores integers into
+        // preallocated atomics. The unwinder itself is not async-signal-safe,
+        // which the module docs accept for a process already being dumped.
         unsafe {
             backtrace::trace_unsynchronized(|frame| {
                 if frames < MAX_FRAMES {
@@ -207,6 +227,7 @@ mod capture {
         };
         #[cfg(target_os = "linux")]
         {
+            // SAFETY: `getpid` takes no arguments and cannot fail.
             let pid = libc::c_long::from(unsafe { libc::getpid() });
             // SAFETY: `tgkill(tgid, tid, sig)` with our own pid and a valid signal.
             let ret = unsafe {
@@ -227,33 +248,51 @@ mod capture {
     }
 }
 
-/// Install the capture-signal handler. Idempotent; call once at startup, before
-/// the `SIGUSR1` dump path can run. No-op on platforms without per-thread
+/// Install the capture-signal handler. Call once at startup, before the
+/// `SIGUSR1` dump path can run. No-op on platforms without per-thread
 /// signalling.
-pub fn install() {
+pub(crate) fn install() {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         // SAFETY: a zeroed `sigaction` with our handler and an empty mask is a
         // valid disposition; `SA_RESTART` keeps interrupted syscalls transparent.
-        unsafe {
+        let rc = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = capture::on_capture as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_RESTART;
-            libc::sigaction(capture::CAPTURE_SIGNAL, &action, std::ptr::null_mut());
+            libc::sigaction(capture::CAPTURE_SIGNAL, &action, std::ptr::null_mut())
+        };
+        if rc == 0 {
+            INSTALLED.store(true, Ordering::Release);
+        } else {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "cannot install the thread-capture handler; thread dumps are disabled",
+            );
         }
     }
 }
 
 /// Capture and write every registered analysis thread's backtrace to stderr.
-/// Operator-triggered (via `SIGUSR1`); safe to call when the worker is wedged.
-pub fn dump_all_threads() {
+///
+/// For a process that is already wedged or about to exit — an operator's
+/// `SIGUSR1`, or the stall abort. See the module docs for why it is not for
+/// anything else.
+pub(crate) fn dump_all_threads() {
+    if DUMPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let mut out = std::io::stderr().lock();
     let pid = std::process::id();
     let _ = writeln!(out, "\n--- scan in-process thread dump (pid {pid}) ---");
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        write_registered_backtraces(&mut out);
+        if INSTALLED.load(Ordering::Acquire) {
+            write_registered_backtraces(&mut out);
+        } else {
+            let _ = writeln!(out, "  capture handler not installed; no stacks captured");
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
@@ -265,11 +304,12 @@ pub fn dump_all_threads() {
         );
     }
     let _ = writeln!(out, "--- end thread dump ---\n");
+    drop(out);
+    DUMPING.store(false, Ordering::Release);
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn write_registered_backtraces(out: &mut impl Write) {
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     let self_tid = os_thread_id();
@@ -288,7 +328,8 @@ fn write_registered_backtraces(out: &mut impl Write) {
         .count();
 
     // Wait for the signalled threads to record their slots, bounded so a thread
-    // that never returns from the kernel can't stall the dump.
+    // that never returns from the kernel can't stall the dump. Polled: a signal
+    // handler can only report back through atomics.
     let deadline = Instant::now() + Duration::from_secs(2);
     while capture::DONE.load(Ordering::Acquire) < signalled && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));

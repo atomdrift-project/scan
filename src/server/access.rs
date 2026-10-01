@@ -9,8 +9,8 @@
 //! rather than a warning there and a mystery here.
 //!
 //! Fields, in order: `id`, `status`, `dur_ms`, `peer`, `fwd`, `auth`,
-//! `req_bytes`, `shared`, `sha256`, `purl`, `url`, `path`, `cred_len`, `cred_fp`,
-//! `trace`, `ua`. Everything that reaches the line
+//! `req_bytes`, `shared`, `streamed`, `sha256`, `purl`, `url`, `path`,
+//! `cred_len`, `cred_fp`, `trace`, `ua`. Everything that reaches the line
 //! is either generated here or parsed/bounded before it is printed, so a
 //! hostile header cannot shape the log. A field with nothing to say is left
 //! off the line entirely rather than printed empty.
@@ -52,6 +52,12 @@ impl RequestId {
 /// which makes a burst of duplicate submissions look like a burst of work.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Shared;
+
+/// Marks a response whose status and headers went out before its answer was
+/// known: a `/v1/analyze` stream. Its `status` and `dur_ms` describe the
+/// headers; the stream logs its own outcome under the same `id`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Streamed;
 
 /// Longest identifier echoed onto the access line. A PURL carrying a scope, a
 /// version and qualifiers fits well inside this; past it the excerpt is still
@@ -308,15 +314,16 @@ pub(super) async fn access_log(
         tracing::Level::INFO
     };
 
-    // Only a rejected credential has these, and only then are they worth a
-    // reader's attention: they are what turns "401" into "the client is holding
-    // a different token than the one this process loaded".
     let shared = response.extensions().get::<Shared>().map(|_| true);
+    let streamed = response.extensions().get::<Streamed>().map(|_| true);
     let subject = response
         .extensions()
         .get::<Subject>()
         .cloned()
         .unwrap_or_default();
+    // Only a rejected credential has these, and only then are they worth a
+    // reader's attention: they are what turns "401" into "the client is holding
+    // a different token than the one this process loaded".
     let (cred_len, cred_fp) = match auth {
         Some(Auth::BadToken { len, fp }) => (Some(len), Some(fp.to_string())),
         _ => (None, None),
@@ -337,6 +344,7 @@ pub(super) async fn access_log(
                 auth = auth.map(Auth::as_str),
                 req_bytes,
                 shared,
+                streamed,
                 sha256 = subject.sha256.as_deref(),
                 purl = subject.purl.as_deref(),
                 url = subject.url.as_deref(),

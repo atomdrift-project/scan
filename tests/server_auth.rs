@@ -5,27 +5,16 @@
 //! body-detail test runs without model artifacts: the middleware rejects a
 //! request long before a handler needs a model.
 
+mod common;
+
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use scan::server::{ServerConfig, TokenDigest, build_app};
-use std::net::SocketAddr;
+use common::{loopback, with_peer};
+use scan::server::{Cidr, ServerConfig, TokenDigest, build_app};
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-
-/// Inject a peer address, as `into_make_service_with_connect_info` does in
-/// production. Without it the ACL fails closed and every request 403s.
-fn with_peer<B>(mut req: Request<B>, ip: [u8; 4]) -> Request<B> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from((ip, 0))));
-    req
-}
-
-fn loopback<B>(req: Request<B>) -> Request<B> {
-    with_peer(req, [127, 0, 0, 1])
-}
 
 fn get(uri: &str, authorization: Option<&str>) -> Result<Request<Body>> {
     let mut builder = Request::builder().uri(uri);
@@ -39,23 +28,15 @@ fn get(uri: &str, authorization: Option<&str>) -> Result<Request<Body>> {
 /// the server never becomes ready, which is irrelevant to the ACL: the
 /// middleware runs ahead of every handler.
 fn config(authenticated: bool) -> Result<ServerConfig> {
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?;
-    if !authenticated {
-        return Ok(config);
-    }
-    let digest = TokenDigest::new(TOKEN).map_err(anyhow::Error::msg)?;
-    Ok(config.with_auth_token(Some(digest)))
+    let auth_digest = if authenticated {
+        Some(TokenDigest::new(TOKEN).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+    Ok(ServerConfig {
+        auth_digest,
+        ..common::unready_config()
+    })
 }
 
 /// The case this feature exists for: behind a Cloudflare tunnel, `cloudflared`
@@ -215,32 +196,73 @@ async fn unauthenticated_server_is_unchanged() -> Result<()> {
     Ok(())
 }
 
+/// The admin routes reload what the server runs, so `--allow-cidr` — which
+/// grants analysis — must not grant them too. Without a token they answer
+/// loopback alone; with one, the token is their credential like any route's.
+///
+/// Asked with GET: a peer the ACL lets through reaches the router and gets 405,
+/// which tells the two outcomes apart without running a reload.
+#[tokio::test]
+async fn admin_routes_need_loopback_or_a_token() -> Result<()> {
+    let allowed = [203, 0, 113, 7];
+    let open = build_app(&ServerConfig {
+        allow_cidrs: vec![Cidr::parse("203.0.113.0/24").map_err(anyhow::Error::msg)?],
+        ..config(false)?
+    })
+    .await?;
+    for route in ["/_/reload", "/_/update"] {
+        let response = open
+            .clone()
+            .oneshot(with_peer(get(route, None)?, allowed))
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an allowed peer reached {route} on a server with no token",
+        );
+        let response = open.clone().oneshot(loopback(get(route, None)?)).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "loopback must still reach {route}",
+        );
+        // Analysis stays open to the allowed peer.
+        let response = open
+            .clone()
+            .oneshot(with_peer(get("/analyze", None)?, allowed))
+            .await?;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    let authenticated = build_app(&ServerConfig {
+        allow_cidrs: vec![Cidr::parse("203.0.113.0/24").map_err(anyhow::Error::msg)?],
+        ..config(true)?
+    })
+    .await?;
+    let authorization = format!("Bearer {TOKEN}");
+    let response = authenticated
+        .oneshot(with_peer(get("/_/reload", Some(&authorization))?, allowed))
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "with a token configured, the token is the admin credential",
+    );
+    Ok(())
+}
+
 /// `/_/health` is public, so its body must not name the samples being
 /// analysed. The diagnostic keys appear only for a request that authenticated.
 ///
-/// Needs a ready server — the privileged keys live in the ready-state body —
-/// so this one is gated on `SCAN_MODELS_DIR` like the analyze tests.
+/// Needs a ready server — the privileged keys live in the ready-state body.
 #[tokio::test]
+#[ignore = "needs a model bundle: set SCAN_MODELS_DIR and run with --ignored"]
 async fn health_detail_requires_authentication() -> Result<()> {
-    let Ok(models) = std::env::var("SCAN_MODELS_DIR") else {
-        eprintln!("skipping: SCAN_MODELS_DIR is not set");
-        return Ok(());
-    };
-
     let digest = TokenDigest::new(TOKEN).map_err(anyhow::Error::msg)?;
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        models,
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?
-    .with_auth_token(Some(digest));
+    let config = ServerConfig {
+        auth_digest: Some(digest),
+        ..common::ready_config()?
+    };
     let app = build_app(&config).await?;
 
     let body_of = async |authorization: Option<&str>| -> Result<serde_json::Value> {

@@ -6,15 +6,16 @@
 //! announced `drain timeout reached` 15 s in, abandoning whatever was in flight.
 //! Nothing here asks the worker to stop, so `run()` must simply not return.
 //!
-//! **Requires `SCAN_MODELS_DIR`** (same convention as `worker_post_hang.rs`).
+//! **Requires `SCAN_MODELS_DIR`**, so it is ignored by default:
+//! `SCAN_MODELS_DIR=... cargo test --test worker_idle_lifetime -- --ignored`.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
+mod worker_support;
+
 use std::time::Duration;
 
-use scan::worker::{WorkerConfig, run};
+use scan::worker::run;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -35,12 +36,8 @@ async fn handle_conn(mut stream: TcpStream) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a model bundle in SCAN_MODELS_DIR; run with --ignored"]
 async fn idle_worker_outlives_the_shutdown_drain_window() {
-    let Ok(models_dir) = std::env::var("SCAN_MODELS_DIR") else {
-        eprintln!("skipping: SCAN_MODELS_DIR not set (same convention as worker_post_hang.rs)");
-        return;
-    };
-
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock hopper");
@@ -51,28 +48,9 @@ async fn idle_worker_outlives_the_shutdown_drain_window() {
         }
     });
 
-    let config = WorkerConfig {
-        no_update: true,
-        // Standalone worker under test; no host server to defer to.
-        hopper_url: format!("http://{addr}"),
-        name: "idle-lifetime-regression".into(),
-        workers: NonZeroUsize::new(2).expect("2 workers"),
-        poll_secs: 1,
-        max_rss_gb: 0,
-        model_dir: PathBuf::from(models_dir),
-        thresholds: None,
-        data_dir: None,
-        slow_rule_ms: 4000,
-        max_jobs: None,
-        // Long-running mode: only a signal ends this worker, and the test
-        // sends none.
-        exit_if_empty: false,
-        level: None,
-        nice: 0,
-        interpret: None,
-        fetch: scan::fetch::FetchPolicy::default(),
-        zip_passwords: scan::ArchivePasswords::default(),
-    };
+    // Long-running mode: only a signal ends this worker, and the test sends none.
+    let config =
+        worker_support::worker_config("idle-lifetime-regression", format!("http://{addr}"), None);
 
     let mut worker = tokio::spawn(run(config));
     let outcome = tokio::time::timeout(WATCH, &mut worker).await;

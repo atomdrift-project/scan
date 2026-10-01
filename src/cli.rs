@@ -17,13 +17,14 @@
 #![allow(
     rustdoc::broken_intra_doc_links,
     rustdoc::bare_urls,
-    rustdoc::invalid_html_tags
+    rustdoc::invalid_html_tags,
+    reason = "these doc comments are `--help` text, not rustdoc"
 )]
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::OutputFormat;
 
@@ -35,13 +36,124 @@ pub const DEFAULT_SLOW_RULE_MS: u64 = 4000;
 /// Default hard wall-clock limit for each Rizin subprocess, in seconds.
 pub const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 10 * 60;
 
+/// What a run does about its rules and models before it starts: the
+/// `-u`/`--update` and `--no-update` flags, settled into one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// `--no-update`: run on whatever is on disk. Wins over `--update`.
+    Skip,
+    /// The default: refresh when the local copy is out of date.
+    IfStale,
+    /// `-u`/`--update`: re-fetch even when the local copy looks current.
+    Force,
+}
+
+/// What `--llm` resolution reads from outside the command line: the
+/// `SCAN_LLM*` variables and the `~/.tok` token files.
+///
+/// Gathered in one place so resolution itself never touches the process
+/// environment — tests hand it their own.
+#[derive(Debug, Default, Clone)]
+pub struct LlmEnv {
+    /// `SCAN_LLM`: the endpoint list, when `--llm` is absent.
+    pub target: Option<String>,
+    /// `SCAN_LLM_MODEL`.
+    pub model: Option<String>,
+    /// `SCAN_LLM_KEY`.
+    pub key: Option<String>,
+    /// `SCAN_LLM_CONCURRENCY`: in-flight cap; `None` scales with the host.
+    pub concurrency: Option<NonZeroUsize>,
+    /// `SCAN_LLM_BACKGROUND_CONCURRENCY`: in-flight calls background work may
+    /// hold; `None` takes a quarter of the cap.
+    pub background_concurrency: Option<NonZeroUsize>,
+    /// `SCAN_LLM_SYSTEM_PROMPT_FILE`: a grading prompt to use in place of the
+    /// built-in one, for a prompt-tuning A/B.
+    pub system_prompt_file: Option<PathBuf>,
+    /// `~/.tok/llm`: our own endpoint's bearer token.
+    pub llm_token_file: Option<PathBuf>,
+    /// `~/.tok/openrouter`.
+    pub openrouter_token_file: Option<PathBuf>,
+}
+
+impl LlmEnv {
+    /// Read the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a concurrency variable is set but not a number.
+    pub fn from_process() -> Result<Self> {
+        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        // 0 keeps its old meaning: the default.
+        let count = |key: &str| -> Result<Option<NonZeroUsize>> {
+            var(key)
+                .map(|raw| raw.trim().parse().with_context(|| format!("{key}={raw:?}")))
+                .transpose()
+                .map(|n| n.and_then(NonZeroUsize::new))
+        };
+        Ok(Self {
+            target: var("SCAN_LLM"),
+            model: var("SCAN_LLM_MODEL"),
+            key: var("SCAN_LLM_KEY"),
+            concurrency: count("SCAN_LLM_CONCURRENCY")?,
+            background_concurrency: count("SCAN_LLM_BACKGROUND_CONCURRENCY")?,
+            system_prompt_file: var("SCAN_LLM_SYSTEM_PROMPT_FILE").map(PathBuf::from),
+            llm_token_file: crate::interpret::llm_token_path(),
+            openrouter_token_file: crate::interpret::openrouter_token_path(),
+        })
+    }
+}
+
+/// Read a token file, when one is configured and present.
+fn token_from(path: Option<&Path>) -> Option<String> {
+    crate::interpret::read_token_file(path?)
+}
+
+/// The model bundle a run analyzes with: `dir` when the operator named one,
+/// otherwise the installed bundle (fetched on first use).
+///
+/// # Errors
+///
+/// Returns an error when no bundle is named and none can be installed.
+pub fn resolve_model_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
+    match dir {
+        Some(dir) => Ok(dir),
+        None => crate::models_repo::ensure_model_dir().context("failed to resolve model directory"),
+    }
+}
+
+/// The operating point a run classifies at. (The envelope's `ml.lvl` is not
+/// this: it is the lowest level at which the sample fires, whatever this is.)
+///
+/// In priority order: the explicit `-l/--level`, the bundle's own
+/// `default_severity_level` (so a bundle calibrated at L50 deploys at L50 with
+/// no rebuild), then [`crate::model::DEFAULT_SEVERITY_LEVEL`]. Manual
+/// `--threshold-*` cutoffs bypass the level grid entirely, so there is no
+/// level to report then and the answer is `None`.
+#[must_use]
+pub fn operating_level(
+    level: Option<u16>,
+    manual_thresholds: bool,
+    model_dir: &Path,
+) -> Option<u16> {
+    if manual_thresholds {
+        return None;
+    }
+    Some(
+        level
+            .or_else(|| crate::model::model_default_level(model_dir))
+            .unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL),
+    )
+}
+
 /// Classification values accepted by `--show`.
 //
-// The variants are deliberately left undocumented: clap's `ValueEnum` derive
-// turns a variant doc comment into that value's help text, which would switch
-// `--show`'s `[possible values: ...]` line into a multi-line list. That is
-// user-visible help output, so the lint yields to it here.
-#[allow(missing_docs)]
+// clap's `ValueEnum` derive turns a variant doc comment into that value's help
+// text, which would switch `--show`'s `[possible values: ...]` line into a
+// multi-line list.
+#[expect(
+    missing_docs,
+    reason = "variant docs would change `--show` help output"
+)]
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum Show {
     Hostile,
@@ -496,23 +608,35 @@ impl GlobalArgs {
     ///
     /// # Errors
     ///
+    /// Returns an error when `SCAN_LLM_CONCURRENCY` does not parse, or for any
+    /// reason [`GlobalArgs::interpret_config_with`] gives.
+    pub fn interpret_config(&self) -> Result<Option<crate::interpret::InterpretConfig>> {
+        self.interpret_config_with(&LlmEnv::from_process()?)
+    }
+
+    /// [`GlobalArgs::interpret_config`] against an explicit environment.
+    ///
+    /// # Errors
+    ///
     /// Returns an error when `--llm` names no endpoint, when the only
     /// endpoint requested is unusable (an OpenRouter target with no key, or
     /// one whose model can be neither pinned nor discovered), or when every
     /// endpoint in a failover chain was dropped for those reasons.
-    pub fn interpret_config(&self) -> Result<Option<crate::interpret::InterpretConfig>> {
+    pub fn interpret_config_with(
+        &self,
+        env: &LlmEnv,
+    ) -> Result<Option<crate::interpret::InterpretConfig>> {
         use crate::interpret::{
-            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint, llm_key_from_home, llm_models,
-            llm_targets, openrouter_key_from_home,
+            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint, llm_models, llm_targets,
         };
-        let from_env = |flag: &Option<String>, key: &str| -> Option<String> {
+        let flag_or = |flag: &Option<String>, env: &Option<String>| -> Option<String> {
             flag.clone()
-                .or_else(|| std::env::var(key).ok())
+                .or_else(|| env.clone())
                 .filter(|s| !s.is_empty())
         };
         // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
         // or the legacy `--interpret` flag turns the pass on.
-        let target = from_env(&self.llm, "SCAN_LLM");
+        let target = flag_or(&self.llm, &env.target);
         if target.is_none() && !self.interpret {
             return Ok(None);
         }
@@ -528,7 +652,7 @@ impl GlobalArgs {
             anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
         }
         let pinned = llm_models(
-            from_env(&self.llm_model, "SCAN_LLM_MODEL").as_deref(),
+            flag_or(&self.llm_model, &env.model).as_deref(),
             targets.len(),
         );
         // An explicit key wins, and applies to every endpoint in the chain —
@@ -538,7 +662,7 @@ impl GlobalArgs {
         // one, and a host that has the file authenticates without any flag.
         // Absent a file, the request goes out unauthenticated, which is still
         // right for an endpoint that wants no key.
-        let explicit_key = from_env(&self.llm_key, "SCAN_LLM_KEY");
+        let explicit_key = flag_or(&self.llm_key, &env.key);
 
         // One endpoint must work; the rest are a cushion. So a config problem
         // is fatal when it is the only endpoint (a misconfigured `--llm` must
@@ -556,9 +680,9 @@ impl GlobalArgs {
             // unrelated host and read as a plain 401 when it did.
             let api_key = explicit_key.clone().or_else(|| {
                 if openrouter {
-                    openrouter_key_from_home()
+                    token_from(env.openrouter_token_file.as_deref())
                 } else {
-                    llm_key_from_home()
+                    token_from(env.llm_token_file.as_deref())
                 }
             });
             if openrouter && api_key.is_none() {
@@ -630,13 +754,28 @@ impl GlobalArgs {
             timeout: std::time::Duration::from_secs(self.llm_timeout),
             // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
             // scales with the box (see `interpret::default_max_concurrency`).
-            max_concurrency: std::env::var("SCAN_LLM_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .and_then(NonZeroUsize::new)
+            max_concurrency: env
+                .concurrency
                 .unwrap_or_else(crate::interpret::default_max_concurrency),
+            background_concurrency: env.background_concurrency,
+            system_prompt: match &env.system_prompt_file {
+                Some(path) => crate::interpret::read_system_prompt(path)?,
+                None => crate::interpret::SYSTEM_PROMPT.into(),
+            },
             fallbacks: resolved.collect(),
         }))
+    }
+
+    /// The `-u`/`--update` and `--no-update` flags as one value.
+    #[must_use]
+    pub fn refresh(&self) -> Refresh {
+        if self.no_update {
+            Refresh::Skip
+        } else if self.update {
+            Refresh::Force
+        } else {
+            Refresh::IfStale
+        }
     }
 
     /// Whether native-binary dependencies are fetched for this host only.
@@ -714,10 +853,10 @@ impl GlobalArgs {
     #[must_use]
     pub fn display_filter(&self) -> crate::DisplayFilter {
         let all = self.show.iter().any(|s| matches!(s, Show::All));
-        crate::DisplayFilter::new(
-            all || self.show.iter().any(|s| matches!(s, Show::Hostile)),
-            all || self.show.iter().any(|s| matches!(s, Show::Sus)),
-            all || self.show.iter().any(|s| matches!(s, Show::Benign)),
-        )
+        crate::DisplayFilter {
+            hostile: all || self.show.iter().any(|s| matches!(s, Show::Hostile)),
+            suspicious: all || self.show.iter().any(|s| matches!(s, Show::Sus)),
+            benign: all || self.show.iter().any(|s| matches!(s, Show::Benign)),
+        }
     }
 }

@@ -2,10 +2,9 @@
 //!
 //! Builds a temporary ensemble bundle (general/ + filegroups/native/ +
 //! filetypes/elf/) from a real ONNX bundle and verifies:
-//!   * `predict_for(file_type, …)` consults the right specialists.
+//!   * `predict_report` on a report of a given file type consults the right
+//!     specialists.
 //!   * Files whose type is unmapped route to general only.
-//!   * A specialist with the wrong number of features is dropped (warning,
-//!     not fatal); the route degrades.
 //!   * `required_routes` lists are enforced.
 //!
 //! Tests are `#[ignore]`d by default because they need a real bundle on
@@ -86,27 +85,54 @@ fn stage_ensemble(
     dir
 }
 
+/// A report whose primary file is of type `file_type`.
+fn report_of(file_type: &str) -> cleave::types::CompactReport {
+    let mut report = cleave::types::CompactReport::default();
+    report.files.push(cleave::types::CompactFile {
+        file_type: file_type.to_string(),
+        ..Default::default()
+    });
+    report
+}
+
+/// The decided probability and the routes scored for a `file_type` report.
+fn routes(model: &Model, file_type: &str) -> (f32, Vec<String>) {
+    let (decision, scores, _) = model
+        .predict_report(&report_of(file_type))
+        .unwrap_or_else(|e| panic!("predict {file_type}: {e:#}"));
+    (
+        decision.probability,
+        scores.into_iter().map(|s| s.model).collect(),
+    )
+}
+
+/// An ensemble config registering every staged route at the default level.
+const CALIBRATED: &str = r#"{
+  "filetype_to_group": { "elf": "native", "pe": "native" },
+  "levels": [{
+    "level": 25,
+    "hostile": {"thresholds": {
+      "general": 0.99, "filegroups/native": 0.99, "filetypes/elf": 0.99
+    }}
+  }]
+}"#;
+
 #[test]
 #[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filetype_specialist_when_present() {
     let Some(src) = onnx_bundle() else {
         panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
-    let cfg = r#"{
-      "filetype_to_filegroup": { "elf": "native", "pe": "native" }
-    }"#;
-    let dir = stage_ensemble(&src, &["native"], &["elf"], cfg);
+    let dir = stage_ensemble(&src, &["native"], &["elf"], CALIBRATED);
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
-    let zeros = vec![0.0f32; model.spec().total_features()];
-
     // Files of type elf consult: general + filegroup(native) + filetype(elf).
-    // Since all three are the same model, the probability is the same as
-    // general-only and the OR decision over identical thresholds is unchanged.
-    let (prob_elf, _) = model.predict_for("elf", &zeros).expect("predict elf");
+    let (prob_elf, elf_routes) = routes(&model, "elf");
+    assert_eq!(elf_routes, ["az", "az/native", "az/elf"]);
 
-    // Files of type "py" are unmapped → route is general only.
-    let (prob_py, _) = model.predict_for("py", &zeros).expect("predict py");
+    // Files of type "python" are unmapped → route is general only.
+    let (prob_py, py_routes) = routes(&model, "python");
+    assert_eq!(py_routes, ["az"]);
 
     // Sanity: probabilities are finite.
     assert!(prob_elf.is_finite());
@@ -122,15 +148,12 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
     let Some(src) = onnx_bundle() else {
         panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
-    let cfg = r#"{
-      "filetype_to_filegroup": { "pe": "native" }
-    }"#;
     // No filetypes/pe specialist; pe routes through filegroup(native) + general.
-    let dir = stage_ensemble(&src, &["native"], &[], cfg);
+    let dir = stage_ensemble(&src, &["native"], &[], CALIBRATED);
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
-    let zeros = vec![0.0f32; model.spec().total_features()];
-    let (prob, _) = model.predict_for("pe", &zeros).expect("predict pe");
+    let (prob, pe_routes) = routes(&model, "pe");
+    assert_eq!(pe_routes, ["az", "az/native"]);
     assert!(prob.is_finite());
 }
 
@@ -140,14 +163,14 @@ fn ensemble_with_only_general_falls_back_to_general() {
     let Some(src) = onnx_bundle() else {
         panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
-    let cfg = r#"{}"#;
-    let dir = stage_ensemble(&src, &[], &[], cfg);
+    let dir = stage_ensemble(&src, &[], &[], "{}");
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
-    let zeros = vec![0.0f32; model.spec().total_features()];
-    let (prob_general, _) = model.predict(&zeros).expect("predict general");
-    let (prob_elf, _) = model.predict_for("elf", &zeros).expect("predict elf");
-    // No specialists, so predict and predict_for must return the same value.
+    // No specialists, so every file type scores on general alone.
+    let (prob_general, general_routes) = routes(&model, "python");
+    let (prob_elf, elf_routes) = routes(&model, "elf");
+    assert_eq!(general_routes, ["az"]);
+    assert_eq!(elf_routes, ["az"]);
     assert!((prob_general - prob_elf).abs() < 1e-6);
 }
 
@@ -158,7 +181,6 @@ fn ensemble_required_route_missing_is_fatal() {
         panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
     };
     let cfg = r#"{
-      "filetype_to_filegroup": {},
       "required_routes": ["filetype:nonexistent"]
     }"#;
     let dir = stage_ensemble(&src, &[], &[], cfg);

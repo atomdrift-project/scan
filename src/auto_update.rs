@@ -2,9 +2,10 @@
 //!
 //! On an interactive scan, if the local ruleset hasn't been checked in 24 hours
 //! (and `--no-update` / `SCAN_NO_UPDATE` is not set), scan refreshes the cleave
-//! trait bundle and the ML model bundle in the background. The check is gated by
-//! a tiny on-disk stamp, so the common case touches neither the network nor the
-//! terminal: most runs return in microseconds having done nothing.
+//! trait bundle, the ML model bundle, and the bloom filters before it starts.
+//! The check is gated by a tiny on-disk stamp, so the common case touches
+//! neither the network nor the terminal: most runs return in microseconds
+//! having done nothing.
 //!
 //! When a refresh *does* run, the update calls are silenced (their own progress
 //! lines would be noise) and, on a terminal, a transient "updating rules…" line
@@ -109,12 +110,13 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
     // Resolve the transient line:
     //   - a real update earns a checkmark;
     //   - a reachable, already-current ruleset leaves no trace (invisible);
-    //   - an unreachable bucket gets one actionable line, at most once a day.
+    //   - a failure (offline, mirror error) gets one actionable line, at most
+    //     once a day.
     if outcome.changed {
         print_checkmark(mode);
     } else if outcome.failed {
         eprint!(
-            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mauto-update timed out \u{2014} run `atomscan update-rules` to update\x1b[0m\n",
+            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mauto-update failed \u{2014} run `atomscan update-rules` to update\x1b[0m\n",
         );
         let _ = std::io::stderr().flush();
     } else {
@@ -124,7 +126,7 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
 }
 
 /// Whether a refresh installed anything new, and whether any of the three
-/// bundles failed to reach the server.
+/// bundles failed to update.
 struct Outcome {
     changed: bool,
     failed: bool,
@@ -139,53 +141,35 @@ struct Outcome {
 fn refresh() -> Outcome {
     let models_dir = crate::models_repo::install_target();
     let bloom_dir = crate::bloom_repo::install_dir();
-    let model_before = crate::model_update::installed(&models_dir).map(|i| i.commit);
-
-    let mut changed = false;
-    let mut failed = false;
-    std::thread::scope(|s| {
+    let results = std::thread::scope(|s| {
         let traits = s.spawn(|| crate::traits_repo::update(false, true));
         let models = s.spawn(|| crate::model_update::update(&models_dir, false, true));
         let bloom = s.spawn(|| crate::bloom_update::update(&bloom_dir, false, true));
-
-        match traits.join() {
-            Ok(Ok(c)) => changed |= c,
-            Ok(Err(e)) => {
-                failed = true;
-                tracing::debug!(error = %format!("{e:#}"), "auto traits update failed");
-            }
-            Err(_) => {
-                failed = true;
-                tracing::debug!("auto traits update panicked");
-            }
-        }
-        match models.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                failed = true;
-                tracing::debug!(error = %format!("{e:#}"), "auto model update failed");
-            }
-            Err(_) => {
-                failed = true;
-                tracing::debug!("auto model update panicked");
-            }
-        }
-        match bloom.join() {
-            Ok(Ok(c)) => changed |= c,
-            Ok(Err(e)) => {
-                failed = true;
-                tracing::debug!(error = %format!("{e:#}"), "auto bloom update failed");
-            }
-            Err(_) => {
-                failed = true;
-                tracing::debug!("auto bloom update panicked");
-            }
-        }
+        [
+            ("traits", traits.join()),
+            ("model", models.join()),
+            ("bloom", bloom.join()),
+        ]
     });
 
-    let model_after = crate::model_update::installed(&models_dir).map(|i| i.commit);
-    changed |= model_before != model_after;
-    Outcome { changed, failed }
+    let mut outcome = Outcome {
+        changed: false,
+        failed: false,
+    };
+    for (bundle, result) in results {
+        match result {
+            Ok(Ok(changed)) => outcome.changed |= changed,
+            Ok(Err(e)) => {
+                outcome.failed = true;
+                tracing::debug!(bundle, error = format!("{e:#}"), "auto update failed");
+            }
+            Err(_) => {
+                outcome.failed = true;
+                tracing::debug!(bundle, "auto update panicked");
+            }
+        }
+    }
+    outcome
 }
 
 /// Erase the transient line and print the update checkmark: the current split

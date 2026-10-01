@@ -97,6 +97,10 @@ fn cancel_all() -> Vec<&'static str> {
 /// second one flips nothing — every flag is already set — and that is the
 /// signal to stop waiting. An interrupt arriving when no scan is registered
 /// takes the same exit, since there is no work left to finish gracefully.
+///
+/// The hard exit is deliberate and the only one in the library: a second
+/// Ctrl-C is the user asking to stop *now*, which every CLI honors, and there
+/// is no caller left to return an outcome to.
 fn interrupted() {
     let notices = cancel_all();
     if notices.is_empty() {
@@ -112,7 +116,6 @@ fn interrupted() {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

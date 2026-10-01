@@ -5,12 +5,12 @@
 //! [`crate::worker`] needs the same answer. It previously lived in atomscan's
 //! `main.rs`, which meant a second front end — postdoc, which builds a
 //! [`crate::worker::Startup`] directly — could not reuse it and passed its raw
-//! CLI value straight through instead. That is a silent, severe failure: the
-//! `Startup` field is already-resolved bytes where `0` means *unlimited*, while
-//! every CLI spells `0` as *resolve one for me*. The two meanings collide on the
-//! default value, so the worker ran with memory admission disabled entirely.
-//! Anything constructing a `Startup` must resolve through
-//! [`resolve_worker_max_rss_gb`] first.
+//! CLI value straight through instead. That is a silent, severe failure: an
+//! already-resolved ceiling uses `0` for *unlimited*, while every CLI spells
+//! `0` as *resolve one for me*. The two meanings collide on the default value,
+//! so the worker ran with memory admission disabled entirely. Which is why
+//! `Startup` now takes a [`MaxRssPolicy`] and resolves it itself: there is no
+//! raw number left to pass through.
 //!
 //! **The basis must be cgroup-aware.** `cleave::memory_tracker::total_memory()`
 //! is the host's `MemTotal` and knows nothing about cgroups, so on a shared host
@@ -21,7 +21,7 @@
 //! analyses — until the cgroup OOM-killed the process every ~20 minutes. It was
 //! never a leak; memory was returned whenever work drained. The budget was a lie.
 //!
-//! Note that the *host floor* in [`crate::admission`] deliberately stays
+//! Note that the *host floor* in `crate::admission` deliberately stays
 //! host-scoped: it protects the machine from all tenants at once, so `MemTotal`
 //! is the right basis there. Only this process's own ceiling is clamped here.
 
@@ -57,6 +57,24 @@ pub enum MaxRssPolicy {
 }
 
 impl MaxRssPolicy {
+    /// The whole-process ceiling in bytes, resolved against this host's
+    /// memory and cgroup limit; `None` when throttling is disabled.
+    #[must_use]
+    pub fn process_ceiling(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Disabled => None,
+            Self::Auto => NonZeroU64::new(cleave::memory_tracker::memory_limit()),
+            Self::Explicit(gb) => NonZeroU64::new(gb.get().saturating_mul(GIB)),
+        }
+    }
+
+    /// The worker's admission ceiling in bytes, resolved against this host;
+    /// `None` when throttling is disabled. See [`resolve_worker_max_rss_gb`].
+    #[must_use]
+    pub fn worker_ceiling(self) -> Option<NonZeroU64> {
+        NonZeroU64::new(worker_max_rss_gb(self).saturating_mul(GIB))
+    }
+
     /// Interpret a raw `--max-rss-gb` value: negative disables, `0` resolves,
     /// positive is an explicit GiB ceiling.
     #[must_use]
@@ -121,7 +139,7 @@ fn cgroup_limit_under(root: &Path, start: &Path) -> Option<u64> {
 ///
 /// `memory.high` counts because a throttle the process can never outrun is a
 /// ceiling in practice. Both files read `max` when unset, which
-/// [`memory_value_bytes`] maps to `None`.
+/// `memory_value_bytes` maps to `None`.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn cgroup_memory_limit_bytes() -> Option<u64> {
@@ -161,26 +179,20 @@ pub fn worker_memory_basis() -> WorkerMemoryBasis {
     }
 }
 
-/// Resolve `--max-rss-gb` into the GiB ceiling a [`crate::worker::Startup`]
-/// expects. **Every** front end must call this; see the module docs.
+/// Resolve a raw `--max-rss-gb` into the worker's GiB ceiling; 0 means
+/// throttling is disabled.
 #[must_use]
 pub fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {
-    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
+    worker_max_rss_gb(MaxRssPolicy::from_cli(raw_max_rss_gb))
+}
+
+fn worker_max_rss_gb(policy: MaxRssPolicy) -> u64 {
+    match policy {
         MaxRssPolicy::Disabled => 0,
         // 85% of the cgroup-aware memory basis, with a one-GiB floor. Slot
         // count scales with cores, so larger hosts need a proportionate ceiling.
         MaxRssPolicy::Auto => std::cmp::max(1, (worker_memory_basis().bytes * 85 / 100) / GIB),
         MaxRssPolicy::Explicit(gb) => gb.get(),
-    }
-}
-
-/// Resolve `--max-rss-gb` into a byte ceiling for whole-process throttling.
-#[must_use]
-pub fn resolve_process_max_rss_bytes(raw_max_rss_gb: i64) -> u64 {
-    match MaxRssPolicy::from_cli(raw_max_rss_gb) {
-        MaxRssPolicy::Disabled => 0,
-        MaxRssPolicy::Auto => cleave::memory_tracker::memory_limit(),
-        MaxRssPolicy::Explicit(gb) => gb.get().saturating_mul(GIB),
     }
 }
 
@@ -329,7 +341,6 @@ pub fn proc_memtotal_mb() -> Result<u64, String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -434,15 +445,20 @@ mod tests {
         // The postdoc collision: a front end passing raw 0 into Startup would
         // disable admission. Resolved, 0 must yield a positive ceiling.
         assert!(resolve_worker_max_rss_gb(0) > 0);
-        assert!(resolve_process_max_rss_bytes(0) > 0);
+        assert!(MaxRssPolicy::from_cli(0).process_ceiling().is_some());
     }
 
     #[test]
     fn negative_disables_and_explicit_is_verbatim() {
         assert_eq!(resolve_worker_max_rss_gb(-1), 0);
-        assert_eq!(resolve_process_max_rss_bytes(-1), 0);
+        assert_eq!(MaxRssPolicy::from_cli(-1).process_ceiling(), None);
         assert_eq!(resolve_worker_max_rss_gb(3), 3);
-        assert_eq!(resolve_process_max_rss_bytes(3), 3 * GIB);
+        assert_eq!(
+            MaxRssPolicy::from_cli(3)
+                .process_ceiling()
+                .map(NonZeroU64::get),
+            Some(3 * GIB)
+        );
     }
 
     #[test]

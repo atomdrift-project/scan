@@ -10,36 +10,13 @@
 //! reads the flight registry and the verdict index, so it must answer while a
 //! restarted server is still loading.
 
+mod common;
+
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use scan::server::{ServerConfig, build_app};
-use std::net::SocketAddr;
+use common::{app, encoded_purl, loopback};
 use tower::ServiceExt;
-
-fn loopback<B>(mut req: Request<B>) -> Request<B> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    req
-}
-
-async fn app() -> Result<Router> {
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?;
-    build_app(&config).await
-}
 
 async fn get(uri: &str) -> Result<(StatusCode, serde_json::Value)> {
     let app = app().await?;
@@ -60,15 +37,6 @@ const UNKNOWN: &str = "pkg:npm/scan-status-fixture-never-analyzed@0.0.0";
 /// canonicalizes. Written out rather than derived, so the test needs no
 /// fallible step of its own to set up.
 const UNKNOWN_BARE: &str = "npm/scan-status-fixture-never-analyzed@0.0.0";
-
-fn encoded_purl(purl: &str) -> String {
-    purl.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' => c.to_string(),
-            other => format!("%{:02X}", other as u32),
-        })
-        .collect()
-}
 
 /// Nothing running and nothing stored. The caller reads this as "lost" when it
 /// follows a dispatch of their own, which is why the state is reported plainly

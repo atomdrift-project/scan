@@ -16,15 +16,20 @@
 //!
 //! Rendering is a bounded, cursor-relative redraw: the region is capped to the
 //! viewport height (a long graph windows around the active frontier), so the
-//! `\x1b[{n}A` cursor moves never walk off-screen and the tree never scrolls
-//! itself apart.
+//! cursor moves never walk off-screen and the tree never scrolls itself apart.
+//! State changes only mark the tree dirty; one heartbeat thread does all the
+//! drawing, at most once a tick, so network threads never wait on the terminal.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::engine::{PROGRESS_TICK, SPINNER, bar_active, term_dims};
+use crate::output::{Rgb, fg};
 
 /// The lifecycle state a caller drives a dependency through. `Fetching` and
 /// `Analyzing` render with a live spinner; `Done` is terminal and carries its
@@ -38,7 +43,7 @@ pub(crate) enum DepState {
     Hidden,
     Done {
         glyph: char,
-        color: (u8, u8, u8),
+        color: Rgb,
         detail: String,
     },
 }
@@ -63,6 +68,16 @@ const RESERVE_ROWS: usize = 3;
 /// terminal width (a wrapped row breaks the in-place redraw).
 const NAME_MAX: usize = 34;
 
+/// Erase the current line and return to its start.
+const CLEAR_LINE: &str = "\r\x1b[2K";
+
+const DIM: Rgb = Rgb(110, 110, 110);
+const DETAIL: Rgb = Rgb(130, 130, 130);
+const SOURCE: Rgb = Rgb(90, 90, 90);
+const LABEL: Rgb = Rgb(160, 160, 160);
+const IN_FLIGHT: Rgb = Rgb(100, 180, 255);
+const SETTLED: Rgb = Rgb(80, 200, 80);
+
 /// One dependency's row: its display name, current status, and a monotonic
 /// sequence stamped on each change so the focused view can pick the most
 /// recently active rows.
@@ -84,7 +99,7 @@ enum Status {
     Hidden,
     Done {
         glyph: char,
-        color: (u8, u8, u8),
+        color: Rgb,
         detail: String,
     },
 }
@@ -96,8 +111,7 @@ impl Status {
     }
 }
 
-/// Mutable tree state, guarded by a single mutex so state changes and the
-/// stderr redraw they trigger never interleave with the heartbeat thread's.
+/// Mutable tree state, guarded by a single mutex.
 struct State {
     /// Entries in discovery order; the render window is computed over this.
     entries: Vec<Entry>,
@@ -106,6 +120,10 @@ struct State {
     /// Monotonic change counter; each `add`/`set` stamps the entry's `seq` from
     /// it, so the focused view can rank rows by how recently they moved.
     clock: u64,
+    /// Whether anything changed since the last redraw.
+    dirty: bool,
+    /// Spinner frame, advanced once per heartbeat.
+    tick: u32,
     /// Lines the region currently occupies on screen, so the next redraw knows
     /// how far up to move the cursor.
     drawn: usize,
@@ -114,28 +132,65 @@ struct State {
 }
 
 impl State {
-    /// Next monotonic sequence value.
+    /// Next monotonic sequence value; marks the tree for the next redraw.
     fn stamp(&mut self) -> u64 {
         self.clock += 1;
+        self.dirty = true;
         self.clock
+    }
+
+    fn add(&mut self, key: &str, name: &str, source: &str) {
+        if self.index.contains_key(key) {
+            return;
+        }
+        let idx = self.entries.len();
+        let seq = self.stamp();
+        self.entries.push(Entry {
+            name: name.to_string(),
+            status: Status::Pending,
+            seq,
+            source: source.to_string(),
+        });
+        self.index.insert(key.to_string(), idx);
+    }
+
+    fn set(&mut self, key: &str, status: Status) {
+        let Some(&idx) = self.index.get(key) else {
+            return;
+        };
+        let seq = self.stamp();
+        let entry = &mut self.entries[idx];
+        entry.seq = seq;
+        entry.status = status;
+    }
+
+    fn any_active(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.status, Status::Active(_)))
     }
 }
 
-/// Shared tree behind an `Arc` so the heartbeat thread holds a clone independent
-/// of the handle the fetch loop drives.
+/// Shared between the handle the fetch loop drives and the heartbeat thread.
 struct Inner {
     state: Mutex<State>,
-    /// Spinner frame, advanced once per heartbeat so in-flight rows animate even
-    /// while no dependency changes state.
-    tick: AtomicU32,
     /// Set on finish: the heartbeat exits and no further redraw runs, so nothing
     /// clobbers the final tree or the summary printed beneath it.
     stopped: AtomicBool,
 }
 
-/// Handle the fetch loop drives. Dropping it stops the heartbeat.
+impl Inner {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Handle the fetch loop drives. Finishing — or dropping — it stops and joins
+/// the heartbeat.
 pub(crate) struct DepTree {
     inner: Arc<Inner>,
+    /// Taken by whichever of `finish` and `drop` stops it first.
+    heartbeat: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DepTree {
@@ -143,9 +198,10 @@ impl DepTree {
     ///
     /// Declines when stderr isn't a terminal (piped/redirected output), when a
     /// scan progress bar already owns the terminal (a multi-file scan), when the
-    /// terminal is too short for the region to stay on screen, or when info-level
+    /// terminal is too short for the region to stay on screen, when info-level
     /// logging is on (`--verbose`/`RUST_LOG`) — stray log lines would desync the
-    /// in-place redraw, and the append-only stream coexists with them cleanly.
+    /// in-place redraw, and the append-only stream coexists with them cleanly —
+    /// or when the heartbeat that draws it cannot start.
     pub(crate) fn activate() -> Option<DepTree> {
         if !std::io::stderr().is_terminal() || bar_active() {
             return None;
@@ -162,63 +218,51 @@ impl DepTree {
                 entries: Vec::new(),
                 index: HashMap::new(),
                 clock: 0,
+                dirty: false,
+                tick: 0,
                 drawn: 0,
                 cols,
                 rows,
             }),
-            tick: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
         });
-        // Detached heartbeat: it observes `stopped` and exits within one tick of
-        // finish/drop. A spawn failure just means no animation — state changes
-        // still redraw the tree.
         let beat = Arc::clone(&inner);
-        let _ = std::thread::Builder::new()
+        let heartbeat = std::thread::Builder::new()
             .name("dep-tree".into())
             .spawn(move || {
-                while !beat.stopped.load(Ordering::Relaxed) {
-                    std::thread::sleep(PROGRESS_TICK);
+                loop {
+                    // Unparked early by `finish`, so stopping costs no tick.
+                    std::thread::park_timeout(PROGRESS_TICK);
                     if beat.stopped.load(Ordering::Relaxed) {
                         break;
                     }
-                    beat.tick.fetch_add(1, Ordering::Relaxed);
-                    beat.render();
+                    let mut state = beat.lock();
+                    state.tick = state.tick.wrapping_add(1);
+                    // Spinners animate; a settled tree redraws only on change.
+                    if state.dirty || state.any_active() {
+                        render(&mut state, false);
+                    }
                 }
-            });
-        Some(DepTree { inner })
+            })
+            .map_err(|e| tracing::debug!(error = %e, "dependency tree heartbeat did not start; streaming instead"))
+            .ok()?;
+        Some(DepTree {
+            inner,
+            heartbeat: Mutex::new(Some(heartbeat)),
+        })
     }
 
     /// Register a dependency as pending, keyed by its locator, noting the
     /// manifest `source` it was declared in. A key already present is ignored, so
     /// re-announcing a hop's references is idempotent.
     pub(crate) fn add(&self, key: &str, name: &str, source: &str) {
-        let mut state = self.lock();
-        if state.index.contains_key(key) {
-            return;
-        }
-        let idx = state.entries.len();
-        let seq = state.stamp();
-        state.entries.push(Entry {
-            name: name.to_string(),
-            status: Status::Pending,
-            seq,
-            source: source.to_string(),
-        });
-        state.index.insert(key.to_string(), idx);
-        drop_render(&self.inner, state);
+        self.inner.lock().add(key, name, source);
     }
 
     /// Transition a known dependency's status. A key never announced is ignored
     /// (the tree only shows what it was told about).
     pub(crate) fn set(&self, key: &str, state: DepState) {
-        let mut guard = self.lock();
-        let Some(&idx) = guard.index.get(key) else {
-            return;
-        };
-        let seq = guard.stamp();
-        let entry = &mut guard.entries[idx];
-        entry.seq = seq;
-        entry.status = match state {
+        let status = match state {
             DepState::Fetching => Status::Active("fetching"),
             DepState::Analyzing => Status::Active("analyzing"),
             DepState::Hidden => Status::Hidden,
@@ -232,7 +276,7 @@ impl DepTree {
                 detail,
             },
         };
-        drop_render(&self.inner, guard);
+        self.inner.lock().set(key, status);
     }
 
     /// Stop the heartbeat, render the settled tree one last time, and print
@@ -240,61 +284,44 @@ impl DepTree {
     /// A tree that never saw a dependency (nothing was fetched) prints nothing —
     /// the phase stays silent, matching the streamed log.
     pub(crate) fn finish(&self, summary: &str) {
-        self.inner.stopped.store(true, Ordering::Relaxed);
-        // Heartbeat is stopped, so this crate's fetch loop is the only accessor —
-        // the re-lock for the final render is uncontended.
-        if self.lock().entries.is_empty() {
+        self.stop();
+        let mut state = self.inner.lock();
+        if state.entries.is_empty() {
             return;
         }
-        let tick = self.inner.tick.load(Ordering::Relaxed);
-        render_locked(self.lock(), tick, true);
+        render(&mut state, true);
+        drop(state);
         if !summary.is_empty() {
             eprintln!("{summary}");
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.inner
-            .state
+    /// Stop and join the heartbeat, so no redraw can follow.
+    fn stop(&self) {
+        self.inner.stopped.store(true, Ordering::Relaxed);
+        let heartbeat = self
+            .heartbeat
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.thread().unpark();
+            let _ = heartbeat.join();
+        }
     }
 }
 
 impl Drop for DepTree {
     fn drop(&mut self) {
         // Safety net: stop the heartbeat even if `finish` was skipped.
-        self.inner.stopped.store(true, Ordering::Relaxed);
+        self.stop();
     }
-}
-
-impl Inner {
-    /// Heartbeat/state-change redraw at the current spinner frame, unless
-    /// finished (a late tick must never repaint over the summary line).
-    fn render(&self) {
-        if self.stopped.load(Ordering::Relaxed) {
-            return;
-        }
-        let guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tick = self.tick.load(Ordering::Relaxed);
-        render_locked(guard, tick, false);
-    }
-}
-
-/// Redraw after a state change, holding the lock through the write so the
-/// heartbeat can't repaint between the mutation and its redraw.
-fn drop_render(inner: &Arc<Inner>, guard: std::sync::MutexGuard<'_, State>) {
-    let tick = inner.tick.load(Ordering::Relaxed);
-    render_locked(guard, tick, false);
 }
 
 /// Paint the region in place from the top down, then leave the cursor on the
-/// blank line just beneath it. The caller holds the state lock.
-fn render_locked(mut state: std::sync::MutexGuard<'_, State>, tick: u32, finished: bool) {
-    let lines = compose(&state, tick, finished);
+/// blank line just beneath it.
+fn render(state: &mut State, finished: bool) {
+    let lines = compose(state, finished);
     let mut out = String::new();
     // Move up to the top of the previously drawn region.
     if state.drawn > 0 {
@@ -302,7 +329,7 @@ fn render_locked(mut state: std::sync::MutexGuard<'_, State>, tick: u32, finishe
     }
     // Repaint each line, clearing whatever it overwrites.
     for line in &lines {
-        out.push_str("\r\x1b[2K");
+        out.push_str(CLEAR_LINE);
         out.push_str(line);
         out.push('\n');
     }
@@ -310,12 +337,14 @@ fn render_locked(mut state: std::sync::MutexGuard<'_, State>, tick: u32, finishe
     // the cursor rests just beneath the new content.
     let leftover = state.drawn.saturating_sub(lines.len());
     for _ in 0..leftover {
-        out.push_str("\r\x1b[2K\n");
+        out.push_str(CLEAR_LINE);
+        out.push('\n');
     }
     if leftover > 0 {
         out.push_str(&format!("\x1b[{leftover}A"));
     }
     state.drawn = lines.len();
+    state.dirty = false;
     eprint!("{out}");
     let _ = std::io::stderr().flush();
 }
@@ -325,7 +354,7 @@ fn render_locked(mut state: std::sync::MutexGuard<'_, State>, tick: u32, finishe
 /// now*, with the rest folded into a one-line footer count. The focus is the
 /// point: on a large graph the answer to "what is it doing" is the handful of
 /// in-flight rows, not a scroll of already-settled ones.
-fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
+fn compose(state: &State, finished: bool) -> Vec<String> {
     let visible: Vec<usize> = state
         .entries
         .iter()
@@ -355,23 +384,20 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
     // Stable name column: the widest name, capped so a long scoped package can't
     // wrap a row (which would break the redraw) or crowd out the detail.
     let name_cap = state.cols.saturating_sub(20).clamp(8, NAME_MAX);
-    let widest = state
-        .entries
+    let widest = visible
         .iter()
-        .filter(|e| !matches!(e.status, Status::Hidden))
-        .map(|e| e.name.chars().count())
+        .map(|&i| state.entries[i].name.width())
         .max()
         .unwrap_or(0);
     let namew = widest.clamp(8, name_cap);
+    let draw = |i: usize| row(&state.entries[i], state.tick, namew, state.cols);
 
     let mut lines = Vec::with_capacity(cap);
     lines.push(header(done, total, active, finished, state.cols));
     let body = cap - 1;
 
     if total <= body {
-        for &i in &visible {
-            lines.push(row(&state.entries[i], tick, namew, state.cols));
-        }
+        lines.extend(visible.iter().map(|&i| draw(i)));
         return lines;
     }
 
@@ -396,21 +422,17 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
         }
         chosen.push(i);
     }
-    if chosen.len() < slots {
-        for &i in &visible {
-            if chosen.len() >= slots {
-                break;
-            }
-            if matches!(state.entries[i].status, Status::Pending) {
-                chosen.push(i);
-            }
+    for &i in &visible {
+        if chosen.len() >= slots {
+            break;
+        }
+        if matches!(state.entries[i].status, Status::Pending) {
+            chosen.push(i);
         }
     }
     // Render in discovery order so rows hold a stable position frame to frame.
     chosen.sort_unstable();
-    for &i in &chosen {
-        lines.push(row(&state.entries[i], tick, namew, state.cols));
-    }
+    lines.extend(chosen.iter().map(|&i| draw(i)));
     let hidden = total - chosen.len();
     if hidden > 0 {
         lines.push(footer(hidden, state.cols));
@@ -421,41 +443,37 @@ fn compose(state: &State, tick: u32, finished: bool) -> Vec<String> {
 /// The region's header: an arrow (or a check, once finished), the running
 /// `done/total` count, and how many references are in flight right now.
 fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize) -> String {
-    let (glyph, r, g, b) = if finished {
-        ('\u{2713}', 80, 200, 80)
+    let (glyph, color) = if finished {
+        ('\u{2713}', SETTLED)
     } else {
-        ('\u{2b07}', 100, 180, 255)
+        ('\u{2b07}', IN_FLIGHT)
     };
     let mut text = format!("dependencies  {done}/{total}");
     if active > 0 {
         text.push_str(&format!("  \u{b7}  {active} in flight"));
     }
-    clip(
-        &format!("  \x1b[38;2;{r};{g};{b}m{glyph}\x1b[0m  \x1b[38;2;160;160;160m{text}\x1b[0m"),
-        // Visible width: 2 + 1 (glyph) + 2 + the text.
-        5 + text.chars().count(),
-        cols,
-    )
+    let line = format!(
+        "  {}  {}",
+        fg(color, glyph.encode_utf8(&mut [0; 4])),
+        fg(LABEL, &text)
+    );
+    clip(&line, 4 + char_width(glyph) + text.width(), cols)
 }
 
 /// The focused view's footer: how many rows aren't shown (the settled and
 /// not-yet-started remainder). Dim, so the eye stays on the active rows above.
 fn footer(hidden: usize, cols: usize) -> String {
     let text = format!("\u{2026} {hidden} more");
-    clip(
-        &format!("    \x1b[38;2;110;110;110m{text}\x1b[0m"),
-        4 + text.chars().count(),
-        cols,
-    )
+    clip(&format!("    {}", fg(DIM, &text)), 4 + text.width(), cols)
 }
 
 /// One dependency row: a status glyph (spinner while in flight), the name padded
 /// to the shared column, and a dim trailing detail.
 fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     let (glyph, color, detail) = match &entry.status {
-        Status::Pending => ('\u{00b7}', (110, 110, 110), "pending".to_string()),
-        Status::Active(label) => (spinner(tick), (100, 180, 255), format!("{label}\u{2026}")),
-        Status::Hidden => (' ', (0, 0, 0), String::new()),
+        Status::Pending => ('\u{00b7}', DIM, "pending".to_string()),
+        Status::Active(label) => (spinner(tick), IN_FLIGHT, format!("{label}\u{2026}")),
+        Status::Hidden => (' ', Rgb(0, 0, 0), String::new()),
         Status::Done {
             glyph,
             color,
@@ -463,11 +481,12 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
         } => (*glyph, *color, detail.clone()),
     };
     let name = elide_middle(&entry.name, namew);
-    let (r, g, b) = color;
+    let namecol = namew.max(name.width());
+    let pad = " ".repeat(namecol - name.width());
     let detail_col = if detail.is_empty() {
         String::new()
     } else {
-        format!("  \x1b[38;2;130;130;130m{detail}\x1b[0m")
+        format!("  {}", fg(DETAIL, &detail))
     };
     // Trailing dim source: `from <manifest>`, so a reader can trace each
     // dependency back to the file that declared it. Sized to the columns left
@@ -475,28 +494,33 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     // long package-relative path keeps its telling head and its filename tail
     // (`github.com-…/package-lock.json`) rather than being chopped to a stub.
     const SOURCE_MIN: usize = 20;
-    let namecol = namew.max(name.chars().count());
-    let used = 4 + 1 + 1 + namecol + 2 + detail.chars().count();
+    let glyph_width = char_width(glyph);
+    let detail_width = if detail.is_empty() {
+        0
+    } else {
+        2 + detail.width()
+    };
+    let used = 4 + glyph_width + 1 + namecol + detail_width;
     let avail = cols.saturating_sub(used + 2 + 5); // 2 gap + "from "
     let source = if entry.source.is_empty() || avail < SOURCE_MIN {
         String::new()
     } else {
         elide_middle(&entry.source, avail)
     };
-    let source_col = if source.is_empty() {
-        String::new()
+    let (source_col, source_width) = if source.is_empty() {
+        (String::new(), 0)
     } else {
-        format!("  \x1b[38;2;90;90;90mfrom {source}\x1b[0m")
+        (
+            format!("  {}", fg(SOURCE, &format!("from {source}"))),
+            2 + 5 + source.width(),
+        )
     };
-    let source_vis = if source.is_empty() {
-        0
-    } else {
-        2 + 5 + source.chars().count()
-    };
-    let visible = used + source_vis;
     clip(
-        &format!("    \x1b[38;2;{r};{g};{b}m{glyph}\x1b[0m {name:<namew$}{detail_col}{source_col}"),
-        visible,
+        &format!(
+            "    {} {name}{pad}{detail_col}{source_col}",
+            fg(color, glyph.encode_utf8(&mut [0; 4]))
+        ),
+        used + source_width,
         cols,
     )
 }
@@ -506,12 +530,26 @@ fn spinner(tick: u32) -> char {
     SPINNER[tick as usize % SPINNER.len()]
 }
 
-/// Truncate a name to `width` display columns, marking a cut with an ellipsis.
-fn truncate(name: &str, width: usize) -> String {
-    if name.chars().count() <= width {
-        return name.to_string();
+/// Display columns a glyph takes: two for an emoji flag, one otherwise.
+fn char_width(c: char) -> usize {
+    c.width().unwrap_or(1)
+}
+
+/// Truncate `text` to `width` display columns, marking a cut with an ellipsis.
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
     }
-    let mut out: String = name.chars().take(width.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('\u{2026}');
     out
 }
@@ -523,21 +561,38 @@ fn truncate(name: &str, width: usize) -> String {
 /// `github.com/be5inv…aCurlySlab-34.7.0.zip` says "a versioned zip from github"
 /// where a tail cut (`github.com/be5invis/Iosevka/relea…`) hides both.
 fn elide_middle(name: &str, width: usize) -> String {
-    let total = name.chars().count();
-    if total <= width {
+    if name.width() <= width {
         return name.to_string();
     }
     if width <= 1 {
         return "\u{2026}".to_string();
     }
     let keep = width - 1;
-    let head = keep.div_ceil(2);
-    let tail = keep - head;
-    let chars: Vec<char> = name.chars().collect();
-    let mut out: String = chars[..head].iter().collect();
-    out.push('\u{2026}');
-    out.extend(&chars[total - tail..]);
-    out
+    let head_budget = keep.div_ceil(2);
+    let tail_budget = keep - head_budget;
+    let mut head = String::new();
+    let mut used = 0;
+    for c in name.chars() {
+        let w = char_width(c);
+        if used + w > head_budget {
+            break;
+        }
+        head.push(c);
+        used += w;
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in name.chars().rev() {
+        let w = char_width(c);
+        if used + w > tail_budget {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    head.push('\u{2026}');
+    head.extend(tail.into_iter().rev());
+    head
 }
 
 /// Clip a coloured line whose *visible* width is `visible` so it never exceeds
@@ -551,8 +606,7 @@ fn clip(line: &str, visible: usize, cols: usize) -> String {
     }
     // Fall back to a plain, hard-truncated form; colour is sacrificed for
     // correctness of the region geometry.
-    let plain: String = strip_ansi(line);
-    truncate(&plain, cols)
+    truncate(&strip_ansi(line), cols)
 }
 
 /// Drop ANSI SGR escapes from a line, leaving its visible text.
@@ -575,7 +629,6 @@ pub(crate) fn strip_ansi(line: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -590,6 +643,8 @@ mod tests {
             entries,
             index,
             clock,
+            dirty: false,
+            tick: 0,
             drawn: 0,
             cols: 100,
             rows,
@@ -614,7 +669,7 @@ mod tests {
             name,
             Status::Done {
                 glyph: '\u{2713}',
-                color: (80, 200, 80),
+                color: SETTLED,
                 detail: "1 KB".into(),
             },
             0,
@@ -628,7 +683,7 @@ mod tests {
     #[test]
     fn small_graph_renders_every_entry_plus_header() {
         let s = state(vec![done("a"), pending("b"), pending("c")], 40);
-        let lines = compose(&s, 0, false);
+        let lines = compose(&s, false);
         // header + 3 entries, no footer.
         assert_eq!(lines.len(), 4);
         assert!(strip_ansi(&lines[0]).contains("1/3"));
@@ -640,7 +695,7 @@ mod tests {
             vec![done("a"), entry("b", Status::Hidden, 1), pending("c")],
             40,
         );
-        let body = strip_ansi(&compose(&s, 0, false).join("\n"));
+        let body = strip_ansi(&compose(&s, false).join("\n"));
         assert!(body.contains("1/2"));
         assert!(!body.contains("b"));
         assert!(body.contains("a") && body.contains("c"));
@@ -651,7 +706,7 @@ mod tests {
         let mut e = pending("react-dropzone");
         e.source = "vexium-1.0.tgz/package/package.json".to_string();
         let s = state(vec![e], 40);
-        let body = strip_ansi(&compose(&s, 0, false).join("\n"));
+        let body = strip_ansi(&compose(&s, false).join("\n"));
         assert!(body.contains("react-dropzone"));
         assert!(body.contains("package.json"), "source manifest not shown");
     }
@@ -665,7 +720,7 @@ mod tests {
         entries[51] = active("d51", 501);
         let rows = 12;
         let s = state(entries, rows);
-        let lines = compose(&s, 0, false);
+        let lines = compose(&s, false);
         assert!(
             lines.len() <= rows - RESERVE_ROWS,
             "region exceeds viewport"
@@ -680,8 +735,44 @@ mod tests {
     #[test]
     fn done_and_total_track_status() {
         let s = state(vec![done("a"), done("b"), pending("c")], 40);
-        let lines = compose(&s, 0, false);
+        let lines = compose(&s, false);
         assert!(strip_ansi(&lines[0]).contains("2/3"));
+    }
+
+    /// Wide names and glyphs are measured in display columns, so a row never
+    /// outgrows the terminal and wraps the in-place region apart.
+    #[test]
+    fn rows_fit_the_terminal_in_display_columns() {
+        let mut s = state(
+            vec![
+                entry(
+                    "日本語のパッケージ名がとても長い場合のテスト",
+                    Status::Done {
+                        glyph: '\u{1f6a9}',
+                        color: SETTLED,
+                        detail: "1 KB".into(),
+                    },
+                    0,
+                ),
+                pending("short"),
+            ],
+            40,
+        );
+        s.cols = 40;
+        for line in compose(&s, false) {
+            let width = strip_ansi(&line).width();
+            assert!(width <= 40, "{width} columns: {line}");
+        }
+    }
+
+    /// Settled state changes are drawn by the heartbeat, never by the caller;
+    /// `add`/`set` only mark the tree dirty.
+    #[test]
+    fn a_change_marks_the_tree_dirty() {
+        let mut s = state(Vec::new(), 40);
+        assert!(!s.dirty);
+        s.stamp();
+        assert!(s.dirty);
     }
 
     #[test]
@@ -708,5 +799,7 @@ mod tests {
             out.contains('\u{2026}'),
             "no ellipsis marking the cut: {out}"
         );
+        // Wide characters count double.
+        assert!(elide_middle("ああああああああああ", 9).width() <= 9);
     }
 }

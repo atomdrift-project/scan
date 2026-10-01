@@ -696,7 +696,7 @@ worker: check-hopper-token kill-scan release
 # dataset, slot count, and job handout order, e.g.:
 #   make worker-benchmark WORKER_BENCH_DATASET=realworld-small WORKERS=12 ORDER=big-first
 # ORDER: fifo (default), shuffle[:seed] (reproducible realistic mix),
-# big-first (small-job-starvation worst case), small-first.
+# big-first (small-job-starvation worst case), small-first, mixed.
 WORKER_BENCH_DATASET ?= $(DATASET)
 WORKER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(WORKER_BENCH_DATASET)
 HEARTBEAT_SECS       ?= 5
@@ -1003,10 +1003,9 @@ fix:
 test:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
-		$(CARGO) test --lib bench_hopper::tests --quiet -- --test-threads=1; \
+		$(CARGO) test --bin scan-bench-hopper --quiet; \
 		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
 		$(CARGO) nextest run --workspace -- \
-			--skip bench_hopper::tests \
 			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 		$(CARGO) test --doc --quiet; \
 	else \
@@ -1016,10 +1015,9 @@ test:
 test-unit:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
-		$(CARGO) test --lib bench_hopper::tests --quiet -- --test-threads=1; \
+		$(CARGO) test --bin scan-bench-hopper --quiet; \
 		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
 		$(CARGO) nextest run --lib -- \
-			--skip bench_hopper::tests \
 			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 	else \
 		$(CARGO) test --lib; \

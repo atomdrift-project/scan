@@ -96,7 +96,7 @@ pub(crate) struct CorpusRecord {
     #[serde(default)]
     pub purl: Option<String>,
     #[serde(default)]
-    pub fires_at: Option<i32>,
+    pub fires_at: crate::model::Level,
     #[serde(default)]
     pub engine_version: Option<String>,
     #[serde(default)]
@@ -120,6 +120,36 @@ pub(crate) struct CorpusFinding {
     /// record's `reason` is already taken when the verdict was also measured.
     #[serde(default)]
     pub desc: Option<String>,
+}
+
+/// Sample bytes hopper served, and their digest.
+#[derive(Debug)]
+pub(crate) struct Sample {
+    pub(crate) bytes: bytes::Bytes,
+    /// Lowercase hex SHA-256 of `bytes`, computed as they arrived.
+    pub(crate) sha256: String,
+}
+
+/// Where corpus lookups went, for `/_/stats`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct CorpusStats {
+    /// Every deferral, and what came back. `unreachable` is the one that
+    /// reaches a caller as a decision about us rather than the artifact.
+    found: u64,
+    nothing: u64,
+    unreachable: u64,
+    /// Non-zero `failed` on the first address with traffic on a later one is
+    /// a failover in progress, whether or not anyone has noticed.
+    preferred_resting: bool,
+    by_address: Vec<AddressStats>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AddressStats {
+    address: String,
+    asked: u64,
+    answered: u64,
+    failed: u64,
 }
 
 /// The corpus behind this worker's index.
@@ -189,13 +219,16 @@ impl Corpus {
         self.bases.join(", ")
     }
 
-    /// Read immutable sample bytes from Hopper's authoritative side.
+    /// Read immutable sample bytes from Hopper's authoritative side, hashing
+    /// them as they arrive.
     ///
     /// The response is accumulated only up to Scan's configured upload limit;
     /// callers pass that limit so this path has the same memory bound as a
     /// direct `/v1/analyze` upload. Sample bytes are immutable, so a replica
-    /// miss can simply fall through to the next configured address.
-    pub(crate) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<bytes::Bytes, String> {
+    /// miss can simply fall through to the next configured address. The error
+    /// names internal addresses: log it, do not serve it.
+    pub(crate) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<Sample, String> {
+        use sha2::Digest as _;
         let path = format!("/api/file/{sha}");
         let mut last = "Hopper did not serve the sample".to_string();
         for base in self.order_at(Instant::now()) {
@@ -231,6 +264,7 @@ impl Corpus {
                 return Err(format!("Hopper sample exceeds the {max_bytes} byte limit"));
             }
             let mut body = bytes::BytesMut::new();
+            let mut digest = sha2::Sha256::new();
             let mut complete = false;
             loop {
                 match response.chunk().await {
@@ -240,6 +274,7 @@ impl Corpus {
                                 "Hopper sample exceeds the {max_bytes} byte limit"
                             ));
                         }
+                        digest.update(&chunk);
                         body.extend_from_slice(&chunk);
                     }
                     Ok(None) => {
@@ -254,7 +289,10 @@ impl Corpus {
             }
             if complete && !body.is_empty() {
                 self.note_at(base, true, Instant::now());
-                return Ok(body.freeze());
+                return Ok(Sample {
+                    bytes: body.freeze(),
+                    sha256: format!("{:x}", digest.finalize()),
+                });
             }
         }
         Err(last)
@@ -466,32 +504,24 @@ impl Corpus {
     }
 
     /// A snapshot for `/_/stats`.
-    pub(crate) fn stats(&self) -> serde_json::Value {
-        let by_address: Vec<_> = self
-            .bases
-            .iter()
-            .zip(&self.traffic)
-            .map(|(base, a)| {
-                serde_json::json!({
-                    "address": base,
-                    "asked": a.asked.load(Ordering::Relaxed),
-                    "answered": a.answered.load(Ordering::Relaxed),
-                    "failed": a.failed.load(Ordering::Relaxed),
+    pub(crate) fn stats(&self) -> CorpusStats {
+        CorpusStats {
+            found: self.found.load(Ordering::Relaxed),
+            nothing: self.nothing.load(Ordering::Relaxed),
+            unreachable: self.unreachable.load(Ordering::Relaxed),
+            preferred_resting: lock(&self.rested).is_some_and(|until| Instant::now() < until),
+            by_address: self
+                .bases
+                .iter()
+                .zip(&self.traffic)
+                .map(|(base, a)| AddressStats {
+                    address: base.clone(),
+                    asked: a.asked.load(Ordering::Relaxed),
+                    answered: a.answered.load(Ordering::Relaxed),
+                    failed: a.failed.load(Ordering::Relaxed),
                 })
-            })
-            .collect();
-        let resting = lock(&self.rested).is_some_and(|until| Instant::now() < until);
-        serde_json::json!({
-            // Every deferral, and what came back. `unreachable` is the one that
-            // reaches a caller as a decision about us rather than the artifact.
-            "found": self.found.load(Ordering::Relaxed),
-            "nothing": self.nothing.load(Ordering::Relaxed),
-            "unreachable": self.unreachable.load(Ordering::Relaxed),
-            // Non-zero `failed` on the first address with traffic on a later one
-            // is a failover in progress, whether or not anyone has noticed.
-            "preferred_resting": resting,
-            "by_address": by_address,
-        })
+                .collect(),
+        }
     }
 
     /// One endpoint's answer, or `None` when it could not give one.
@@ -608,7 +638,6 @@ fn percent_encode(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -866,14 +895,17 @@ mod tests {
         let replica = endpoint("404 Not Found", r#"{"error":"not found"}"#);
         let primary = endpoint("200 OK", "hello");
         let c = corpus(&format!("{replica},{primary}"));
-        assert_eq!(
-            c.sample(
+        let sample = c
+            .sample(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 5,
             )
             .await
-            .expect("primary bytes"),
-            bytes::Bytes::from_static(b"hello"),
+            .expect("primary bytes");
+        assert_eq!(sample.bytes, bytes::Bytes::from_static(b"hello"));
+        assert_eq!(
+            sample.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "hashed as it arrived"
         );
 
         let c = corpus(&primary);

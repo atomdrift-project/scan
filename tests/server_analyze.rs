@@ -1,41 +1,17 @@
-//! Integration tests for the /analyze endpoint.
+//! Integration tests for the analyze routes against a real model bundle.
+//!
+//! Each needs `SCAN_MODELS_DIR`, so each is ignored by default; run them with
+//! `cargo test --test server_analyze -- --ignored`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use scan::server::{ServerConfig, build_app};
-use std::net::SocketAddr;
+use common::{init_tracing, loopback, ready_app, ready_config, status_and_json};
+use scan::server::ServerConfig;
 use tower::ServiceExt;
-use tracing_subscriber::EnvFilter;
-
-/// Inject a loopback ConnectInfo on a request so the ACL middleware sees a
-/// peer address. axum's `into_make_service_with_connect_info` runs only when
-/// the server is started via `axum::serve`; tests using `oneshot` must add
-/// it manually or every request 403s.
-fn loopback<B>(mut req: Request<B>) -> Request<B> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    req
-}
-
-/// Install a tracing subscriber so server logs are visible on test failure.
-/// Silently ignored if another test in the process already installed one.
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
-fn model_dir() -> Result<std::path::PathBuf> {
-    std::env::var("SCAN_MODELS_DIR")
-        .map(std::path::PathBuf::from)
-        .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
-}
 
 fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
     let boundary = "----litmus-test-boundary";
@@ -53,95 +29,37 @@ fn multipart_body(file_bytes: &[u8], filename: &str) -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
+fn test_archive() -> Result<Vec<u8>> {
+    let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
+    std::fs::read(&testdata).context("testdata/encrypted.zip not found — copy a test sample there")
+}
+
+fn analyze_request(file_bytes: &[u8]) -> Result<Request<Body>> {
+    let (content_type, body) = multipart_body(file_bytes, "encrypted.zip");
+    Ok(loopback(
+        Request::builder()
+            .method("POST")
+            .uri("/analyze")
+            .header("content-type", content_type)
+            .body(Body::from(body))?,
+    ))
+}
+
 /// Submit an encrypted zip via /analyze and verify JSON response structure.
 #[tokio::test]
+#[ignore = "needs a model bundle: set SCAN_MODELS_DIR and run with --ignored"]
 async fn analyze_encrypted_zip_returns_json() -> Result<()> {
     init_tracing();
-    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
-        eprintln!("skipping: SCAN_MODELS_DIR is not set");
-        return Ok(());
-    }
+    let file_bytes = test_archive()?;
+    let app = ready_app(&ready_config()?).await?;
 
-    let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
-    assert!(
-        testdata.exists(),
-        "testdata/encrypted.zip not found — copy a test sample there"
-    );
-    let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
-
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 8081)),
-        100 * 1024 * 1024,
-        8 * 1024 * 1024 * 1024,
-        model_dir()?,
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?;
-    let app = build_app(&config).await.context("failed to build app")?;
-
-    // Wait for background resource loading to complete before sending requests.
-    // YARA warmup can take ~15s in release and longer in debug builds.
-    let max_health_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
-    eprintln!(
-        "waiting for server readiness (up to {}s)...",
-        max_health_polls / 10
-    );
-    let mut ready = false;
-    for _ in 0..max_health_polls {
-        let resp = app
-            .clone()
-            .oneshot(loopback(
-                Request::builder()
-                    .uri("/_/health")
-                    .body(Body::empty())
-                    .context("failed to build health request")?,
-            ))
-            .await
-            .context("health request failed")?;
-        if resp.status() == StatusCode::OK {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(
-        ready,
-        "server did not become ready within {}s",
-        max_health_polls / 10
-    );
-
-    let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
-
-    let response = app
-        .oneshot(loopback(
-            Request::builder()
-                .method("POST")
-                .uri("/analyze")
-                .header("content-type", content_type)
-                .body(Body::from(body))
-                .context("failed to build analyze request")?,
-        ))
-        .await
-        .context("analyze request failed")?;
-
-    let status = response.status();
-    let body_bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
-        .await
-        .context("failed to read response body")?;
-
+    let response = app.oneshot(analyze_request(&file_bytes)?).await?;
+    let (status, json) = status_and_json(response).await?;
     assert_eq!(
         status,
         StatusCode::OK,
-        "expected 200 but got {status}: {}",
-        String::from_utf8_lossy(&body_bytes),
+        "expected 200 but got {status}: {json}"
     );
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&body_bytes).context("response must be valid JSON")?;
 
     // Every response must have the v7 envelope fields, regardless of classification.
     let ml = json["ml"].as_object().context("missing ml section")?;
@@ -162,8 +80,7 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
         );
     }
 
-    let l = ml["lvl"].as_i64();
-    if let Some(l) = l {
+    if let Some(l) = ml["lvl"].as_i64() {
         assert!(l == -1 || (0..=100).contains(&l), "unexpected l value: {l}");
     } // null is also valid (manual thresholds on a hostile verdict)
     Ok(())
@@ -176,70 +93,24 @@ async fn analyze_encrypted_zip_returns_json() -> Result<()> {
 /// analysis of its own, renders the leader's real report correctly and gets
 /// byte-for-byte the same answer.
 #[tokio::test]
+#[ignore = "needs a model bundle: set SCAN_MODELS_DIR and run with --ignored"]
 async fn concurrent_identical_uploads_share_one_analysis() -> Result<()> {
     init_tracing();
-    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
-        eprintln!("skipping: SCAN_MODELS_DIR is not set");
-        return Ok(());
-    }
-
-    let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/encrypted.zip");
-    assert!(testdata.exists(), "testdata/encrypted.zip not found");
-    let file_bytes = std::fs::read(&testdata).context("failed to read test archive")?;
-
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 8081)),
-        100 * 1024 * 1024,
-        8 * 1024 * 1024 * 1024,
-        model_dir()?,
-        None,
-        4000,
-        vec![],
-        None,
-        // One slot: without sharing, the duplicates would 429 instead of
-        // riding along with the analysis already running.
-        1,
-        vec![],
-    )?;
-    let app = build_app(&config).await.context("failed to build app")?;
-
-    let max_health_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
-    let mut ready = false;
-    for _ in 0..max_health_polls {
-        let resp = app
-            .clone()
-            .oneshot(loopback(
-                Request::builder()
-                    .uri("/_/health")
-                    .body(Body::empty())
-                    .context("failed to build health request")?,
-            ))
-            .await
-            .context("health request failed")?;
-        if resp.status() == StatusCode::OK {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(ready, "server did not become ready");
+    let file_bytes = test_archive()?;
+    // One slot: without sharing, the duplicates would 429 instead of riding
+    // along with the analysis already running.
+    let config = ServerConfig {
+        workers: 1,
+        ..ready_config()?
+    };
+    let app = ready_app(&config).await?;
 
     let mut requests = Vec::new();
     for _ in 0..4 {
-        let (content_type, body) = multipart_body(&file_bytes, "encrypted.zip");
+        let request = analyze_request(&file_bytes)?;
         let app = app.clone();
         requests.push(tokio::spawn(async move {
-            let response = app
-                .oneshot(loopback(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/analyze")
-                        .header("content-type", content_type)
-                        .body(Body::from(body))
-                        .expect("build analyze request"),
-                ))
-                .await
-                .expect("analyze request failed");
+            let response = app.oneshot(request).await.expect("analyze request failed");
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
                 .await
@@ -264,5 +135,48 @@ async fn concurrent_identical_uploads_share_one_analysis() -> Result<()> {
         assert_eq!(status, first_status, "every sharer gets the same status");
         assert_eq!(body, first_body, "every sharer gets the same report");
     }
+    Ok(())
+}
+
+/// `/analyze-path` reports its completions to `/_/stats` like every other
+/// analyze route. It used to skip the shared completion step, so
+/// `jobs_completed` never moved and `jobs_unfinished` climbed with every
+/// request it served — the shape of a sick server, on a healthy one.
+#[tokio::test]
+#[ignore = "needs a model bundle: set SCAN_MODELS_DIR and run with --ignored"]
+async fn analyze_path_counts_as_completed() -> Result<()> {
+    init_tracing();
+    let dir = tempfile::tempdir()?;
+    let sample = dir.path().join("encrypted.zip");
+    std::fs::write(&sample, test_archive()?)?;
+    let config = ServerConfig {
+        allowed_dirs: vec![dir.path().canonicalize()?],
+        ..ready_config()?
+    };
+    let app = ready_app(&config).await?;
+
+    let body = serde_json::json!({ "path": sample }).to_string();
+    let response = app
+        .clone()
+        .oneshot(loopback(
+            Request::builder()
+                .method("POST")
+                .uri("/analyze-path")
+                .header("content-type", "application/json")
+                .body(Body::from(body))?,
+        ))
+        .await?;
+    let (status, json) = status_and_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+
+    let response = app
+        .oneshot(loopback(
+            Request::builder().uri("/_/stats").body(Body::empty())?,
+        ))
+        .await?;
+    let (_, stats) = status_and_json(response).await?;
+    assert_eq!(stats["jobs_started"], 1, "{stats}");
+    assert_eq!(stats["jobs_completed"], 1, "{stats}");
+    assert_eq!(stats["jobs_unfinished"], 0, "{stats}");
     Ok(())
 }

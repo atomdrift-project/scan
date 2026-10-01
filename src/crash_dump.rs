@@ -16,7 +16,7 @@
 //! offending file is one of the in-flight set, not necessarily the last to
 //! start — dumping them all is the honest answer.
 
-pub use imp::{Guard, install, register};
+pub(crate) use imp::{install, register};
 
 #[cfg(unix)]
 mod imp {
@@ -60,7 +60,7 @@ mod imp {
     /// stack overflow `abort()`s without unwinding, so the entry is still live
     /// when the handler runs — which is exactly what we want to report.
     #[derive(Debug)]
-    pub struct Guard {
+    pub(crate) struct Guard {
         slot: Option<usize>,
     }
 
@@ -75,7 +75,7 @@ mod imp {
     /// Record an analysis as in flight. The line is formatted here, on the
     /// normal worker thread; the signal handler only ever copies bytes and
     /// calls `write(2)`, both async-signal-safe.
-    pub fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
+    pub(crate) fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
         let mut buf = [0u8; LINE];
         let n = format_line(&mut buf, analysis_id, thread_id, sha, file);
 
@@ -152,18 +152,24 @@ mod imp {
     /// `has overflowed its stack` line, then calls `abort()`. Catching the
     /// resulting `SIGABRT` adds our dump *after* that message while preserving
     /// it, and also covers panics-as-abort and OOM aborts.
-    pub fn install() {
+    pub(crate) fn install() {
         // SAFETY: a zeroed `sigaction` is a valid empty disposition; we set the
         // handler, an empty mask, and run on the alternate signal stack the
         // Rust runtime already established (the faulting thread's own stack is
         // exhausted). `SA_RESETHAND` restores the default after we run so the
         // closing `raise` actually aborts (and can still dump core).
-        unsafe {
+        let rc = unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_abort as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = libc::SA_ONSTACK | libc::SA_RESETHAND;
-            libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut())
+        };
+        if rc != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "cannot install the SIGABRT handler; an abort will not name its in-flight analyses",
+            );
         }
     }
 
@@ -187,6 +193,7 @@ mod imp {
         write_all(b"--- end in-flight dump ---\n");
 
         // SA_RESETHAND has restored SIG_DFL; re-raise to abort for real.
+        // SAFETY: `raise(2)` is async-signal-safe and takes only a signal number.
         unsafe {
             libc::raise(libc::SIGABRT);
         }
@@ -196,6 +203,8 @@ mod imp {
     /// errors — there is nothing useful to do with them mid-abort.
     fn write_all(mut bytes: &[u8]) {
         while !bytes.is_empty() {
+            // SAFETY: `write(2)` is async-signal-safe; the pointer and length
+            // describe the live `bytes` slice.
             let n = unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
             if n <= 0 {
                 break;

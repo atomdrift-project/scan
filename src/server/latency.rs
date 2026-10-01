@@ -209,9 +209,12 @@ fn percentile_micros(hist: &[u64; BUCKETS], count: u64, p: f64) -> u64 {
     // Rank of the sample we want, 1-based, clamped into the histogram. The
     // bounds are established before the cast: count is a real sample count and
     // p is in (0,1], so the product is finite and non-negative.
-    #[allow(clippy::cast_precision_loss)] // sample counts never reach 2^53
     let rank = ((count as f64) * p).ceil().clamp(1.0, count as f64);
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)] // clamped to [1, count]
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "clamped to 1..=count"
+    )]
     let target = rank as u64;
     let mut seen = 0u64;
     for (i, n) in hist.iter().enumerate() {
@@ -255,13 +258,16 @@ fn micros_from_ms(ms: f64) -> u64 {
     if us >= u64::MAX as f64 {
         return u64::MAX;
     }
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)] // bounded just above
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "bounded just above"
+    )]
     let out = us as u64;
     out
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

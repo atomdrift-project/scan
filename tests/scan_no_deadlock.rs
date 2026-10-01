@@ -10,8 +10,8 @@
 //! cold-start work happens before analysis, and cleave's YARA loader is safe if
 //! a new entry point misses that prefetch.
 //!
-//! **Requires `SCAN_MODELS_DIR` to be set** (same convention as
-//! `server_analyze.rs`).
+//! **Requires `SCAN_MODELS_DIR`**, so it is ignored by default:
+//! `SCAN_MODELS_DIR=... cargo test --test scan_no_deadlock -- --ignored`.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -34,14 +34,10 @@ fn scan_ran_to_completion(code: i32) -> bool {
 }
 
 #[test]
+#[ignore = "needs a model bundle in SCAN_MODELS_DIR; run with --ignored"]
 fn scan_cli_completes_under_cold_yara_cache() {
-    let Ok(models_dir) = std::env::var("SCAN_MODELS_DIR") else {
-        eprintln!(
-            "skipping: SCAN_MODELS_DIR not set (same convention as \
-             server_analyze.rs integration tests)"
-        );
-        return;
-    };
+    let models_dir =
+        std::env::var_os("SCAN_MODELS_DIR").expect("set SCAN_MODELS_DIR to a model bundle");
 
     // Trivial scan target — we don't care what cleave decides, only that the
     // binary exits cleanly. Use a named temp file so the path survives the

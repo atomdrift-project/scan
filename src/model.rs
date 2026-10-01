@@ -133,69 +133,131 @@
 //! Collimator no longer emits a `suspicious` field in any of the JSONs it
 //! writes (`config.json`, `evaluation.json`, `route_policies.json`). Litmus
 //! derives it consumer-side as a **level-table lookup**: the suspicious
-//! threshold is the hostile threshold at level `min(max_grid_level, 100)`
-//! (the looser-budget row in the same `severity_levels[]` / `levels[]` table).
-//! Manual `--threshold-hostile <val>` (no `-l`) skips the derivation: the
-//! `Thresholds` struct carries `suspicious == hostile`, so `classify` only
-//! ever returns Benign or Hostile.
+//! threshold is the hostile threshold at level
+//! `min(max_grid_level, SUSPICIOUS_LEVEL_CEILING)` (the looser-budget row in
+//! the same `levels[]` table). Manual `--threshold-hostile <val>` (no `-l`)
+//! skips the derivation: the `Thresholds` struct carries
+//! `suspicious == hostile`, so `classify` only ever returns Benign or Hostile.
+//!
+//! ## Malformed metadata
+//!
+//! A bundle file that is absent is simply not used. One that is present but
+//! unreadable, unparseable, or internally inconsistent stops the load with an
+//! error: a silently-ignored threshold table degrades every verdict.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::features::{EXPECTED_MODEL_ABI_VERSION, ExtractContext, FeatureSpec};
+use crate::features::{
+    EXPECTED_MODEL_ABI_VERSION, ExtractContext, FeatureSpec, ParsedReport, RawNeeds,
+};
 
-/// Recommended thresholds loaded from collimator's model metadata.
-///
-/// These are computed during training based on FPR targets and represent
-/// the empirically optimal operating points for the model.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-struct EvaluationThresholds {
-    suspicious: Option<f64>,
-    hostile: Option<f64>,
+/// Parse `path` as JSON. `Ok(None)` when the file does not exist; a read or
+/// parse failure is an error.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_slice(&data)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Per-level threshold metrics emitted by collimator.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-struct SeverityThresholdMetric {
-    threshold: Option<f64>,
-}
-
-/// Gzip-style severity level thresholds emitted by collimator.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
-struct SeverityLevel {
-    level: u16,
-    suspicious: Option<SeverityThresholdMetric>,
-    hostile: Option<SeverityThresholdMetric>,
-}
-
-/// config.json in the model directory.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ConfigJson {
-    suspicious: Option<f64>,
-    hostile: Option<f64>,
+/// A bundle's `config.json`, parsed once. The single-bundle layout carries
+/// top-level `suspicious`/`hostile`; an ensemble carries the routing map and
+/// the per-level threshold grid. Keys litmus does not read are ignored.
+#[derive(Debug, Default, serde::Deserialize)]
+struct BundleConfig {
+    suspicious: Option<f32>,
+    hostile: Option<f32>,
+    /// `cleave file_type → filegroup name`.
     #[serde(default)]
-    severity_levels: Vec<SeverityLevel>,
+    filetype_to_group: HashMap<String, String>,
+    /// Routes whose absence is fatal at startup.
+    #[serde(default)]
+    required_routes: Vec<String>,
+    #[serde(default)]
+    levels: Vec<LevelEntryJson>,
+    /// Deploy tuning goal prescribed by the model (collimator bakes its
+    /// `DEFAULT_SEVERITY_LEVEL` here). Absent on older bundles.
+    default_severity_level: Option<u16>,
 }
 
-/// Thresholds block within evaluation.json.
-#[derive(Debug, Clone, serde::Deserialize)]
+impl BundleConfig {
+    /// `<dir>/config.json`, or `None` when the bundle has none.
+    fn load(dir: &Path) -> Result<Option<Self>> {
+        read_json(&dir.join("config.json"))
+    }
+
+    /// The single-bundle top-level thresholds. `suspicious` defaults to
+    /// `hostile` (hostile-only): the level-space derivation needs a level
+    /// table, which this block does not have.
+    fn thresholds(&self) -> Result<Option<Thresholds>> {
+        let Some(hostile) = self.hostile else {
+            return Ok(None);
+        };
+        let t = Thresholds {
+            suspicious: self.suspicious.unwrap_or(hostile),
+            hostile,
+        };
+        t.validate().context("config.json thresholds are invalid")?;
+        Ok(Some(t))
+    }
+}
+
+/// `evaluation.json`: the legacy home of recommended thresholds.
+#[derive(Debug, serde::Deserialize)]
 struct EvaluationJson {
     #[serde(default = "default_model_abi_version")]
     model_abi_version: u32,
-    #[serde(default)]
     recommended_thresholds: Option<EvaluationThresholds>,
-    #[serde(default)]
-    optimal_threshold: Option<f64>,
-    #[serde(default)]
-    severity_levels: Vec<SeverityLevel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EvaluationThresholds {
+    suspicious: Option<f32>,
+    hostile: Option<f32>,
 }
 
 const fn default_model_abi_version() -> u32 {
     EXPECTED_MODEL_ABI_VERSION
+}
+
+/// Recommended thresholds from `<dir>/evaluation.json`, or `None` when the
+/// file or its recommendation is absent. As with `config.json`, a missing
+/// `suspicious` collapses to hostile-only.
+fn load_evaluation_thresholds(dir: &Path) -> Result<Option<Thresholds>> {
+    let path = dir.join("evaluation.json");
+    let Some(eval) = read_json::<EvaluationJson>(&path)? else {
+        return Ok(None);
+    };
+    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
+        anyhow::bail!(
+            "{} has model_abi_version {} but this build expects {EXPECTED_MODEL_ABI_VERSION}",
+            path.display(),
+            eval.model_abi_version,
+        );
+    }
+    let Some(hostile) = eval.recommended_thresholds.as_ref().and_then(|r| r.hostile) else {
+        return Ok(None);
+    };
+    let t = Thresholds {
+        suspicious: eval
+            .recommended_thresholds
+            .and_then(|r| r.suspicious)
+            .unwrap_or(hostile),
+        hostile,
+    };
+    t.validate()
+        .with_context(|| format!("{} recommended thresholds are invalid", path.display()))?;
+    Ok(Some(t))
 }
 
 /// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
@@ -213,7 +275,7 @@ const fn default_model_abi_version() -> u32 {
 /// this permanent; tighten back toward L100/L250 if the suspicious bucket floods.
 const SUSPICIOUS_LEVEL_CEILING: u16 = 3000;
 
-/// The suspicious LEVEL for a grid: `min(max_grid_level, 100)`.
+/// The suspicious LEVEL for a grid: `min(max_grid_level, SUSPICIOUS_LEVEL_CEILING)`.
 ///
 /// Any file that fires at a level looser than the operator's selected hostile
 /// level — but not above the suspicious ceiling — is classified as suspicious.
@@ -222,203 +284,10 @@ pub(crate) fn capped_suspicious_level(max_grid_level: u16) -> u16 {
     max_grid_level.min(SUSPICIOUS_LEVEL_CEILING)
 }
 
-/// Try to load thresholds from config.json in the model directory.
-///
-/// config.json is the primary model-level configuration and takes precedence
-/// over evaluation.json recommendations. The `suspicious` field, if present,
-/// is honored as-is; otherwise we set `suspicious == hostile` (hostile-only
-/// behavior) — the level-space lookup only applies when a severity level
-/// is in play, not for the top-level fallback constants.
-// Threshold values from JSON are in 0.0..1.0; narrowing to f32 is safe.
-#[allow(clippy::cast_possible_truncation)]
-fn load_config_thresholds(model_dir: &Path) -> Option<Thresholds> {
-    let path = model_dir.join("config.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cfg: ConfigJson = serde_json::from_str(&data).ok()?;
-    let hostile = cfg.hostile? as f32;
-    let suspicious = cfg.suspicious.map(|s| s as f32).unwrap_or(hostile);
-    let t = Thresholds {
-        suspicious,
-        hostile,
-    };
-    if t.validate().is_ok() {
-        tracing::info!(
-            path = %path.display(),
-            suspicious = suspicious,
-            hostile = hostile,
-            "loaded thresholds from config.json"
-        );
-        Some(t)
-    } else {
-        // Hard model-config anomaly: surface at error level so CI / deploy
-        // verify catches it instead of silently degrading to fallbacks.
-        tracing::error!(path = %path.display(), "config.json thresholds are invalid, ignoring");
-        None
-    }
-}
-
-/// Largest level value present in a `severity_levels[]` table, or `None` when
-/// the table is empty. Used to clamp the suspicious lookup so we never
-/// ask for a level the bundle doesn't have.
-fn max_level(levels: &[SeverityLevel]) -> Option<u16> {
-    levels.iter().map(|e| e.level).max()
-}
-
-/// Build a `Thresholds` block from a single `severity_levels[]` table at the
-/// requested level.
-///
-/// Suspicious resolution order:
-/// 1. Explicit per-level `suspicious.threshold` (when collimator emits one).
-/// 2. Level-space lookup: the hostile threshold at level
-///    `min(max_level, 100)`.
-/// 3. Hostile-only fallback (suspicious == hostile) when the suspicious row is
-///    absent — typical when the bundle's grid is truncated.
-#[allow(clippy::cast_possible_truncation)]
-fn thresholds_from_severity_levels(levels: &[SeverityLevel], level: u16) -> Option<Thresholds> {
-    let entry = levels.iter().find(|entry| entry.level == level)?;
-    let hostile = entry.hostile?.threshold? as f32;
-    let suspicious = if let Some(explicit) = entry.suspicious.and_then(|s| s.threshold) {
-        explicit as f32
-    } else {
-        let max = max_level(levels).unwrap_or(level);
-        let suspicious_level = capped_suspicious_level(max);
-        if suspicious_level == level {
-            // Already at the top of the grid; no looser row to pull from.
-            hostile
-        } else {
-            levels
-                .iter()
-                .find(|entry| entry.level == suspicious_level)
-                .and_then(|entry| entry.hostile?.threshold)
-                .map_or(hostile, |threshold| threshold as f32)
-        }
-    };
-    // Suspicious cutoff sits ABOVE hostile only if the suspicious row's hostile is
-    // tighter than the active level's hostile — that would invert the band,
-    // so clamp to the hostile threshold as a safety net.
-    let suspicious = suspicious.min(hostile);
-    let thresholds = Thresholds {
-        suspicious,
-        hostile,
-    };
-    thresholds.validate().ok()?;
-    Some(thresholds)
-}
-
-fn load_config_severity_thresholds(model_dir: &Path, level: u16) -> Option<Thresholds> {
-    let path = model_dir.join("config.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cfg: ConfigJson = serde_json::from_str(&data).ok()?;
-    let thresholds = thresholds_from_severity_levels(&cfg.severity_levels, level)?;
-    tracing::info!(
-        path = %path.display(),
-        level = level,
-        suspicious = thresholds.suspicious,
-        hostile = thresholds.hostile,
-        "loaded severity thresholds from config.json"
-    );
-    Some(thresholds)
-}
-
-fn load_evaluation_severity_thresholds(model_dir: &Path, level: u16) -> Option<Thresholds> {
-    let path = model_dir.join("evaluation.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
-    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
-        tracing::error!(
-            path = %path.display(),
-            found = eval.model_abi_version,
-            expected = EXPECTED_MODEL_ABI_VERSION,
-            "evaluation.json ABI version mismatch, ignoring severity thresholds"
-        );
-        return None;
-    }
-    let thresholds = thresholds_from_severity_levels(&eval.severity_levels, level)?;
-    tracing::info!(
-        path = %path.display(),
-        level = level,
-        suspicious = thresholds.suspicious,
-        hostile = thresholds.hostile,
-        "loaded severity thresholds from evaluation.json"
-    );
-    Some(thresholds)
-}
-
-/// Load gzip-style severity thresholds from model metadata.
-///
-/// Resolution order matches normal threshold loading: `config.json` first, then
-/// `evaluation.json`. Returns `Ok(None)` when this model bundle predates
-/// severity metadata.
-///
-/// Suspicious is derived in level-space (see
-/// `capped_suspicious_level`) — there is no probability-space
-/// fallback.
-///
-/// # Errors
-/// Returns an error if `level` is outside `0..=25000`.
-pub fn load_severity_thresholds(model_dir: &Path, level: u16) -> Result<Option<Thresholds>> {
-    if !(0..=25000).contains(&level) {
-        anyhow::bail!("severity level must be in 0..=25000, got {level}");
-    }
-    Ok(load_config_severity_thresholds(model_dir, level)
-        .or_else(|| load_evaluation_severity_thresholds(model_dir, level)))
-}
-
-/// Try to load recommended thresholds from evaluation.json.
-#[allow(clippy::cast_possible_truncation)]
-fn load_evaluation_thresholds(model_dir: &Path) -> Option<Thresholds> {
-    let path = model_dir.join("evaluation.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let eval: EvaluationJson = serde_json::from_str(&data).ok()?;
-    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
-        tracing::error!(
-            path = %path.display(),
-            found = eval.model_abi_version,
-            expected = EXPECTED_MODEL_ABI_VERSION,
-            "evaluation.json ABI version mismatch, ignoring thresholds"
-        );
-        return None;
-    }
-
-    if let Some(rec) = eval.recommended_thresholds {
-        let hostile = rec.hostile? as f32;
-        // Top-level `recommended_thresholds` is the no-level fallback. When
-        // suspicious is absent we collapse to hostile-only (suspicious ==
-        // hostile) — the level-space lookup needs a `severity_levels[]` table, which
-        // this branch doesn't have access to.
-        let suspicious = rec.suspicious.map(|s| s as f32).unwrap_or(hostile);
-        let t = Thresholds {
-            suspicious,
-            hostile,
-        };
-        if t.validate().is_ok() {
-            tracing::info!(
-                path = %path.display(),
-                suspicious = suspicious,
-                hostile = hostile,
-                "loaded recommended thresholds from evaluation.json"
-            );
-            return Some(t);
-        }
-    }
-
-    // Fall back to optimal_threshold as a single hostile threshold.
-    if let Some(threshold) = eval.optimal_threshold {
-        let t = threshold as f32;
-        tracing::debug!(
-            path = %path.display(),
-            threshold = t,
-            "evaluation.json has optimal_threshold but no recommended_thresholds"
-        );
-    }
-
-    None
-}
-
-/// Classification outcome.
+/// Classification outcome, ordered by severity (`Benign < Suspicious < Hostile`).
 ///
 /// Serializes as an integer: 0 = benign, 1 = suspicious, 2 = hostile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Classification {
@@ -598,27 +467,27 @@ impl Thresholds {
     #[must_use]
     pub fn decide(&self, probability: f32) -> Decision {
         // The raw threshold path carries no level table (manual `--threshold-*`
-        // mode, single-bundle, or the no-grid fallback), so `level` is `None`.
+        // mode, single-bundle, or the no-grid fallback), so `level` is `Manual`.
         if probability >= self.hostile {
             Decision {
                 class: Classification::Hostile,
                 probability,
                 threshold: self.hostile,
-                level: None,
+                level: Level::Manual,
             }
         } else if probability >= self.suspicious {
             Decision {
                 class: Classification::Suspicious,
                 probability,
                 threshold: self.suspicious,
-                level: None,
+                level: Level::Manual,
             }
         } else {
             Decision {
                 class: Classification::Benign,
                 probability,
                 threshold: self.suspicious,
-                level: None,
+                level: Level::Manual,
             }
         }
     }
@@ -639,15 +508,84 @@ pub struct Decision {
     pub probability: f32,
     /// Cutoff defining the verdict band.
     pub threshold: f32,
-    /// Level-independent envelope marker (serialized as JSON `lvl`): the lowest
-    /// false-positive level (FP per 100M benigns) at which this file's hostile
-    /// decision fires. `Some(-1)` when it never fires at any grid level (clean);
-    /// `Some(0..=grid_max)` for the firing level; `None` in manual-threshold
-    /// mode, where no level table applies. Independent of the deploy `-l`, so
-    /// the serialized envelope is identical across levels and cache-shareable —
-    /// `-l` only moves the hostile/suspicious cutoffs applied to `level` to produce
-    /// `class`.
-    pub level: Option<i32>,
+    /// Level-independent envelope marker (serialized as JSON `lvl`): where this
+    /// file's hostile decision fires on the grid. Independent of the deploy
+    /// `-l`, so the serialized envelope is identical across levels and
+    /// cache-shareable — `-l` only moves the hostile/suspicious cutoffs applied
+    /// to `level` to produce `class`.
+    pub level: Level,
+}
+
+/// The lowest false-positive level (FP per 100M benigns) at which a file's
+/// hostile decision fires: a property of the file and the model, never of a
+/// caller's budget.
+///
+/// On the wire (`lvl`, `fires_at`) it is `null`, `-1` or the level. That
+/// encoding invites comparing `-1` as the tightest level of all, so in code
+/// each case is its own variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Level {
+    /// No level applies: manual-threshold mode, or a record that carries none
+    /// (a corpus row written before levels, a decision with no answer).
+    /// Serialized as `null`.
+    #[default]
+    Manual,
+    /// Fires at no level on the grid. Serialized as `-1`.
+    Clean,
+    /// Fires at this level and every looser one. Synthesized verdicts (LLM,
+    /// trait floor) are placed on the same axis so they decode to their class.
+    At(u16),
+}
+
+impl Level {
+    /// Whether no level table applies; omits `lvl` where the wire does.
+    #[must_use]
+    pub const fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual)
+    }
+
+    /// The wire encoding.
+    fn wire(self) -> Option<i32> {
+        match self {
+            Self::Manual => None,
+            Self::Clean => Some(-1),
+            Self::At(n) => Some(i32::from(n)),
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    /// `L50`, `clean` or `manual`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Manual => f.write_str("manual"),
+            Self::Clean => f.write_str("clean"),
+            Self::At(n) => write!(f, "L{n}"),
+        }
+    }
+}
+
+impl serde::Serialize for Level {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.wire(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Level {
+    /// Through `Option`, so an absent field reads as [`Self::Manual`] exactly as
+    /// the `Option<i32>` it replaces did.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match <Option<i32> as serde::Deserialize>::deserialize(deserializer)? {
+            None => Ok(Self::Manual),
+            Some(-1) => Ok(Self::Clean),
+            Some(n) => u16::try_from(n).ok().map(Self::At).ok_or_else(|| {
+                serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Signed(n.into()),
+                    &"null, -1, or a level in 0..=65535",
+                )
+            }),
+        }
+    }
 }
 
 /// Validation error for [`Thresholds`].
@@ -696,36 +634,21 @@ pub struct ModelInfo {
     pub version: u32,
     /// Stable preprocessing/inference ABI version.
     pub abi_version: u32,
-    /// Optional SHA-256 hex digest of the model file.
-    ///
-    /// Litmus does not compute this for ordinary scan startup because hashing
-    /// the model artifact is avoidable hot-path work.
-    pub sha256: String,
-    /// Short git commit hash of the models repository, if available.
-    ///
-    /// This is optional because spawning `git` during every scan is likewise
-    /// avoidable startup work.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
 }
 
-/// One trained tree-boosting model, picked at load time by file extension.
-/// Pure-Rust ONNX backend (tract). Loads a serialized ONNX graph and
-/// runs single-sample inference returning the positive-class
-/// probability. Reads the `.onnx` route artifacts collimator emits — the
-/// only model format litmus loads.
+/// One trained route member: a serialized ONNX graph scored single-sample,
+/// returning the positive-class probability. Collimator's `.onnx` route
+/// artifacts are the only model format litmus loads.
 ///
 /// The graph is `onnxmltools.convert_lightgbm`'s standard output:
 /// inputs `("input", float32, [N, n_features])`, outputs
 /// `[label (int64, [N]), probabilities (float32, [N, 2])]`. We
 /// ignore the label output and use column 1 of probabilities.
+///
+/// A plain tree ensemble is walked directly ([`FastTreeBackend`]); any other
+/// graph falls back to tract.
 #[derive(Debug)]
-struct OnnxBackend {
-    inner: OnnxRuntime,
-}
-
-#[derive(Debug)]
-enum OnnxRuntime {
+enum OnnxModel {
     Fast(FastTreeBackend),
     Tract(TractOnnxBackend),
 }
@@ -745,8 +668,17 @@ impl std::fmt::Debug for TractOnnxBackend {
     }
 }
 
-impl OnnxBackend {
+impl OnnxModel {
+    /// Load one `.onnx` member. Only ONNX is supported — the native LightGBM
+    /// (`.txt`) and XGBoost (`.json`) loaders were retired.
     fn load(path: &Path) -> Result<Self> {
+        if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
+            anyhow::bail!(
+                "unsupported model file {}; only .onnx is supported \
+                 (the LightGBM/XGBoost loaders were removed)",
+                path.display(),
+            );
+        }
         match FastTreeBackend::load(path) {
             Ok(fast) => {
                 tracing::debug!(
@@ -755,9 +687,7 @@ impl OnnxBackend {
                     trees = fast.trees.len(),
                     "loaded fast ONNX tree ensemble"
                 );
-                return Ok(Self {
-                    inner: OnnxRuntime::Fast(fast),
-                });
+                return Ok(Self::Fast(fast));
             }
             Err(error) => {
                 tracing::debug!(
@@ -767,23 +697,20 @@ impl OnnxBackend {
                 );
             }
         }
-
-        Ok(Self {
-            inner: OnnxRuntime::Tract(TractOnnxBackend::load(path)?),
-        })
+        Ok(Self::Tract(TractOnnxBackend::load(path)?))
     }
 
     fn predict(&self, features: &[f32]) -> Result<f32> {
-        match &self.inner {
-            OnnxRuntime::Fast(fast) => fast.predict(features),
-            OnnxRuntime::Tract(tract) => tract.predict(features),
+        match self {
+            Self::Fast(fast) => fast.predict(features),
+            Self::Tract(tract) => tract.predict(features),
         }
     }
 
     const fn n_features(&self) -> usize {
-        match &self.inner {
-            OnnxRuntime::Fast(fast) => fast.n_features,
-            OnnxRuntime::Tract(tract) => tract.n_features,
+        match self {
+            Self::Fast(fast) => fast.n_features,
+            Self::Tract(tract) => tract.n_features,
         }
     }
 }
@@ -1367,31 +1294,6 @@ fn fast_compare(cmp: FastCmp, feature: f32, threshold: f32, nan_is_true: bool) -
     }
 }
 
-#[derive(Debug)]
-enum InnerModel {
-    Onnx(Box<OnnxBackend>),
-}
-
-impl InnerModel {
-    fn num_features(&self) -> usize {
-        match self {
-            Self::Onnx(m) => m.n_features(),
-        }
-    }
-
-    fn predict(&self, features: &[f32]) -> Result<f32> {
-        match self {
-            Self::Onnx(m) => m.predict(features),
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Onnx(_) => "onnx",
-        }
-    }
-}
-
 /// Inference backend powering a loaded [`Model`].
 ///
 /// Holds one or more trained models for a route. Single-model bundles (the
@@ -1405,13 +1307,13 @@ impl InnerModel {
 /// mismatches are rejected at load time.
 #[derive(Debug)]
 struct Backend {
-    first: InnerModel,
-    rest: Vec<InnerModel>,
+    first: OnnxModel,
+    rest: Vec<OnnxModel>,
 }
 
 impl Backend {
-    fn num_features(&self) -> usize {
-        self.first.num_features()
+    const fn num_features(&self) -> usize {
+        self.first.n_features()
     }
 
     fn predict(&self, features: &[f32]) -> Result<f32> {
@@ -1433,15 +1335,12 @@ impl Backend {
         for m in &self.rest {
             sum += f64::from(m.predict(features)?);
         }
-        // Every member emits f32 probabilities; f64 only keeps ensemble
-        // summation stable before returning to the public f32 surface.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "members emit f32; f64 only keeps the ensemble sum stable"
+        )]
         let avg = (sum / self.n_members() as f64) as f32;
         Ok(avg)
-    }
-
-    fn kind(&self) -> &'static str {
-        self.first.kind()
     }
 
     /// Number of trained members (1 = legacy single-model bundle, ≥2 =
@@ -1453,7 +1352,7 @@ impl Backend {
 }
 
 /// Per-route isotonic calibrator persisted by collimator's
-/// `azoth_calibrate_ensemble.py` as `calibrator.json` next to `model.txt`.
+/// `azoth_calibrate_ensemble.py` as `calibrator.json` in the route directory.
 ///
 /// Maps a route's raw model probability to a calibrated probability on
 /// `[0, 1]`. The calibrator is fit on the deployment-time calibration corpus
@@ -1484,22 +1383,18 @@ struct IsotonicCalibrator {
 impl IsotonicCalibrator {
     /// Read `<bundle_dir>/calibrator.json` if it exists. Returns Ok(None) if
     /// the file is missing (intentional — pre-calibrator bundles are still
-    /// loadable). Errors only when the file exists but is unparseable.
+    /// loadable). Errors when the file exists but is unreadable or invalid.
     fn load_optional(bundle_dir: &Path) -> Result<Option<Self>> {
-        let path = bundle_dir.join("calibrator.json");
-        if !path.is_file() {
-            return Ok(None);
-        }
         #[derive(serde::Deserialize)]
         struct Raw {
             schema: Option<String>,
             x: Vec<f32>,
             y: Vec<f32>,
         }
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("reading calibrator at {}", path.display()))?;
-        let raw: Raw = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing calibrator at {}", path.display()))?;
+        let path = bundle_dir.join("calibrator.json");
+        let Some(raw) = read_json::<Raw>(&path)? else {
+            return Ok(None);
+        };
         if let Some(schema) = raw.schema.as_deref() {
             // Hard-fail on unrecognized future versions to avoid silently
             // applying a calibrator we don't understand.
@@ -1600,7 +1495,7 @@ impl IsotonicCalibrator {
 }
 
 /// Output of the per-bundle loader: backend, spec, resolved thresholds, plus
-/// telemetry about where the thresholds came from for the load-time log line.
+/// where the thresholds came from for the load-time log line.
 struct LoadedBundle {
     backend: Backend,
     spec: FeatureSpec,
@@ -1622,9 +1517,20 @@ struct LoadedBundle {
 /// if the staged bundle's level, collimator's const, and this const disagree.
 pub const DEFAULT_SEVERITY_LEVEL: u16 = 25;
 
-/// Ensemble-level config parsed from the top-level `config.json`. Every field
-/// is optional — an ensemble bundle with only `general/` populated and no
-/// extras loads with general as the only route at fallback thresholds.
+/// The deploy tuning goal prescribed by THIS model's `config.json`
+/// (`default_severity_level`), or `None` if the bundle predates the field.
+///
+/// Resolution order for the operating point is: explicit CLI level → this
+/// model-prescribed default → the `DEFAULT_SEVERITY_LEVEL` const fallback. So a
+/// bundle calibrated at L50 operates at L50 without any litmus rebuild, and a
+/// caller can still pin a different level explicitly. A malformed config.json
+/// reads as `None` here; `Model::load` reports it.
+#[must_use]
+pub fn model_default_level(model_dir: &Path) -> Option<u16> {
+    BundleConfig::load(model_dir).ok()??.default_severity_level
+}
+
+/// The ensemble's top-level `config.json`, resolved at one level.
 #[derive(Debug, Default)]
 struct EnsembleConfig {
     /// `cleave file_type → filegroup name` map. Files whose `file_type` is
@@ -1634,7 +1540,7 @@ struct EnsembleConfig {
     /// `filegroups/<name>`, `filetypes/<name>` (matching the route paths in
     /// `config.json`'s `models[]` array).
     required_routes: Vec<String>,
-    /// Per-route thresholds at the active level. Keyed by route name as
+    /// Per-route thresholds at the resolved level. Keyed by route name as
     /// emitted in `levels[].hostile.thresholds`: `"general"`,
     /// `"filegroups/<name>"`, `"filetypes/<name>"`.
     route_thresholds: HashMap<String, Thresholds>,
@@ -1643,17 +1549,121 @@ struct EnsembleConfig {
     /// space, matching the general route's emitted probability.
     general_grid: Vec<(u16, f32)>,
     /// Largest level present in the `levels[]` grid. The suspicious cap is
-    /// `min(grid_max, 100)`.
+    /// `capped_suspicious_level(grid_max)`.
     grid_max: u16,
+}
+
+impl EnsembleConfig {
+    fn new(cfg: BundleConfig, level: u16) -> Self {
+        let route_thresholds = thresholds_at_level(&cfg.levels, level);
+        // General route's hostile threshold per level, ascending. Used by the
+        // verdict sweep for filetypes that have no route policy of their own.
+        let mut general_grid: Vec<(u16, f32)> = cfg
+            .levels
+            .iter()
+            .filter_map(|entry| {
+                let threshold = *entry.hostile.thresholds.get("general")?;
+                Some((entry.level, threshold))
+            })
+            .collect();
+        general_grid.sort_by_key(|&(level, _)| level);
+        let grid_max = cfg.levels.iter().map(|e| e.level).max().unwrap_or(0);
+        Self {
+            filetype_to_filegroup: cfg.filetype_to_group,
+            required_routes: cfg.required_routes,
+            route_thresholds,
+            general_grid,
+            grid_max,
+        }
+    }
+}
+
+/// A route's index in [`RouteNames`]. Assigned at load, so the per-file
+/// decision compares integers rather than hashing route names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RouteId(usize);
+
+impl RouteId {
+    /// The general route: always interned first.
+    const GENERAL: Self = Self(0);
+}
+
+/// What a route name names. Route names are the on-disk layout paths:
+/// `general`, `filegroups/<name>`, `filetypes/<name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKind<'a> {
+    General,
+    Group(&'a str),
+    Type(&'a str),
+}
+
+impl<'a> RouteKind<'a> {
+    fn parse(name: &'a str) -> Option<Self> {
+        if name == "general" {
+            return Some(Self::General);
+        }
+        if let Some(group) = name.strip_prefix("filegroups/") {
+            return Some(Self::Group(group));
+        }
+        name.strip_prefix("filetypes/").map(Self::Type)
+    }
+}
+
+/// The wire name of a route: `az` for general, `az/<name>` for a specialist.
+fn compact_route_name(route: &str) -> String {
+    match RouteKind::parse(route) {
+        Some(RouteKind::General) => "az".to_string(),
+        Some(RouteKind::Group(name) | RouteKind::Type(name)) => format!("az/{name}"),
+        None => format!("az/{route}"),
+    }
+}
+
+/// Every route name the bundle refers to — in `config.json`, in
+/// `route_policies.json`, or on disk — interned at load. Index 0 is `general`.
+#[derive(Debug)]
+struct RouteNames {
+    names: Vec<String>,
+    ids: HashMap<String, RouteId>,
+}
+
+impl Default for RouteNames {
+    fn default() -> Self {
+        let mut names = Self {
+            names: Vec::new(),
+            ids: HashMap::new(),
+        };
+        names.intern("general");
+        names
+    }
+}
+
+impl RouteNames {
+    fn intern(&mut self, name: &str) -> RouteId {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = RouteId(self.names.len());
+        self.names.push(name.to_string());
+        self.ids.insert(name.to_string(), id);
+        id
+    }
+
+    fn id(&self, name: &str) -> Option<RouteId> {
+        self.ids.get(name).copied()
+    }
+
+    fn name(&self, id: RouteId) -> &str {
+        &self.names[id.0]
+    }
 }
 
 /// Per-filetype route policy loaded from `route_policies.json`.
 ///
-/// `by_filetype` holds the policy resolved at the *active* deploy level and
-/// drives the diagnostic per-route classification (`models[]`). `grid` retains
-/// the hostile policy at *every* level so the verdict path can sweep for the
-/// lowest false-positive level at which a file fires — that swept level is the
-/// envelope level marker (see `sweep_policy_grid` and `Model::decide_swept`).
+/// `by_filetype` holds the policy resolved at the default level and drives the
+/// diagnostic per-route classification (`models[]`). `grid` retains the hostile
+/// policy at *every* level so the verdict path can sweep for the lowest
+/// false-positive level at which a file fires — that swept level is the envelope
+/// level marker (see `sweep_policy_grid` and `Model::decide_swept`).
 #[derive(Debug, Default)]
 struct RoutePolicies {
     by_filetype: HashMap<String, RoutePolicy>,
@@ -1663,9 +1673,9 @@ struct RoutePolicies {
 impl RoutePolicies {
     /// True when `route` is referenced by any policy at any level. Used to
     /// decide whether an on-disk specialist participates in the ensemble — a
-    /// route referenced only at non-active levels must still load so the sweep
-    /// can evaluate it.
-    fn contains_route(&self, route: &str) -> bool {
+    /// route referenced only at non-default levels must still load so the
+    /// sweep can evaluate it.
+    fn contains_route(&self, route: RouteId) -> bool {
         self.grid
             .values()
             .flatten()
@@ -1675,57 +1685,48 @@ impl RoutePolicies {
             })
     }
 
-    /// Look up the active-level policy for a file type, transparently
-    /// stripping pure-compression suffixes. `tar.gz` → `tar`, `tar.bz2.xz`
-    /// → `tar`. Tries the original spelling first so a bundle that
-    /// pre-dates the normalization (its keys still carry the suffix) keeps
-    /// working without a re-train. Mirrors
-    /// `collimator.data.normalize_archive_filetype`.
+    /// The default-level policy for a file type (see [`lookup_filetype`]).
     fn policy_for(&self, file_type: &str) -> Option<&RoutePolicy> {
-        if let Some(p) = self.by_filetype.get(file_type) {
-            return Some(p);
-        }
-        let normalized = normalize_archive_filetype(file_type);
-        if normalized != file_type
-            && let Some(p) = self.by_filetype.get(&normalized)
-        {
-            return Some(p);
-        }
-        // Specialty-else-container: a packaged type with no policy of its own
-        // inherits its container archive's (gem → tar, whl → zip). Mirrors the
-        // route fallback in `RouteSet::specialist_keys` so the resolved policy
-        // and specialist keys agree.
-        if let Some(container) = container_filetype(file_type)
-            && container != file_type
-            && container != normalized
-        {
-            return self.by_filetype.get(&container);
-        }
-        None
+        lookup_filetype(&self.by_filetype, file_type)
     }
 
-    /// Look up the per-level policy grid for a file type, with the same
-    /// suffix-stripping fallback as [`Self::policy_for`]. Used by the
-    /// envelope-level sweep.
-    fn grid_for(&self, file_type: &str) -> Option<&Vec<LevelPolicy>> {
-        if let Some(g) = self.grid.get(file_type) {
-            return Some(g);
-        }
-        let normalized = normalize_archive_filetype(file_type);
-        if normalized != file_type
-            && let Some(g) = self.grid.get(&normalized)
-        {
-            return Some(g);
-        }
-        // Specialty-else-container fallback, matching `policy_for`.
-        if let Some(container) = container_filetype(file_type)
-            && container != file_type
-            && container != normalized
-        {
-            return self.grid.get(&container);
-        }
-        None
+    /// The per-level policy grid for a file type (see [`lookup_filetype`]).
+    /// Used by the envelope-level sweep.
+    fn grid_for(&self, file_type: &str) -> Option<&[LevelPolicy]> {
+        lookup_filetype(&self.grid, file_type).map(Vec::as_slice)
     }
+
+    /// Every policy severity, for load-time passes over the thresholds.
+    fn severities_mut(&mut self) -> impl Iterator<Item = &mut PolicySeverity> {
+        self.by_filetype
+            .values_mut()
+            .flat_map(|policy| [&mut policy.hostile, &mut policy.suspicious])
+            .chain(self.grid.values_mut().flatten().map(|lp| &mut lp.hostile))
+    }
+}
+
+/// Look a cleave file type up in a per-filetype table: as given, then with
+/// pure-compression suffixes stripped (`tar.gz` → `tar`; the original
+/// spelling goes first so a bundle whose keys still carry the suffix keeps
+/// working), then as its container archive (`gem` → `tar`, `whl` → `zip`).
+/// Mirrors `collimator.data.normalize_archive_filetype`, and the specialist
+/// fallback in [`RouteSet::specialist_keys`], so the resolved policy and the
+/// specialists scored agree.
+fn lookup_filetype<'a, V>(table: &'a HashMap<String, V>, file_type: &str) -> Option<&'a V> {
+    if let Some(v) = table.get(file_type) {
+        return Some(v);
+    }
+    let normalized = normalize_archive_filetype(file_type);
+    if normalized != file_type
+        && let Some(v) = table.get(normalized.as_ref())
+    {
+        return Some(v);
+    }
+    let container = container_filetype(file_type)?;
+    if container != file_type && container != normalized {
+        return table.get(container);
+    }
+    None
 }
 
 /// Pure-compression suffixes — formats with no multi-file container of
@@ -1740,14 +1741,23 @@ const PURE_COMPRESSION_SUFFIXES: &[&str] = &["gz", "bz2", "xz", "zst", "z", "lzm
 /// `tar.gz` → `tar`, `tar.bz2.xz` → `tar`. Bare compression labels
 /// (`gz`, `bz2`, …) are returned unchanged — litmus decompresses and
 /// re-routes those at extraction time; the wrapper has no route of its
-/// own. See [`RoutePolicies::policy_for`] for the call site.
-fn normalize_archive_filetype(file_type: &str) -> String {
-    let mut normalized = file_type.trim().to_ascii_lowercase();
+/// own. Borrows when the label is already normalized, the common case.
+fn normalize_archive_filetype(file_type: &str) -> Cow<'_, str> {
+    let trimmed = file_type.trim();
+    let mut normalized: Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(trimmed)
+    };
     while let Some((head, tail)) = normalized.rsplit_once('.') {
         if head.is_empty() || !PURE_COMPRESSION_SUFFIXES.contains(&tail) {
             break;
         }
-        normalized = head.to_string();
+        let head_len = head.len();
+        match &mut normalized {
+            Cow::Borrowed(s) => *s = s.get(..head_len).unwrap_or(s),
+            Cow::Owned(s) => s.truncate(head_len),
+        }
     }
     normalized
 }
@@ -1764,10 +1774,10 @@ fn normalize_archive_filetype(file_type: &str) -> String {
 /// collimator parity), this also collapses specialty package types onto their
 /// container, so it is consulted *after* the exact and compression-stripped
 /// lookups, never instead of them.
-fn container_filetype(file_type: &str) -> Option<String> {
+fn container_filetype(file_type: &str) -> Option<&'static str> {
     filefacts::FileType::from_label(file_type.trim())
         .and_then(filefacts::FileType::archive_format)
-        .map(|archive| archive.label().to_string())
+        .map(filefacts::ArchiveFormat::label)
 }
 
 /// Hostile decision policy for one filetype at one severity level. A filetype's
@@ -1787,9 +1797,9 @@ struct RoutePolicy {
 
 #[derive(Debug, Clone)]
 struct PolicySeverity {
-    /// Route-name → calibrated threshold. Routes absent from this map do not
-    /// participate in that severity decision.
-    thresholds: HashMap<String, f32>,
+    /// Route → calibrated threshold, ordered by route name. Routes absent
+    /// from this list do not participate in that severity decision.
+    thresholds: Vec<(RouteId, f32)>,
     /// Learned-blend policy. When set, ``thresholds`` is empty and this
     /// severity is evaluated as ``sigmoid(intercept + sum(w_i * logit(p_i))) >=
     /// threshold`` over the named routes. Mirrors what
@@ -1801,17 +1811,23 @@ struct PolicySeverity {
 }
 
 impl PolicySeverity {
+    /// The OR-rule threshold for `route`, if it participates.
+    fn threshold(&self, route: RouteId) -> Option<f32> {
+        self.thresholds
+            .iter()
+            .find(|&&(r, _)| r == route)
+            .map(|&(_, t)| t)
+    }
+
     /// True iff this severity could fire on a contribution from ``route``.
     /// For OR-rule policies that's "route has a threshold"; for blend policies
     /// it's "route is one of the blend inputs."
-    fn references_route(&self, route: &str) -> bool {
-        if self.thresholds.contains_key(route) {
-            return true;
-        }
-        if let Some(blend) = &self.blend {
-            return blend.routes.iter().any(|r| r == route);
-        }
-        false
+    fn references_route(&self, route: RouteId) -> bool {
+        self.threshold(route).is_some()
+            || self
+                .blend
+                .as_ref()
+                .is_some_and(|blend| blend.routes.contains(&route))
     }
 
     /// True iff this severity fires given the per-route scores. Dispatches
@@ -1834,11 +1850,11 @@ impl PolicySeverity {
         }
         let mut best: Option<(f32, f32)> = None;
         for score in scores {
-            if let Some(&t) = self.thresholds.get(&score.route)
+            if let Some(t) = self.threshold(score.route)
                 && score.probability >= t
             {
                 let margin = score.probability - t;
-                let best_margin = best.map(|(p, bt)| p - bt).unwrap_or(f32::NEG_INFINITY);
+                let best_margin = best.map_or(f32::NEG_INFINITY, |(p, bt)| p - bt);
                 if margin > best_margin {
                     best = Some((score.probability, t));
                 }
@@ -1853,7 +1869,7 @@ struct BlendPolicy {
     /// Routes consumed by the blend, in the order their weights are listed.
     /// Both ``weights`` and the score lookup happen by index, so reordering
     /// after load is forbidden.
-    routes: Vec<String>,
+    routes: Vec<RouteId>,
     weights: Vec<f32>,
     intercept: f32,
     /// Calibrated-space threshold on the sigmoid output. Already in the
@@ -1870,7 +1886,6 @@ impl BlendPolicy {
     /// the blend can't be honestly evaluated with incomplete inputs and
     /// firing on a partial blend would be a calibration mismatch.
     #[cfg(test)]
-    #[allow(clippy::cast_possible_truncation)]
     fn fires(&self, scores: &[RouteProbability]) -> bool {
         self.fire(scores).is_some()
     }
@@ -1878,56 +1893,25 @@ impl BlendPolicy {
     /// Compute the blend's sigmoid output and, if it crosses the threshold,
     /// return `(sigmoid_output, threshold)`. Missing routes mean the blend
     /// cannot be honestly evaluated; treat as "doesn't fire."
-    #[allow(clippy::cast_possible_truncation)]
     fn fire(&self, scores: &[RouteProbability]) -> Option<(f32, f32)> {
         // f64 math throughout — logit blows up near 0/1, and the cumulative
         // weighted sum can drift if we stay in f32. The final compare against
         // ``threshold`` is in f32 to match how the calibration step writes it.
         const EPS: f64 = 1e-6;
         let mut z: f64 = f64::from(self.intercept);
-        for (idx, route) in self.routes.iter().enumerate() {
-            let score = scores.iter().find(|s| &s.route == route)?;
+        for (route, &weight) in self.routes.iter().zip(&self.weights) {
+            let score = scores.iter().find(|s| s.route == *route)?;
             let p = (f64::from(score.probability)).clamp(EPS, 1.0 - EPS);
             let logit = (p / (1.0 - p)).ln();
-            z += f64::from(self.weights[idx]) * logit;
+            z += f64::from(weight) * logit;
         }
-        let sigmoid_z = 1.0 / (1.0 + (-z).exp());
-        let sigmoid_z = sigmoid_z as f32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the blend threshold is an f32; the f64 only steadies the sum"
+        )]
+        let sigmoid_z = (1.0 / (1.0 + (-z).exp())) as f32;
         (sigmoid_z >= self.threshold).then_some((sigmoid_z, self.threshold))
     }
-}
-
-/// Wire-format view of `config.json`. Captures only the fields litmus reads;
-/// other keys (timestamp, score_table_hash, model_set_hash, models[], etc.)
-/// are accepted and ignored.
-#[derive(Debug, serde::Deserialize)]
-struct EnsembleConfigJson {
-    #[serde(default)]
-    filetype_to_group: HashMap<String, String>,
-    #[serde(default)]
-    required_routes: Vec<String>,
-    #[serde(default)]
-    levels: Vec<LevelEntryJson>,
-    /// Deploy tuning goal prescribed by the model (collimator bakes its
-    /// `DEFAULT_SEVERITY_LEVEL` here). Read by `model_default_level`; used as the
-    /// operating point when the caller hasn't selected a level on the CLI.
-    /// Absent on older bundles → consumers fall back to `DEFAULT_SEVERITY_LEVEL`.
-    #[serde(default)]
-    default_severity_level: Option<u16>,
-}
-
-/// The deploy tuning goal prescribed by THIS model's `config.json`
-/// (`default_severity_level`), or `None` if the bundle predates the field.
-///
-/// Resolution order for the operating point is: explicit CLI level → this
-/// model-prescribed default → the `DEFAULT_SEVERITY_LEVEL` const fallback. So a
-/// bundle calibrated at L50 operates at L50 without any litmus rebuild, and a
-/// caller can still pin a different level explicitly.
-#[must_use]
-pub fn model_default_level(model_dir: &Path) -> Option<u16> {
-    let data = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
-    let json: EnsembleConfigJson = serde_json::from_str(&data).ok()?;
-    json.default_severity_level
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1948,7 +1932,6 @@ struct RoutePolicyLevelJson {
     level: u16,
     hostile: RoutePolicySeverityJson,
     // Collimator may omit `suspicious`; the loader derives it from `hostile`.
-    #[serde(default)]
     suspicious: Option<RoutePolicySeverityJson>,
 }
 
@@ -1960,29 +1943,26 @@ struct RoutePolicySeverityJson {
 #[derive(Debug, serde::Deserialize)]
 struct RoutePolicyBestJson {
     #[serde(default)]
-    thresholds: HashMap<String, f64>,
+    thresholds: HashMap<String, f32>,
     /// Optional learned-blend variant. When set, ``thresholds`` is typically
     /// empty and the severity classifies via the blend's combined score.
     /// Mirrors azoth_route_policy_search._make_learned_blend_candidate_at_fp.
-    #[serde(default)]
     blend: Option<BlendPolicyJson>,
 }
 
+/// Every field a blend is evaluated with is required: a defaulted threshold
+/// of 0.0 would pass validation and fire on everything.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlendPolicyJson {
-    #[serde(default)]
     routes: Vec<String>,
-    #[serde(default)]
-    weights: Vec<f64>,
-    #[serde(default)]
-    intercept: f64,
-    #[serde(default)]
-    threshold: f64,
-    /// Currently only ``"logit"`` is supported. Future blend variants
-    /// (e.g., raw-prob linear, monotonic GAM) would advertise themselves
-    /// here so deploy can refuse unknown shapes loudly rather than
+    weights: Vec<f32>,
+    intercept: f32,
+    threshold: f32,
+    /// Currently only ``"logit"`` is supported; absent means logit. Future
+    /// blend variants (e.g., raw-prob linear, monotonic GAM) would advertise
+    /// themselves here so deploy refuses unknown shapes loudly rather than
     /// silently misapplying the wrong transform.
-    #[serde(default)]
     transform: Option<String>,
 }
 
@@ -1994,7 +1974,6 @@ struct LevelEntryJson {
     // `thresholds_at_level`. An absent block is treated as an empty map,
     // which yields hostile-only routes (the same shape used when only some
     // routes have a calibrated suspicious threshold).
-    #[serde(default)]
     suspicious: Option<SeverityEntryJson>,
 }
 
@@ -2003,120 +1982,82 @@ struct SeverityEntryJson {
     /// Route-name → threshold map for this severity. Route names match the
     /// `models[].route` field: `"general"`, `"filegroups/<name>"`, `"filetypes/<name>"`.
     #[serde(default)]
-    thresholds: HashMap<String, f64>,
+    thresholds: HashMap<String, f32>,
 }
 
-/// Load and partially validate `<model_dir>/config.json`'s ensemble fields.
-/// Returns `None` if the file is absent or unparseable; ensemble routing
-/// then degrades to general-only with no specialists matched.
-fn load_ensemble_config(model_dir: &Path, level: u16) -> Option<EnsembleConfig> {
-    let path = model_dir.join("config.json");
-    let data = std::fs::read_to_string(&path).ok()?;
-    let json: EnsembleConfigJson = serde_json::from_str(&data).ok()?;
-
-    let route_thresholds = thresholds_at_level(&json.levels, level);
-
-    // General route's hostile threshold per level, ascending. Used by the
-    // verdict sweep for filetypes that have no route policy of their own.
-    #[allow(clippy::cast_possible_truncation)]
-    let mut general_grid: Vec<(u16, f32)> = json
-        .levels
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .hostile
-                .thresholds
-                .get("general")
-                .map(|&t| (entry.level, t as f32))
-        })
-        .collect();
-    general_grid.sort_by_key(|&(level, _)| level);
-    let grid_max = json.levels.iter().map(|e| e.level).max().unwrap_or(0);
-
-    Some(EnsembleConfig {
-        filetype_to_filegroup: json.filetype_to_group,
-        required_routes: json.required_routes,
-        route_thresholds,
-        general_grid,
-        grid_max,
-    })
-}
-
-/// Load searched per-filetype decision policies. These are optional: older
-/// ensembles without `route_policies.json` keep the original OR semantics.
-fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
+/// Load the searched per-filetype decision policies, interning every route
+/// they name. Optional: an ensemble without `route_policies.json` keeps the
+/// original OR semantics.
+fn load_route_policies(
+    model_dir: &Path,
+    level: u16,
+    names: &mut RouteNames,
+) -> Result<RoutePolicies> {
     let path = model_dir.join("route_policies.json");
-    let data = match std::fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RoutePolicies::default(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cannot read route policies");
-            return RoutePolicies::default();
-        }
-    };
-    let json: RoutePoliciesJson = match serde_json::from_str(&data) {
-        Ok(json) => json,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "cannot parse route policies");
-            return RoutePolicies::default();
-        }
+    let Some(json) = read_json::<RoutePoliciesJson>(&path)? else {
+        return Ok(RoutePolicies::default());
     };
 
     let mut by_filetype = HashMap::new();
     let mut grid: HashMap<String, Vec<LevelPolicy>> = HashMap::new();
     for route in json.routes.into_values() {
+        let context = || format!("{}: filetype {}", path.display(), route.filetype);
         // Retain the hostile policy at every level (ascending) for the verdict
-        // sweep. A level whose hostile block can't be loaded is dropped from
-        // the grid — the sweep simply can't fire there.
-        let mut levels: Vec<LevelPolicy> = route
-            .levels
-            .iter()
-            .filter_map(|entry| {
-                policy_severity_from_json(&entry.hostile).map(|hostile| LevelPolicy {
+        // sweep. A level with no usable policy (collimator's `no_policy`) is
+        // dropped from the grid — the sweep simply can't fire there.
+        let mut levels = Vec::new();
+        for entry in &route.levels {
+            if let Some(hostile) =
+                policy_severity_from_json(&entry.hostile, names).with_context(context)?
+            {
+                levels.push(LevelPolicy {
                     level: entry.level,
                     hostile,
-                })
-            })
-            .collect();
+                });
+            }
+        }
         levels.sort_by_key(|lp| lp.level);
+
+        // The default-level policy drives the diagnostic per-route
+        // classification in the `models[]` array. Its suspicious band is
+        // derived in level-space via the suspicious-ceiling lookup: the hostile
+        // policy at `capped_suspicious_level(max)`. An explicit `suspicious`
+        // block, when collimator emits one, wins; the level's own hostile is
+        // the final fallback.
+        let active = match route.levels.iter().find(|entry| entry.level == level) {
+            Some(entry) => {
+                match policy_severity_from_json(&entry.hostile, names).with_context(context)? {
+                    Some(hostile) => {
+                        let explicit = match &entry.suspicious {
+                            Some(json) => {
+                                policy_severity_from_json(json, names).with_context(context)?
+                            }
+                            None => None,
+                        };
+                        let suspicious = explicit.unwrap_or_else(|| {
+                            let max = route.levels.iter().map(|e| e.level).max().unwrap_or(level);
+                            let suspicious_level = capped_suspicious_level(max);
+                            levels
+                                .iter()
+                                .find(|lp| lp.level == suspicious_level)
+                                .map_or_else(|| hostile.clone(), |lp| lp.hostile.clone())
+                        });
+                        Some(RoutePolicy {
+                            suspicious,
+                            hostile,
+                        })
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         if !levels.is_empty() {
             grid.insert(route.filetype.clone(), levels);
         }
-
-        // The active-level policy drives the diagnostic per-route classification
-        // in the `models[]` array. Its suspicious band is derived in level-space
-        // via the suspicious-ceiling lookup: pull the hostile policy from level
-        // `min(max, 100)`. An explicit `suspicious` block, when collimator
-        // emits one, wins; the active level's hostile is the final fallback.
-        let Some(level_entry) = route.levels.iter().find(|entry| entry.level == level) else {
-            continue;
-        };
-        let Some(hostile) = policy_severity_from_json(&level_entry.hostile) else {
-            continue;
-        };
-        let suspicious = if let Some(explicit) = level_entry
-            .suspicious
-            .as_ref()
-            .and_then(policy_severity_from_json)
-        {
-            explicit
-        } else {
-            let max = route.levels.iter().map(|e| e.level).max().unwrap_or(level);
-            let suspicious_level = capped_suspicious_level(max);
-            route
-                .levels
-                .iter()
-                .find(|entry| entry.level == suspicious_level)
-                .and_then(|entry| policy_severity_from_json(&entry.hostile))
-                .unwrap_or_else(|| hostile.clone())
-        };
-        by_filetype.insert(
-            route.filetype,
-            RoutePolicy {
-                suspicious,
-                hostile,
-            },
-        );
+        if let Some(policy) = active {
+            by_filetype.insert(route.filetype, policy);
+        }
     }
 
     tracing::info!(
@@ -2126,74 +2067,77 @@ fn load_route_policies(model_dir: &Path, level: u16) -> RoutePolicies {
         grid_routes = grid.len(),
         "loaded route policies",
     );
-    RoutePolicies { by_filetype, grid }
+    Ok(RoutePolicies { by_filetype, grid })
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn policy_severity_from_json(json: &RoutePolicySeverityJson) -> Option<PolicySeverity> {
-    let best = json.best.as_ref()?;
-    let blend = best.blend.as_ref().and_then(blend_policy_from_json);
-    let mut thresholds = HashMap::new();
-    for (route, &threshold) in &best.thresholds {
-        let threshold = threshold as f32;
-        if (0.0..=1.0).contains(&threshold) {
-            thresholds.insert(route.clone(), threshold);
-        }
-    }
+/// One severity's policy, or `None` when collimator found none at this level
+/// (no `best`, or neither thresholds nor a blend).
+///
+/// Thresholds outside `[0, 1]` are dropped: collimator writes one ulp above
+/// 1.0 for a route that must never fire at a level, and a probability can
+/// never reach it, so dropping it decides the same way.
+fn policy_severity_from_json(
+    json: &RoutePolicySeverityJson,
+    names: &mut RouteNames,
+) -> Result<Option<PolicySeverity>> {
+    let Some(best) = json.best.as_ref() else {
+        return Ok(None);
+    };
+    let blend = best
+        .blend
+        .as_ref()
+        .map(|blend| blend_policy_from_json(blend, names))
+        .transpose()?;
+    // Ordered by name so diagnostics that list a policy's routes are stable.
+    let mut named: Vec<(&String, f32)> = best
+        .thresholds
+        .iter()
+        .filter(|&(_, t)| (0.0..=1.0).contains(t))
+        .map(|(route, &t)| (route, t))
+        .collect();
+    named.sort_by(|a, b| a.0.cmp(b.0));
+    let thresholds: Vec<(RouteId, f32)> = named
+        .into_iter()
+        .map(|(route, t)| (names.intern(route), t))
+        .collect();
     // A severity is loadable if either the OR-rule has at least one
     // threshold OR the blend is well-formed. The two coexist only in
     // pathological writer output — current code emits one or the other.
     if thresholds.is_empty() && blend.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(PolicySeverity { thresholds, blend })
+    Ok(Some(PolicySeverity { thresholds, blend }))
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn blend_policy_from_json(json: &BlendPolicyJson) -> Option<BlendPolicy> {
-    // Only the logit transform is currently supported. An unknown transform
-    // means the writer is ahead of this deploy binary — refuse loudly rather
-    // than silently misapplying.
-    match json.transform.as_deref() {
-        None | Some("logit") => {}
-        Some(other) => {
-            tracing::error!(
-                transform = %other,
-                "unknown blend transform; ignoring blend policy",
-            );
-            return None;
-        }
+fn blend_policy_from_json(json: &BlendPolicyJson, names: &mut RouteNames) -> Result<BlendPolicy> {
+    // Only the logit transform is supported. An unknown transform means the
+    // writer is ahead of this deploy binary — refuse rather than misapply.
+    if let Some(other) = json.transform.as_deref().filter(|t| *t != "logit") {
+        anyhow::bail!("unknown blend transform {other:?}");
     }
-    if json.routes.len() != json.weights.len() {
-        tracing::error!(
-            routes = json.routes.len(),
-            weights = json.weights.len(),
-            "blend routes/weights length mismatch; ignoring blend policy",
+    if json.routes.is_empty() || json.routes.len() != json.weights.len() {
+        anyhow::bail!(
+            "blend needs one weight per route (routes={}, weights={})",
+            json.routes.len(),
+            json.weights.len(),
         );
-        return None;
     }
-    if json.routes.is_empty() {
-        return None;
+    if !(0.0..=1.0).contains(&json.threshold) {
+        anyhow::bail!("blend threshold {} is outside [0, 1]", json.threshold);
     }
-    let threshold = json.threshold as f32;
-    if !(0.0..=1.0).contains(&threshold) {
-        tracing::error!(threshold, "blend threshold outside [0,1]; ignoring");
-        return None;
-    }
-    Some(BlendPolicy {
-        routes: json.routes.clone(),
-        weights: json.weights.iter().map(|&w| w as f32).collect(),
-        intercept: json.intercept as f32,
-        threshold,
+    Ok(BlendPolicy {
+        routes: json.routes.iter().map(|r| names.intern(r)).collect(),
+        weights: json.weights.clone(),
+        intercept: json.intercept,
+        threshold: json.threshold,
     })
 }
 
 /// Pull per-route thresholds from `levels[]` at the requested level. Pairs up
 /// hostile and suspicious thresholds for each route. When the JSON omits a
-/// `suspicious` block, suspicious is derived in level-space by
-/// reading the hostile threshold for the same route at level
-/// `min(max_grid_level, 100)`.
-#[allow(clippy::cast_possible_truncation)]
+/// `suspicious` block, suspicious is derived in level-space by reading the
+/// hostile threshold for the same route at level
+/// `capped_suspicious_level(max_grid_level)`.
 fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String, Thresholds> {
     let Some(entry) = levels.iter().find(|e| e.level == level) else {
         if !levels.is_empty() {
@@ -2223,21 +2167,15 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String,
         // suspicious cutoff from the ceiling row's hostile threshold for the
         // same route (level-space lookup, falls back to hostile-only when
         // the route is missing from the looser row).
-        let hostile_f32 = hostile as f32;
-        let suspicious_f32 = match suspicious_block {
-            Some(block) => block
-                .thresholds
-                .get(route)
-                .map(|&s| s as f32)
-                .unwrap_or(hostile_f32),
+        let suspicious = match suspicious_block {
+            Some(block) => block.thresholds.get(route).copied().unwrap_or(hostile),
             None => loose_hostile
                 .and_then(|m| m.get(route))
-                .map(|&s| (s as f32).min(hostile_f32))
-                .unwrap_or(hostile_f32),
+                .map_or(hostile, |&s| s.min(hostile)),
         };
         let t = Thresholds {
-            suspicious: suspicious_f32,
-            hostile: hostile_f32,
+            suspicious,
+            hostile,
         };
         if t.validate().is_ok() {
             out.insert(route.clone(), t);
@@ -2258,7 +2196,7 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String,
                 continue;
             }
             let t = Thresholds {
-                suspicious: suspicious as f32,
+                suspicious,
                 hostile: 1.0,
             };
             if t.validate().is_ok() {
@@ -2276,7 +2214,7 @@ fn thresholds_at_level(levels: &[LevelEntryJson], level: u16) -> HashMap<String,
 }
 
 /// Load the inference backend for a bundle directory. Multi-seed bundles
-/// store every member at `models/seed_NN.{txt,json}` (one file per seed); the
+/// store every member at `models/seed_NN.onnx` (one file per seed); the
 /// single-bundle layout has a single `model.onnx` directly under the bundle
 /// dir. Both layouts are accepted; the multi-seed layout is preferred when the
 /// `models/` subdirectory is present and non-empty.
@@ -2327,14 +2265,14 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     let Some(first_path) = paths.next() else {
         anyhow::bail!("model bundle contains no loadable model")
     };
-    let first = load_inner_model(&first_path)?;
-    let n_features = first.num_features();
+    let first = OnnxModel::load(&first_path)?;
+    let n_features = first.n_features();
     let mut rest = Vec::with_capacity(paths.len());
     for path in paths {
-        let inner = load_inner_model(&path)?;
+        let member = OnnxModel::load(&path)?;
         // Refuse to mix feature counts — averaging across heterogeneous
         // feature spaces would silently produce nonsense scores.
-        let n = inner.num_features();
+        let n = member.n_features();
         if n_features != n {
             anyhow::bail!(
                 "model bundle has mismatched feature counts in {}: member {} expects {n} \
@@ -2343,7 +2281,7 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
                 path.display(),
             );
         }
-        rest.push(inner);
+        rest.push(member);
     }
 
     Ok(Backend { first, rest })
@@ -2353,9 +2291,7 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
 /// `.txt`/`.json` seeds are ignored — only ONNX is loadable. Output is
 /// sorted (so seed_42 lands before seed_43) and deterministic across runs.
 fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
-    use std::collections::BTreeSet;
-    // Sorted set keeps a deterministic load order for the averaged ensemble.
-    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(multi_dir)
         .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
     {
@@ -2370,33 +2306,13 @@ fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
         };
         // Tolerate bystander files (READMEs, hashes) and retired native dumps
         // so they don't break loading; only ONNX seeds are members.
-        if !name.starts_with("seed_") {
-            continue;
+        if name.starts_with("seed_") && path.extension().and_then(|e| e.to_str()) == Some("onnx") {
+            paths.push(path);
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
-            continue;
-        }
-        paths.insert(path);
     }
-    Ok(paths.into_iter().collect())
-}
-
-/// Load one trained model from a path. Only ONNX is supported — the native
-/// LightGBM (`.txt`) and XGBoost (`.json`) loaders were retired now that
-/// collimator deploys ONNX-only bundles.
-fn load_inner_model(path: &Path) -> Result<InnerModel> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ext {
-        "onnx" => {
-            let m = OnnxBackend::load(path)?;
-            Ok(InnerModel::Onnx(Box::new(m)))
-        }
-        other => anyhow::bail!(
-            "unsupported model extension {other:?} for {}; only .onnx is supported \
-             (the LightGBM/XGBoost loaders were removed)",
-            path.display(),
-        ),
-    }
+    // Sorted for a deterministic load order of the averaged ensemble.
+    paths.sort();
+    Ok(paths)
 }
 
 /// Load one model bundle (model file + feature spec + thresholds).
@@ -2404,9 +2320,12 @@ fn load_inner_model(path: &Path) -> Result<InnerModel> {
 /// `is_general` controls how missing artifacts are reported: for the general
 /// route they're fatal load errors; for specialists callers handle the error
 /// non-fatally (drop with a warning).
+///
+/// Threshold resolution: `explicit` → the bundle's `config.json` →
+/// `evaluation.json` recommendations → [`Thresholds::default`].
 fn load_bundle(
     bundle_dir: &Path,
-    explicit_thresholds: Option<&Thresholds>,
+    explicit: Option<Thresholds>,
     is_general: bool,
 ) -> Result<LoadedBundle> {
     let spec_path = bundle_dir.join("feature_spec.json");
@@ -2435,38 +2354,31 @@ fn load_bundle(
         );
     }
 
-    let config_thresholds = load_config_thresholds(bundle_dir);
-    let recommended = load_evaluation_thresholds(bundle_dir);
-    let (thresholds, threshold_source) = match explicit_thresholds {
-        Some(explicit) => {
-            explicit
-                .validate()
-                .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
-            if let Some(ref rec) = recommended {
-                explicit.warn_if_divergent(rec);
-            }
-            (*explicit, "explicit")
+    let (thresholds, threshold_source) = if let Some(explicit) = explicit {
+        explicit
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
+        if let Some(recommended) = load_evaluation_thresholds(bundle_dir)? {
+            explicit.warn_if_divergent(&recommended);
         }
-        None => match config_thresholds.or(recommended) {
-            Some(t) => (
-                t,
-                if config_thresholds.is_some() {
-                    "config.json"
-                } else {
-                    "evaluation.json"
-                },
-            ),
-            None => {
-                tracing::error!(
-                    bundle = %bundle_dir.display(),
-                    "no config.json or evaluation.json thresholds found — using conservative \
-                     fallback (suspicious={}, hostile={})",
-                    Thresholds::FALLBACK_SUSPICIOUS,
-                    Thresholds::FALLBACK_HOSTILE,
-                );
-                (Thresholds::default(), "fallback")
-            }
-        },
+        (explicit, "explicit")
+    } else if let Some(t) = BundleConfig::load(bundle_dir)?
+        .map(|cfg| cfg.thresholds())
+        .transpose()?
+        .flatten()
+    {
+        (t, "config.json")
+    } else if let Some(t) = load_evaluation_thresholds(bundle_dir)? {
+        (t, "evaluation.json")
+    } else {
+        tracing::error!(
+            bundle = %bundle_dir.display(),
+            "no config.json or evaluation.json thresholds found — using conservative \
+             fallback (suspicious={}, hostile={})",
+            Thresholds::FALLBACK_SUSPICIOUS,
+            Thresholds::FALLBACK_HOSTILE,
+        );
+        (Thresholds::default(), "fallback")
     };
 
     let calibrator = IsotonicCalibrator::load_optional(bundle_dir)
@@ -2503,17 +2415,15 @@ fn load_bundle(
                 bundle_dir.display(),
             )
         })?;
-        calibrated
-    } else {
-        thresholds
-    };
-    if let Some(cal) = calibrator.as_ref() {
         tracing::debug!(
             bundle = %bundle_dir.display(),
             breakpoints = cal.x.len(),
             "loaded isotonic calibrator (thresholds calibrated to match)"
         );
-    }
+        calibrated
+    } else {
+        thresholds
+    };
 
     Ok(LoadedBundle {
         backend,
@@ -2524,9 +2434,10 @@ fn load_bundle(
     })
 }
 
-/// Walk a `filegroups/` or `filetypes/` directory, loading each subdirectory
-/// as a specialist bundle. ABI mismatches and spec-subset violations drop the
-/// specialist with a warning rather than failing the whole load.
+/// Walk a `filegroups/` or `filetypes/` directory and register each
+/// subdirectory as a lazily loaded specialist. A directory the deployment
+/// config does not mention, or whose calibrator is invalid, is recorded as
+/// skipped rather than failing the whole load.
 ///
 /// `category` is the path prefix used in the ensemble config's route names —
 /// either `"filegroups"` or `"filetypes"` — so specialist thresholds can be
@@ -2535,22 +2446,21 @@ fn load_specialists(
     parent: &Path,
     route_thresholds: &HashMap<String, Thresholds>,
     route_policies: &RoutePolicies,
+    names: &RouteNames,
     category: &'static str,
-    out: &mut RouteStore,
-) {
+) -> RouteStore {
+    let mut out = RouteStore::default();
     let entries = match std::fs::read_dir(parent) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
         Err(e) => {
             tracing::warn!(parent = %parent.display(), error = %e, "cannot read specialist directory");
-            return;
+            return out;
         }
     };
 
-    // Enumerate the directory and apply the config-gating filter. Building
-    // each specialist's runnable tract plan is the expensive part, so normal
-    // scans retain lazy descriptors after cheap calibrator validation.
-    let mut pending: Vec<(PathBuf, String, Thresholds)> = Vec::new();
+    // Building each specialist's runnable tract plan is the expensive part,
+    // so scans keep lazy descriptors after cheap calibrator validation.
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -2563,21 +2473,21 @@ fn load_specialists(
         let route_name = format!("{category}/{name}");
         // Skip on-disk subdirectories that the deployment config doesn't list.
         // These are common as artifacts of experimentation; loading them with
-        // fallback thresholds would put uncalibrated routes in the OR.
+        // fallback thresholds would put uncalibrated routes in the OR. Every
+        // route the config or the policies name was interned before this runs.
         let route_t = route_thresholds.get(&route_name).copied();
-        if route_t.is_none() && !route_policies.contains_route(&route_name) {
+        let Some(id) = names
+            .id(&route_name)
+            .filter(|&id| route_t.is_some() || route_policies.contains_route(id))
+        else {
             tracing::debug!(
                 category = %category,
                 name = %name,
                 "skipping specialist directory: no thresholds in ensemble config"
             );
-            out.insert_skipped(name);
+            out.skipped.insert(name);
             continue;
-        }
-        pending.push((path, name, route_t.unwrap_or_default()));
-    }
-
-    for (path, name, route_t) in pending {
+        };
         let calibrator = match IsotonicCalibrator::load_optional(&path) {
             Ok(calibrator) => calibrator,
             Err(error) => {
@@ -2588,31 +2498,31 @@ fn load_specialists(
                     error = ?error,
                     "dropping specialist with invalid calibrator",
                 );
-                out.insert_skipped(name);
+                out.skipped.insert(name);
                 continue;
             }
         };
         out.lazy.insert(
             name.clone(),
-            LazyRoute::new(path, name, category, route_t, calibrator),
+            LazyRoute {
+                bundle_dir: path,
+                name,
+                category,
+                id,
+                thresholds: route_t.unwrap_or_default(),
+                calibrator,
+                loaded: OnceLock::new(),
+            },
         );
     }
+    out
 }
 
-/// Load and validate one specialist bundle, applying the spec-subset and
-/// ABI-version rules. Errors here are recoverable — the specialist is
-/// dropped, not fatal.
-fn load_specialist(
-    bundle_dir: &Path,
-    name: &str,
-    explicit_thresholds: Option<Thresholds>,
-) -> Result<Route> {
-    let bundle = load_bundle(
-        bundle_dir,
-        explicit_thresholds.as_ref(),
-        /* is_general = */ false,
-    )
-    .with_context(|| format!("specialist {name}"))?;
+/// Load and validate one specialist bundle, applying the ABI-version rule.
+/// Errors here are recoverable — the specialist is dropped, not fatal.
+fn load_specialist(bundle_dir: &Path, name: &str, thresholds: Thresholds) -> Result<Route> {
+    let bundle = load_bundle(bundle_dir, Some(thresholds), /* is_general = */ false)
+        .with_context(|| format!("specialist {name}"))?;
 
     if bundle.spec.abi_version() != EXPECTED_MODEL_ABI_VERSION {
         anyhow::bail!(
@@ -2652,33 +2562,23 @@ struct Route {
 }
 
 impl Route {
-    /// Score a feature vector with the route's backend, then apply the
-    /// route's calibrator if present. Single source of truth for "what does
-    /// this route output for this file" — used by every code path that
-    /// previously called `backend.predict` directly.
-    fn predict_calibrated(&self, features: &[f32]) -> Result<f32> {
-        Ok(self.predict_raw_calibrated(features)?.1)
-    }
-
     /// Score a feature vector and return `(raw, calibrated)`. The raw value is
     /// the backend's pre-isotonic probability; the calibrated value is what
-    /// every decision path consumes. Used where both are wanted (route-score
-    /// diagnostics that display raw while the verdict uses calibrated).
+    /// every decision path consumes.
     fn predict_raw_calibrated(&self, features: &[f32]) -> Result<(f32, f32)> {
         let raw = self.backend.predict(features)?;
-        let calibrated = match &self.calibrator {
-            Some(cal) => cal.apply(raw),
-            None => raw,
-        };
+        let calibrated = self.calibrator.as_ref().map_or(raw, |cal| cal.apply(raw));
         Ok((raw, calibrated))
     }
 }
 
+/// A specialist registered at load and built on first use.
 #[derive(Debug)]
 struct LazyRoute {
     bundle_dir: PathBuf,
     name: String,
     category: &'static str,
+    id: RouteId,
     thresholds: Thresholds,
     calibrator: Option<IsotonicCalibrator>,
     loaded: OnceLock<RouteLoad>,
@@ -2691,26 +2591,9 @@ enum RouteLoad {
 }
 
 impl LazyRoute {
-    fn new(
-        bundle_dir: PathBuf,
-        name: String,
-        category: &'static str,
-        thresholds: Thresholds,
-        calibrator: Option<IsotonicCalibrator>,
-    ) -> Self {
-        Self {
-            bundle_dir,
-            name,
-            category,
-            thresholds,
-            calibrator,
-            loaded: OnceLock::new(),
-        }
-    }
-
     fn load_once(&self) -> &RouteLoad {
         self.loaded.get_or_init(|| {
-            match load_specialist(&self.bundle_dir, &self.name, Some(self.thresholds)) {
+            match load_specialist(&self.bundle_dir, &self.name, self.thresholds) {
                 Ok(route) => RouteLoad::Loaded(Arc::new(route)),
                 Err(error) => {
                     let message = format!("{error:#}");
@@ -2750,50 +2633,36 @@ impl LazyRoute {
     }
 }
 
+/// The specialists of one category (`filegroups` or `filetypes`), by name.
 #[derive(Debug, Default)]
 struct RouteStore {
-    loaded: HashMap<String, Arc<Route>>,
     lazy: HashMap<String, LazyRoute>,
+    /// On-disk specialists that were not registered (uncalibrated or invalid).
     skipped: HashSet<String>,
 }
 
 impl RouteStore {
-    fn insert_skipped(&mut self, name: String) {
-        self.skipped.insert(name);
+    /// The named specialist, loading it on first use; `None` when absent or
+    /// when it failed to load.
+    fn get(&self, name: &str) -> Option<(RouteId, Arc<Route>)> {
+        let lazy = self.lazy.get(name)?;
+        Some((lazy.id, lazy.get()?))
     }
 
-    fn is_skipped(&self, name: &str) -> bool {
-        self.skipped.contains(name)
-    }
-
-    fn get(&self, name: &str) -> Option<Arc<Route>> {
-        self.loaded
-            .get(name)
-            .map(Arc::clone)
-            .or_else(|| self.lazy.get(name).and_then(LazyRoute::get))
+    fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
     }
 
     fn calibrator(&self, name: &str) -> Option<&IsotonicCalibrator> {
-        self.loaded
-            .get(name)
-            .and_then(|route| route.calibrator.as_ref())
-            .or_else(|| {
-                self.lazy
-                    .get(name)
-                    .and_then(|route| route.calibrator.as_ref())
-            })
+        self.lazy.get(name)?.calibrator.as_ref()
     }
 
-    fn available_len(&self) -> usize {
-        self.loaded.len() + self.lazy.len()
-    }
-
-    fn lazy_len(&self) -> usize {
+    fn len(&self) -> usize {
         self.lazy.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.loaded.is_empty() && self.lazy.is_empty()
+        self.lazy.is_empty()
     }
 
     fn validate_all(&self) -> Result<()> {
@@ -2803,9 +2672,6 @@ impl RouteStore {
     }
 
     fn validate_route(&self, name: &str) -> Result<()> {
-        if self.loaded.contains_key(name) {
-            return Ok(());
-        }
         match self.lazy.get(name) {
             Some(route) => route.validate(),
             None => anyhow::bail!("route {name:?} is not available"),
@@ -2828,6 +2694,8 @@ struct RouteSet {
     filetype_to_filegroup: HashMap<String, String>,
     /// Optional searched policies keyed by cleave file type.
     policies: RoutePolicies,
+    /// Every route name the config, the policies and the specialists use.
+    names: RouteNames,
 }
 
 impl RouteSet {
@@ -2837,40 +2705,48 @@ impl RouteSet {
         self.filegroups.is_empty() && self.filetypes.is_empty()
     }
 
-    fn filegroup(&self, name: &str) -> Option<Arc<Route>> {
-        self.filegroups.get(name)
-    }
-
-    fn filetype(&self, name: &str) -> Option<Arc<Route>> {
-        self.filetypes.get(name)
-    }
-
     /// Specialist lookup keys for a scanned `file_type`, selected by ARCHIVE
     /// format rather than compression. A compressed label collapses onto its
     /// container (`tar.gz` → `tar`, `tar.bz2.xz` → `tar`) so the compressed
     /// variant reaches the same filetype/filegroup specialists — and the same
     /// per-route policy thresholds — that collimator trained and calibrated
-    /// under the normalized label. Returns `(container_filetype, filegroup)`.
-    /// Mirrors the normalization `RoutePolicies::policy_for`/`grid_for` apply,
-    /// so route selection and the policy's per-route threshold keys agree.
-    fn specialist_keys(&self, file_type: &str) -> (String, Option<String>) {
+    /// under the normalized label. Returns `(filetype key, filegroup)`.
+    /// Agrees with [`lookup_filetype`], so route selection and the policy's
+    /// per-route threshold keys agree.
+    fn specialist_keys<'a>(&'a self, file_type: &'a str) -> (Cow<'a, str>, Option<&'a str>) {
         let normalized = normalize_archive_filetype(file_type);
         // Specialty-else-container: prefer a specialist trained for the type
         // itself (e.g. `gem`, `whl`, `python_sdist`); when none exists, fall
         // back to its container archive (`tar`, `zip`) as filefacts defines
         // it. Compression is already collapsed by `normalize_archive_filetype`
         // (`tar.gz` → `tar`), so this only adds the package → container hop.
-        let route = if self.filetypes.get(&normalized).is_some() {
+        let key = if self.filetypes.contains(&normalized) {
             normalized
         } else if let Some(container) =
-            container_filetype(file_type).filter(|c| self.filetypes.get(c).is_some())
+            container_filetype(file_type).filter(|c| self.filetypes.contains(c))
         {
-            container
+            Cow::Borrowed(container)
         } else {
             normalized
         };
-        let group = self.filetype_to_filegroup.get(route.as_str()).cloned();
-        (route, group)
+        let group = self
+            .filetype_to_filegroup
+            .get(key.as_ref())
+            .map(String::as_str);
+        (key, group)
+    }
+
+    /// The isotonic calibrator of a route, if it has one.
+    fn calibrator<'a>(
+        &'a self,
+        general: Option<&'a IsotonicCalibrator>,
+        route: RouteId,
+    ) -> Option<&'a IsotonicCalibrator> {
+        match RouteKind::parse(self.names.name(route))? {
+            RouteKind::General => general,
+            RouteKind::Group(name) => self.filegroups.calibrator(name),
+            RouteKind::Type(name) => self.filetypes.calibrator(name),
+        }
     }
 
     fn validate_all(&self) -> Result<()> {
@@ -2884,26 +2760,10 @@ impl RouteSet {
     }
 }
 
-/// OR over classifications: pick the more severe of two outcomes.
-const fn max_class(a: Classification, b: Classification) -> Classification {
-    if (a as u8) >= (b as u8) { a } else { b }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct RouteProbability {
-    route: String,
+    route: RouteId,
     probability: f32,
-}
-
-fn compact_route_name(route: &str) -> String {
-    if route == "general" {
-        return "az".to_string();
-    }
-    let name = route
-        .strip_prefix("filegroups/")
-        .or_else(|| route.strip_prefix("filetypes/"))
-        .unwrap_or(route);
-    format!("az/{name}")
 }
 
 #[cfg(test)]
@@ -2929,7 +2789,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Hostile,
             probability: p,
             threshold: t,
-            level: None,
+            level: Level::Manual,
         });
     }
     if let Some((p, t)) = policy.suspicious.fire(scores) {
@@ -2937,7 +2797,7 @@ fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -> Option<De
             class: Classification::Suspicious,
             probability: p,
             threshold: t,
-            level: None,
+            level: Level::Manual,
         });
     }
     None
@@ -3007,36 +2867,26 @@ fn sweep_general_grid(grid: &[(u16, f32)], scores: &[RouteProbability]) -> Optio
 /// by a policy but not loaded as a specialist are also left untouched —
 /// they'll never produce a `RouteProbability` entry, so the comparison never
 /// fires.
-fn calibrate_policy_thresholds_with<'a>(
+///
+/// Blend severities are calibrated at fit time (the policy writer applies
+/// isotonic to the per-route inputs before fitting LR), so their threshold
+/// and weights are already in calibrated-prob space. Skipping the per-route
+/// mapping is intentional — the logistic combination doesn't decompose
+/// through isotonic the way per-route OR-rule thresholds do.
+fn calibrate_policy_thresholds<'a>(
     policies: &mut RoutePolicies,
-    lookup: impl Fn(&str) -> Option<&'a IsotonicCalibrator>,
+    lookup: impl Fn(RouteId) -> Option<&'a IsotonicCalibrator>,
 ) {
     let mut adjusted = 0_usize;
-    // Blend severities are calibrated at fit time (the policy writer applies
-    // isotonic to the per-route inputs before fitting LR), so their threshold
-    // and weights are already in calibrated-prob space. Skipping the per-route
-    // mapping is intentional — the logistic combination doesn't decompose
-    // through isotonic the way per-route OR-rule thresholds do.
-    let mut calibrate = |severity: &mut PolicySeverity| {
+    for severity in policies.severities_mut() {
         if severity.blend.is_some() {
-            return;
+            continue;
         }
-        for (route_name, threshold) in severity.thresholds.iter_mut() {
-            if let Some(cal) = lookup(route_name) {
+        for (route, threshold) in &mut severity.thresholds {
+            if let Some(cal) = lookup(*route) {
                 *threshold = cal.apply(*threshold);
                 adjusted += 1;
             }
-        }
-    };
-    for policy in policies.by_filetype.values_mut() {
-        calibrate(&mut policy.hostile);
-        calibrate(&mut policy.suspicious);
-    }
-    // The verdict sweep compares against the per-level grid, so every retained
-    // level's hostile policy must be calibrated into the same space too.
-    for levels in policies.grid.values_mut() {
-        for lp in levels.iter_mut() {
-            calibrate(&mut lp.hostile);
         }
     }
     if adjusted > 0 {
@@ -3044,50 +2894,20 @@ fn calibrate_policy_thresholds_with<'a>(
     }
 }
 
-/// Production lookup for `calibrate_policy_thresholds_with`. Resolves a route
-/// name (`general`, `filegroups/X`, `filetypes/Y`) to its calibrator, if any.
-fn calibrate_policy_thresholds(
-    policies: &mut RoutePolicies,
-    general_calibrator: &Option<IsotonicCalibrator>,
-    filegroups: &RouteStore,
-    filetypes: &RouteStore,
-) {
-    calibrate_policy_thresholds_with(policies, |route_name| {
-        if route_name == "general" {
-            general_calibrator.as_ref()
-        } else if let Some(name) = route_name.strip_prefix("filegroups/") {
-            filegroups.calibrator(name)
-        } else if let Some(name) = route_name.strip_prefix("filetypes/") {
-            filetypes.calibrator(name)
-        } else {
-            None
-        }
-    });
-}
-
-fn policy_route_class(policy: &RoutePolicy, route: &str, probability: f32) -> Classification {
+fn policy_route_class(policy: &RoutePolicy, route: RouteId, probability: f32) -> Classification {
     // Per-route classification is well-defined only for OR-rule severities —
     // a learned blend's verdict is a function of all its inputs jointly, so
     // no single route can be labeled Hostile/Suspicious on its own. For
     // blend severities we return Benign here; the final verdict still comes
-    // from policy_classify, which evaluates the blend over the full score
+    // from the policy decision, which evaluates the blend over the full score
     // vector. The diagnostic per-route classification just won't get an
     // individual contribution for blend-driven filetypes.
-    if policy.hostile.blend.is_none()
-        && policy
-            .hostile
-            .thresholds
-            .get(route)
-            .is_some_and(|&threshold| probability >= threshold)
-    {
+    let fires = |severity: &PolicySeverity| {
+        severity.blend.is_none() && severity.threshold(route).is_some_and(|t| probability >= t)
+    };
+    if fires(&policy.hostile) {
         Classification::Hostile
-    } else if policy.suspicious.blend.is_none()
-        && policy
-            .suspicious
-            .thresholds
-            .get(route)
-            .is_some_and(|&threshold| probability >= threshold)
-    {
+    } else if fires(&policy.suspicious) {
         Classification::Suspicious
     } else {
         Classification::Benign
@@ -3103,6 +2923,8 @@ fn policy_route_class(policy: &RoutePolicy, route: &str, probability: f32) -> Cl
 pub struct Model {
     inner: Backend,
     spec: FeatureSpec,
+    /// Extraction tables for `spec`, built once at load.
+    ctx: ExtractContext,
     thresholds: Thresholds,
     info: ModelInfo,
     routes: RouteSet,
@@ -3118,27 +2940,17 @@ pub struct Model {
     /// General route's hostile threshold per level (ascending), for the
     /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
     general_grid: Vec<(u16, f32)>,
-    /// Largest grid level; suspicious cap = `min(grid_max, 100)`.
+    /// Largest grid level; suspicious cap = `capped_suspicious_level(grid_max)`.
     grid_max: u16,
 }
 
-impl Model {
-    /// Score with the general model and apply its calibrator if present.
-    /// Single source of truth for the general path's calibrated output —
-    /// every previous direct `self.inner.predict` call now goes through here.
-    fn predict_general_calibrated(&self, features: &[f32]) -> Result<f32> {
-        Ok(self.predict_general_raw_calibrated(features)?.1)
-    }
-
-    /// General route `(raw, calibrated)`. See [`Route::predict_raw_calibrated`].
-    fn predict_general_raw_calibrated(&self, features: &[f32]) -> Result<(f32, f32)> {
-        let raw = self.inner.predict(features)?;
-        let calibrated = match &self.general_calibrator {
-            Some(cal) => cal.apply(raw),
-            None => raw,
-        };
-        Ok((raw, calibrated))
-    }
+/// One route's score for a file, before it is split into the decision input
+/// and the wire record.
+struct Scored {
+    route: RouteId,
+    raw: f32,
+    probability: f32,
+    class: Classification,
 }
 
 impl Model {
@@ -3150,7 +2962,8 @@ impl Model {
     ///
     /// # Errors
     /// Returns an error if thresholds are invalid, required model artifacts are
-    /// missing, or the loaded feature spec does not match this build.
+    /// missing, any present metadata file is malformed, or the loaded feature
+    /// spec does not match this build.
     ///
     /// Threshold resolution order:
     /// 1. Explicit `thresholds` argument (from CLI flags)
@@ -3175,16 +2988,15 @@ impl Model {
     }
 
     /// Load a single-bundle layout (legacy / dev). The model artifacts
-    /// (`model.txt`/`model.json`, `feature_spec.json`, `config.json`,
+    /// (`model.onnx`, `feature_spec.json`, `config.json`,
     /// `evaluation.json`) sit directly in `model_dir`. No specialists.
     fn load_single_bundle(
         model_dir: &Path,
         thresholds: Option<Thresholds>,
         active_level: Option<u16>,
     ) -> Result<Self> {
-        let bundle = load_bundle(model_dir, thresholds.as_ref(), /* is_general = */ true)?;
+        let bundle = load_bundle(model_dir, thresholds, /* is_general = */ true)?;
         tracing::info!(
-            backend = bundle.backend.kind(),
             n_members = bundle.backend.n_members(),
             features = bundle.spec.total_features(),
             model_abi_version = bundle.spec.abi_version(),
@@ -3195,31 +3007,20 @@ impl Model {
             layout = "single-bundle",
             "model loaded",
         );
-        let info = ModelInfo {
-            version: bundle.spec.version(),
-            abi_version: bundle.spec.abi_version(),
-            sha256: String::new(),
-            commit: None,
-        };
-        Ok(Self {
-            inner: bundle.backend,
-            spec: bundle.spec,
-            thresholds: bundle.thresholds,
-            info,
-            routes: RouteSet::default(),
-            general_calibrator: bundle.calibrator,
-            // Single-bundle deployments carry no level grid, so the verdict
-            // sweep has nothing to sweep: `decide` falls back to the threshold
-            // path and the level serializes as `null`.
+        // Single-bundle deployments carry no level grid, so the verdict sweep
+        // has nothing to sweep: `decide` falls back to the threshold path and
+        // the level serializes as `null`.
+        Ok(Self::new(
+            bundle,
+            RouteSet::default(),
             active_level,
-            general_grid: Vec::new(),
-            grid_max: 0,
-        })
+            Vec::new(),
+            0,
+        ))
     }
 
     /// Load an ensemble layout (`general/` + `filegroups/*` + `filetypes/*`).
     /// See module-level docs for the on-disk shape and config schema.
-    #[allow(clippy::too_many_lines)]
     fn load_ensemble(
         model_dir: &Path,
         thresholds: Option<Thresholds>,
@@ -3236,25 +3037,27 @@ impl Model {
         // caller's `-l` — the JSON envelope stays cacheable across levels. The
         // active level enters only the final verdict derivation, via the
         // level-independent sweep over `policies.grid` / `general_grid`.
-        let ensemble_cfg =
-            load_ensemble_config(model_dir, DEFAULT_SEVERITY_LEVEL).unwrap_or_default();
-        let policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL);
+        let cfg = EnsembleConfig::new(
+            BundleConfig::load(model_dir)?.unwrap_or_default(),
+            DEFAULT_SEVERITY_LEVEL,
+        );
+        let mut names = RouteNames::default();
+        for route in cfg.route_thresholds.keys() {
+            names.intern(route);
+        }
+        let mut policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL, &mut names)?;
 
         let general_dir = model_dir.join("general");
         let general_thresholds =
-            thresholds.or_else(|| ensemble_cfg.route_thresholds.get("general").copied());
-        let mut filegroups = RouteStore::default();
-        let mut filetypes = RouteStore::default();
+            thresholds.or_else(|| cfg.route_thresholds.get("general").copied());
 
-        // Walk filegroups/<name>/ and filetypes/<name>/, loading each
-        // specialist that exists. Specialists with ABI mismatch or bad spec
-        // subset are dropped with a warning, not a hard failure.
+        // Walk filegroups/<name>/ and filetypes/<name>/ while general loads.
         let specialist_start = std::time::Instant::now();
-        let (general, _) = rayon::join(
+        let (general, (filegroups, filetypes)) = rayon::join(
             || {
                 load_bundle(
                     &general_dir,
-                    general_thresholds.as_ref(),
+                    general_thresholds,
                     /* is_general = */ true,
                 )
                 .with_context(|| format!("loading general route from {}", general_dir.display()))
@@ -3264,71 +3067,77 @@ impl Model {
                     || {
                         load_specialists(
                             &model_dir.join("filegroups"),
-                            &ensemble_cfg.route_thresholds,
+                            &cfg.route_thresholds,
                             &policies,
+                            &names,
                             "filegroups",
-                            &mut filegroups,
-                        );
+                        )
                     },
                     || {
                         load_specialists(
                             &model_dir.join("filetypes"),
-                            &ensemble_cfg.route_thresholds,
+                            &cfg.route_thresholds,
                             &policies,
+                            &names,
                             "filetypes",
-                            &mut filetypes,
-                        );
+                        )
                     },
                 )
             },
         );
         let general = general?;
         tracing::info!(
-            filegroups = filegroups.available_len(),
-            filetypes = filetypes.available_len(),
-            lazy_filegroups = filegroups.lazy_len(),
-            lazy_filetypes = filetypes.lazy_len(),
+            filegroups = filegroups.len(),
+            filetypes = filetypes.len(),
             elapsed_ms = specialist_start.elapsed().as_millis(),
             "prepared specialist routes",
         );
 
+        let routes = RouteSet {
+            filegroups,
+            filetypes,
+            filetype_to_filegroup: cfg.filetype_to_filegroup,
+            policies: RoutePolicies::default(),
+            names,
+        };
+
         // Required routes from config: any listed name that didn't load is
         // fatal. "general" is implicitly required and was already loaded above.
-        for required in &ensemble_cfg.required_routes {
-            if required == "general" {
-                continue;
-            }
-            if let Some(name) = required.strip_prefix("filegroups/") {
-                filegroups.validate_route(name).with_context(|| {
-                    format!(
-                        "ensemble config marks filegroup {name:?} as required but it failed to load"
-                    )
-                })?;
-            } else if let Some(name) = required.strip_prefix("filetypes/") {
-                filetypes.validate_route(name).with_context(|| {
-                    format!(
-                        "ensemble config marks filetype {name:?} as required but it failed to load"
-                    )
-                })?;
-            } else {
-                anyhow::bail!(
+        for required in &cfg.required_routes {
+            match RouteKind::parse(required) {
+                Some(RouteKind::General) => {}
+                Some(RouteKind::Group(name)) => {
+                    routes.filegroups.validate_route(name).with_context(|| {
+                        format!(
+                            "ensemble config marks filegroup {name:?} as required but it failed to load"
+                        )
+                    })?;
+                }
+                Some(RouteKind::Type(name)) => {
+                    routes.filetypes.validate_route(name).with_context(|| {
+                        format!(
+                            "ensemble config marks filetype {name:?} as required but it failed to load"
+                        )
+                    })?;
+                }
+                None => anyhow::bail!(
                     "unknown required-route name {required:?} in ensemble config; \
                      expected `general`, `filegroups/<name>`, or `filetypes/<name>`"
-                );
+                ),
             }
         }
 
         // The route_policies.json thresholds for the OR-of-routes decision
-        // path were loaded in raw-score space, but the route scorers now emit
+        // path were loaded in raw-score space, but the route scorers emit
         // calibrated probabilities (see `load_bundle`). Push each per-route
-        // threshold through that route's calibrator so policy_classify
-        // compares like with like. Isotonic monotonicity preserves the
-        // decision; the comparison is now numerically consistent.
-        let mut policies = policies;
-        calibrate_policy_thresholds(&mut policies, &general.calibrator, &filegroups, &filetypes);
+        // threshold through that route's calibrator so the policy compares
+        // like with like. Isotonic monotonicity preserves the decision.
+        calibrate_policy_thresholds(&mut policies, |route| {
+            routes.calibrator(general.calibrator.as_ref(), route)
+        });
+        let routes = RouteSet { policies, ..routes };
 
         tracing::info!(
-            backend = general.backend.kind(),
             n_members = general.backend.n_members(),
             features = general.spec.total_features(),
             model_abi_version = general.spec.abi_version(),
@@ -3336,34 +3145,45 @@ impl Model {
             threshold_hostile = general.thresholds.hostile,
             threshold_source = general.threshold_source,
             spec_version = general.spec.version(),
-            filegroups = filegroups.available_len(),
-            filetypes = filetypes.available_len(),
+            filegroups = routes.filegroups.len(),
+            filetypes = routes.filetypes.len(),
             layout = "ensemble",
             "model loaded",
         );
 
+        Ok(Self::new(
+            general,
+            routes,
+            active_level,
+            cfg.general_grid,
+            cfg.grid_max,
+        ))
+    }
+
+    fn new(
+        general: LoadedBundle,
+        routes: RouteSet,
+        active_level: Option<u16>,
+        general_grid: Vec<(u16, f32)>,
+        grid_max: u16,
+    ) -> Self {
         let info = ModelInfo {
             version: general.spec.version(),
             abi_version: general.spec.abi_version(),
-            sha256: String::new(),
-            commit: None,
         };
-        Ok(Self {
+        let ctx = ExtractContext::new(&general.spec);
+        Self {
             inner: general.backend,
             spec: general.spec,
+            ctx,
             thresholds: general.thresholds,
             info,
-            routes: RouteSet {
-                filegroups,
-                filetypes,
-                filetype_to_filegroup: ensemble_cfg.filetype_to_filegroup,
-                policies,
-            },
+            routes,
             general_calibrator: general.calibrator,
             active_level,
-            general_grid: ensemble_cfg.general_grid,
-            grid_max: ensemble_cfg.grid_max,
-        })
+            general_grid,
+            grid_max,
+        }
     }
 
     /// Force every calibrated specialist route to load and validate.
@@ -3372,6 +3192,9 @@ impl Model {
     /// observed file type. Validation and install gates call this explicitly so
     /// malformed specialist artifacts are caught even if the current fixture set
     /// never routes to them.
+    ///
+    /// # Errors
+    /// Returns the first specialist that fails to load.
     pub fn validate_all_routes(&self) -> Result<()> {
         if self.routes.is_empty() {
             return Ok(());
@@ -3379,27 +3202,148 @@ impl Model {
         let started = std::time::Instant::now();
         self.routes.validate_all()?;
         tracing::info!(
-            filegroups = self.routes.filegroups.available_len(),
-            filetypes = self.routes.filetypes.available_len(),
+            filegroups = self.routes.filegroups.len(),
+            filetypes = self.routes.filetypes.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "validated specialist routes",
         );
         Ok(())
     }
 
-    /// Run inference on a feature vector against the general route only.
-    ///
-    /// Use [`Model::predict_for`] when the caller knows the file's `type` so
-    /// the ensemble's filegroup and filetype specialists can contribute. This
-    /// method exists for call sites that don't yet have a file type (and for
-    /// single-bundle deployments where it makes no difference).
+    /// Classify a cleave report the way a scan does: featurize every file,
+    /// standardize, score each route the report's primary file type reaches,
+    /// and decide.
     ///
     /// # Errors
-    /// Returns an error if the underlying model backend fails to produce a
-    /// prediction for the provided feature vector.
-    pub fn predict(&self, features: &[f32]) -> Result<(f32, Classification)> {
-        let probability = self.predict_general_calibrated(features)?;
-        Ok((probability, self.thresholds.classify(probability)))
+    /// Returns an error if a consulted route's backend fails.
+    pub fn predict_report(
+        &self,
+        report: &cleave::types::CompactReport,
+    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let parsed = ParsedReport::from_compact_report(report, RawNeeds::all(), None);
+        let mut features = self.ctx.extract_from_parsed(&parsed);
+        self.spec.standardize(&mut features);
+        let file_type = report
+            .files
+            .first()
+            .map_or("unknown", |f| f.file_type.as_str());
+        self.predict_for_report_detailed(file_type, &features, &parsed)
+    }
+
+    /// Routed prediction from a parsed cleave report (a whole sample or one
+    /// archive member), with per-route scores retained for JSON and `--extra`
+    /// output.
+    ///
+    /// This is the production ensemble path. General is scored from the
+    /// caller-provided standardized general feature vector; each specialist
+    /// scores its own route-specific vector from the shared [`ParsedReport`].
+    pub(crate) fn predict_for_report_detailed(
+        &self,
+        file_type: &str,
+        general_features: &[f32],
+        parsed: &ParsedReport,
+    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        let policy = self.routes.policies.policy_for(file_type);
+        let (route_probs, scores, mut skipped) =
+            self.score_routes(file_type, policy, general_features, parsed)?;
+        let decision = self.decide(file_type, policy, &route_probs, &mut skipped);
+        Ok((decision, scores, skipped))
+    }
+
+    /// Score every applicable route for `file_type` and return the
+    /// `(probabilities, RouteScore list, SkippedRoute list)` triple. The
+    /// per-route `RouteScore.classification` uses the policy's per-route
+    /// classifier when available, else the route's own thresholds.
+    fn score_routes(
+        &self,
+        file_type: &str,
+        policy: Option<&RoutePolicy>,
+        general_features: &[f32],
+        parsed: &ParsedReport,
+    ) -> Result<(Vec<RouteProbability>, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        // Select specialists by ARCHIVE format, not compression: a `.tgz`
+        // resolves to the `tar` container specialist instead of routing
+        // general-only and surfacing `filetypes/tar` as an `unavailable` skip.
+        let (type_key, group_key) = self.routes.specialist_keys(file_type);
+        let group = group_key.and_then(|name| self.routes.filegroups.get(name));
+        let filetype = self.routes.filetypes.get(&type_key);
+
+        let classify = |route: RouteId, probability: f32, own: &Thresholds| {
+            policy.map_or_else(
+                || own.classify(probability),
+                |policy| policy_route_class(policy, route, probability),
+            )
+        };
+        let score_general = || -> Result<Scored> {
+            let raw = self.inner.predict(general_features)?;
+            let probability = self
+                .general_calibrator
+                .as_ref()
+                .map_or(raw, |cal| cal.apply(raw));
+            Ok(Scored {
+                route: RouteId::GENERAL,
+                raw,
+                probability,
+                class: classify(RouteId::GENERAL, probability, &self.thresholds),
+            })
+        };
+        let score_specialist = |entry: Option<&(RouteId, Arc<Route>)>| -> Result<Option<Scored>> {
+            let Some((id, route)) = entry else {
+                return Ok(None);
+            };
+            let mut features = route.ctx.extract_from_parsed(parsed);
+            route.spec.standardize(&mut features);
+            let (raw, probability) = route.predict_raw_calibrated(&features)?;
+            Ok(Some(Scored {
+                route: *id,
+                raw,
+                probability,
+                class: classify(*id, probability, &route.thresholds),
+            }))
+        };
+        let (general, (group_score, filetype_score)) = rayon::join(score_general, || {
+            rayon::join(
+                || score_specialist(group.as_ref()),
+                || score_specialist(filetype.as_ref()),
+            )
+        });
+
+        let mut route_probs = Vec::with_capacity(3);
+        let mut scores = Vec::with_capacity(3);
+        for scored in [Some(general?), group_score?, filetype_score?]
+            .into_iter()
+            .flatten()
+        {
+            route_probs.push(RouteProbability {
+                route: scored.route,
+                probability: scored.probability,
+            });
+            scores.push(RouteScore {
+                model: compact_route_name(self.routes.names.name(scored.route)),
+                probability: scored.probability,
+                raw: scored.raw,
+                classification: scored.class,
+            });
+        }
+
+        let mut skipped = Vec::new();
+        if group.is_none()
+            && let Some(name) = group_key
+            && self.routes.filegroups.skipped.contains(name)
+        {
+            skipped.push(SkippedRoute {
+                model: format!("az/{name}"),
+                reason: "uncalibrated",
+            });
+        }
+        if filetype.is_none() && self.routes.filetypes.skipped.contains(type_key.as_ref()) {
+            skipped.push(SkippedRoute {
+                model: format!("az/{type_key}"),
+                reason: "uncalibrated",
+            });
+        }
+
+        Ok((route_probs, scores, skipped))
     }
 
     /// Pick the strongest [`Decision`] across the route scores using only the
@@ -3410,12 +3354,12 @@ impl Model {
         // General route is always first when scoring through predict_*_detailed.
         let general_prob = scores
             .iter()
-            .find(|s| s.route == "general")
-            .map_or_else(|| 0.0, |s| s.probability);
+            .find(|s| s.route == RouteId::GENERAL)
+            .map_or(0.0, |s| s.probability);
         let mut best = self.thresholds.decide(general_prob);
         for score in scores {
             let candidate = self.thresholds.decide(score.probability);
-            let better = match (candidate.class as u8).cmp(&(best.class as u8)) {
+            let better = match candidate.class.cmp(&best.class) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Equal => candidate.probability > best.probability,
                 std::cmp::Ordering::Less => false,
@@ -3427,251 +3371,6 @@ impl Model {
         best
     }
 
-    /// Routed prediction for a file of type `file_type`.
-    ///
-    /// Consults general always; consults the filegroup specialist if a
-    /// mapping exists for `file_type`; consults the filetype specialist if
-    /// one is loaded for `file_type`. The reported classification is the OR
-    /// over per-route threshold crossings — see DESIGN.md §Runtime Decision.
-    ///
-    /// The reported probability is `max(per-route probabilities)`. It is
-    /// monotone with the OR decision: if any route flagged hostile, the
-    /// reported probability is at least that route's, and at least one
-    /// route's threshold for hostile.
-    ///
-    /// On a single-bundle deployment this falls through to `predict()`.
-    ///
-    /// # Errors
-    /// Returns an error if any consulted backend fails on `features`.
-    pub fn predict_for(&self, file_type: &str, features: &[f32]) -> Result<(f32, Classification)> {
-        if self.routes.is_empty() {
-            return self.predict(features);
-        }
-
-        // Score general first; it's always present and supplies the baseline.
-        let general_prob = self.predict_general_calibrated(features)?;
-        let mut max_prob = general_prob;
-        let mut classification = self.thresholds.classify(general_prob);
-
-        // Optional filegroup specialist, looked up via the configured
-        // filetype → filegroup map. `specialist_keys` normalizes compression
-        // suffixes first so a `tar.gz`/`foo.zst` resolves to its container's
-        // group.
-        let (route_file_type, group_name) = self.routes.specialist_keys(file_type);
-        if let Some(group_name) = group_name
-            && let Some(route) = self.routes.filegroups.get(&group_name)
-        {
-            if route.spec.total_features() != features.len() {
-                tracing::debug!(
-                    route = %group_name,
-                    expected = route.spec.total_features(),
-                    got = features.len(),
-                    "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
-                );
-            } else {
-                let prob = route.predict_calibrated(features)?;
-                if prob > max_prob {
-                    max_prob = prob;
-                }
-                classification = max_class(classification, route.thresholds.classify(prob));
-            }
-        }
-
-        // Optional filetype specialist (same container normalization as above).
-        if let Some(route) = self.routes.filetypes.get(&route_file_type) {
-            if route.spec.total_features() != features.len() {
-                tracing::debug!(
-                    route = %route_file_type,
-                    expected = route.spec.total_features(),
-                    got = features.len(),
-                    "skipping routed feature-vector prediction; use predict_for_report for heterogeneous specialists",
-                );
-            } else {
-                let prob = route.predict_calibrated(features)?;
-                if prob > max_prob {
-                    max_prob = prob;
-                }
-                classification = max_class(classification, route.thresholds.classify(prob));
-            }
-        }
-
-        Ok((max_prob, classification))
-    }
-
-    /// Extract this route's feature vector from the shared parse, standardize,
-    /// and score it into `(raw, calibrated_probability, classification)`.
-    fn score_route(
-        route: &Route,
-        parsed: &crate::features::ParsedReport,
-    ) -> Result<(f32, f32, Classification)> {
-        let mut features = route.ctx.extract_from_parsed(parsed);
-        route.spec.standardize(&mut features);
-        let (raw, probability) = route.predict_raw_calibrated(&features)?;
-        Ok((raw, probability, route.thresholds.classify(probability)))
-    }
-
-    /// Routed prediction from a full cleave report, with per-route scores
-    /// retained for JSON and `--extra` output.
-    ///
-    /// This is the production ensemble path. General is scored from the
-    /// caller-provided general feature vector; each specialist scores its own
-    /// route-specific vector from the shared [`crate::features::ParsedReport`].
-    pub(crate) fn predict_for_report_detailed(
-        &self,
-        file_type: &str,
-        general_features: &[f32],
-        parsed: &crate::features::ParsedReport,
-    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let (route_probs, scores, mut skipped) =
-            self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route(route, parsed)
-            })?;
-        let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
-        Ok((decision, scores, skipped))
-    }
-
-    /// Routed prediction for one embedded-file (archive member), with per-route
-    /// scores retained. Shares the member's parse across general + every route.
-    pub(crate) fn predict_for_file_detailed(
-        &self,
-        file_type: &str,
-        general_features: &[f32],
-        parsed: &crate::features::ParsedReport,
-    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let (route_probs, scores, mut skipped) =
-            self.score_all_routes(file_type, general_features, |route| {
-                Self::score_route(route, parsed)
-            })?;
-        let decision = self.decide_from_routes(file_type, &route_probs, &mut skipped);
-        Ok((decision, scores, skipped))
-    }
-
-    /// Score every applicable route for `file_type` and return the
-    /// `(probabilities, RouteScore list, SkippedRoute list)` triple. The
-    /// per-route `RouteScore.classification` uses the policy's per-route
-    /// classifier when available, mirroring the previous behaviour for the
-    /// diagnostic `models` array.
-    fn score_all_routes<F>(
-        &self,
-        file_type: &str,
-        general_features: &[f32],
-        score: F,
-    ) -> Result<(Vec<RouteProbability>, Vec<RouteScore>, Vec<SkippedRoute>)>
-    where
-        F: Fn(&Route) -> Result<(f32, f32, Classification)> + Sync,
-    {
-        let policy = self.routes.policies.policy_for(file_type);
-
-        // Select specialists by ARCHIVE format, not compression: a `.tgz`
-        // resolves to the `tar` container specialist instead of routing
-        // general-only and surfacing `filetypes/tar` as an `unavailable` skip.
-        let (route_file_type, group_name) = self.routes.specialist_keys(file_type);
-        let group_route = group_name
-            .as_deref()
-            .and_then(|name| self.routes.filegroup(name));
-        let filetype_route = self.routes.filetype(&route_file_type);
-
-        let score_general = || -> Result<(RouteProbability, RouteScore)> {
-            let (general_raw, general_prob) =
-                self.predict_general_raw_calibrated(general_features)?;
-            let general_class = policy.map_or_else(
-                || self.thresholds.classify(general_prob),
-                |policy| policy_route_class(policy, "general", general_prob),
-            );
-            Ok((
-                RouteProbability {
-                    route: "general".to_string(),
-                    probability: general_prob,
-                },
-                RouteScore {
-                    model: "az".to_string(),
-                    probability: general_prob,
-                    raw: general_raw,
-                    classification: general_class,
-                },
-            ))
-        };
-
-        let score_group = || -> Result<Option<(RouteProbability, RouteScore)>> {
-            let (Some(group_name), Some(route)) = (group_name.as_deref(), group_route.as_ref())
-            else {
-                return Ok(None);
-            };
-            let route_name = format!("filegroups/{group_name}");
-            let (raw, prob, class) = score(route)?;
-            let class = policy.map_or(class, |policy| {
-                policy_route_class(policy, &route_name, prob)
-            });
-            Ok(Some((
-                RouteProbability {
-                    route: route_name,
-                    probability: prob,
-                },
-                RouteScore {
-                    model: format!("az/{group_name}"),
-                    probability: prob,
-                    raw,
-                    classification: class,
-                },
-            )))
-        };
-
-        let score_filetype = || -> Result<Option<(RouteProbability, RouteScore)>> {
-            let Some(route) = filetype_route.as_ref() else {
-                return Ok(None);
-            };
-            let route_name = format!("filetypes/{route_file_type}");
-            let (raw, prob, class) = score(route)?;
-            let class = policy.map_or(class, |policy| {
-                policy_route_class(policy, &route_name, prob)
-            });
-            Ok(Some((
-                RouteProbability {
-                    route: route_name,
-                    probability: prob,
-                },
-                RouteScore {
-                    model: format!("az/{route_file_type}"),
-                    probability: prob,
-                    raw,
-                    classification: class,
-                },
-            )))
-        };
-
-        let (general_result, (group_result, filetype_result)) =
-            rayon::join(score_general, || rayon::join(score_group, score_filetype));
-
-        let (general_prob, general_score) = general_result?;
-        let mut route_probs = vec![general_prob];
-        let mut scores = vec![general_score];
-        let mut skipped = Vec::new();
-
-        if let Some((route_prob, route_score)) = group_result? {
-            route_probs.push(route_prob);
-            scores.push(route_score);
-        } else if let Some(group_name) = group_name.as_deref()
-            && self.routes.filegroups.is_skipped(group_name)
-        {
-            skipped.push(SkippedRoute {
-                model: format!("az/{group_name}"),
-                reason: "uncalibrated",
-            });
-        }
-
-        if let Some((route_prob, route_score)) = filetype_result? {
-            route_probs.push(route_prob);
-            scores.push(route_score);
-        } else if self.routes.filetypes.is_skipped(&route_file_type) {
-            skipped.push(SkippedRoute {
-                model: format!("az/{route_file_type}"),
-                reason: "uncalibrated",
-            });
-        }
-
-        Ok((route_probs, scores, skipped))
-    }
-
     /// Pick the final [`Decision`] from per-route scores.
     ///
     /// In level mode the verdict comes from the level-independent sweep (see
@@ -3679,25 +3378,25 @@ impl Model {
     /// `None`) it keeps the pre-level behaviour: the per-filetype policy at the
     /// default level when one exists, else the OR over the model's thresholds —
     /// with no level marker, since no level table applies.
-    fn decide_from_routes(
+    fn decide(
         &self,
         file_type: &str,
+        policy: Option<&RoutePolicy>,
         route_probs: &[RouteProbability],
         skipped: &mut Vec<SkippedRoute>,
     ) -> Decision {
-        let policy = self.routes.policies.policy_for(file_type);
-        // Diagnostic: note routes the active-level policy references but that
+        // Diagnostic: note routes the default-level policy references but that
         // produced no score this run.
         if let Some(policy) = policy {
-            for route in policy
+            for &(route, _) in policy
                 .hostile
                 .thresholds
-                .keys()
-                .chain(policy.suspicious.thresholds.keys())
+                .iter()
+                .chain(&policy.suspicious.thresholds)
             {
-                if !route_probs.iter().any(|score| score.route == *route) {
+                if !route_probs.iter().any(|score| score.route == route) {
                     skipped.push(SkippedRoute {
-                        model: compact_route_name(route),
+                        model: compact_route_name(self.routes.names.name(route)),
                         reason: "unavailable",
                     });
                 }
@@ -3708,7 +3407,7 @@ impl Model {
             // Manual-threshold mode: pre-level semantics, level is null.
             return match policy {
                 Some(policy) => policy_decide(policy, route_probs)
-                    .unwrap_or_else(|| self.benign_fallback(route_probs, None)),
+                    .unwrap_or_else(|| self.benign_fallback(route_probs, Level::Manual)),
                 None => self.decide_from_scores(route_probs),
             };
         };
@@ -3719,14 +3418,10 @@ impl Model {
     /// Benign decision reporting the general route's probability against the
     /// model's suspicious cutoff (the band the score didn't reach), tagged with
     /// the given level marker.
-    fn benign_fallback(
-        &self,
-        route_probs: &[RouteProbability],
-        level_marker: Option<i32>,
-    ) -> Decision {
+    fn benign_fallback(&self, route_probs: &[RouteProbability], level_marker: Level) -> Decision {
         let general_prob = route_probs
             .iter()
-            .find(|s| s.route == "general")
+            .find(|s| s.route == RouteId::GENERAL)
             .map_or(0.0, |s| s.probability);
         Decision {
             class: Classification::Benign,
@@ -3743,8 +3438,8 @@ impl Model {
     /// identical regardless of the deploy `-l`, keeping the result
     /// cache-shareable. The active deploy level only positions the cutoffs:
     /// hostile when the swept level is <= the deploy level, suspicious when it
-    /// is <= min(grid_max, 100), else benign. A file that fires at no grid
-    /// level is clean and reports `-1`.
+    /// is <= `capped_suspicious_level(grid_max)`, else benign. A file that
+    /// fires at no grid level is [`Level::Clean`].
     fn decide_swept(
         &self,
         file_type: &str,
@@ -3762,31 +3457,37 @@ impl Model {
         };
 
         let Some((fired_level, probability, threshold)) = swept else {
-            return self.benign_fallback(route_probs, Some(-1));
+            return self.benign_fallback(route_probs, Level::Clean);
         };
 
         Decision {
             class: verdict_for_level(fired_level, level, self.grid_max),
             probability,
             threshold,
-            level: Some(i32::from(fired_level)),
+            level: Level::At(fired_level),
         }
     }
 
     /// Inference backend identifier (always `"onnx"`).
     #[must_use]
-    pub fn backend_kind(&self) -> &'static str {
-        self.inner.kind()
+    pub const fn backend_kind(&self) -> &'static str {
+        "onnx"
     }
 
     /// Feature specification used to build input vectors.
     #[must_use]
-    pub fn spec(&self) -> &FeatureSpec {
+    pub const fn spec(&self) -> &FeatureSpec {
         &self.spec
     }
 
-    /// Largest calibrated grid level (the suspicious ceiling). Used by the
-    /// trait floor to assign off-grid synthetic levels (`grid_max + 1/2`).
+    /// Extraction tables for [`Self::spec`], built once at load.
+    #[must_use]
+    pub const fn ctx(&self) -> &ExtractContext {
+        &self.ctx
+    }
+
+    /// Largest calibrated grid level, which caps the suspicious ceiling (see
+    /// `capped_suspicious_level`).
     #[must_use]
     pub(crate) const fn grid_max(&self) -> u16 {
         self.grid_max
@@ -3808,13 +3509,12 @@ impl Model {
 
     /// Stable metadata describing the loaded model artifacts.
     #[must_use]
-    pub fn info(&self) -> &ModelInfo {
+    pub const fn info(&self) -> &ModelInfo {
         &self.info
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use anyhow::Result;
@@ -3840,6 +3540,11 @@ mod tests {
         // Empty / whitespace.
         assert_eq!(normalize_archive_filetype(""), "");
         assert_eq!(normalize_archive_filetype("  tar.gz  "), "tar");
+        // An already-normal label is borrowed, not copied.
+        assert!(matches!(
+            normalize_archive_filetype("elf"),
+            Cow::Borrowed("elf")
+        ));
     }
 
     #[test]
@@ -3847,16 +3552,16 @@ mod tests {
         // Specialty package types collapse onto their container archive —
         // filefacts is the source of truth, so these stay correct as new
         // package formats are added there.
-        assert_eq!(container_filetype("gem").as_deref(), Some("tar"));
-        assert_eq!(container_filetype("crate").as_deref(), Some("tar"));
-        assert_eq!(container_filetype("python_sdist").as_deref(), Some("tar"));
-        assert_eq!(container_filetype("npm").as_deref(), Some("tar"));
-        assert_eq!(container_filetype("whl").as_deref(), Some("zip"));
-        assert_eq!(container_filetype("jar").as_deref(), Some("zip"));
-        assert_eq!(container_filetype("nupkg").as_deref(), Some("zip"));
+        assert_eq!(container_filetype("gem"), Some("tar"));
+        assert_eq!(container_filetype("crate"), Some("tar"));
+        assert_eq!(container_filetype("python_sdist"), Some("tar"));
+        assert_eq!(container_filetype("npm"), Some("tar"));
+        assert_eq!(container_filetype("whl"), Some("zip"));
+        assert_eq!(container_filetype("jar"), Some("zip"));
+        assert_eq!(container_filetype("nupkg"), Some("zip"));
         // Compressed tar variants resolve to the tar container too.
-        assert_eq!(container_filetype("tar.gz").as_deref(), Some("tar"));
-        assert_eq!(container_filetype("tar.zst").as_deref(), Some("tar"));
+        assert_eq!(container_filetype("tar.gz"), Some("tar"));
+        assert_eq!(container_filetype("tar.zst"), Some("tar"));
         // Non-archive types and bare compression carry no container.
         assert_eq!(container_filetype("pe"), None);
         assert_eq!(container_filetype("python"), None);
@@ -3876,34 +3581,57 @@ mod tests {
             ]),
             ..Default::default()
         };
+        let keys = |file_type: &str| {
+            let (key, group) = routes.specialist_keys(file_type);
+            (key.into_owned(), group.map(str::to_owned))
+        };
 
         // A compressed tarball must resolve to the `tar` container specialist
         // and its filegroup. This is the `.tgz` routing gap: selecting by the
         // raw `tar.gz` label found no specialist, surfaced `filetypes/tar` as an
         // `unavailable` skip, and let an obfuscated npm dropper score benign on
         // the general route alone.
-        assert_eq!(
-            routes.specialist_keys("tar.gz"),
-            ("tar".to_string(), Some("archive".to_string())),
-        );
+        let tar = ("tar".to_string(), Some("archive".to_string()));
+        assert_eq!(keys("tar.gz"), tar);
         // Stacked compression suffixes collapse all the way to the container.
-        assert_eq!(
-            routes.specialist_keys("tar.bz2.xz"),
-            ("tar".to_string(), Some("archive".to_string())),
-        );
+        assert_eq!(keys("tar.bz2.xz"), tar);
         // The uncompressed container is unchanged.
-        assert_eq!(
-            routes.specialist_keys("tar"),
-            ("tar".to_string(), Some("archive".to_string())),
-        );
+        assert_eq!(keys("tar"), tar);
         // Non-archive types pass through untouched and still resolve their group.
         assert_eq!(
-            routes.specialist_keys("javascript"),
-            ("javascript".to_string(), Some("scripts".to_string())),
+            keys("javascript"),
+            ("javascript".to_string(), Some("scripts".to_string()))
         );
         // A container with no configured filegroup yields no group, still
         // normalized so its filetype specialist (if any) is reachable.
-        assert_eq!(routes.specialist_keys("zip"), ("zip".to_string(), None));
+        assert_eq!(keys("zip"), ("zip".to_string(), None));
+    }
+
+    #[test]
+    fn route_names_parse_and_render_compactly() {
+        assert_eq!(RouteKind::parse("general"), Some(RouteKind::General));
+        assert_eq!(
+            RouteKind::parse("filegroups/native"),
+            Some(RouteKind::Group("native"))
+        );
+        assert_eq!(
+            RouteKind::parse("filetypes/elf"),
+            Some(RouteKind::Type("elf"))
+        );
+        assert_eq!(RouteKind::parse("mystery/thing"), None);
+        assert_eq!(compact_route_name("general"), "az");
+        assert_eq!(compact_route_name("filegroups/native"), "az/native");
+        assert_eq!(compact_route_name("filetypes/elf"), "az/elf");
+
+        let mut names = RouteNames::default();
+        assert_eq!(names.id("general"), Some(RouteId::GENERAL));
+        let elf = names.intern("filetypes/elf");
+        assert_eq!(
+            names.intern("filetypes/elf"),
+            elf,
+            "interning is idempotent"
+        );
+        assert_eq!(names.name(elf), "filetypes/elf");
     }
 
     #[test]
@@ -3921,80 +3649,7 @@ mod tests {
     }
 
     #[test]
-    fn load_severity_thresholds_honors_explicit_suspicious_when_present() -> Result<()> {
-        // When collimator emits an explicit `suspicious` block for a level,
-        // the level-space lookup is bypassed and the explicit value is used as-is.
-        let dir = tempfile::tempdir()?;
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{
-              "suspicious": 0.65,
-              "hostile": 0.90,
-              "severity_levels": [
-                {
-                  "level": 1,
-                  "suspicious": {"threshold": 0.99},
-                  "hostile": {"threshold": 0.99}
-                },
-                {
-                  "level": 9,
-                  "suspicious": {"threshold": 0.50},
-                  "hostile": {"threshold": 0.80}
-                }
-              ]
-            }"#,
-        )?;
-
-        let level_1 = load_severity_thresholds(dir.path(), 1)?.context("level 1")?;
-        // Explicit per-level `suspicious.threshold` wins over the level-space lookup.
-        assert_eq!(level_1.hostile, 0.99);
-        assert_eq!(level_1.suspicious, 0.99);
-        assert_eq!(level_1.classify(0.99), Classification::Hostile);
-
-        let level_9 = load_severity_thresholds(dir.path(), 9)?.context("level 9")?;
-        assert_eq!(level_9.hostile, 0.80);
-        // Explicit suspicious threshold honored even when the level-space lookup
-        // would otherwise miss (L36 absent from this table).
-        assert_eq!(level_9.suspicious, 0.50);
-        Ok(())
-    }
-
-    #[test]
-    fn load_severity_thresholds_derives_suspicious_in_level_space() -> Result<()> {
-        // With no explicit `suspicious` block per level, the suspicious cutoff
-        // comes from the level-table's HOSTILE threshold at the capped
-        // suspicious level `min(grid_max, SUSPICIOUS_LEVEL_CEILING)`. Anything
-        // firing looser than the ceiling lands below this threshold and reads
-        // benign. This table puts a row exactly at the ceiling (0.90) plus a
-        // looser row, so the cap clamps to the ceiling row (0.90) regardless of
-        // the ceiling's numeric value.
-        let dir = tempfile::tempdir()?;
-        std::fs::write(
-            dir.path().join("config.json"),
-            format!(
-                r#"{{
-              "hostile": 0.90,
-              "severity_levels": [
-                {{"level": 50,       "hostile": {{"threshold": 0.99}}}},
-                {{"level": {ceiling}, "hostile": {{"threshold": 0.90}}}},
-                {{"level": 25000,    "hostile": {{"threshold": 0.70}}}}
-              ]
-            }}"#,
-                ceiling = SUSPICIOUS_LEVEL_CEILING
-            ),
-        )?;
-
-        let l50 = load_severity_thresholds(dir.path(), 50)?.context("level 50")?;
-        assert_eq!(l50.hostile, 0.99);
-        assert_eq!(
-            l50.suspicious, 0.90,
-            "suspicious should be the ceiling-row hostile threshold"
-        );
-
-        let l300 = load_severity_thresholds(dir.path(), 300);
-        // L300 is absent from this table so the loader returns None — the
-        // ceiling clamp itself is exercised via `capped_suspicious_level` below.
-        assert!(matches!(l300, Ok(None)));
+    fn capped_suspicious_level_clamps_to_the_ceiling() {
         // Below the ceiling passes through; at/above it clamps to the ceiling.
         assert_eq!(
             capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING - 1),
@@ -4009,14 +3664,39 @@ mod tests {
             SUSPICIOUS_LEVEL_CEILING
         );
         assert_eq!(capped_suspicious_level(25_000), SUSPICIOUS_LEVEL_CEILING);
+    }
+
+    #[test]
+    fn bundle_config_is_absent_when_missing_and_fatal_when_malformed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(BundleConfig::load(dir.path())?.is_none());
+
+        std::fs::write(dir.path().join("config.json"), b"{\"levels\": [")?;
+        let err = BundleConfig::load(dir.path()).expect_err("truncated config must fail");
+        assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+        // The default-level probe leaves the report to `Model::load`.
+        assert_eq!(model_default_level(dir.path()), None);
+
+        // An ensemble whose config.json is malformed refuses to load rather
+        // than silently degrading to general-only.
+        std::fs::create_dir_all(dir.path().join("general"))?;
+        let err = Model::load(dir.path(), None, None).expect_err("malformed config must fail");
+        assert!(format!("{err:#}").contains("config.json"), "{err:#}");
         Ok(())
     }
 
     #[test]
-    fn load_severity_thresholds_rejects_invalid_level() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let err = load_severity_thresholds(dir.path(), 25001).expect_err("level 25001 is invalid");
-        assert!(err.to_string().contains("0..=25000"));
+    fn single_bundle_thresholds_must_be_valid() -> Result<()> {
+        let cfg: BundleConfig = serde_json::from_str(r#"{"hostile": 0.9}"#)?;
+        let t = cfg.thresholds()?.context("hostile present")?;
+        assert_eq!((t.suspicious, t.hostile), (0.9, 0.9), "hostile-only");
+
+        let cfg: BundleConfig = serde_json::from_str(r#"{"suspicious": 0.95, "hostile": 0.9}"#)?;
+        assert!(cfg.thresholds().is_err(), "inverted thresholds are fatal");
+
+        let cfg: BundleConfig = serde_json::from_str(r#"{"default_severity_level": 50}"#)?;
+        assert!(cfg.thresholds()?.is_none());
+        assert_eq!(cfg.default_severity_level, Some(50));
         Ok(())
     }
 
@@ -4166,6 +3846,25 @@ mod tests {
         Ok(())
     }
 
+    /// An OR-rule severity over named routes, interned into `names`.
+    fn or_rule(names: &mut RouteNames, thresholds: &[(&str, f32)]) -> PolicySeverity {
+        PolicySeverity {
+            thresholds: thresholds
+                .iter()
+                .map(|&(route, t)| (names.intern(route), t))
+                .collect(),
+            blend: None,
+        }
+    }
+
+    /// One route score, interned into `names`.
+    fn score(names: &mut RouteNames, route: &str, probability: f32) -> RouteProbability {
+        RouteProbability {
+            route: names.intern(route),
+            probability,
+        }
+    }
+
     #[test]
     fn calibrate_policy_thresholds_pushes_each_route_through_its_calibrator() {
         // Build two distinct calibrators so we can verify per-route routing.
@@ -4179,52 +3878,40 @@ mod tests {
         };
         // RoutePolicy with thresholds for general, filetypes/elf (calibrated)
         // and filegroups/missing (no calibrator — must remain untouched).
-        let mut hostile = HashMap::new();
-        hostile.insert("general".to_string(), 0.5);
-        hostile.insert("filetypes/elf".to_string(), 0.5);
-        hostile.insert("filegroups/missing".to_string(), 0.5);
-        let mut suspicious = HashMap::new();
-        suspicious.insert("general".to_string(), 0.5);
+        let mut names = RouteNames::default();
         let policy = RoutePolicy {
-            hostile: PolicySeverity {
-                thresholds: hostile,
-                blend: None,
-            },
-            suspicious: PolicySeverity {
-                thresholds: suspicious,
-                blend: None,
-            },
+            hostile: or_rule(
+                &mut names,
+                &[
+                    ("general", 0.5),
+                    ("filetypes/elf", 0.5),
+                    ("filegroups/missing", 0.5),
+                ],
+            ),
+            suspicious: or_rule(&mut names, &[("general", 0.5)]),
         };
         let mut policies = RoutePolicies {
             by_filetype: HashMap::from([("elf".to_string(), policy)]),
             ..Default::default()
         };
 
-        calibrate_policy_thresholds_with(&mut policies, |route| match route {
-            "general" => Some(&cal_general),
-            "filetypes/elf" => Some(&cal_elf),
+        let elf = names.id("filetypes/elf").unwrap();
+        let missing = names.id("filegroups/missing").unwrap();
+        calibrate_policy_thresholds(&mut policies, |route| match route {
+            RouteId::GENERAL => Some(&cal_general),
+            r if r == elf => Some(&cal_elf),
             _ => None,
         });
 
-        let elf = policies.by_filetype.get("elf").expect("policy retained");
+        let policy = policies.by_filetype.get("elf").expect("policy retained");
         // general at raw=0.5 → 0.10
-        assert!((elf.hostile.thresholds["general"] - 0.10).abs() < 1e-6);
+        assert!((policy.hostile.threshold(RouteId::GENERAL).unwrap() - 0.10).abs() < 1e-6);
         // filetypes/elf at raw=0.5 → 0.90
-        assert!((elf.hostile.thresholds["filetypes/elf"] - 0.90).abs() < 1e-6);
+        assert!((policy.hostile.threshold(elf).unwrap() - 0.90).abs() < 1e-6);
         // No calibrator for filegroups/missing — left at raw 0.5.
-        assert!((elf.hostile.thresholds["filegroups/missing"] - 0.5).abs() < 1e-6);
+        assert!((policy.hostile.threshold(missing).unwrap() - 0.5).abs() < 1e-6);
         // Suspicious side also calibrated.
-        assert!((elf.suspicious.thresholds["general"] - 0.10).abs() < 1e-6);
-    }
-
-    #[test]
-    fn max_class_is_or_over_severity() {
-        use Classification::*;
-        assert_eq!(max_class(Benign, Benign), Benign);
-        assert_eq!(max_class(Benign, Suspicious), Suspicious);
-        assert_eq!(max_class(Suspicious, Hostile), Hostile);
-        assert_eq!(max_class(Hostile, Suspicious), Hostile);
-        assert_eq!(max_class(Hostile, Hostile), Hostile);
+        assert!((policy.suspicious.threshold(RouteId::GENERAL).unwrap() - 0.10).abs() < 1e-6);
     }
 
     #[test]
@@ -4245,7 +3932,7 @@ mod tests {
             }
           ]
         }"#;
-        let parsed: EnsembleConfigJson = serde_json::from_str(json).unwrap();
+        let parsed: BundleConfig = serde_json::from_str(json).unwrap();
 
         let level5 = thresholds_at_level(&parsed.levels, 5);
         assert_eq!(level5.len(), 2);
@@ -4269,7 +3956,7 @@ mod tests {
             "suspicious": {"thresholds": {"general": 0.6}}
           }]
         }"#;
-        let parsed: EnsembleConfigJson = serde_json::from_str(half).unwrap();
+        let parsed: BundleConfig = serde_json::from_str(half).unwrap();
         let level5 = thresholds_at_level(&parsed.levels, 5);
         assert_eq!(level5.len(), 2);
         assert!(level5.contains_key("general"));
@@ -4283,54 +3970,31 @@ mod tests {
 
     #[test]
     fn route_policy_classification_keeps_general_escape() {
+        let mut names = RouteNames::default();
         let policy = RoutePolicy {
-            hostile: PolicySeverity {
-                thresholds: HashMap::from([
-                    ("filetypes/elf".to_string(), 0.99),
-                    ("general".to_string(), 0.95),
-                ]),
-                blend: None,
-            },
-            suspicious: PolicySeverity {
-                thresholds: HashMap::from([("filetypes/elf".to_string(), 0.90)]),
-                blend: None,
-            },
+            hostile: or_rule(&mut names, &[("filetypes/elf", 0.99), ("general", 0.95)]),
+            suspicious: or_rule(&mut names, &[("filetypes/elf", 0.90)]),
         };
 
-        let general_escape = vec![
-            RouteProbability {
-                route: "general".to_string(),
-                probability: 0.96,
-            },
-            RouteProbability {
-                route: "filetypes/elf".to_string(),
-                probability: 0.10,
-            },
+        let general_escape = [
+            score(&mut names, "general", 0.96),
+            score(&mut names, "filetypes/elf", 0.10),
         ];
         assert_eq!(
             policy_classify(&policy, &general_escape),
             Classification::Hostile
         );
 
-        let specialist_suspicious = vec![
-            RouteProbability {
-                route: "general".to_string(),
-                probability: 0.10,
-            },
-            RouteProbability {
-                route: "filetypes/elf".to_string(),
-                probability: 0.91,
-            },
+        let specialist_suspicious = [
+            score(&mut names, "general", 0.10),
+            score(&mut names, "filetypes/elf", 0.91),
         ];
         assert_eq!(
             policy_classify(&policy, &specialist_suspicious),
             Classification::Suspicious
         );
 
-        let inactive_route = vec![RouteProbability {
-            route: "filegroups/native".to_string(),
-            probability: 1.0,
-        }];
+        let inactive_route = [score(&mut names, "filegroups/native", 1.0)];
         assert_eq!(
             policy_classify(&policy, &inactive_route),
             Classification::Benign
@@ -4339,7 +4003,7 @@ mod tests {
 
     fn general_only(prob: f32) -> Vec<RouteProbability> {
         vec![RouteProbability {
-            route: "general".to_string(),
+            route: RouteId::GENERAL,
             probability: prob,
         }]
     }
@@ -4352,7 +4016,7 @@ mod tests {
             .map(|&(level, thr)| LevelPolicy {
                 level,
                 hostile: PolicySeverity {
-                    thresholds: HashMap::from([("general".to_string(), thr)]),
+                    thresholds: vec![(RouteId::GENERAL, thr)],
                     blend: None,
                 },
             })
@@ -4391,6 +4055,33 @@ mod tests {
         for active in [0_u16, 10, 20, 50, 200, 1000] {
             // Swept level is unchanged; only the class depends on `active`.
             let _ = verdict_for_level(swept_level, active, 1000);
+        }
+    }
+
+    /// `lvl`/`fires_at` keep the encoding the `Option<i32>` had: `null`, `-1`,
+    /// or the level, with an absent field reading as `null`. Anything else is
+    /// not a level and is refused rather than guessed at.
+    #[test]
+    fn level_keeps_its_wire_encoding() {
+        for (json, level) in [
+            ("null", Level::Manual),
+            ("-1", Level::Clean),
+            ("0", Level::At(0)),
+            ("25000", Level::At(25_000)),
+        ] {
+            assert_eq!(serde_json::to_string(&level).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Level>(json).unwrap(), level);
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            lvl: Level,
+        }
+        assert_eq!(
+            serde_json::from_str::<Row>("{}").unwrap().lvl,
+            Level::Manual
+        );
+        for bad in ["-2", "65536", "\"25\""] {
+            assert!(serde_json::from_str::<Level>(bad).is_err(), "{bad}");
         }
     }
 
@@ -4434,16 +4125,11 @@ mod tests {
     fn sweep_general_grid_uses_max_crossing_route() {
         // General-route OR fallback: any route crossing the level's general
         // threshold fires it. A weak general but strong specialist still fires.
+        let mut names = RouteNames::default();
         let grid = [(2_u16, 0.99_f32), (20, 0.85), (200, 0.40)];
-        let scores = vec![
-            RouteProbability {
-                route: "general".to_string(),
-                probability: 0.10,
-            },
-            RouteProbability {
-                route: "filetypes/elf".to_string(),
-                probability: 0.90,
-            },
+        let scores = [
+            score(&mut names, "general", 0.10),
+            score(&mut names, "filetypes/elf", 0.90),
         ];
         let swept = sweep_general_grid(&grid, &scores).expect("fires");
         assert_eq!(swept.0, 20, "0.90 clears L20 (0.85) but not L2 (0.99)");
@@ -4458,73 +4144,71 @@ mod tests {
         // sigmoid(intercept + 1.0 * logit(0.6)) = 0.5
         //   logit(0.6) ≈ 0.4054
         //   intercept = -0.4054 gives sigmoid(0) = 0.5
+        let mut names = RouteNames::default();
+        let elf = names.intern("filetypes/elf");
         let blend = BlendPolicy {
-            routes: vec!["general".to_string(), "filetypes/elf".to_string()],
+            routes: vec![RouteId::GENERAL, elf],
             weights: vec![1.0, 0.0],
             intercept: -0.4054,
             threshold: 0.5,
         };
+        let scores = |general: f32, specialist: f32| {
+            [
+                RouteProbability {
+                    route: RouteId::GENERAL,
+                    probability: general,
+                },
+                RouteProbability {
+                    route: elf,
+                    probability: specialist,
+                },
+            ]
+        };
         // general=0.6 → fires
-        let fires = blend.fires(&[
-            RouteProbability {
-                route: "general".to_string(),
-                probability: 0.6,
-            },
-            RouteProbability {
-                route: "filetypes/elf".to_string(),
-                probability: 0.0,
-            },
-        ]);
-        assert!(fires);
+        assert!(blend.fires(&scores(0.6, 0.0)));
         // general=0.5 → doesn't fire (logit(0.5)=0, intercept negative)
-        let no_fire = blend.fires(&[
-            RouteProbability {
-                route: "general".to_string(),
-                probability: 0.5,
-            },
-            RouteProbability {
-                route: "filetypes/elf".to_string(),
-                probability: 0.99,
-            },
-        ]);
-        assert!(!no_fire);
+        assert!(!blend.fires(&scores(0.5, 0.99)));
         // Missing route → can't blend, doesn't fire.
-        let missing = blend.fires(&[RouteProbability {
-            route: "general".to_string(),
-            probability: 1.0,
-        }]);
-        assert!(!missing);
+        assert!(!blend.fires(&general_only(1.0)));
+    }
+
+    fn write_policies(dir: &Path, blend: &str) -> Result<()> {
+        std::fs::write(
+            dir.join("route_policies.json"),
+            format!(
+                r#"{{
+              "schema": "azoth.route_policy_search.v1",
+              "routes": {{
+                "filetypes/elf": {{
+                  "filetype": "elf",
+                  "levels": [{{
+                    "level": 5,
+                    "hostile": {{"best": {{"thresholds": {{}}, "blend": {blend}}}}},
+                    "suspicious": {{"best": {{"thresholds": {{"general": 0.7}}}}}}
+                  }}]
+                }}
+              }}
+            }}"#
+            ),
+        )?;
+        Ok(())
     }
 
     #[test]
     fn load_route_policies_parses_blend_field() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        std::fs::write(
-            dir.path().join("route_policies.json"),
+        write_policies(
+            dir.path(),
             r#"{
-              "schema": "azoth.route_policy_search.v1",
-              "routes": {
-                "filetypes/elf": {
-                  "filetype": "elf",
-                  "levels": [{
-                    "level": 5,
-                    "hostile": {"best": {
-                      "thresholds": {},
-                      "blend": {
-                        "routes": ["general", "filegroups/native", "filetypes/elf"],
-                        "weights": [0.5, 0.3, 1.2],
-                        "intercept": -1.5,
-                        "threshold": 0.8,
-                        "transform": "logit"
-                      }
-                    }},
-                    "suspicious": {"best": {"thresholds": {"general": 0.7}}}
-                  }]
-                }
-              }
+                "routes": ["general", "filegroups/native", "filetypes/elf"],
+                "weights": [0.5, 0.3, 1.2],
+                "intercept": -1.5,
+                "threshold": 0.8,
+                "transform": "logit"
             }"#,
         )?;
-        let policies = load_route_policies(dir.path(), 5);
+        let mut names = RouteNames::default();
+        let policies = load_route_policies(dir.path(), 5, &mut names)?;
         let policy = policies.by_filetype.get("elf").expect("elf policy loaded");
         let blend = policy.hostile.blend.as_ref().expect("blend loaded");
         assert_eq!(blend.routes.len(), 3);
@@ -4532,31 +4216,79 @@ mod tests {
         assert!((blend.intercept - -1.5).abs() < 1e-6);
         assert!((blend.threshold - 0.8).abs() < 1e-6);
         // contains_route should recognize blend routes too.
-        assert!(policies.contains_route("filegroups/native"));
-        assert!(policies.contains_route("filetypes/elf"));
+        assert!(policies.contains_route(names.id("filegroups/native").unwrap()));
+        assert!(policies.contains_route(names.id("filetypes/elf").unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_blend_stops_the_load() -> Result<()> {
+        for (blend, why) in [
+            // A defaulted threshold of 0.0 would fire on everything.
+            (
+                r#"{"routes": ["general"], "weights": [1.0], "intercept": 0.0}"#,
+                "missing threshold",
+            ),
+            (
+                r#"{"routes": ["general"], "weights": [1.0], "threshold": 0.5}"#,
+                "missing intercept",
+            ),
+            (
+                r#"{"routes": ["general"], "weights": [1.0], "intercept": 0.0, "threshold": 0.5, "bias": 1}"#,
+                "unknown field",
+            ),
+            (
+                r#"{"routes": ["general"], "weights": [1.0, 2.0], "intercept": 0.0, "threshold": 0.5}"#,
+                "length mismatch",
+            ),
+            (
+                r#"{"routes": ["general"], "weights": [1.0], "intercept": 0.0, "threshold": 1.5}"#,
+                "threshold out of range",
+            ),
+            (
+                r#"{"routes": ["general"], "weights": [1.0], "intercept": 0.0, "threshold": 0.5, "transform": "gam"}"#,
+                "unknown transform",
+            ),
+        ] {
+            let dir = tempfile::tempdir()?;
+            write_policies(dir.path(), blend)?;
+            let result = load_route_policies(dir.path(), 5, &mut RouteNames::default());
+            assert!(result.is_err(), "{why} must fail the load");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn route_policies_are_optional_but_must_parse() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let policies = load_route_policies(dir.path(), 5, &mut RouteNames::default())?;
+        assert!(policies.by_filetype.is_empty() && policies.grid.is_empty());
+
+        std::fs::write(dir.path().join("route_policies.json"), b"{\"routes\": 7}")?;
+        assert!(load_route_policies(dir.path(), 5, &mut RouteNames::default()).is_err());
         Ok(())
     }
 
     #[test]
     fn blend_policy_severity_isnt_isotonic_calibrated() {
-        // calibrate_policy_thresholds_with must leave blend severities alone —
+        // calibrate_policy_thresholds must leave blend severities alone —
         // the blend's threshold is already in calibrated-prob space (its fit
         // ran on isotonic-calibrated route probs at policy-search time).
         // If we double-applied isotonic here it would shift the threshold off
         // the calibrated distribution and deploy verdicts would silently drift.
         let blend = BlendPolicy {
-            routes: vec!["general".to_string()],
+            routes: vec![RouteId::GENERAL],
             weights: vec![1.0],
             intercept: 0.0,
             threshold: 0.42,
         };
         let policy = RoutePolicy {
             hostile: PolicySeverity {
-                thresholds: HashMap::new(),
+                thresholds: Vec::new(),
                 blend: Some(blend),
             },
             suspicious: PolicySeverity {
-                thresholds: HashMap::from([("general".to_string(), 0.5)]),
+                thresholds: vec![(RouteId::GENERAL, 0.5)],
                 blend: None,
             },
         };
@@ -4569,15 +4301,14 @@ mod tests {
             x: vec![0.0, 1.0],
             y: vec![0.1, 1.0],
         };
-        calibrate_policy_thresholds_with(&mut policies, |_route| Some(&cal));
+        calibrate_policy_thresholds(&mut policies, |_route| Some(&cal));
         let pol = policies.by_filetype.get("elf").unwrap();
         // Hostile (blend) threshold stays at its original calibrated value.
         let blend = pol.hostile.blend.as_ref().unwrap();
         assert!((blend.threshold - 0.42).abs() < 1e-6);
         // Suspicious (OR-rule) threshold did get mapped.
         assert!(
-            (pol.suspicious.thresholds.get("general").copied().unwrap() - cal.apply(0.5)).abs()
-                < 1e-6
+            (pol.suspicious.threshold(RouteId::GENERAL).unwrap() - cal.apply(0.5)).abs() < 1e-6
         );
     }
 
@@ -4616,18 +4347,39 @@ mod tests {
             }"#,
         )?;
 
-        let policies = load_route_policies(dir.path(), 5);
-        assert!(policies.contains_route("general"));
-        assert!(policies.contains_route("filegroups/native"));
-        assert!(policies.contains_route("filetypes/elf"));
-        assert!(!policies.contains_route("filetypes/pe"));
+        let mut names = RouteNames::default();
+        let policies = load_route_policies(dir.path(), 5, &mut names)?;
+        let id = |name: &str| names.id(name).unwrap();
+        assert!(policies.contains_route(RouteId::GENERAL));
+        assert!(policies.contains_route(id("filegroups/native")));
+        assert!(policies.contains_route(id("filetypes/elf")));
+        assert_eq!(names.id("filetypes/pe"), None);
 
         let elf = policies.by_filetype.get("elf").expect("elf policy");
         assert!(
-            (elf.hostile.thresholds["filetypes/elf"] - 0.98).abs() < 1e-6,
+            (elf.hostile.threshold(id("filetypes/elf")).unwrap() - 0.98).abs() < 1e-6,
             "must select the requested level"
         );
-        assert!(!elf.suspicious.thresholds.contains_key("general"));
+        assert!(elf.suspicious.threshold(RouteId::GENERAL).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_routes_never_firing_sentinel_is_dropped() -> Result<()> {
+        // Collimator writes one ulp above 1.0 for a route that must never fire
+        // at a level; the real bundle carries it, so it must still load.
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("route_policies.json"),
+            r#"{"routes": {"filetypes/yaml": {"filetype": "yaml", "levels": [
+                {"level": 0, "hostile": {"best": {"thresholds": {"general": 1.0000001192092896}}}},
+                {"level": 5, "hostile": {"best": {"thresholds": {"general": 0.9}}}}
+            ]}}}"#,
+        )?;
+        let policies = load_route_policies(dir.path(), 5, &mut RouteNames::default())?;
+        let grid = policies.grid_for("yaml").expect("grid");
+        assert_eq!(grid.len(), 1, "the never-fires level has no policy");
+        assert_eq!(grid[0].level, 5);
         Ok(())
     }
 

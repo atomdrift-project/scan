@@ -5,12 +5,25 @@
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Emit the stale-SHAP warning at most once per process (it would otherwise
-/// fire per file on a directory scan).
+use crate::features::FeatureSpec;
+
+/// Emit the feature-space mismatch warning at most once per process (it would
+/// otherwise fire per file on a directory scan).
 static SHAP_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// `shap_importance.json` as collimator writes it.
+#[derive(Debug, serde::Deserialize)]
+struct ShapFile {
+    #[serde(default)]
+    top_features: Vec<ShapFeature>,
+    /// Provenance: SHA-256 of the ordered feature-name list the SHAP was
+    /// computed against (collimator stamps it). Absent on legacy files.
+    feature_names_sha256: Option<String>,
+}
 
 /// A single feature importance entry from shap_importance.json.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -19,15 +32,22 @@ struct ShapFeature {
     importance: f64,
 }
 
-/// Global SHAP importance data.
+/// One important feature, resolved to its slot in the model's feature vector.
+#[derive(Debug, Clone)]
+struct BoundFeature {
+    slot: usize,
+    name: String,
+    importance: f64,
+    description: String,
+}
+
+/// Global SHAP importance, bound to the feature space it was computed for.
 #[derive(Debug, Clone)]
 pub struct ShapImportance {
-    features: Vec<ShapFeature>,
-    /// Provenance: SHA-256 of the ordered feature-name list the SHAP was
-    /// computed against (collimator stamps it). `None` for legacy/unstamped
-    /// files. A SHAP file is only valid for its exact feature space, so we
-    /// refuse to apply one whose digest doesn't match the loaded model.
-    feature_names_sha256: Option<String>,
+    /// The important features present in the spec, most important first.
+    features: Vec<BoundFeature>,
+    /// Length of the feature vector the slots index.
+    n_features: usize,
 }
 
 /// SHA-256 over the ordered feature names, newline-joined — must match
@@ -57,7 +77,8 @@ pub struct Reason {
 }
 
 impl ShapImportance {
-    /// Load shap_importance.json for the model directory.
+    /// Load shap_importance.json for the model directory and bind it to the
+    /// feature spec beside it.
     ///
     /// Reasons are computed in the general feature space (`Model::spec()`), so
     /// the matching file in a routed bundle is the general route's
@@ -66,84 +87,94 @@ impl ShapImportance {
     /// kept under each route dir for offline analysis; attributing a specific
     /// winning route in-scan would require explaining in that route's feature
     /// space — a larger change tracked separately.)
-    pub fn load(model_dir: &Path) -> Result<Self> {
-        let path = [
-            model_dir.join("general").join("shap_importance.json"),
-            model_dir.join("shap_importance.json"),
-        ]
-        .into_iter()
-        .find(|p| p.is_file())
-        .with_context(|| format!("no shap_importance.json under {}", model_dir.display()))?;
-        let data = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&data).context("parsing SHAP data")?;
-        let features: Vec<ShapFeature> = v["top_features"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| serde_json::from_value(f.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let feature_names_sha256 = v["feature_names_sha256"].as_str().map(ToString::to_string);
-
-        tracing::info!("loaded {} SHAP importance features", features.len());
-        Ok(Self {
-            features,
-            feature_names_sha256,
-        })
+    ///
+    /// A bundle without a SHAP file is `Ok(None)`: most ship none.
+    ///
+    /// # Errors
+    /// When the file or its feature spec cannot be read, or it was not
+    /// computed against that spec — a stale file (an older model) would
+    /// otherwise yield misleading reasons.
+    pub fn load(model_dir: &Path) -> Result<Option<Self>> {
+        let Some(dir) = [model_dir.join("general"), model_dir.to_path_buf()]
+            .into_iter()
+            .find(|d| d.join("shap_importance.json").is_file())
+        else {
+            return Ok(None);
+        };
+        let path = dir.join("shap_importance.json");
+        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let file: ShapFile =
+            serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
+        let spec = FeatureSpec::load(&dir.join("feature_spec.json"))
+            .with_context(|| format!("loading the feature spec beside {}", path.display()))?;
+        let shap = Self::bind(file, spec.feature_names()).inspect_err(|e| {
+            if !SHAP_MISMATCH_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("ignoring {}: {e}", path.display());
+            }
+        })?;
+        tracing::info!("loaded {} SHAP importance features", shap.features.len());
+        Ok(Some(shap))
     }
 
-    /// Explain why a file was flagged by cross-referencing active features
-    /// with global importance, sorted by descending importance.
-    #[must_use]
-    pub fn explain(&self, feature_values: &[f32], feature_names: &[String]) -> Vec<Reason> {
-        // Provenance gate: only apply SHAP computed against this exact feature
-        // space. A stale file (different/old model) would otherwise yield
-        // misleading reasons — the silent failure that masked a 6-week-old
-        // SHAP. Mismatch or a missing stamp ⇒ no reasons, warn once.
-        let valid = match &self.feature_names_sha256 {
-            Some(stamp) => stamp == &feature_names_digest(feature_names),
-            None => false,
-        };
-        if !valid {
-            if !SHAP_MISMATCH_WARNED.swap(true, Ordering::Relaxed) {
-                let reason = if self.feature_names_sha256.is_some() {
-                    "feature space does not match the loaded model (stale SHAP)"
-                } else {
-                    "no provenance stamp (regenerate with `make azoth-shap`)"
-                };
-                tracing::warn!("ignoring shap_importance.json: {reason}");
-            }
-            return Vec::new();
+    /// Resolve `file`'s features to slots in `feature_names`, which must be
+    /// the feature space it was computed against.
+    fn bind(file: ShapFile, feature_names: &[String]) -> Result<Self> {
+        match &file.feature_names_sha256 {
+            Some(stamp) if *stamp == feature_names_digest(feature_names) => {}
+            Some(_) => anyhow::bail!("feature space does not match the loaded model (stale SHAP)"),
+            None => anyhow::bail!("no provenance stamp (regenerate with `make azoth-shap`)"),
         }
-
-        let name_to_idx: std::collections::HashMap<&str, usize> = feature_names
+        let slots: HashMap<&str, usize> = feature_names
             .iter()
             .enumerate()
             .map(|(i, n)| (n.as_str(), i))
             .collect();
-
-        let mut reasons: Vec<Reason> = self
-            .features
-            .iter()
-            .filter_map(|shap| {
-                let idx = name_to_idx.get(shap.name.as_str())?;
-                let value = *feature_values.get(*idx)? as f64;
-                if value == 0.0 {
-                    return None;
-                }
-                Some(Reason {
-                    feature: shap.name.clone(),
-                    importance: shap.importance,
-                    value,
-                    description: describe_feature(&shap.name),
+        let mut features: Vec<BoundFeature> = file
+            .top_features
+            .into_iter()
+            .filter_map(|f| {
+                Some(BoundFeature {
+                    slot: *slots.get(f.name.as_str())?,
+                    description: describe_feature(&f.name),
+                    name: f.name,
+                    importance: f.importance,
                 })
             })
             .collect();
+        features.sort_by(|a, b| b.importance.total_cmp(&a.importance));
+        Ok(Self {
+            features,
+            n_features: feature_names.len(),
+        })
+    }
 
-        reasons.sort_by(|a, b| b.importance.total_cmp(&a.importance));
-        reasons
+    /// Explain why a file was flagged: the important features active in
+    /// `feature_values` (a vector in the spec the SHAP file was bound to at
+    /// load), by descending importance. A vector of another length gets none.
+    #[must_use]
+    pub fn explain(&self, feature_values: &[f32]) -> Vec<Reason> {
+        if feature_values.len() != self.n_features {
+            if !SHAP_MISMATCH_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    expected = self.n_features,
+                    got = feature_values.len(),
+                    "ignoring shap_importance.json: feature vector is not the space it was loaded for"
+                );
+            }
+            return Vec::new();
+        }
+        self.features
+            .iter()
+            .filter_map(|f| {
+                let value = f64::from(*feature_values.get(f.slot)?);
+                (value != 0.0).then(|| Reason {
+                    feature: f.name.clone(),
+                    importance: f.importance,
+                    value,
+                    description: f.description.clone(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -179,4 +210,59 @@ fn describe_feature(name: &str) -> String {
         return format!("structural: {}", rest.replace('_', " "));
     }
     name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    fn shap_file(stamp: Option<String>) -> ShapFile {
+        ShapFile {
+            top_features: vec![
+                ShapFeature {
+                    name: "agg:max_crit".to_string(),
+                    importance: 0.5,
+                },
+                ShapFeature {
+                    name: "struct:zero_findings".to_string(),
+                    importance: 0.9,
+                },
+                ShapFeature {
+                    name: "not:in_spec".to_string(),
+                    importance: 2.0,
+                },
+            ],
+            feature_names_sha256: stamp,
+        }
+    }
+
+    #[test]
+    fn binds_once_and_explains_active_features_by_importance() {
+        let spec = names(&["agg:max_crit", "struct:zero_findings", "ext:has_yara_match"]);
+        let shap = ShapImportance::bind(shap_file(Some(feature_names_digest(&spec))), &spec)
+            .expect("stamped for this spec");
+        let reasons = shap.explain(&[5.0, 1.0, 0.0]);
+        let got: Vec<(&str, f64)> = reasons
+            .iter()
+            .map(|r| (r.feature.as_str(), r.value))
+            .collect();
+        assert_eq!(got, [("struct:zero_findings", 1.0), ("agg:max_crit", 5.0)]);
+        assert_eq!(reasons[1].description, "aggregate: max crit");
+        // An inactive feature gives no reason.
+        assert_eq!(shap.explain(&[0.0, 1.0, 0.0]).len(), 1);
+        // A vector from another feature space gives none at all.
+        assert!(shap.explain(&[1.0, 1.0]).is_empty());
+    }
+
+    #[test]
+    fn stale_or_unstamped_shap_is_refused() {
+        let spec = names(&["agg:max_crit"]);
+        let stale = feature_names_digest(&names(&["agg:other"]));
+        assert!(ShapImportance::bind(shap_file(Some(stale)), &spec).is_err());
+        assert!(ShapImportance::bind(shap_file(None), &spec).is_err());
+    }
 }

@@ -7,8 +7,9 @@
 //!   * a directory with both `model.onnx` and `models/` is ambiguous.
 //!   * a native `.txt`/`.json` (or empty) bundle is rejected.
 //!
-//! The ONNX tests are `#[ignore]`d by default because they depend on a real
-//! ONNX bundle on disk. To run:
+//! Predictions go through `Model::predict_report`, the path a scan takes, on
+//! an empty cleave report. The ONNX tests are `#[ignore]`d by default because
+//! they depend on a real ONNX bundle on disk. To run:
 //!
 //! ```sh
 //! SCAN_ONNX_BUNDLE=/path/to/onnx-bundle \
@@ -24,6 +25,13 @@ use scan::model::Model;
 fn onnx_bundle() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+}
+
+/// The probability a scan of an empty report gets from `model`.
+fn predict(model: &Model) -> f32 {
+    let report = cleave::types::CompactReport::default();
+    let (decision, _, _) = model.predict_report(&report).expect("predict empty report");
+    decision.probability
 }
 
 fn copy_bundle(src: &Path, files: &[&str]) -> tempfile::TempDir {
@@ -45,8 +53,7 @@ fn onnx_bundle_dispatches_to_onnx_backend() {
     assert_eq!(model.backend_kind(), "onnx");
     assert!(model.spec().total_features() > 0);
 
-    let zeros = vec![0.0f32; model.spec().total_features()];
-    let (prob, _class) = model.predict(&zeros).expect("predict zeros");
+    let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 }
 
@@ -75,13 +82,12 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
 
     let model = Model::load(dir.path(), None, None).expect("load multi-seed bundle");
     assert_eq!(model.backend_kind(), "onnx");
-    let zeros = vec![0.0f32; model.spec().total_features()];
-    let (prob, _class) = model.predict(&zeros).expect("predict zeros");
+    let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 
     let single = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
     let single_model = Model::load(single.path(), None, None).expect("load single bundle");
-    let (single_prob, _) = single_model.predict(&zeros).expect("predict zeros");
+    let single_prob = predict(&single_model);
     assert!(
         (prob - single_prob).abs() < 1e-6,
         "K=2 (identical members) prediction {prob} != K=1 prediction {single_prob}"

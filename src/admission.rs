@@ -7,12 +7,8 @@
 //! bogus "rule took 30000ms" timings).
 //!
 //! This gate pauses admission — it never kills the process — once memory reaches
-//! a ceiling (the resolved `--max-rss-gb`, default 85% of RAM). Two checks gate
-//! each new job, both keyed on signals every supported platform exposes:
-//!
-//! The reservation is taken where the analysis begins — after the worker's
-//! nested-work gate admits the job — not when the job is dispatched, so a job
-//! still queued for a Rayon slot is not charged for memory it is not yet using.
+//! a ceiling (the resolved `--max-rss-gb`, default 85% of RAM). Three checks
+//! gate each new job, all keyed on signals every supported platform exposes:
 //!
 //! * **Predictive** — each in-flight analysis reserves an estimated footprint.
 //!   Archive-shaped jobs reserve more than flat files because they expand into
@@ -28,6 +24,10 @@
 //!   can still be out of memory because of other tenants, page cache that
 //!   will not be reclaimed in time, or estimates that ran low everywhere at
 //!   once. When the kernel says there is no room, there is no room.
+//!
+//! The reservation is taken where the analysis begins — after the worker's
+//! nested-work gate admits the job — not when the job is dispatched, so a job
+//! still queued for a Rayon slot is not charged for memory it is not yet using.
 //!
 //! Archive detection uses the job's path suffix and hopper's `file_type`, and
 //! — when the payload is at hand — its leading bytes: hopper hands out
@@ -124,14 +124,14 @@ fn live_available() -> Option<u64> {
 
 /// Bytes of a payload worth sniffing for an archive signature. The tar magic
 /// sits at offset 257, everything else in the first 8 bytes.
-pub const SNIFF_BYTES: usize = 512;
+pub(crate) const SNIFF_BYTES: usize = 512;
 
 /// Archive signature check on a payload's leading bytes. Only formats whose
 /// analysis expands into a member walk matter here; a wrong `false` costs a
 /// flat estimate (today's behavior), a wrong `true` costs one pessimistic
 /// reservation.
 #[must_use]
-pub fn looks_like_archive_bytes(head: &[u8]) -> bool {
+pub(crate) fn looks_like_archive_bytes(head: &[u8]) -> bool {
     const SIGS: &[&[u8]] = &[
         b"\x1f\x8b",           // gzip
         b"PK\x03\x04",         // zip (and jar/whl/nupkg/vsix wrappers)
@@ -239,7 +239,7 @@ struct Inflight {
 
 /// Live memory-pressure gate over all in-flight analyses.
 #[derive(Debug)]
-pub struct MemoryAdmission {
+pub(crate) struct MemoryAdmission {
     /// Memory ceiling in bytes. Admission pauses once committed reservations or
     /// live usage would push past it. `0` disables the gate (slot-limited only),
     /// matching a disabled `--max-rss-gb`.
@@ -265,7 +265,7 @@ impl MemoryAdmission {
     /// Build the gate. `ceiling_bytes` is the resolved `--max-rss-gb` (default
     /// auto = 85% of RAM); `0` disables proactive throttling so an operator who
     /// opts out, or an unsupported platform, degrades to slot-limited dispatch.
-    pub fn new(ceiling_bytes: u64) -> Arc<Self> {
+    pub(crate) fn new(ceiling_bytes: u64) -> Arc<Self> {
         let fixed_est_bytes = std::env::var("SCAN_PER_SLOT_ESTIMATE_MB")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -319,25 +319,23 @@ impl MemoryAdmission {
         })
     }
 
-    /// Acquire admission, awaiting free memory asynchronously (worker dispatch
-    /// loop). The returned guard releases the reservation on drop. `on_disk_bytes`
     /// Current sum of in-flight memory reservations, in bytes. Surfaced on the
     /// worker heartbeat so hopper can see how close to the ceiling a worker is
     /// running (and thus whether memory admission is about to pause intake).
-    pub fn reserved_bytes(&self) -> u64 {
+    pub(crate) fn reserved_bytes(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
 
     /// Configured memory ceiling in bytes — the resolved `--max-rss-gb` that
     /// throttles intake. `0` means the gate is disabled (slot-limited only).
-    pub fn ceiling_bytes(&self) -> u64 {
+    pub(crate) fn ceiling_bytes(&self) -> u64 {
         self.ceiling_bytes
     }
 
     /// The sha256 of every analysis currently in flight. Reported on the worker
     /// heartbeat so hopper can renew these claims' leases: a multi-hour scan
     /// must not have its claim expire and be re-issued to another worker.
-    pub fn in_flight_shas(&self) -> Vec<Arc<str>> {
+    pub(crate) fn in_flight_shas(&self) -> Vec<Arc<str>> {
         self.inflight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -346,10 +344,13 @@ impl MemoryAdmission {
             .collect()
     }
 
-    /// is the hopper-reported size, recorded only for the per-slot diagnostics.
-    /// `head` is the payload's leading bytes when the caller has them (see
-    /// [`SNIFF_BYTES`]); they refine the archive estimate for suffix-less names.
-    pub async fn admit(
+    /// Acquire admission, awaiting free memory asynchronously (worker dispatch
+    /// loop). The returned guard releases the reservation on drop.
+    /// `on_disk_bytes` is the hopper-reported size, recorded only for the
+    /// per-slot diagnostics. `head` is the payload's leading bytes when the
+    /// caller has them (see [`SNIFF_BYTES`]); they refine the archive estimate
+    /// for suffix-less names.
+    pub(crate) async fn admit(
         self: &Arc<Self>,
         sha256: Arc<str>,
         path: Arc<str>,
@@ -364,6 +365,12 @@ impl MemoryAdmission {
             .unwrap_or_else(|| dynamic_estimate_bytes(&path, &file_type, on_disk_bytes, head));
 
         loop {
+            // Registered before the check: `release` wakes only waiters that
+            // already exist, so one landing between a refusal and the wait
+            // would otherwise be lost until the next re-poll.
+            let released = self.released.notified();
+            let mut released = std::pin::pin!(released);
+            released.as_mut().enable();
             let refusal = self.try_reserve(est).err();
             if refusal.is_none() {
                 let guard = self.register(sha256, path, file_type, on_disk_bytes, est);
@@ -428,7 +435,7 @@ impl MemoryAdmission {
             // Wait for a release, but wake periodically to re-poll live usage
             // even when no reservation is freed.
             tokio::select! {
-                () = self.released.notified() => {}
+                () = released => {}
                 () = tokio::time::sleep(REPOLL_INTERVAL) => {}
             }
         }
@@ -548,7 +555,7 @@ impl MemoryAdmission {
     /// Log a per-slot breakdown of where in-flight memory is tied up: total
     /// reserved vs ceiling vs live usage, then one line per in-flight analysis
     /// (oldest first).
-    pub fn log_inflight(&self, reason: &str) {
+    pub(crate) fn log_inflight(&self, reason: &str) {
         let mut jobs: Vec<_> = {
             let guard = self
                 .inflight
@@ -611,9 +618,9 @@ enum Refusal {
     Host { available: u64 },
 }
 
-/// RAII reservation. Dropping it frees the budget and wakes one waiter.
+/// RAII reservation. Dropping it frees the budget and wakes every waiter.
 #[derive(Debug)]
-pub struct AdmissionGuard {
+pub(crate) struct AdmissionGuard {
     admission: Arc<MemoryAdmission>,
     id: u64,
     est: u64,
@@ -626,9 +633,10 @@ impl Drop for AdmissionGuard {
 }
 
 #[cfg(test)]
-// `used_9gb`/`used_11gb` must keep the `Option<u64>` return to match the
-// `fn() -> Option<u64>` pointer `gate` takes (shared with `no_used` → None).
-#[allow(clippy::unwrap_used, clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the probes must match the `fn() -> Option<u64>` pointer `gate` takes"
+)]
 mod tests {
     use super::*;
 
@@ -640,13 +648,11 @@ mod tests {
 
     // Signatures are fixed by `MemoryAdmission.used_fn: fn() -> Option<u64>`.
     /// 9 GB live usage — leaves < 1.5 GB below a 10 GB ceiling.
-    #[allow(clippy::unnecessary_wraps)]
     fn used_9gb() -> Option<u64> {
         Some(9 * GB)
     }
 
     /// 11 GB live usage — already past a 10 GB ceiling.
-    #[allow(clippy::unnecessary_wraps)]
     fn used_11gb() -> Option<u64> {
         Some(11 * GB)
     }
@@ -676,13 +682,11 @@ mod tests {
     }
 
     /// 3 GB available on the host — below floor + a 2 GB estimate.
-    #[allow(clippy::unnecessary_wraps)]
     fn avail_3gb() -> Option<u64> {
         Some(3 * GB)
     }
 
     /// 20 GB available on the host — ample.
-    #[allow(clippy::unnecessary_wraps)]
     fn avail_20gb() -> Option<u64> {
         Some(20 * GB)
     }

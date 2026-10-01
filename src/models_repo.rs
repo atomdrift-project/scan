@@ -1,7 +1,8 @@
 //! Locates the model bundle and installs/updates it from the R2 bundle.
 //!
-//! Models are distributed as signed `.tar.zst` bundles from the update bucket —
-//! see [`crate::model_update`], which `scan update-rules` drives. This module
+//! Models are distributed as `.tar.zst` bundles from the update bucket,
+//! verified by sha256 against the bucket's own (unsigned) manifest — see
+//! [`crate::model_update`], which `scan update-rules` drives. This module
 //! handles *resolution* (where the bundle lives) and the first-run bootstrap
 //! install. The bundle root *is* what [`crate::model::Model::load`] reads:
 //! `feature_spec.json` + `model.onnx` (or `models/seed_*.onnx`) at the top, or a
@@ -29,23 +30,15 @@ const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
 /// litmus is ONNX-only — the native LightGBM/XGBoost loaders were retired.
 const MODEL_FILES: &[&str] = &["model.onnx"];
 
-/// Resolve the configured upstream URL: `SCAN_MODELS_REPO` or the built-in
-/// default. Used only to derive the on-disk bundle directory name. Any `#ref`
-/// fragment is dropped — bundles are version-keyed R2 downloads, so a ref no
-/// longer selects anything (see [`crate::model_update`]).
-fn models_repo_url() -> String {
-    let raw =
-        std::env::var("SCAN_MODELS_REPO").unwrap_or_else(|_| DEFAULT_MODELS_REPO_URL.to_owned());
-    match raw.rsplit_once('#') {
-        Some((url, _)) => url.to_owned(),
-        None => raw,
-    }
-}
-
-/// Resolve the models bundle directory, bootstrap-installing if necessary.
+/// Resolve the models bundle directory, bootstrap-installing (a download) if
+/// nothing is installed yet.
 ///
 /// Returns the path suitable for [`crate::model::Model::load`].
-pub fn model_dir() -> Result<PathBuf> {
+///
+/// # Errors
+/// Returns an error if `SCAN_MODELS_DIR` names a missing directory, or the
+/// first-run install fails.
+pub fn ensure_model_dir() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("SCAN_MODELS_DIR") {
         let p = PathBuf::from(&explicit);
         if p.is_dir() {
@@ -56,7 +49,8 @@ pub fn model_dir() -> Result<PathBuf> {
     }
 
     let data_dir = default_models_dir();
-    if has_models(&data_dir) {
+    // `settle`: an update between its swap's two renames is not a first run.
+    if has_models(&data_dir) || (crate::model_update::settle(&data_dir) && has_models(&data_dir)) {
         tracing::debug!("Using models from {}", data_dir.display());
         return Ok(data_dir);
     }
@@ -70,15 +64,15 @@ pub fn model_dir() -> Result<PathBuf> {
 /// Get the installed model commit (short), from the bundle's sidecar.
 #[must_use]
 pub fn version() -> Option<String> {
-    crate::model_update::installed(&current_models_dir())
-        .map(|i| i.commit.chars().take(12).collect())
+    crate::model_update::installed(&install_target()).map(|i| i.commit.chars().take(12).collect())
 }
 
-/// Directory the updater should install into: `SCAN_MODELS_DIR` override or
-/// the default bundle path. Public, and doesn't require the dir to exist.
+/// The models directory in use: the `SCAN_MODELS_DIR` override (which the
+/// updater leaves alone) or the default bundle path the updater fills. Doesn't
+/// bootstrap or require the dir to exist.
 #[must_use]
 pub fn install_target() -> PathBuf {
-    current_models_dir()
+    std::env::var_os("SCAN_MODELS_DIR").map_or_else(default_models_dir, PathBuf::from)
 }
 
 /// Feature dimensionality of the installed model: the number of inputs each
@@ -91,7 +85,7 @@ pub fn feature_dimension() -> Option<usize> {
     struct Dim {
         total_features: usize,
     }
-    let base = current_models_dir();
+    let base = install_target();
     let spec = [
         base.join("general").join("feature_spec.json"),
         base.join("feature_spec.json"),
@@ -109,7 +103,7 @@ pub fn feature_dimension() -> Option<usize> {
 /// no model is installed. Used by `scan version`.
 #[must_use]
 pub fn model_count() -> Option<usize> {
-    let base = current_models_dir();
+    let base = install_target();
     if !base.is_dir() {
         return None;
     }
@@ -123,37 +117,27 @@ pub fn model_count() -> Option<usize> {
 }
 
 /// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,
-/// where `<bundle>` is the last path segment of the configured upstream URL.
+/// where `<bundle>` is named by `SCAN_MODELS_REPO` (see [`bundle_name`]).
 fn default_models_dir() -> PathBuf {
-    let url = models_repo_url();
-    let bundle = bundle_name_from_url(&url).unwrap_or_else(|| "azoth".to_owned());
+    let repo = std::env::var("SCAN_MODELS_REPO");
+    let bundle = bundle_name(repo.as_deref().unwrap_or(DEFAULT_MODELS_REPO_URL));
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("atomdrift")
         .join("scan")
         .join("models")
-        .join(bundle)
+        .join(bundle.unwrap_or("azoth"))
 }
 
-/// Extract the bundle directory name from a git URL: the last path segment
-/// with any trailing `.git` and `/` stripped.
-fn bundle_name_from_url(url: &str) -> Option<String> {
+/// The bundle directory name for an upstream git URL: its last path segment,
+/// without a trailing `.git` or `/`. A `#ref` fragment is dropped — bundles are
+/// version-keyed R2 downloads (see [`crate::model_update`]), so a ref selects
+/// nothing.
+fn bundle_name(url: &str) -> Option<&str> {
+    let url = url.split_once('#').map_or(url, |(url, _)| url);
     let trimmed = url.trim_end_matches('/');
     let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let segment = stripped.rsplit(&['/', ':']).next()?;
-    if segment.is_empty() {
-        None
-    } else {
-        Some(segment.to_owned())
-    }
-}
-
-/// Resolve the models directory currently in use (without bootstrapping).
-fn current_models_dir() -> PathBuf {
-    if let Ok(explicit) = std::env::var("SCAN_MODELS_DIR") {
-        return PathBuf::from(explicit);
-    }
-    default_models_dir()
+    stripped.rsplit(['/', ':']).next().filter(|s| !s.is_empty())
 }
 
 /// True if the directory looks like a complete bundle litmus can load.
@@ -191,28 +175,27 @@ fn has_model_artifact(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn bundle_name_from_url_handles_common_shapes() {
+    fn bundle_name_handles_common_shapes() {
         assert_eq!(
-            bundle_name_from_url("https://github.com/atomdrift-project/azoth.git").as_deref(),
+            bundle_name("https://github.com/atomdrift-project/azoth.git"),
             Some("azoth")
         );
         assert_eq!(
-            bundle_name_from_url("https://github.com/atomdrift-project/azoth-pe.git/").as_deref(),
+            bundle_name("https://github.com/atomdrift-project/azoth-pe.git/"),
             Some("azoth-pe")
         );
         assert_eq!(
-            bundle_name_from_url("git@codeberg.org:atomdrift/azoth-elf.git").as_deref(),
+            bundle_name("git@codeberg.org:atomdrift/azoth-elf.git"),
             Some("azoth-elf")
         );
-        assert_eq!(
-            bundle_name_from_url("https://example.com/foo").as_deref(),
-            Some("foo")
-        );
+        assert_eq!(bundle_name("https://example.com/foo"), Some("foo"));
+        assert_eq!(bundle_name("https://example.com/foo.git#v3"), Some("foo"));
+        assert_eq!(bundle_name("https://example.com/"), Some("example.com"));
+        assert_eq!(bundle_name(""), None);
     }
 
     #[test]
@@ -271,46 +254,5 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
         assert!(!has_models(tmp.path()));
-    }
-
-    #[test]
-    fn models_repo_url_resolves_and_drops_fragment() {
-        // SAFETY: env-var manipulation in tests; this var is only read here.
-        unsafe {
-            let saved_repo = std::env::var("SCAN_MODELS_REPO").ok();
-
-            // A `#ref` fragment is stripped so the bundle name stays clean.
-            std::env::set_var("SCAN_MODELS_REPO", "https://example.com/foo.git#v3");
-            assert_eq!(models_repo_url(), "https://example.com/foo.git");
-
-            // A plain URL passes through unchanged.
-            std::env::set_var("SCAN_MODELS_REPO", "https://example.com/bar.git");
-            assert_eq!(models_repo_url(), "https://example.com/bar.git");
-
-            // Unset falls back to the built-in default.
-            std::env::remove_var("SCAN_MODELS_REPO");
-            assert_eq!(models_repo_url(), DEFAULT_MODELS_REPO_URL);
-
-            match saved_repo {
-                Some(v) => std::env::set_var("SCAN_MODELS_REPO", v),
-                None => std::env::remove_var("SCAN_MODELS_REPO"),
-            }
-        }
-    }
-
-    #[test]
-    fn env_var_overrides_default() {
-        // SAFETY: set_var is unsound under parallel test execution; SCAN_MODELS_DIR
-        // is only read here.
-        unsafe {
-            let original = std::env::var("SCAN_MODELS_DIR").ok();
-            std::env::set_var("SCAN_MODELS_DIR", "/tmp/test-models");
-            let result = current_models_dir();
-            assert_eq!(result, PathBuf::from("/tmp/test-models"));
-            match original {
-                Some(v) => std::env::set_var("SCAN_MODELS_DIR", v),
-                None => std::env::remove_var("SCAN_MODELS_DIR"),
-            }
-        }
     }
 }

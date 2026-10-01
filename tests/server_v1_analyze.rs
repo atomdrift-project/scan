@@ -10,36 +10,13 @@
 //! refuses bad requests by name, and that a refusal keeps a status a router can
 //! act on rather than being buried in a 200 body.
 
+mod common;
+
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
-use scan::server::{ServerConfig, build_app};
-use std::net::SocketAddr;
+use common::{app, loopback};
 use tower::ServiceExt;
-
-fn loopback<B>(mut req: Request<B>) -> Request<B> {
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-    req
-}
-
-async fn app() -> Result<Router> {
-    let config = ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        1024 * 1024,
-        0,
-        std::env::temp_dir(),
-        None,
-        4000,
-        vec![],
-        None,
-        2,
-        vec![],
-    )?;
-    build_app(&config).await
-}
 
 async fn post(uri: &str, body: &str) -> Result<(StatusCode, serde_json::Value)> {
     let app = app().await?;

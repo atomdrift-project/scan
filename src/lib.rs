@@ -1,60 +1,52 @@
-//! `litmus` classifies files as benign, suspicious, or hostile using
-//! `cleave` static analysis plus a gradient-boosted tree model (loaded as
-//! ONNX via `tract`).
+//! Atomdrift Scan classifies files as benign, suspicious, or hostile using
+//! `cleave` static analysis plus an ensemble of ONNX models (run via `tract`).
 //!
-//! The crate exposes a small public API centered around:
-//! - [`ScanConfig`] for validated scan settings
-//! - [`engine::run`] for recursive file and directory scans
-//! - [`ps::run`] for process scans
-//! - [`Classification`] and [`Thresholds`] for interpreting model output
+//! Library users want [`Analyzer`], or [`ScanConfig`] with [`engine::run`]:
+//! - [`Analyzer`] scans bytes or a file and returns a [`ScanResult`].
+//! - [`engine::run`] scans files and directories under a [`ScanConfig`].
+//! - [`Classification`] and [`Thresholds`] interpret the model's output.
+//!
+//! The other public modules exist for the `atomscan` binary and the
+//! integration tests, and change with them.
 //!
 //! # Example
 //! ```no_run
 //! use scan::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
 //!
-//! let config = ScanConfig::new(
-//!     "/path/to/models",
-//!     OutputFormat::Json,
-//!     Some(Thresholds::default()),
-//!     DisplayFilter::all(),
-//!     4_000,
-//!     false,
-//! )?;
+//! let config = ScanConfig::new("/path/to/models", OutputFormat::Json, Some(Thresholds::default()))?
+//!     .with_filter(DisplayFilter::all());
 //!
 //! let summary = scan::engine::run(std::path::Path::new("/tmp/sample.exe"), &config)?;
 //! println!("scanned {} file(s)", summary.total_files);
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-// `/_/stats` is one `serde_json::json!` literal, and the macro recurses once
-// per key; the default limit of 128 was crossed when two more keys landed
-// there (2026-09-05).
-#![recursion_limit = "512"]
-pub mod admission;
-pub mod allocator;
-pub mod analysis_cache;
-pub mod analyzer;
+pub(crate) mod admission;
+pub(crate) mod allocator;
+mod analysis;
+pub(crate) mod analysis_cache;
+pub(crate) mod analyzer;
 pub mod auto_update;
-pub mod bench_hopper;
 
 pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
 pub mod cache_cleanup;
+mod civil;
 pub mod cli;
-pub mod corpus_precheck;
-pub mod crash_dump;
-pub mod deptree;
+pub(crate) mod corpus_precheck;
+pub(crate) mod crash_dump;
+pub(crate) mod deptree;
 pub mod engine;
-pub mod explain;
+pub(crate) mod explain;
 pub mod features;
 pub mod fetch;
 pub mod heap_profile;
-pub mod hosts;
-pub mod inflight;
+pub(crate) mod hosts;
+pub(crate) mod inflight;
 pub mod interpret;
 mod interrupt;
-pub mod lookup;
+pub(crate) mod lookup;
 pub mod memory;
 pub mod model;
 pub mod model_update;
@@ -65,14 +57,14 @@ pub mod provenance;
 pub mod ps;
 pub mod runtime;
 pub mod server;
-pub mod suspend;
+pub(crate) mod suspend;
 pub mod sys;
-pub mod thread_dump;
-pub mod thread_priority;
+pub(crate) mod thread_dump;
+pub(crate) mod thread_priority;
 pub mod tools;
 pub mod traits_repo;
 pub mod update_check;
-pub mod update_manifest;
+pub(crate) mod update_manifest;
 pub mod upload;
 pub mod validate;
 pub mod worker;
@@ -141,6 +133,7 @@ pub(crate) fn system_load_avg() -> Option<f64> {
     ))]
     {
         let mut avg: [libc::c_double; 1] = [0.0];
+        // SAFETY: `avg` is a live buffer of exactly the one element requested.
         let ret = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
         if ret == 1 { Some(avg[0]) } else { None }
     }
@@ -219,7 +212,7 @@ pub fn refresh_rules_at_startup(force: bool, no_update: bool) {
         s.spawn(|| {
             let dir = models_repo::install_target();
             if let Err(e) = model_update::update(&dir, force, false) {
-                tracing::warn!(dir = %dir.display(), error = %e, "model update failed");
+                tracing::warn!(dir = %dir.display(), error = format!("{e:#}"), "model update failed");
             }
         });
         s.spawn(|| {

@@ -8,7 +8,7 @@
 //! between members, so the flag is only read as often as the shortest member
 //! takes; and the expensive work is not cleave's at all but the children it
 //! spawns. A stripped ELF's `rizin aaa` pass runs 10-30 s single-threaded (see
-//! `lower_pool_thread_priority` in main.rs) inside a blocking `Command::output`
+//! [`crate::thread_priority`]) inside a blocking `Command::output`
 //! that no flag reaches. Asking nicely has a tail measured in tens of seconds,
 //! which is the whole latency budget.
 //!
@@ -44,7 +44,7 @@ use std::process::{Child, Command};
 /// needed to control it — a server that exits must not leave a full-throttle
 /// worker behind on the box.
 #[derive(Debug)]
-pub struct Idle {
+pub(crate) struct Idle {
     child: Child,
     control: imp::Control,
 }
@@ -54,7 +54,7 @@ impl Idle {
     ///
     /// The containment is established *before* exec, so there is no window in
     /// which the child could fork a grandchild outside it.
-    pub fn spawn(mut cmd: Command) -> io::Result<Self> {
+    pub(crate) fn spawn(mut cmd: Command) -> io::Result<Self> {
         let control = imp::prepare(&mut cmd)?;
         match cmd.spawn() {
             Ok(child) => Ok(Self { child, control }),
@@ -67,24 +67,24 @@ impl Idle {
 
     /// Process id of the worker itself (not of its descendants).
     #[must_use]
-    pub fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
 
     /// Suspend the worker and every descendant. Returns once the kernel has
     /// accepted the request; no core is running its work after that.
-    pub fn freeze(&self) -> io::Result<()> {
+    pub(crate) fn freeze(&self) -> io::Result<()> {
         imp::freeze(&self.control, self.child.id())
     }
 
     /// Resume everything [`Idle::freeze`] suspended.
-    pub fn thaw(&self) -> io::Result<()> {
+    pub(crate) fn thaw(&self) -> io::Result<()> {
         imp::thaw(&self.control, self.child.id())
     }
 
     /// Kill the worker and every descendant. For a worker that has stopped
     /// making progress; the request path uses [`Idle::freeze`].
-    pub fn kill(&self) -> io::Result<()> {
+    pub(crate) fn kill(&self) -> io::Result<()> {
         imp::kill(&self.control, self.child.id())
     }
 
@@ -92,7 +92,7 @@ impl Idle {
     ///
     /// Also reaps it, so a worker that died on its own does not linger as a
     /// zombie until the server exits.
-    pub fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+    pub(crate) fn exited(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
 }
@@ -103,7 +103,7 @@ impl Drop for Idle {
         // waiting on one without killing it first would block forever. On
         // Linux `cgroup.kill` reaches a frozen cgroup; on FreeBSD SIGKILL is
         // delivered to a stopped process without needing SIGCONT first.
-        let _ = imp::kill(&self.control, self.child.id());
+        let _ = self.kill();
         let _ = self.child.wait();
         imp::release(&self.control);
     }
@@ -195,9 +195,16 @@ mod imp {
         // A frozen cgroup will not run the handlers, but SIGKILL does not need
         // it to: the kernel reaps a stopped process on SIGKILL.
         let procs = fs::read_to_string(control.dir.join("cgroup.procs"))?;
-        for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
-            // SAFETY: `kill(2)` on a pid read from this cgroup; no memory
-            // effects, and a failure means the process already exited.
+        // Only positive pids: `kill(0)` signals our own process group and
+        // `kill(-1)` every process we may signal, so a malformed line must
+        // never reach it as either.
+        for pid in procs
+            .lines()
+            .filter_map(|l| l.trim().parse::<libc::pid_t>().ok())
+            .filter(|&pid| pid > 0)
+        {
+            // SAFETY: `kill(2)` on a positive pid read from this cgroup; no
+            // memory effects, and a failure means the process already exited.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         Ok(())
@@ -278,7 +285,9 @@ mod imp {
     const REAPER_KILL_ALL: libc::c_uint = 0;
 
     /// `struct procctl_reaper_kill` from `<sys/procctl.h>`. Not in the `libc`
-    /// crate, so it is declared here; the layout is the kernel's ABI.
+    /// crate, so it is declared here; the layout is the kernel's ABI. The
+    /// kernel copies `sizeof` the whole struct in and out, padding included,
+    /// so leaving `rk_pad` off lets it write past the end of the value.
     #[repr(C)]
     struct ReaperKill {
         rk_sig: libc::c_int,
@@ -286,7 +295,10 @@ mod imp {
         rk_subtree: libc::pid_t,
         rk_killed: libc::c_uint,
         rk_fpid: libc::pid_t,
+        rk_pad: [libc::c_uint; 15],
     }
+
+    const _: () = assert!(std::mem::size_of::<ReaperKill>() == 80);
 
     /// Have the child become the reaper for its own descendants before exec.
     ///
@@ -367,6 +379,7 @@ mod imp {
             rk_subtree: 0,
             rk_killed: 0,
             rk_fpid: 0,
+            rk_pad: [0; 15],
         };
         // SAFETY: `procctl(2)` with a correctly-sized `procctl_reaper_kill` for
         // the PROC_REAP_KILL command, addressed to a pid this process spawned.
@@ -401,9 +414,10 @@ mod imp {
     #[derive(Debug)]
     pub(super) struct Control;
 
-    // The Result is the shape `Idle::spawn` needs from every platform; this one
-    // has nothing that can fail.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "every platform's `prepare` has this shape; this one cannot fail"
+    )]
     pub(super) fn prepare(cmd: &mut Command) -> io::Result<Control> {
         cmd.process_group(0);
         Ok(Control)
@@ -494,7 +508,6 @@ mod imp {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::Idle;
     use std::process::Command;

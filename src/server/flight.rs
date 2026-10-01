@@ -8,22 +8,23 @@
 //! slot of its own and push the server toward `429 At capacity` for work it is
 //! already doing.
 //!
-//! The first request for a key *leads*: it runs the analysis in a detached task
-//! and publishes the outcome. Later requests *follow* — they take no slot and
-//! wait for that same outcome. Because the analysis outlives any one request,
-//! the leader hanging up no longer abandons the followers. Cancellation is
-//! driven by the attachment count instead, so work stops only once nobody is
-//! left to receive it.
+//! The first request for a key *leads*: it runs the analysis in a server-owned
+//! task and publishes the outcome. Later requests *follow* — they take no slot
+//! and wait for that same outcome. Because the analysis outlives any one
+//! request, the leader hanging up no longer abandons the followers, and nobody
+//! hanging up cancels it: its verdict is filed either way (see
+//! [`Attachment`]'s `Drop`).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
-use axum::http::StatusCode;
 use tokio::sync::watch;
 
+use super::error::ApiError;
+use crate::analysis::RequestPhase;
 use crate::engine::ScanResult;
 
 /// What makes two requests the same piece of work.
@@ -136,32 +137,19 @@ pub(super) enum Outcome {
     /// than cloning it — the report can be hundreds of kilobytes.
     Report(Box<ScanResult>),
     /// Anything that ends in an error response. `anyhow::Error` is not `Clone`,
-    /// so a failure, a timeout, or a panic is rendered to its status and body
-    /// once by the leader and replayed to every follower.
-    Rendered {
-        /// Status the waiters should return.
-        status: StatusCode,
-        /// JSON body the waiters should return.
-        body: serde_json::Value,
-    },
+    /// so a failure, a timeout, or a panic is turned into its answer once by
+    /// the leader, and each waiter renders it in its own route's shape.
+    Failed(ApiError),
 }
 
 impl Outcome {
-    /// An error response that every waiter replays.
-    pub(super) fn rendered(status: StatusCode, message: impl Into<String>) -> Self {
-        Self::Rendered {
-            status,
-            body: serde_json::json!({ "error": message.into() }),
-        }
-    }
-
     /// The outcome published when a leader's task dies without producing one.
     /// Without it every follower would wait out its own client timeout.
     fn abandoned() -> Self {
-        Self::Rendered {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: serde_json::json!({ "error": "analysis did not complete" }),
-        }
+        Self::Failed(ApiError {
+            message: "analysis did not complete".into(),
+            ..ApiError::internal()
+        })
     }
 }
 
@@ -169,10 +157,15 @@ impl Outcome {
 #[derive(Debug)]
 pub(super) struct Flight {
     key: FlightKey,
-    /// Raised when the analysis outruns `--analysis-timeout`; cleave polls it
-    /// at its checkpoints and stops. Callers leaving does *not* raise it — see
-    /// [`Attachment::drop`] for why the work outlives them.
+    /// Raised when the analysis outruns `--analysis-timeout` or the server
+    /// shuts down; cleave polls it at its checkpoints and stops. Callers
+    /// leaving does *not* raise it — see [`Attachment`]'s `Drop` for why the
+    /// work outlives them.
     cancellation: Arc<AtomicBool>,
+    /// The run's phase tracker, once the leader has started it. A follower
+    /// streaming progress reads the phase here: it does not know the leader's
+    /// request, and the run's display name is not its key.
+    phase: OnceLock<RequestPhase>,
     /// When the analysis began, so `/status` can say how far along a run is
     /// and a caller can tell a long analysis from a stuck one.
     started_at: Instant,
@@ -186,9 +179,21 @@ impl Flight {
         Self {
             key,
             cancellation: Arc::new(AtomicBool::new(false)),
+            phase: OnceLock::new(),
             started_at: Instant::now(),
             outcome,
         }
+    }
+
+    /// Record the phase tracker of the run the leader started.
+    pub(super) fn set_phase(&self, phase: RequestPhase) {
+        // Only the leader sets it, once.
+        let _ = self.phase.set(phase);
+    }
+
+    /// The phase the analysis is in, once it has started.
+    pub(super) fn phase(&self) -> Option<String> {
+        self.phase.get().map(RequestPhase::get)
     }
 
     /// The key this analysis is shared under.
@@ -355,9 +360,8 @@ pub(super) struct Census {
     pub(super) attached: usize,
 }
 
-/// One request's claim on a flight. Dropping it detaches; when the last
-/// attachment goes, the analysis is cancelled, because nobody is left to
-/// receive it.
+/// One request's claim on a flight. Dropping it detaches; the analysis runs on
+/// regardless, so a caller who reconnects can rejoin it.
 #[derive(Debug)]
 pub(super) struct Attachment {
     flights: Arc<Flights>,
@@ -436,7 +440,6 @@ impl Drop for Publisher {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
@@ -445,16 +448,15 @@ mod tests {
         FlightKey::Sha("a".repeat(64))
     }
 
+    use axum::http::StatusCode;
+
     fn rendered(status: StatusCode) -> Outcome {
-        Outcome::Rendered {
-            status,
-            body: serde_json::json!({ "error": "x" }),
-        }
+        Outcome::Failed(ApiError::new(status, "test", "x"))
     }
 
     fn status_of(outcome: &Outcome) -> Option<StatusCode> {
         match outcome {
-            Outcome::Rendered { status, .. } => Some(*status),
+            Outcome::Failed(e) => Some(e.status),
             Outcome::Report(_) => None,
         }
     }
@@ -676,6 +678,24 @@ mod tests {
 
         let outcome = follower.flight().wait().await;
         assert_eq!(status_of(&outcome), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    /// A follower streaming progress reads the leader's phase through the
+    /// flight. It used to search `/_/requests` for an entry named like the
+    /// flight's subject — but an upload's entry is named by its filename and
+    /// its subject is the digest, so every streamed upload reported a null
+    /// phase.
+    #[test]
+    fn a_follower_reads_the_phase_of_the_run_it_rides() {
+        let flights = Arc::new(Flights::default());
+        let leader = flights.join(key());
+        let follower = flights.join(key());
+        assert_eq!(follower.flight().phase(), None, "nothing has started");
+
+        let phase = RequestPhase::with_label("req#7 upload.zip");
+        leader.flight().set_phase(phase.clone());
+        phase.set("cleave:analyze");
+        assert_eq!(follower.flight().phase().as_deref(), Some("cleave:analyze"));
     }
 
     #[tokio::test]

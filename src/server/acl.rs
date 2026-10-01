@@ -18,6 +18,10 @@
 //! `/analyze-path` stays on that list, but the real protection is an empty
 //! `--allowed-dirs`, which makes it reject every request.
 //!
+//! The admin routes ([`ADMIN_ROUTES`]) change what the server runs. With a
+//! token configured they need it like every other route; without one they are
+//! loopback-only, so `--allow-cidr` grants analysis and never administration.
+//!
 //! Requests clearing both gates carry a [`Trusted`] marker, which handlers use
 //! to decide whether a response may include privileged diagnostic detail.
 //!
@@ -272,6 +276,11 @@ pub(super) struct Trusted;
 /// it loopback-only.
 const LOOPBACK_ONLY_ROUTES: &[&str] = &["/analyze-path"];
 
+/// Routes that reload or update the models and rules the server runs. The
+/// bearer token is their credential; on a server without one, only loopback
+/// may call them.
+const ADMIN_ROUTES: &[&str] = &["/_/reload", "/_/update"];
+
 /// The one route reachable without a bearer token, so that load balancers,
 /// tunnel health checks, and monitoring can probe liveness without holding a
 /// credential. A valid token still upgrades the response to the full
@@ -317,7 +326,8 @@ pub(super) async fn acl(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let loopback_only = LOOPBACK_ONLY_ROUTES.contains(&path);
+    let loopback_only = LOOPBACK_ONLY_ROUTES.contains(&path)
+        || (ADMIN_ROUTES.contains(&path) && state.config.auth_digest.is_none());
     let auth_exempt = path == HEALTH_ROUTE;
 
     let peer = req
@@ -341,13 +351,13 @@ pub(super) async fn acl(
                 Auth::LoopbackOnly,
             );
         }
-        if !state.allow_cidrs.iter().any(|c| c.contains(ip)) {
+        if !state.config.allow_cidrs.iter().any(|c| c.contains(ip)) {
             return forbidden("peer address not in any allow-cidr", Auth::PeerDenied);
         }
     }
 
     // Gate 2: bearer token. Loopback is not exempt — see the module docs.
-    let auth = match state.auth_digest {
+    let auth = match state.config.auth_digest {
         None => Auth::Open,
         Some(digest) => match bearer_credential(req.headers()) {
             Presented::Bearer(credential) if digest.matches(credential) => Auth::Token,
@@ -375,7 +385,6 @@ pub(super) async fn acl(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // tests intentionally unwrap parse results to assert success
 mod tests {
     use super::*;
 

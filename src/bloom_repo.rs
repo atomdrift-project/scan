@@ -6,10 +6,9 @@
 //! routes.
 //!
 //! Filters live as `<kind>-<tier>.adbl` files, with a `bloom.toml` manifest, in
-//! a directory resolved as:
-//! 1. `SCAN_BLOOM_DIR`, if set;
-//! 2. a `bloom/` directory in the working tree (dev convenience);
-//! 3. `<data_dir>/atomdrift/scan/bloom` (what the updater fills).
+//! `SCAN_BLOOM_DIR` if set, else `<data_dir>/atomdrift/scan/bloom` (what the
+//! updater fills). Never the working directory: a `bloom/` there could bless
+//! the very files being scanned.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,12 +36,12 @@ pub fn purl_key(purl: &str) -> Option<String> {
     fletch::purl::identity(purl)
 }
 
-/// Process-wide handle to the loaded bundle, published by the scan config so
-/// decoupled subsystems (the dependency-fetch reporter) can consult the same
-/// verdicts without threading config through. Set once per run.
+/// Process-wide handle to the loaded bundle, published once at startup by the
+/// binary so decoupled subsystems (the dependency-fetch age gate and reporter,
+/// the server's lookup routes) consult the same verdicts.
 static GLOBAL: OnceLock<Arc<Lookup>> = OnceLock::new();
 
-/// Publish the loaded bundle process-wide (from [`crate::engine::ScanConfig::with_bloom`]).
+/// Publish the loaded bundle process-wide. The first call wins.
 pub fn set_global(lookup: Arc<Lookup>) {
     let _ = GLOBAL.set(lookup);
 }
@@ -89,13 +88,24 @@ impl Lookup {
     /// is about to be analyzed that need not have been.
     #[must_use]
     pub fn load() -> Self {
-        Self::load_from(&bloom_dir())
+        Self::load_from(&install_dir())
     }
 
     /// Open a bundle from a specific directory.
     #[must_use]
     pub fn load_from(dir: &Path) -> Self {
-        match burton::Lookup::open(dir, KEY_SCHEME) {
+        use burton::OpenError::{Manifest, Missing};
+        use std::io::ErrorKind::NotFound;
+        let mut opened = burton::Lookup::open(dir, KEY_SCHEME);
+        // A file that isn't there may be an update between its swap's two
+        // renames: let it finish and look again rather than run without filters.
+        if let Err(Manifest(_, e) | Missing(_, e)) = &opened
+            && e.kind() == NotFound
+            && crate::model_update::settle(dir)
+        {
+            opened = burton::Lookup::open(dir, KEY_SCHEME);
+        }
+        match opened {
             Ok(inner) => {
                 tracing::debug!(
                     dir = %dir.display(),
@@ -104,7 +114,7 @@ impl Lookup {
                 );
                 Self::wrap(inner)
             }
-            Err(burton::OpenError::Manifest(_, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Manifest(_, e)) if e.kind() == NotFound => {
                 tracing::debug!(dir = %dir.display(), "no bloom bundle installed");
                 Self::default()
             }
@@ -275,24 +285,11 @@ pub fn counts() -> BloomCounts {
 /// bundle is installed. Used by `scan version`.
 #[must_use]
 pub fn installed_manifest() -> Option<burton::Manifest> {
-    burton::build::read_manifest(&bloom_dir())
+    burton::build::read_manifest(&install_dir())
 }
 
-/// Resolve the directory the loader reads filters from (see module docs).
-fn bloom_dir() -> PathBuf {
-    if let Ok(explicit) = std::env::var("SCAN_BLOOM_DIR") {
-        return PathBuf::from(explicit);
-    }
-    let local = PathBuf::from("bloom");
-    if local.is_dir() {
-        return local;
-    }
-    default_install_dir()
-}
-
-/// The directory the updater installs into: `SCAN_BLOOM_DIR` if set, else the
-/// canonical data path. `bloom_dir` resolves to the same place, its `bloom/`
-/// dev fallback aside, so installed filters are found.
+/// Where filters are read from: `SCAN_BLOOM_DIR` if set (which the updater
+/// then leaves alone), else the canonical data path the updater fills.
 #[must_use]
 pub fn install_dir() -> PathBuf {
     std::env::var("SCAN_BLOOM_DIR").map_or_else(|_| default_install_dir(), PathBuf::from)
@@ -307,7 +304,6 @@ fn default_install_dir() -> PathBuf {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use burton::{KeySets, Record, Tier};

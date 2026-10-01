@@ -12,12 +12,8 @@ fn model_dir() -> Result<std::path::PathBuf> {
 }
 
 #[test]
+#[ignore = "needs SCAN_MODELS_DIR pointing at a model bundle"]
 fn spec_version_matches_expected() -> Result<()> {
-    if std::env::var_os("SCAN_MODELS_DIR").is_none() {
-        eprintln!("skipping: SCAN_MODELS_DIR is not set");
-        return Ok(());
-    }
-
     let dir = model_dir()?;
     let root_spec = dir.join("feature_spec.json");
     let ensemble_spec = dir.join("general").join("feature_spec.json");

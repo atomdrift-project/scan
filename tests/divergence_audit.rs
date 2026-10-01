@@ -1,5 +1,5 @@
 //! Diagnostic — count parity divergences per feature family, per route.
-//! Doesn't fail; prints a table. Run with `--nocapture`.
+//! Doesn't gate on them; prints a table. Run with `--ignored --nocapture`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -65,11 +65,11 @@ fn family_of(name: &str) -> &'static str {
 }
 
 #[test]
+#[ignore = "diagnostic: needs SCAN_MODELS_DIR with per-route fixtures; run with --nocapture"]
 fn audit_per_route_divergences() {
-    let Some(dir) = std::env::var_os("SCAN_MODELS_DIR").map(std::path::PathBuf::from) else {
-        eprintln!("set SCAN_MODELS_DIR to a model bundle to run this audit");
-        return;
-    };
+    let dir = std::env::var_os("SCAN_MODELS_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("set SCAN_MODELS_DIR to a model bundle to run this audit");
     let mut found = 0usize;
     for parent in ["filetypes", "filegroups"] {
         let parent_dir = dir.join(parent);
