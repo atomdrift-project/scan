@@ -87,12 +87,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     // Owned rather than borrowed: `registry_locator` may alias `locator`
     // itself (when `derived_purl` is `None`), and `locator` moves into
     // `fetch_one` below before this is used again in the fetch-failure arm.
-    // `run`/`run_pkg`/`run_url` never build a `Path` locator; folded into this
-    // arm only because `RefLocator` is matched exhaustively.
-    let fallback_locator = match registry_locator {
-        RefLocator::Purl(p) | RefLocator::Path(p) => p.clone(),
-        RefLocator::Url(u) => u.clone(),
-    };
+    let fallback_locator = crate::fetch::locator_str(registry_locator).to_owned();
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
         // The registry lookup we just did (the packument we need for the record

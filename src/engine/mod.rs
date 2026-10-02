@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -135,6 +135,21 @@ pub struct ScanConfig {
     zip_passwords: crate::ArchivePasswords,
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
+}
+
+static RIZIN_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+/// Fix the wall-clock limit (`--rizin-timeout-secs`) on each Rizin run of every
+/// analysis this process starts. Call once at startup, before any analysis; a
+/// later call is ignored.
+pub fn set_rizin_timeout(timeout: Duration) {
+    let _ = RIZIN_TIMEOUT.set(timeout);
+}
+
+/// The Rizin limit for an [`cleave::AnalysisOptions`]: the configured one, or
+/// `None` (cleave's default) when the process never set it.
+pub(crate) fn rizin_timeout() -> Option<Duration> {
+    RIZIN_TIMEOUT.get().copied()
 }
 
 pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords: &[String]) {

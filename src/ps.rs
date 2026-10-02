@@ -30,43 +30,14 @@ struct ProcessGroup {
 }
 
 /// Rizin's size gate for a live-process scan.
-const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
-
-/// Rizin tuning for live-process scanning, put back when dropped.
 ///
 /// Unlike a filesystem scan (where we want every architecture and tolerate
 /// minutes of deep analysis), `ps` is interactive and dominated by a few giant
-/// signed apps (Electron/Bun binaries can be 100–215 MB). Two shape/size caps
-/// keep it responsive without changing verdicts materially:
-///   - native-arch-only: a universal binary's non-host slice never runs here,
-///     so don't pay full `aaa` on it (roughly halves fat-binary cost).
-///   - 100 MB size gate: skip rizin on the giants entirely — disassembling a
-///     signed 200 MB app is never worth blocking the scan on.
-///
-/// Both are process-global, and `scan sys` runs a file scan right after this
-/// one, which must not inherit them. The process timeout is configured once by
-/// the CLI (`--rizin-timeout-secs`) and is not touched here.
-struct PsRizinLimits {
-    native_arch_only: bool,
-}
-
-impl PsRizinLimits {
-    fn apply() -> Self {
-        let native_arch_only = filefacts::rizin::native_arch_only();
-        filefacts::rizin::set_native_arch_only(true);
-        filefacts::rizin::set_max_bytes(PS_RIZIN_MAX_BYTES);
-        Self { native_arch_only }
-    }
-}
-
-impl Drop for PsRizinLimits {
-    fn drop(&mut self) {
-        filefacts::rizin::set_native_arch_only(self.native_arch_only);
-        // filefacts has no getter for the size gate. Nothing else in this
-        // process sets it, so its default — 0, no gate — is what was there.
-        filefacts::rizin::set_max_bytes(0);
-    }
-}
+/// signed apps (Electron/Bun binaries can be 100–215 MB). Two caps keep it
+/// responsive without changing verdicts materially: this gate skips Rizin on
+/// the giants entirely, and native-arch-only analysis never pays full `aaa` on
+/// a universal binary's non-host slice, which never runs here.
+const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Compute SHA256 of a file, reading from the given path.
 fn sha256_file(path: &std::path::Path) -> Result<String> {
@@ -82,8 +53,6 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Warm cleave's YARA engine + capability mapper off the rayon pool before
     // any scan fires rayon work. See `run_scan_paths` for why this matters.
     crate::engine::prefetch_cleave_resources();
-
-    let _rizin_limits = PsRizinLimits::apply();
 
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -213,6 +182,11 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let mut cleave_opts = cleave::AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
+        // The ps-only caps (see `PS_RIZIN_MAX_BYTES`) are per analysis, so the
+        // file scan `scan sys` runs next keeps the defaults.
+        rizin_timeout: crate::engine::rizin_timeout(),
+        rizin_max_bytes: Some(PS_RIZIN_MAX_BYTES),
+        rizin_native_arch_only: true,
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());
@@ -493,22 +467,5 @@ fn is_root() -> bool {
     #[cfg(not(unix))]
     {
         false // Conservative: always show the warning on non-unix
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PsRizinLimits;
-
-    /// `scan sys` runs a file scan after the process scan; the caps the process
-    /// scan sets must not leak into it.
-    #[test]
-    fn rizin_limits_are_restored_after_the_process_scan() {
-        let before = filefacts::rizin::native_arch_only();
-        {
-            let _limits = PsRizinLimits::apply();
-            assert!(filefacts::rizin::native_arch_only());
-        }
-        assert_eq!(filefacts::rizin::native_arch_only(), before);
     }
 }
