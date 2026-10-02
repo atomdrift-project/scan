@@ -474,7 +474,7 @@ fn reference_lengths(edges: &[FetchRecord], report: &AnalysisReport) -> Vec<u64>
                     .as_deref()
                     .and_then(|sha| by_sha.get(sha))
                     .and_then(|file| file.filefacts.as_ref())
-                    .and_then(|facts| facts.references.iter().find(|r| r.offset == offset))
+                    .and_then(|facts| facts.references.iter().find(|r| r.offset == Some(offset)))
                     .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX))
             })
         })

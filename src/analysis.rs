@@ -68,6 +68,7 @@ impl<'a> Analysis<'a> {
         cleave::set_compact_member_retention(true);
         let mut opts = cleave::AnalysisOptions {
             slow_rule_ms: self.slow_rule_ms,
+            rizin_timeout: crate::engine::rizin_timeout(),
             cancellation: self.cancellation.cloned(),
             phase: self.phase.map(RequestPhase::tracker).cloned(),
             ..Default::default()

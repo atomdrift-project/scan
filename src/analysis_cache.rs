@@ -90,13 +90,17 @@ impl AnalysisCache {
 
     /// Store an analysis under its content sha. Best-effort: any failure
     /// (serialize, compress, write) leaves the cache untouched and is silent —
-    /// the result is already in hand, the cache is only an optimization.
+    /// the result is already in hand, the cache is only an optimization. An
+    /// [`incomplete`] analysis is not stored.
     pub(crate) fn put(
         &self,
         content_sha: &str,
         sub: &Option<AnalysisReport>,
         next: &[(String, Vec<Reference>)],
     ) {
+        if sub.as_ref().is_some_and(incomplete) {
+            return;
+        }
         let Ok(json) = serde_json::to_vec(&StoreRef { sub, next }) else {
             return;
         };
@@ -121,6 +125,19 @@ impl AnalysisCache {
     fn path(&self, content_sha: &str) -> PathBuf {
         self.dir.join(format!("{content_sha}.zst"))
     }
+}
+
+/// Whether `report` or any file in it is missing results a later run may
+/// produce: rule evaluation ran out of time (findings depend on how loaded the
+/// machine was) or Rizin did not finish. Caching it would serve the shortfall to
+/// every later scan of the same bytes. cleave's own cache makes the same call.
+fn incomplete(report: &AnalysisReport) -> bool {
+    use cleave::types::{AnalysisGap, AnalysisGaps};
+    let incomplete = |gaps: &AnalysisGaps| {
+        gaps.contains(AnalysisGap::EvaluationDeadline)
+            || gaps.contains(AnalysisGap::DisassemblyIncomplete)
+    };
+    incomplete(&report.analysis_gaps) || report.files.iter().any(|f| incomplete(&f.analysis_gaps))
 }
 
 /// A token identifying the analysis-producing detector, so a rules, model, or
@@ -287,6 +304,35 @@ mod tests {
         assert!(hit.sub.is_none());
         assert_eq!(hit.next.len(), 1);
         assert!(cache.get("missing").is_none());
+    }
+
+    /// A report cut short by the rule deadline or an unfinished Rizin run lacks
+    /// results a later scan would have, so it must not be served to one.
+    #[test]
+    fn incomplete_analyses_are_not_stored() {
+        use cleave::types::AnalysisGap::{DisassemblyIncomplete, EvaluationDeadline};
+        let base = tempfile::tempdir().unwrap();
+        let cache = AnalysisCache {
+            dir: base.path().to_path_buf(),
+        };
+        let report = || {
+            AnalysisReport::new(cleave::TargetInfo {
+                path: "x.so".into(),
+                file_type: "elf".into(),
+                size_bytes: 1,
+                sha256: "abc".into(),
+                architectures: None,
+            })
+        };
+
+        cache.put("complete", &Some(report()), &[]);
+        assert!(cache.get("complete").is_some());
+        for gap in [EvaluationDeadline, DisassemblyIncomplete] {
+            let cut_short = report();
+            cut_short.analysis_gaps.record(gap);
+            cache.put(gap.label(), &Some(cut_short), &[]);
+            assert!(cache.get(gap.label()).is_none(), "{gap:?}");
+        }
     }
 
     /// The cache key holds verdicts, and verdicts are the model's output — a

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::engine::{self, ClassifiedReport, ScanConfig};
@@ -98,7 +98,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     }
 
     // Keep model fixture validation cheap and deterministic: no YARA/radare2/UPX,
-    // one mapper shared by all target analyses, and analysis caching enabled.
+    // one engine shared by all target analyses, and analysis caching enabled.
     // The cache key includes the traits revision, so current trait edits still
     // invalidate stale reports without forcing every pre-commit run to rescan
     // the whole cleave fixture tree. The cache override is put back when this
@@ -114,12 +114,12 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut options, config.zip_passwords());
-    let mapper = Arc::new(cleave::CapabilityMapper::try_new_with_load_options(
-        cleave::CapabilityMapper::DEFAULT_MIN_HOSTILE_PRECISION,
-        cleave::CapabilityMapper::DEFAULT_MIN_SUSPICIOUS_PRECISION,
-        false,
-        false,
-    )?);
+    // The engine carries the rules and the compact member folding production
+    // scans use, so each fixture's members are folded under the rules it is
+    // evaluated with. Folding used to consult a process-global mapper that
+    // validation never loads, and member features production keeps went
+    // missing here.
+    let engine = cleave::Engine::for_options(&options)?.with_compact_members(true);
 
     let total_targets = targets.len();
     eprintln!("validate fixtures: scanning {total_targets} benign targets...");
@@ -131,7 +131,8 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         .map(|path| {
             let started = Instant::now();
             let analysis_started = Instant::now();
-            let result = cleave::analyze_file_with_mapper(&path, &options, &mapper)
+            let result = engine
+                .analyze_file(&path, &options)
                 .with_context(|| format!("cleave analysis of {}", path.display()))
                 .and_then(|report| {
                     let analysis_elapsed = analysis_started.elapsed();

@@ -902,9 +902,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
 /// The process-global settings every command shares: the Rizin deadline, the
 /// fetch ceilings, and the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) {
-    // Before any analysis or Rayon worker can start. Filefacts owns the
-    // subprocess lifecycle; this only selects the deadline.
-    filefacts::rizin::set_timeout_secs(global.rizin_timeout_secs);
+    // Before any analysis can start: every analysis's options read it.
+    scan::engine::set_rizin_timeout(std::time::Duration::from_secs(global.rizin_timeout_secs));
     // The fetch client and blob cache are built once per process, on first use,
     // so their settings are fixed here: every mode (interactive scan and worker
     // alike) honors `--fetch-max-size` and `--registry-ttl`.

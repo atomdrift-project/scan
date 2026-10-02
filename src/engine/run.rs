@@ -287,6 +287,7 @@ fn analysis_options(config: &ScanConfig) -> AnalysisOptions {
     cleave::set_compact_member_retention(true);
     let mut opts = AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
+        rizin_timeout: super::rizin_timeout(),
         ..Default::default()
     };
     add_zip_passwords(&mut opts, config.zip_passwords());

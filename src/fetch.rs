@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
     BlobCache, Fetch, FetchBudget, FetchError, FetchRecord, Fetched, HttpFetch, Method, Outcome,
-    RecordedSource, Request, Served, fetch_ref, fetch_references_with,
+    RecordedSource, Request, Served, UrlFetches, fetch_ref, fetch_references_with,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
 use reqwest::Url;
@@ -353,7 +353,7 @@ fn fetch_count_budget_notice(
 fn live_fetch_usage(records: &[FetchRecord]) -> Allowance {
     records
         .iter()
-        .filter(|record| fletch::fetch::counts_against_budget(record))
+        .filter(|record| record.counts_against_budget())
         .fold(
             Allowance {
                 fetches: 0,
@@ -1316,10 +1316,12 @@ impl Fetch for AsClient<'_> {
         let plain =
             request.method == Method::Get && request.headers.is_empty() && !request.any_status;
         match self.agents.get(request.url) {
-            Some(&agent) if plain => self.net.send(&Request {
-                headers: &[("User-Agent", agent)],
-                ..*request
-            }),
+            Some(&agent) if plain => {
+                let headers = [("User-Agent", agent)];
+                let mut request = *request;
+                request.headers = &headers;
+                self.net.send(&request)
+            }
             _ => self.net.send(request),
         }
     }
@@ -1486,15 +1488,12 @@ fn mark_redirect_destinations(bytes: &[u8], refs: &mut Vec<Reference>) {
                 reference.kind = RefKind::UrlFetch;
                 REDIRECT_DESTINATION_SOURCE.clone_into(&mut reference.source);
             }
-            None => refs.push(Reference {
-                locator: RefLocator::Url(url.clone()),
-                kind: RefKind::UrlFetch,
-                source: REDIRECT_DESTINATION_SOURCE.to_string(),
-                evidence: url,
-                offset: 0,
-                pinned_hash: None,
-                content_sha256: None,
-            }),
+            None => refs.push(Reference::new(
+                RefLocator::Url(url.clone()),
+                RefKind::UrlFetch,
+                REDIRECT_DESTINATION_SOURCE,
+                url,
+            )),
         }
     }
 }
@@ -1831,6 +1830,7 @@ impl FetchSession {
         cleave::set_compact_member_retention(true); // compact projection only
         let mut opts = AnalysisOptions {
             skip_predicate: dep_skip_predicate(),
+            rizin_timeout: crate::engine::rizin_timeout(),
             ..AnalysisOptions::default()
         };
         crate::engine::add_zip_passwords(&mut opts, zip_passwords);
@@ -2057,6 +2057,8 @@ impl FetchSession {
                 return false;
             }
             RefLocator::Url(raw) => raw,
+            // A locator kind this scan predates names nothing it can fetch.
+            _ => return false,
         };
         let skip = |why: &str| {
             tracing::debug!(url = %raw, source = %r.source, "{why}; fetch skipped");
@@ -2314,7 +2316,7 @@ impl FetchSession {
             FetchClass::Deps => fetch_references_with(
                 refs,
                 source_sha,
-                false,
+                UrlFetches::Skip,
                 &self.res.net,
                 &self.res.cache,
                 budget,
@@ -2331,7 +2333,7 @@ impl FetchSession {
                 fetch_references_with(
                     refs,
                     source_sha,
-                    true,
+                    UrlFetches::Include,
                     &net,
                     &self.res.cache,
                     budget,
@@ -2640,10 +2642,9 @@ impl FetchSession {
 /// to its reference; the offset fletch stamps on every record from its
 /// reference does. See [`pair_records`].
 fn keyed(r: &Reference, index: usize) -> Reference {
-    Reference {
-        offset: index as u64,
-        ..r.clone()
-    }
+    let mut keyed = r.clone();
+    keyed.offset = Some(index as u64);
+    keyed
 }
 
 /// Put each record fletch returned in the slot of the reference it was fetched
@@ -2663,7 +2664,7 @@ fn pair_records(
             tracing::error!(locator = %record.locator, "fetch record names no selected reference; dropped");
             continue;
         };
-        record.source_offset = Some(selected[i].offset);
+        record.source_offset = selected[i].offset;
         slots[i] = Some((record, Standing::Analyze));
     }
 }
@@ -3071,6 +3072,7 @@ fn dep_display_name(r: &Reference) -> String {
             .or_else(|| u.strip_prefix("http://"))
             .unwrap_or(u)
             .to_string(),
+        _ => String::new(),
     }
 }
 
@@ -3202,16 +3204,9 @@ pub fn fetch_one(
         RefLocator::Purl(_) => RefKind::Dependency,
         RefLocator::Url(_) => RefKind::UrlFetch,
         RefLocator::Path(_) => RefKind::Local,
+        _ => RefKind::Undefined,
     };
-    let reference = Reference {
-        locator,
-        kind,
-        source: "cli".to_string(),
-        evidence: String::new(),
-        offset: 0,
-        pinned_hash: None,
-        content_sha256: None,
-    };
+    let reference = Reference::new(locator, kind, "cli", "");
     let rec = fetch_ref(&reference, &res.net, &res.cache);
     if progress {
         eprintln!("\n  {}  {}", fg(LIVE, "\u{2b07}"), fg(LABEL, "fetching"));
@@ -3452,7 +3447,7 @@ fn fetch_row(rec: &FetchRecord) -> FetchRow {
             FetchRow::new('\u{25cf}', "stale", CAUTION)
         }
         Outcome::Ok => bloom_fetch_verdict(rec).unwrap_or_else(|| {
-            if rec.cached() {
+            if rec.is_cached() {
                 FetchRow::new('\u{25cf}', "cache", CACHED)
             } else {
                 FetchRow::new('\u{2b07}', "live", LIVE)
@@ -3522,7 +3517,9 @@ fn failure_detail(why: &FetchError) -> String {
         FetchError::Refused(_) => "refused".to_string(),
         FetchError::Transport(_) => "transport".to_string(),
         FetchError::Internal(_) => "internal error".to_string(),
-        FetchError::TooLarge | FetchError::Timeout => why.to_string(),
+        // Too large, timed out, or a failure this scan predates: its own
+        // message is short.
+        _ => why.to_string(),
     }
 }
 
@@ -4193,7 +4190,7 @@ fn summary_line(records: &[FetchRecord]) -> String {
     for rec in records {
         bytes += rec.size.unwrap_or(0);
         match &rec.outcome {
-            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.cached() => {
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.is_cached() => {
                 cached += 1;
             }
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin => live += 1,
@@ -4679,15 +4676,15 @@ fn provenance_subject(bytes: &[u8]) -> Option<Reference> {
             value: d.to_ascii_lowercase(),
         });
     let content_sha256 = pinned_hash.as_ref().map(|p| p.value.clone());
-    Some(Reference {
-        locator: RefLocator::Url(url.to_string()),
-        kind: RefKind::UrlFetch,
-        source: "forage.fetch.url".to_string(),
-        evidence: url.to_string(),
-        offset: 0,
-        pinned_hash,
-        content_sha256,
-    })
+    let mut reference = Reference::new(
+        RefLocator::Url(url.to_string()),
+        RefKind::UrlFetch,
+        "forage.fetch.url",
+        url,
+    );
+    reference.pinned_hash = pinned_hash;
+    reference.content_sha256 = content_sha256;
+    Some(reference)
 }
 
 fn is_vendored_node_module(path: &str) -> bool {
@@ -4799,8 +4796,15 @@ fn merge_into_root(
 /// A reference's locator as written — the key dedup, rows, memos, and
 /// registry findings pair on.
 fn locator(r: &Reference) -> &str {
-    match &r.locator {
+    locator_str(&r.locator)
+}
+
+/// A locator's text: the PURL, URL or path as written. Empty for a locator
+/// kind this scan predates, which names nothing it can look up.
+pub(crate) fn locator_str(locator: &RefLocator) -> &str {
+    match locator {
         RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
+        _ => "",
     }
 }
 
@@ -5011,7 +5015,7 @@ impl Payloads<'_> {
 fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord {
     FetchRecord {
         source_sha256: (!source_sha.is_empty()).then(|| source_sha.to_owned()),
-        source_offset: Some(r.offset),
+        source_offset: r.offset,
         kind: r.kind,
         locator: locator(r).to_owned(),
         resolved_url: None,
@@ -5554,15 +5558,13 @@ mod tests {
     /// the former or a security-holder transition disappears.
     #[test]
     fn registry_join_survives_versionless_purl_resolution() {
-        let declared = Reference {
-            locator: RefLocator::Purl("pkg:npm/held".to_string()),
-            kind: RefKind::Dependency,
-            source: "package.json".to_string(),
-            evidence: "held".to_string(),
-            offset: 17,
-            pinned_hash: None,
-            content_sha256: None,
-        };
+        let mut declared = Reference::new(
+            RefLocator::Purl("pkg:npm/held".to_string()),
+            RefKind::Dependency,
+            "package.json",
+            "held",
+        );
+        declared.offset = Some(17);
         let fetched = fetched_record();
         assert_eq!(fetched.locator, "pkg:npm/held@0.0.1-security");
         assert_ne!(locator(&declared), fetched.locator);
@@ -5909,14 +5911,13 @@ mod tests {
 
     #[test]
     fn resolved_purl_pairs_registry_version_onto_range_declarations() {
-        let dep = |locator: &str| Reference {
-            locator: RefLocator::Purl(locator.to_string()),
-            kind: RefKind::Dependency,
-            source: String::new(),
-            evidence: String::new(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
+        let dep = |locator: &str| {
+            Reference::new(
+                RefLocator::Purl(locator.to_string()),
+                RefKind::Dependency,
+                "",
+                "",
+            )
         };
         let at = |v: &str| Registry {
             version: v.to_string(),
@@ -5953,15 +5954,12 @@ mod tests {
         assert_eq!(resolved_purl(&dep("pkg:npm/axios"), &at("")), None);
         assert_eq!(
             resolved_purl(
-                &Reference {
-                    locator: RefLocator::Url("https://example.test/x.tgz".into()),
-                    kind: RefKind::UrlFetch,
-                    source: String::new(),
-                    evidence: String::new(),
-                    offset: 0,
-                    pinned_hash: None,
-                    content_sha256: None,
-                },
+                &Reference::new(
+                    RefLocator::Url("https://example.test/x.tgz".into()),
+                    RefKind::UrlFetch,
+                    "",
+                    "",
+                ),
                 &at("1.0.0")
             ),
             None
@@ -6022,27 +6020,21 @@ mod tests {
     }
 
     fn url_ref(url: &str) -> Reference {
-        Reference {
-            locator: RefLocator::Url(url.to_string()),
-            kind: RefKind::UrlFetch,
-            source: "test".to_string(),
-            evidence: url.to_string(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        }
+        Reference::new(
+            RefLocator::Url(url.to_string()),
+            RefKind::UrlFetch,
+            "test",
+            url,
+        )
     }
 
     fn purl_ref(purl: &str) -> Reference {
-        Reference {
-            locator: RefLocator::Purl(purl.to_string()),
-            kind: RefKind::Dependency,
-            source: "test".to_string(),
-            evidence: purl.to_string(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        }
+        Reference::new(
+            RefLocator::Purl(purl.to_string()),
+            RefKind::Dependency,
+            "test",
+            purl,
+        )
     }
 
     #[test]
@@ -6823,7 +6815,7 @@ mod tests {
             ),
         ];
         let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
-            let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
+            let parsed = filefacts::OpenOptions::new().path(Path::new(path.rsplit("!!").next().unwrap())).open(text.as_bytes());
             serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{i:064x}"),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
         }).collect();
         let report: AnalysisReport =
@@ -6863,7 +6855,7 @@ mod tests {
             ),
         ];
         let files: Vec<_> = input.iter().enumerate().map(|(i, (path, text))| {
-            let parsed = filefacts::open_with_path(Path::new(path.rsplit("!!").next().unwrap()), text.as_bytes()).unwrap();
+            let parsed = filefacts::OpenOptions::new().path(Path::new(path.rsplit("!!").next().unwrap())).open(text.as_bytes());
             serde_json::json!({"id":i,"path":path,"depth":1,"file_type":"go_mod","sha256":format!("{:064x}",i.min(2)),"size":text.len(),"filefacts":{"references":parsed.references(),"values":parsed.values()}})
         }).collect();
         let report: AnalysisReport =
@@ -6998,15 +6990,8 @@ mod tests {
 
     #[test]
     fn image_url_is_a_carrier_only_beside_stego_evidence() {
-        let url = |u: &str| Reference {
-            locator: RefLocator::Url(u.into()),
-            kind: RefKind::UrlFetch,
-            source: "rust".into(),
-            evidence: String::new(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        };
+        let url =
+            |u: &str| Reference::new(RefLocator::Url(u.into()), RefKind::UrlFetch, "rust", "");
         let report: AnalysisReport = serde_json::from_value(serde_json::json!({
             "version": "3",
             "files": [
@@ -7455,11 +7440,11 @@ mod tests {
         let mut path = purl_ref("unused");
         path.locator = RefLocator::Path("./lib/index.js".to_string());
         let mut b = purl_ref("pkg:npm/b");
-        b.offset = 99;
+        b.offset = Some(99);
         let selected = vec![purl_ref("pkg:npm/a"), path, b];
         // As fletch answers: nothing for the path, `b` refined to a release.
         let record = |i: usize, locator: &str| FetchRecord {
-            source_offset: Some(keyed(&selected[i], i).offset),
+            source_offset: keyed(&selected[i], i).offset,
             locator: locator.to_string(),
             ..fetched_record()
         };
