@@ -129,13 +129,19 @@ impl AnalysisCache {
 
 /// Whether `report` or any file in it is missing results a later run may
 /// produce: rule evaluation ran out of time (findings depend on how loaded the
-/// machine was) or Rizin did not finish. Caching it would serve the shortfall to
-/// every later scan of the same bytes. cleave's own cache makes the same call.
+/// machine was), Rizin did not finish, or a source parse was cut short.
+/// Caching it would serve the shortfall to every later scan of the same bytes.
+/// cleave's own cache makes the same call.
 fn incomplete(report: &AnalysisReport) -> bool {
     use cleave::types::{AnalysisGap, AnalysisGaps};
     let incomplete = |gaps: &AnalysisGaps| {
-        gaps.contains(AnalysisGap::EvaluationDeadline)
-            || gaps.contains(AnalysisGap::DisassemblyIncomplete)
+        [
+            AnalysisGap::EvaluationDeadline,
+            AnalysisGap::DisassemblyIncomplete,
+            AnalysisGap::SourceParseIncomplete,
+        ]
+        .into_iter()
+        .any(|gap| gaps.contains(gap))
     };
     incomplete(&report.analysis_gaps) || report.files.iter().any(|f| incomplete(&f.analysis_gaps))
 }
@@ -306,11 +312,14 @@ mod tests {
         assert!(cache.get("missing").is_none());
     }
 
-    /// A report cut short by the rule deadline or an unfinished Rizin run lacks
-    /// results a later scan would have, so it must not be served to one.
+    /// A report cut short by the rule deadline, an unfinished Rizin run or an
+    /// interrupted source parse lacks results a later scan would have, so it
+    /// must not be served to one.
     #[test]
     fn incomplete_analyses_are_not_stored() {
-        use cleave::types::AnalysisGap::{DisassemblyIncomplete, EvaluationDeadline};
+        use cleave::types::AnalysisGap::{
+            DisassemblyIncomplete, EvaluationDeadline, SourceParseIncomplete,
+        };
         let base = tempfile::tempdir().unwrap();
         let cache = AnalysisCache {
             dir: base.path().to_path_buf(),
@@ -327,7 +336,11 @@ mod tests {
 
         cache.put("complete", &Some(report()), &[]);
         assert!(cache.get("complete").is_some());
-        for gap in [EvaluationDeadline, DisassemblyIncomplete] {
+        for gap in [
+            EvaluationDeadline,
+            DisassemblyIncomplete,
+            SourceParseIncomplete,
+        ] {
             let cut_short = report();
             cut_short.analysis_gaps.record(gap);
             cache.put(gap.label(), &Some(cut_short), &[]);
