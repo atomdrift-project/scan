@@ -514,6 +514,24 @@ pub struct GlobalArgs {
     )]
     pub fetch_max_size: u64,
 
+    /// Persist unfinished fetches and resume them when scanning the same content.
+    /// Increasing --follow-depth resumes saved deeper references.
+    #[arg(long, global = true, value_name = "PATH", env = "SCAN_FETCH_PENDING")]
+    pub fetch_pending: Option<std::path::PathBuf>,
+
+    /// Include lockfile dependencies used exclusively for development or tests.
+    #[arg(long, global = true, action = clap::ArgAction::Set, default_value_t = true)]
+    pub fetch_dev_deps: bool,
+
+    /// Analyze all pinned dependency versions, including older releases.
+    #[arg(long, global = true)]
+    pub fetch_all_versions: bool,
+
+    /// Retry only native binaries whose disassembler timed out, once, with this
+    /// larger per-file deadline. Unset disables the extra attempt.
+    #[arg(long, global = true, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub rizin_retry_timeout_secs: Option<u64>,
+
     /// [EXPERIMENTAL] Maximum number of *live* dependency/package fetches
     /// triggered by a single scanned file. This is 100 by default. Cache hits
     /// are always served and never counted, so a warm re-run is never throttled.
@@ -813,6 +831,8 @@ impl GlobalArgs {
         scans_for_other_hosts: bool,
     ) -> crate::fetch::FetchPolicy {
         policy.depth = self.fetch_depth;
+        policy.include_dev_dependencies = self.fetch_dev_deps;
+        policy.all_versions = self.fetch_all_versions;
         policy.max_dep_age_days = self.fetch_max_age.unwrap_or(default_max_age);
         policy.max_file_fetches = self.fetch_max_file_fetches;
         policy.max_url_fetches = self.fetch_max_urls;

