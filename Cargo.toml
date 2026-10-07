@@ -82,10 +82,10 @@ publish = false
 # stop doing anything and cleave logs `allocator="system"`. The flag was here
 # until 88baea5 (2026-08-20) dropped it by accident, on a rationale that did not
 # hold; leaving it off is the correct end state, so do not add it back.
-cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
+cleave = { path = "../cleave" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
-fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
+fletch = { path = "../fletch" }
 # Keep the scan/fletch API pair aligned while the dependency helpers are
 # developed locally; switch back to the published git revision after the
 # matching fletch commit is pushed.
@@ -96,7 +96,7 @@ proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # Direct handle on filefacts (already in the graph via cleave/fletch) so the
 # `ps` subcommand can tune rizin for low-latency live-process scanning:
 # native-arch-only, a tighter timeout, and a size gate on giant binaries.
-filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
+filefacts = { path = "../filefacts" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -370,3 +370,9 @@ tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", bran
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
 dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
+
+[patch."https://github.com/atomdrift-project/filefacts.git"]
+filefacts = { path = "../filefacts" }
+
+[patch."https://github.com/atomdrift-project/stng.git"]
+stng = { path = "../stng" }

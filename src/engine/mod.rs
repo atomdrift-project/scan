@@ -139,9 +139,17 @@ pub struct ScanConfig {
 
 static RIZIN_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
-/// Fix the wall-clock limit (`--rizin-timeout-secs`) on each Rizin run of every
-/// analysis this process starts. Call once at startup, before any analysis; a
-/// later call is ignored.
+static RIZIN_RETRY_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+/// Configure one larger deadline for retrying timed-out native files.
+pub fn set_rizin_retry_timeout(timeout: Duration) {
+    let _ = RIZIN_RETRY_TIMEOUT.set(timeout);
+}
+pub(crate) fn rizin_retry_timeout() -> Option<Duration> {
+    RIZIN_RETRY_TIMEOUT.get().copied()
+}
+
+/// Fix the wall-clock limit on each Rizin run. Call once before analysis;
+/// later calls are ignored.
 pub fn set_rizin_timeout(timeout: Duration) {
     let _ = RIZIN_TIMEOUT.set(timeout);
 }

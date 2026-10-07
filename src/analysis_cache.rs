@@ -72,7 +72,9 @@ impl AnalysisCache {
             return None;
         }
         let base = cache_base()?;
-        let version = ruleset_version();
+        // Reference discovery/context changed independently of the trait set.
+        // Historical next-hop lists can contain prose-derived package names.
+        let version = format!("dependency-v2-{}", ruleset_version());
         prune_stale_versions(&base, &version);
         let dir = base.join(version);
         std::fs::create_dir_all(&dir).ok()?;
@@ -85,7 +87,8 @@ impl AnalysisCache {
     pub(crate) fn get(&self, content_sha: &str) -> Option<Cached> {
         let bytes = std::fs::read(self.path(content_sha)).ok()?;
         let json = zstd::decode_all(&bytes[..]).ok()?;
-        serde_json::from_slice(&json).ok()
+        let cached: Cached = serde_json::from_slice(&json).ok()?;
+        (!cached.sub.as_ref().is_some_and(incomplete)).then_some(cached)
     }
 
     /// Store an analysis under its content sha. Best-effort: any failure
@@ -371,5 +374,40 @@ mod tests {
             "model token must be a safe path segment: {}",
             model_version(),
         );
+    }
+}
+
+#[cfg(test)]
+mod historical_gap_tests {
+    use super::*;
+    #[test]
+    fn historical_partial_cache_entry_is_rejected_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AnalysisCache {
+            dir: dir.path().to_owned(),
+        };
+        let report = AnalysisReport::new(cleave::TargetInfo {
+            path: "binary".into(),
+            file_type: "elf".into(),
+            size_bytes: 1,
+            sha256: "content".into(),
+            architectures: None,
+        });
+        report
+            .analysis_gaps
+            .record(cleave::types::AnalysisGap::DisassemblyIncomplete);
+        let sub = Some(report);
+        let next = vec![];
+        let bytes = serde_json::to_vec(&StoreRef {
+            sub: &sub,
+            next: &next,
+        })
+        .unwrap();
+        std::fs::write(
+            cache.path("content"),
+            zstd::encode_all(&bytes[..], 3).unwrap(),
+        )
+        .unwrap();
+        assert!(cache.get("content").is_none());
     }
 }

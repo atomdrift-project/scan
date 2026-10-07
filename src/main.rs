@@ -776,7 +776,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    configure_process(&global, &command);
+    configure_process(&global, &command)?;
     init_logging(&global, command.is_daemon());
 
     // Resolved after logging is up: with no hardcoded default, the model comes
@@ -901,9 +901,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
 /// The process-global settings every command shares: the Rizin deadline, the
 /// fetch ceilings, and the cache sweeper.
-fn configure_process(global: &GlobalArgs, command: &Commands) {
+fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
+    if let Some(path) = &global.fetch_pending {
+        scan::fetch::configure_pending(path)?;
+    }
     // Before any analysis can start: every analysis's options read it.
     scan::engine::set_rizin_timeout(std::time::Duration::from_secs(global.rizin_timeout_secs));
+    if let Some(seconds) = global.rizin_retry_timeout_secs {
+        scan::engine::set_rizin_retry_timeout(std::time::Duration::from_secs(seconds));
+    }
     // The fetch client and blob cache are built once per process, on first use,
     // so their settings are fixed here: every mode (interactive scan and worker
     // alike) honors `--fetch-max-size` and `--registry-ttl`.
@@ -921,6 +927,7 @@ fn configure_process(global: &GlobalArgs, command: &Commands) {
     if !command.is_daemon() {
         scan::fetch::set_total_budget(global.fetch_max_total_fetches, global.fetch_max_total_size);
     }
+    Ok(())
 }
 
 /// Install the tracing subscriber and quiet the `log` bridge.
@@ -2365,5 +2372,49 @@ mod tests {
             .context("tok file should supply key")?;
         assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dependency_audit_cli_tests {
+    use super::*;
+    #[test]
+    fn resume_scope_and_native_retry_flags_parse_and_reject_invalid_values() {
+        let cli = Cli::try_parse_from(with_default_subcommand([
+            "atomscan",
+            "--follow=all",
+            "--fetch-pending=/tmp/backlog.json",
+            "--fetch-dev-deps=false",
+            "--fetch-all-versions",
+            "--rizin-timeout-secs=60",
+            "--rizin-retry-timeout-secs=120",
+            "/tmp/sample",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.global.fetch_pending.as_deref(),
+            Some(std::path::Path::new("/tmp/backlog.json"))
+        );
+        assert_eq!(cli.global.rizin_retry_timeout_secs, Some(120));
+        let policy = cli
+            .global
+            .fetch_policy(cli.global.follow.unwrap(), 0, false);
+        assert!(!policy.include_dev_dependencies);
+        assert!(policy.all_versions);
+        for flag in ["--rizin-retry-timeout-secs=0", "--fetch-dev-deps=maybe"] {
+            assert!(
+                Cli::try_parse_from(with_default_subcommand(["atomscan", flag, "/tmp/sample"]))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn audit_defaults_preserve_development_coverage_and_disable_extra_native_attempt() {
+        let cli =
+            Cli::try_parse_from(with_default_subcommand(["atomscan", "/tmp/sample"])).unwrap();
+        assert!(cli.global.fetch_dev_deps);
+        assert!(!cli.global.fetch_all_versions);
+        assert!(cli.global.fetch_pending.is_none());
+        assert!(cli.global.rizin_retry_timeout_secs.is_none());
     }
 }
