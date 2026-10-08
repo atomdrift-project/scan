@@ -108,28 +108,21 @@ pub(crate) fn snapshot() -> Vec<Arc<Entry>> {
 /// Best-effort name of what a blocked thread is waiting on: its kernel
 /// wait-channel (e.g. `futex`, `pipe_wait`, a lock symbol). Read straight from
 /// procfs on Linux — no shell-out, async-cheap. Returns `None` when the thread
-/// is running, the channel is unavailable, or the platform doesn't expose it, so
-/// the caller falls back to the analysis phase. Other platforms resolve
-/// wait-channels in batch via [`wait_channels`].
+/// is running or the channel is unavailable, so the caller falls back to the
+/// analysis phase. Other platforms resolve wait-channels in batch via
+/// [`wait_channels`].
+#[cfg(target_os = "linux")]
 #[must_use]
-pub(crate) fn wait_channel(thread_id: u64) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        if thread_id == 0 {
-            return None;
-        }
-        let raw = std::fs::read_to_string(format!("/proc/self/task/{thread_id}/wchan")).ok()?;
-        let chan = raw.trim();
-        if chan.is_empty() || chan == "0" {
-            None
-        } else {
-            Some(chan.to_string())
-        }
+fn wait_channel(thread_id: u64) -> Option<String> {
+    if thread_id == 0 {
+        return None;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = thread_id;
+    let raw = std::fs::read_to_string(format!("/proc/self/task/{thread_id}/wchan")).ok()?;
+    let chan = raw.trim();
+    if chan.is_empty() || chan == "0" {
         None
+    } else {
+        Some(chan.to_string())
     }
 }
 
@@ -417,10 +410,11 @@ mod tests {
         assert!(pos(id_old) < pos(id_new), "older entry must sort first");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn wait_channel_is_none_for_unknown_thread() {
-        // tid 0 is never a real worker thread; on every platform this yields None
-        // so the census falls back to the analysis stage.
+        // tid 0 is never a real worker thread, so this yields None and the
+        // census falls back to the analysis stage.
         assert_eq!(wait_channel(0), None);
     }
 

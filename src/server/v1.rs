@@ -373,12 +373,15 @@ pub(super) async fn v1_analyze(
         Err(rejected) => return *rejected,
     };
 
-    // Admitted before the body is read: an artifact of up to `--max-size-mb`
-    // is read only by a server that can take it on. A refresh may be answered
-    // from what is already held, so it is admitted once it has to analyze.
+    // Memory is checked before the body is read: an artifact of up to
+    // `--max-size-mb` is read only by a server with room for it. Full admission
+    // waits until it has to analyze, so a verdict already held for these bytes
+    // is answered even by a server whose startup failed. A refresh may be
+    // answered from what is already held, so it is admitted once it has to
+    // analyze.
     if !req.q.refresh
         && !body.is_end_stream()
-        && let Err(refusal) = state.admit_request(request_id).await
+        && let Err(refusal) = state.check_memory().await
     {
         return refusal.v1();
     }
@@ -537,6 +540,10 @@ async fn analyze_bytes(
             sha256 = %sha,
             "no verdict held for these bytes; analyzing"
         );
+    }
+
+    if let Err(refusal) = state.admit_request(request_id).await {
+        return refused(req, &refusal);
     }
 
     let attachment = state.flights.join(FlightKey::sha_follow(
@@ -738,9 +745,6 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     let Some((asked, purl)) = req.purl.clone() else {
         return ApiError::bad_request("missing_package", "Name an artifact with ?purl=.").v1();
     };
-    if let Err(refusal) = state.admit_request(request_id).await {
-        return refusal.v1();
-    }
 
     // Already answered?
     //
@@ -779,6 +783,13 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
         tracing::info!(id = request_id, purl = %purl, "no verdict held; analyzing");
     }
 
+    // Admitted only once it has to analyze: there is no body to protect, and
+    // an answer already held costs nothing to serve, even from a server whose
+    // startup failed.
+    if let Err(refusal) = state.admit_request(request_id).await {
+        return refused(req, &refusal);
+    }
+
     let attachment = state.flights.join(FlightKey::purl_follow(
         purl.clone(),
         req.follow.policy.selection_bits(),
@@ -805,6 +816,18 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
         is_url: false,
     };
     answer(req, attachment, named).await
+}
+
+/// A request refused admission, named with the follow policy it would have
+/// run under — as every other analyze answer is, refusals included.
+fn refused(req: &V1Analyze, refusal: &ApiError) -> Response {
+    let mut resp = refusal.v1();
+    if let Some(name) = req.follow.policy.follow_name()
+        && let Ok(value) = HeaderValue::from_str(&name)
+    {
+        resp.headers_mut().insert("X-Scan-Follow", value);
+    }
+    resp
 }
 
 /// A decision answered without an analysis.
