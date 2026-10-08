@@ -729,8 +729,10 @@ jobs:
           cpu: "4"
           mem: "12288"
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          # -u: the image's preinstalled packages trail the live pkgsrc
+          # branch, and plain pkg_add refuses to upgrade a dependency in place.
           prepare: |
-            /usr/sbin/pkg_add rust cmake git pkg-config
+            /usr/sbin/pkg_add -u rust cmake git pkg-config
           run: |
             set -eux
             rustc --version

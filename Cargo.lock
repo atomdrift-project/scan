@@ -1196,8 +1196,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d521bdbc6098937af83ef4ab6d5c07398126bc71878f7ef4ea9499977978ef5"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
@@ -1205,8 +1204,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dde0b83164d4a497860af4236271178bc640512b067101e0853e4f74eaa4df5"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-srcgen",
 ]
@@ -1214,8 +1212,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0111d110b72b4efad69a372e29e21628652fd0bcab66967e5c8350ab679affd5"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -1224,8 +1221,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf01ecc92fc5499789d79c3b817299d5a8ddd828d31dcf0f9cc3cc66f38dbb36"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "serde",
  "serde_derive",
@@ -1235,8 +1231,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cd2563bead0090c3879a7ff7327f7550c9d59bb5d05ecc8cd7886977aa3125a"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -1263,8 +1258,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9640d250d26f9381a73dc7f9862b27928d4809119aec73be0e556612e67b6a99"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -1276,14 +1270,12 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07f156b90efc94371ddb3536f76e4ab671ad2e093bfa5511e10198cadbb0c47"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 
 [[package]]
 name = "cranelift-control"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d75a76fd9dd37dcbc3d2d2e00abe3281a7e88adc035fba3b8114cc69981576ec"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "arbitrary",
 ]
@@ -1291,8 +1283,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eea22522144ba08c7e7ef94bfc25d474ef016c2771974b8ab1986734ac85965"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -1303,8 +1294,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efa2826c80dff1d93b19b3cfbcaf9fae44c78d739a98d146dd5bd89c51e14367"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -1315,14 +1305,12 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e238a69b95c5415456f22189494a12db94f313bb72b6ec9cc88ddf2f1056e28e"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 
 [[package]]
 name = "cranelift-native"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eceb0ebd8d6aef6bb287e8d532a164b0db1c0062961211e9c22a91f67521c098"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -1332,8 +1320,7 @@ dependencies = [
 [[package]]
 name = "cranelift-srcgen"
 version = "0.132.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "004643f39a7bec553de5263d650db30e5b9caec1d5cbe065fd732b7ec9ae40d0"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 
 [[package]]
 name = "crc"
@@ -4176,8 +4163,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b04adf8f93264685f2c70a3edb8f828c791e71b22659253319c33f29d1165aef"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -4188,8 +4174,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c120a6af1a574a42efcd9df2ad27cb78bc04118c5e0c69e90599f17301a1c7a"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6799,8 +6784,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a83ef84ac8bab735c89e27b0268b0586099fbe81281ae45be2b8e4f407b2daa"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "addr2line 0.26.1",
  "async-trait",
@@ -6836,8 +6820,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "439686d3deb38525c86b88bbc90f7ba669f70c8edc7d6b35147c738bbef5ff76"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -6865,8 +6848,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-core"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3073c03f97f871fe6400e68621c863b93ba79296f8e570285231952d23fcc804"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
@@ -6876,8 +6858,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a15981261d361f9c93b42929f446b4009840853ceea181ad6e17730f4016a0b"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -6903,8 +6884,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33aed9d91d54c9f861ba7e3c3130bded8a7a63e01fe58c3a9a36b45d6ee0fb57"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cc",
  "cfg-if",
@@ -6918,8 +6898,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "944942118aab67e7b4febfe88a65d0af4cfd10af8ed0e79fd6cf39d75359ab7e"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -6928,8 +6907,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37dee05e8c35759826f6b926cd949c51f771b6a58619d8e60c63c3f3d3e5e59b"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cfg-if",
  "libc",
@@ -6940,8 +6918,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83f7ebe911a6f1605ff0d3a678472ddb1fcc57c3e2f6bae5dd4d170b625b3ed"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -6953,8 +6930,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "45.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d75980644456dc003238766254b0e5f002704630237ccd0728747991fe2739d7"
+source = "git+https://github.com/tstromberg/wasmtime.git?branch=netbsd-solaris-45.0.3#7c04f13deaacdefc756b5cc53f5eaa0f09af4ce4"
 dependencies = [
  "proc-macro2",
  "quote",
