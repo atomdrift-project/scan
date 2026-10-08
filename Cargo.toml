@@ -366,6 +366,13 @@ test = false
 # state cap) plus the unpushed per-pattern-exceeded increment in the working tree.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+# NetBSD and Solaris arms for wasmtime's signal trap handler, pulled in via
+# cleave -> yara-x. Upstream 45.0.3 has neither, so those builds stop at
+# compile_error!("unsupported platform"). Must match cleave's patch. The
+# branch name carries the version: when yara-x moves wasmtime, rebase the
+# branch onto the new tag or this patch silently stops applying (cargo only
+# warns).
+wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "netbsd-solaris-45.0.3" }
 
 
 [patch."https://github.com/tstromberg/dmgwiz.git"]
