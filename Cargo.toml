@@ -55,7 +55,7 @@ default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
 # MSRV-aware resolver above; raise deliberately, not by accident.
-rust-version = "1.94"
+rust-version = "1.97"
 authors = ["The Atomdrift Project"]
 description = "ML-powered malware classification using cleave static analysis"
 license = "Apache-2.0"
@@ -374,8 +374,5 @@ tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", bran
 # warns).
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "netbsd-solaris-45.0.3" }
 
-
-[patch."https://github.com/tstromberg/dmgwiz.git"]
-dmgwiz = { git = "https://github.com/atomdrift-project/dmgwiz.git" }
 
 

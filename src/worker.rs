@@ -1760,7 +1760,7 @@ impl SpoolState {
         // Check and reserve in one step: a separate load and add would let
         // two concurrent downloads both see room only one of them has.
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (used == 0 || used.saturating_add(size) <= self.budget_bytes)
                     .then(|| used.saturating_add(size))
             })

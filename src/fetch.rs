@@ -237,13 +237,13 @@ impl TotalBudget {
     fn reserve(&self, want: Allowance) -> Allowance {
         let fetches = self
             .fetches
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(left - left.min(want.fetches))
             })
             .unwrap_or_else(|left| left);
         let bytes = self
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(left - left.min(want.bytes))
             })
             .unwrap_or_else(|left| left);
@@ -259,12 +259,12 @@ impl TotalBudget {
     fn settle(&self, granted: Allowance, spent: Allowance) {
         let _ = self
             .fetches
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(left.saturating_add(granted.fetches.saturating_sub(spent.fetches)))
             });
         let _ = self
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(if spent.bytes <= granted.bytes {
                     left.saturating_add(granted.bytes - spent.bytes)
                 } else {

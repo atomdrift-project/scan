@@ -169,7 +169,7 @@ fn adjust_external(dependencies: usize, urls: usize, op: fn(u32, u32) -> u32) {
     ] {
         let n = u32::try_from(n).unwrap_or(u32::MAX);
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(op(count, n))
             })
             .ok();

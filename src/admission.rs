@@ -542,7 +542,7 @@ impl MemoryAdmission {
         // ~2^64 and pauses admission forever (seen live on smaug 2026-08-22).
         let _ = self
             .reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |r| {
                 Some(r.saturating_sub(est))
             });
         self.inflight
