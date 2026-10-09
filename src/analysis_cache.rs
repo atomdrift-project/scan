@@ -10,12 +10,11 @@
 //! later scan of the same bytes reuses them instead of re-running cleave.
 //!
 //! Correctness over speed: the cache is namespaced by a *ruleset version* token
-//! (scan release, installed traits commit, trait/composite/YARA counts, the
-//! content of the bloom set the skip-predicate consults, and the installed
-//! model bundle, whose output the cached verdict is). Any change to what the
-//! detector would find lands in a different namespace, so a stale result can
-//! never mask a detection a newer ruleset adds — a version bump simply misses
-//! and re-analyzes.
+//! (scan release, traits commit, the content of the bloom set the
+//! skip-predicate consults, and the installed model bundle, whose output the
+//! cached verdict is). Any change to what the detector would find lands in a
+//! different namespace, so a stale result can never mask a detection a newer
+//! ruleset adds — a version bump simply misses and re-analyzes.
 //! A hit is only ever a result the *current* detector already produced. Set
 //! `SCAN_ANALYSIS_CACHE=0` to disable it entirely.
 
@@ -151,10 +150,21 @@ fn incomplete(report: &AnalysisReport) -> bool {
 
 /// A token identifying the analysis-producing detector, so a rules, model, or
 /// engine update invalidates cached results. Folds in the scan release, the
-/// installed traits commit, cleave's trait/composite/YARA counts, the content of
-/// the installed bloom set (which the dependency skip-predicate consults), and
-/// the installed model bundle — any of these changing the analysis lands cached
-/// results in a fresh namespace.
+/// traits commit, the content of the installed bloom set (which the dependency
+/// skip-predicate consults), and the installed model bundle — any of these
+/// changing the analysis lands cached results in a fresh namespace.
+///
+/// Every part is read from a small file, never derived from the rules
+/// themselves: the verdict index opens on a server's first lookup, which must
+/// be answered — or refused — while the rules are still loading. Until
+/// 2026-10-09 the rules were named by cleave's trait, composite and YARA rule
+/// counts, and counting meant compiling every rule: tens of seconds on a cold
+/// cache, spent in front of a request that only needed a refusal. Hashing the
+/// rule files was tried too: reading them all took over 10s on a loaded
+/// machine. The commit is also what hopper records a
+/// verdict's rules by, so the two agree on when a verdict is stale. A traits
+/// checkout with uncommitted edits shares its commit's namespace; set
+/// `SCAN_ANALYSIS_CACHE=0` while editing rules.
 ///
 /// The model belongs here for the same reason the rules do: a cached entry
 /// holds the *verdict*, and the verdict is the model's output. Until
@@ -164,20 +174,13 @@ fn incomplete(report: &AnalysisReport) -> bool {
 /// OpenDocument files graded hostile at every deploy level) would have
 /// outlived the corrected bundle that fixed it.
 pub(crate) fn ruleset_version() -> String {
-    let vi = cleave::version_info();
-    let commit = cleave::rule_update::installed(&cleave::traits_repo::install_target())
-        .map_or_else(
-            || "none".to_string(),
-            |i| i.commit.chars().take(12).collect(),
-        );
+    let traits =
+        cleave::traits_repo::version().map_or_else(|| "none".to_string(), |v| sanitize(&v));
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
     format!(
-        "{}-{commit}-t{}-c{}-y{}-{bloom}-m{}",
+        "{}-{traits}-{bloom}-m{}",
         env!("CARGO_PKG_VERSION"),
-        vi.trait_count,
-        vi.composite_count,
-        vi.yara_rules,
         model_version(),
     )
 }
