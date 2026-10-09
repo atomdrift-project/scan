@@ -45,7 +45,7 @@ const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
 
 /// One finding, flattened to what a consumer gates on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Hit {
+pub struct Hit {
     /// Stable trait identifier (`objectives/execution/shell/bash`).
     pub id: String,
     /// Criticality ordinal: 3 notable, 4 suspicious, 5 hostile.
@@ -130,7 +130,7 @@ impl Verdict {
 /// [`MAX_STORED_HITS`]. `purl` names the package a finding belongs to when
 /// the artifact was fetched by coordinate.
 #[must_use]
-pub(crate) fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
+pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &report.files {

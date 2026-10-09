@@ -449,7 +449,7 @@ impl WhaleSlot {
     /// stream in milliseconds and the router tries the next worker.
     fn try_acquire(slots: usize) -> Result<Self, WhaleSlotBusy> {
         WHALE_SLOTS_IN_USE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |in_use| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |in_use| {
                 (in_use < slots).then_some(in_use + 1)
             })
             .map(|_| Self)

@@ -13,6 +13,7 @@ use crate::bloom_repo::Lookup;
 use crate::model::{Classification, Thresholds};
 
 pub use crate::explain::Reason;
+pub use crate::lookup::{Hit, collect_hits};
 
 mod envelope;
 mod hopper;
