@@ -1774,11 +1774,9 @@ struct FetchSession {
     /// cloning `AnalysisOptions` per record cost more user time than the YARA
     /// saving returned.
     registry_opts: AnalysisOptions,
-    /// Opened on the first payload actually analyzed. Opening it derives the
-    /// ruleset-version namespace, which calls `cleave::version_info` — and that
-    /// spins up the YARA engine just to count rules. A scan that analyzes
+    /// Opened on the first payload actually analyzed, so a scan that analyzes
     /// nothing (every reference age-gated or none present, the common `pkg:`
-    /// case) must not pay that.
+    /// case) never creates or prunes the cache directory.
     acache: OnceLock<Option<AnalysisCache>>,
     /// Where the fetch phase's progress goes: the live in-place dependency tree
     /// on an interactive single-artifact scan, the streamed log above any active
