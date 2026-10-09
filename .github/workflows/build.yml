@@ -490,7 +490,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD VM
-        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
         with:
           usesh: true
           # Newest stable image the builder publishes, pinned explicitly rather than
@@ -582,7 +582,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD aarch64 VM
-        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
         with:
           usesh: true
           # Same pin and the same 15.x-only reach tradeoff as the x86_64 job.
@@ -647,7 +647,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in OpenBSD VM
-        uses: vmactions/openbsd-vm@86cdc08415d9d0865267e686561e276c52d62530 # v1.4.7
+        uses: vmactions/openbsd-vm@5f7b2c933b8846a138361d6843c52af4bef5d945 # v1.4.8
         with:
           usesh: true
           # Newest image available. OpenBSD makes no cross-release ABI promise,
@@ -721,7 +721,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in NetBSD VM
-        uses: vmactions/netbsd-vm@7f23a491dcc69c34195721ab67934917707f84c7 # v1.4.9
+        uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92 # v1.5.2
         with:
           usesh: true
           # Latest stable image published by vmactions.
@@ -774,7 +774,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in DragonFlyBSD VM
-        uses: vmactions/dragonflybsd-vm@7cd7c9b7f2b06e8e03d2337a9476995f3c112acf # v1.3.3
+        uses: vmactions/dragonflybsd-vm@4ab776fa9f914fbea72f13715b451e77e7ef5c41 # v1.3.4
         with:
           usesh: true
           # This is the newest image vmactions publishes. DragonFly's official
@@ -830,7 +830,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in Haiku VM
-        uses: vmactions/haiku-vm@6a07e023ed05895c09aa73843b58cfa671f34594 # v1.1.5
+        uses: vmactions/haiku-vm@4d49d1f4d8c265fe5b27c41aa98b7153255d9d4c # v1.1.6
         with:
           release: "r1beta5"
           cpu: "4"
@@ -882,7 +882,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in GNU/Hurd VM
-        uses: vmactions/hurd-vm@a116077bec07c4f07f6efc88a45270a021ffac52 # v1.0.1
+        uses: vmactions/hurd-vm@430b769cb10d4019d62abb78fa4c48d29ef51765 # v1.0.2
         with:
           release: "2025"
           cpu: "4"
@@ -947,7 +947,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in Solaris VM
-        uses: vmactions/solaris-vm@96d8d976f9e67d82ec6c7e8ce9c1060731f9e21c # v1.3.9
+        uses: vmactions/solaris-vm@87d3c436511cef802cd1637f86f73b1a97715c8c # v1.4.1
         with:
           release: "11.4-gcc"
           cpu: "4"
@@ -1026,7 +1026,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in OmniOS VM
-        uses: vmactions/omnios-vm@317e4f8069dad8a65e1520808f1a68ef3fd20565 # v1.3.6
+        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
         with:
           usesh: true
           # Newest image the builder publishes. Unlike the FreeBSD pin, newer
