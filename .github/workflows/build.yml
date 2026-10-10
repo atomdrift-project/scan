@@ -460,7 +460,7 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-${{ matrix.target }}
           path: atomscan-${{ matrix.target }}.tar.gz
@@ -490,7 +490,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD VM
-        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           usesh: true
           # Newest stable image the builder publishes, pinned explicitly rather than
@@ -532,7 +532,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-freebsd.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-freebsd
           path: atomscan-x86_64-unknown-freebsd.tar.gz
@@ -582,7 +582,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in FreeBSD aarch64 VM
-        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           usesh: true
           # Same pin and the same 15.x-only reach tradeoff as the x86_64 job.
@@ -614,7 +614,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-aarch64-unknown-freebsd.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-aarch64-unknown-freebsd
           path: atomscan-aarch64-unknown-freebsd.tar.gz
@@ -697,7 +697,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-openbsd.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-openbsd
           path: atomscan-x86_64-unknown-openbsd.tar.gz
@@ -747,7 +747,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-netbsd.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-netbsd
           path: atomscan-x86_64-unknown-netbsd.tar.gz
@@ -803,7 +803,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-dragonfly.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-dragonfly
           path: atomscan-x86_64-unknown-dragonfly.tar.gz
@@ -860,7 +860,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-haiku.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-haiku
           path: atomscan-x86_64-unknown-haiku.tar.gz
@@ -918,7 +918,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-unknown-hurd-gnu.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-unknown-hurd-gnu
           path: atomscan-x86_64-unknown-hurd-gnu.tar.gz
@@ -999,7 +999,7 @@ jobs:
       - name: Package
         run: tar -czf atomscan-x86_64-pc-solaris.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-x86_64-pc-solaris
           path: atomscan-x86_64-pc-solaris.tar.gz
@@ -1095,7 +1095,7 @@ jobs:
       - name: Package
         run: tar -czf omnios-native-atomscan.tar.gz atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: omnios-native-atomscan
           path: omnios-native-atomscan.tar.gz
@@ -1184,7 +1184,7 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan.exe
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-${{ matrix.target }}
           path: atomscan-${{ matrix.target }}.tar.gz
@@ -1365,7 +1365,7 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: tar -czf "atomscan-$TARGET.tar.gz" -C "target/$TARGET/$PROFILE" atomscan
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomscan-${{ matrix.target }}
           path: atomscan-${{ matrix.target }}.tar.gz
