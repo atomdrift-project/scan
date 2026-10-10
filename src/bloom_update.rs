@@ -60,6 +60,25 @@ fn is_current(installed: &Manifest, remote: &Manifest) -> bool {
         })
 }
 
+/// Whether `remote` was built before `installed`. The manifest is unsigned, so a
+/// replayed older `bloom.toml` (with its still-hosted, correctly hashed filters)
+/// would otherwise reinstate a good-filter that still blesses since-revoked
+/// packages. Only well-formed `YYYY-MM-DD` dates compare — they order
+/// lexically — and a same-day rebuild is never a rollback.
+fn rolls_back(installed: &Manifest, remote: &Manifest) -> bool {
+    let iso = |d: &str| {
+        d.len() == 10
+            && d.bytes().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            })
+    };
+    iso(&installed.built) && iso(&remote.built) && remote.built < installed.built
+}
+
 /// Install or refresh the bloom filters. Skips the download when every
 /// installed filter's sha256 already matches the manifest, unless `force`.
 /// Returns `true` when filters were installed.
@@ -85,6 +104,17 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
             eprintln!("Bloom filters already up to date: {}", manifest.built);
         }
         return Ok(false);
+    }
+    if !force
+        && let Some(have) = installed_manifest(dir)
+        && rolls_back(&have, &manifest)
+    {
+        bail!(
+            "remote bloom bundle (built {}) is older than the installed one (built {}); \
+             refusing the rollback (pass --force to install it anyway)",
+            manifest.built,
+            have.built
+        );
     }
     let installer = Installer::lock(dir)?;
     if current() {
@@ -218,4 +248,30 @@ fn stage(staging: &Path, client: &Client, prefix_url: &str, manifest: &Manifest)
     // The sidecar is the manifest itself, which `installed_manifest` reads back.
     let rendered = toml::to_string(manifest).context("rendering bloom sidecar")?;
     std::fs::write(staging.join(SIDECAR), rendered).context("writing bloom sidecar")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn built(date: &str) -> Manifest {
+        Manifest {
+            schema: 1,
+            built: date.to_owned(),
+            key_scheme: None,
+            filter: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn an_older_bundle_is_a_rollback_and_a_same_day_rebuild_is_not() {
+        let installed = built("2026-10-09");
+        assert!(rolls_back(&installed, &built("2026-09-30")));
+        assert!(!rolls_back(&installed, &built("2026-10-09")));
+        assert!(!rolls_back(&installed, &built("2026-10-10")));
+        // Malformed dates never block an update: the guard only reads what it
+        // can order.
+        assert!(!rolls_back(&installed, &built("")));
+        assert!(!rolls_back(&built("unknown"), &built("2020-01-01")));
+    }
 }

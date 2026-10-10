@@ -197,10 +197,15 @@ impl Corpus {
         if bases.is_empty() {
             return None;
         }
+        // No fallback to `Client::default()`: it has no timeout, and it panics
+        // on the same TLS-backend failure that failed this build.
         let client = reqwest::Client::builder()
             .timeout(READ_TIMEOUT)
             .build()
-            .unwrap_or_default();
+            .inspect_err(|e| {
+                tracing::error!(error = %e, "cannot build the corpus HTTP client; lookups answer from the local index alone");
+            })
+            .ok()?;
         let traffic = bases.iter().map(|_| Address::default()).collect();
         Some(Arc::new(Self {
             bases,

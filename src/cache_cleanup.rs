@@ -44,7 +44,7 @@ fn budgets() -> Vec<Budget> {
     let mut out = vec![cache_sweep::legacy_stng_budget()];
 
     // scan's own caches: the analysis snapshot store
-    // (`analysis/<version>/<sha>.zst`, depth 2), the lookup verdict index
+    // (`analysis/<version>/<key>.zst`, depth 2), the lookup verdict index
     // (`lookup/<version>/<sha>.json` and its `<key>.purl` aliases, also depth
     // 2) and the LLM verdict cache (`interpret/<hash>.json`, depth 1), sharing
     // one ceiling.

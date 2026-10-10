@@ -96,7 +96,10 @@ fn notify(latest: &str, url: Option<&str>, installed: &str) {
     if !update_manifest::is_newer(latest, installed) {
         return;
     }
-    match url {
+    // Both strings come off the network: a tampered manifest must not drive
+    // the terminal.
+    let latest = crate::output::tty_text(latest);
+    match url.map(crate::output::tty_text) {
         Some(url) => {
             eprintln!("update available: Atomdrift Scan {latest} (you have {installed}) — {url}");
         }

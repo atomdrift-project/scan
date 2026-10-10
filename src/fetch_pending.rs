@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
+/// Most entries one root may hold. The backlog is shared, and past
+/// [`MAX_ENTRIES`] every checkpoint fails for *every* root; one hostile root
+/// naming a hundred thousand URLs must not wedge the rest. Additions past this
+/// are dropped (and logged), never the backlog.
+const MAX_ROOT_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Entry {
@@ -122,16 +127,35 @@ impl Store {
             .enumerate()
             .map(|(i, entry)| (key(entry), i))
             .collect();
+        let mut per_root: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for entry in &state.entries {
+            *per_root.entry(entry.root_sha.clone()).or_default() += 1;
+        }
+        let mut dropped = 0usize;
         for entry in additions {
             let signature = key(entry);
             if let Some(&i) = indices.get(&signature) {
                 state.entries[i].reason.clone_from(&entry.reason);
                 state.entries[i].redirect_credit =
                     state.entries[i].redirect_credit.max(entry.redirect_credit);
-            } else {
-                indices.insert(signature, state.entries.len());
-                state.entries.push(entry.clone());
+                continue;
             }
+            let held = per_root.entry(entry.root_sha.clone()).or_default();
+            if *held >= MAX_ROOT_ENTRIES {
+                dropped += 1;
+                continue;
+            }
+            *held += 1;
+            indices.insert(signature, state.entries.len());
+            state.entries.push(entry.clone());
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                cap = MAX_ROOT_ENTRIES,
+                "fetch backlog: root at its entry cap; additions dropped"
+            );
         }
         if state.entries.len() > MAX_ENTRIES {
             return Err(io::Error::other("fetch backlog exceeds entry limit"));
@@ -237,6 +261,24 @@ mod tests {
         assert!(Store::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
+    #[test]
+    fn one_root_cannot_fill_the_shared_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pending.json")).unwrap();
+        let flood: Vec<Entry> = (0..=MAX_ROOT_ENTRIES)
+            .map(|i| {
+                let mut e = entry("hostile", 0);
+                e.reference.locator = RefLocator::Purl(format!("pkg:npm/flood-{i}@1.0.0"));
+                e
+            })
+            .collect();
+        store.update(&flood, &[]).unwrap();
+        assert_eq!(store.entries("hostile").unwrap().len(), MAX_ROOT_ENTRIES);
+        // Another root still checkpoints.
+        store.update(&[entry("other", 0)], &[]).unwrap();
+        assert_eq!(store.entries("other").unwrap().len(), 1);
+    }
+
     #[test]
     fn concurrent_updates_preserve_every_root() {
         let dir = tempfile::tempdir().unwrap();

@@ -39,7 +39,10 @@ struct Args {
     /// resistance (which filter size cannot buy). 1e-9 (1-in-a-billion) keeps a
     /// good-set FP — which skips the full scan — vanishingly rare; at the current
     /// ~1.8M-key corpus each SHA filter lands in the 16 MiB power-of-two bucket.
-    #[arg(long, default_value_t = 1e-9, value_name = "P")]
+    /// At most 1e-3: burton refuses to load a filter whose effective
+    /// false-positive rate is implausibly high (a forged all-blessing filter),
+    /// and builds anything looser at its 1e-9 fallback.
+    #[arg(long, default_value_t = 1e-9, value_name = "P", value_parser = parse_fp)]
     fp: f64,
 
     /// On-disk layout version to emit. Defaults to this build's
@@ -67,6 +70,16 @@ struct Args {
         env = "SCAN_BLOOM_ACCEPT_UNUSUAL_GROWTH"
     )]
     accept_unusual_growth: bool,
+}
+
+/// `--fp` within (0, 1e-3]; see the flag's docs.
+fn parse_fp(raw: &str) -> Result<f64, String> {
+    let fp: f64 = raw.parse().map_err(|e| format!("{raw:?}: {e}"))?;
+    if fp > 0.0 && fp <= 1e-3 {
+        Ok(fp)
+    } else {
+        Err(format!("{fp} is outside (0, 1e-3]"))
+    }
 }
 
 /// Ubiquitous system binaries that must never be catalogued bad. Hashed at build

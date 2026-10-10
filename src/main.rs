@@ -77,17 +77,65 @@ mod jemalloc {
     /// tree-sitter concurrently. In practice: call once, first thing in `main`.
     pub(super) unsafe fn route_tree_sitter_through_jemalloc() {
         // SAFETY: jemalloc's malloc/calloc/realloc/free are one allocator
-        // family, never return null for non-zero sizes, and satisfy libc
-        // malloc alignment. The ordering and thread-exclusivity clauses are
-        // this function's own documented precondition.
+        // family and satisfy libc malloc alignment; the shims below restore
+        // tree-sitter's abort-on-null contract. The ordering and
+        // thread-exclusivity clauses are this function's own documented
+        // precondition.
         unsafe {
             tree_sitter::set_allocator(Some(tree_sitter::Allocator {
-                malloc: tikv_jemalloc_sys::malloc,
-                calloc: tikv_jemalloc_sys::calloc,
-                realloc: tikv_jemalloc_sys::realloc,
+                malloc: ts_malloc,
+                calloc: ts_calloc,
+                realloc: ts_realloc,
                 free: tikv_jemalloc_sys::free,
             }));
         }
+    }
+
+    // tree-sitter's own allocators abort on null; a custom one is trusted, and
+    // its array growth (`array.h`) writes through a `realloc` result unchecked.
+    // jemalloc does return null on exhaustion (ENOMEM is real under
+    // `vm.max_map_count`), so passing it straight through would turn memory
+    // pressure while parsing a hostile source file into a wild write. Abort
+    // instead, exactly as tree-sitter's defaults do.
+
+    /// # Safety
+    ///
+    /// The C `malloc` contract.
+    unsafe extern "C" fn ts_malloc(size: usize) -> *mut std::ffi::c_void {
+        // SAFETY: jemalloc's malloc accepts any size.
+        let ptr = unsafe { tikv_jemalloc_sys::malloc(size) };
+        if ptr.is_null() && size != 0 {
+            std::process::abort();
+        }
+        ptr
+    }
+
+    /// # Safety
+    ///
+    /// The C `calloc` contract.
+    unsafe extern "C" fn ts_calloc(count: usize, size: usize) -> *mut std::ffi::c_void {
+        // SAFETY: jemalloc's calloc accepts any count and size, and returns
+        // null on overflow.
+        let ptr = unsafe { tikv_jemalloc_sys::calloc(count, size) };
+        if ptr.is_null() && count != 0 && size != 0 {
+            std::process::abort();
+        }
+        ptr
+    }
+
+    /// # Safety
+    ///
+    /// The C `realloc` contract: `ptr` is null or came from this allocator.
+    unsafe extern "C" fn ts_realloc(
+        ptr: *mut std::ffi::c_void,
+        size: usize,
+    ) -> *mut std::ffi::c_void {
+        // SAFETY: forwarded under the caller's contract.
+        let grown = unsafe { tikv_jemalloc_sys::realloc(ptr, size) };
+        if grown.is_null() && size != 0 {
+            std::process::abort();
+        }
+        grown
     }
 }
 
@@ -101,18 +149,23 @@ mod mimalloc_alloc {
     static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
     /// `calloc` for tree-sitter: a zeroed `count * size` allocation from
-    /// mimalloc, or null on overflow or exhaustion.
+    /// mimalloc. Aborts on overflow or exhaustion, as tree-sitter's own
+    /// allocators do: a custom allocator is trusted, and its array growth
+    /// writes through the result unchecked.
     ///
     /// # Safety
     ///
     /// The C allocator contract: the result is freed only through `mi_free`.
     unsafe extern "C" fn calloc_compat(count: usize, size: usize) -> *mut std::ffi::c_void {
         let Some(bytes) = count.checked_mul(size) else {
-            return std::ptr::null_mut();
+            std::process::abort();
         };
         // SAFETY: `mi_malloc` accepts any size and returns null on failure.
         let ptr = unsafe { libmimalloc_sys::mi_malloc(bytes) };
-        if !ptr.is_null() && bytes > 0 {
+        if ptr.is_null() && bytes > 0 {
+            std::process::abort();
+        }
+        if bytes > 0 {
             // SAFETY: `ptr` is a fresh, non-null allocation of `bytes` bytes.
             unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
         }
@@ -129,12 +182,43 @@ mod mimalloc_alloc {
         // function's own documented precondition.
         unsafe {
             tree_sitter::set_allocator(Some(tree_sitter::Allocator {
-                malloc: libmimalloc_sys::mi_malloc,
+                malloc: malloc_compat,
                 calloc: calloc_compat,
-                realloc: libmimalloc_sys::mi_realloc,
+                realloc: realloc_compat,
                 free: libmimalloc_sys::mi_free,
             }));
         }
+    }
+
+    /// `malloc` for tree-sitter, aborting on exhaustion (see [`calloc_compat`]).
+    ///
+    /// # Safety
+    ///
+    /// The C allocator contract: the result is freed only through `mi_free`.
+    unsafe extern "C" fn malloc_compat(size: usize) -> *mut std::ffi::c_void {
+        // SAFETY: `mi_malloc` accepts any size and returns null on failure.
+        let ptr = unsafe { libmimalloc_sys::mi_malloc(size) };
+        if ptr.is_null() && size != 0 {
+            std::process::abort();
+        }
+        ptr
+    }
+
+    /// `realloc` for tree-sitter, aborting on exhaustion (see [`calloc_compat`]).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is null or came from mimalloc.
+    unsafe extern "C" fn realloc_compat(
+        ptr: *mut std::ffi::c_void,
+        size: usize,
+    ) -> *mut std::ffi::c_void {
+        // SAFETY: forwarded under the caller's contract.
+        let grown = unsafe { libmimalloc_sys::mi_realloc(ptr, size) };
+        if grown.is_null() && size != 0 {
+            std::process::abort();
+        }
+        grown
     }
 }
 
@@ -346,7 +430,11 @@ where
 /// subcommands let clap populate their local `hopper` field from the
 /// environment, but bare-path shorthand bypasses subcommand parsing.
 fn resolve_hopper(hopper: Option<String>) -> Option<String> {
-    resolve_hopper_value(hopper, std::env::var("SCAN_HOPPER").ok())
+    let hopper = resolve_hopper_value(hopper, std::env::var("SCAN_HOPPER").ok());
+    if let Some(raw) = hopper.as_deref() {
+        scan::upload::warn_if_cleartext(raw);
+    }
+    hopper
 }
 
 fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<String> {
@@ -1139,9 +1227,15 @@ fn finish_scan(summary: &scan::ScanSummary) -> ExitCode {
 }
 
 /// A multi-threaded runtime for a daemon.
+///
+/// Its blocking threads run small analyses inline (`classify_bytes` without a
+/// whale lane), so they get the same stack as every analysis pool
+/// ([`scan::RAYON_STACK_MB`]): a hostile sample that recurses fine on a pool
+/// must not overflow tokio's 2 MiB default and abort the whole daemon.
 fn daemon_runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(scan::RAYON_STACK_MB * 1024 * 1024)
         .build()?)
 }
 
@@ -1224,6 +1318,7 @@ fn worker(
     // with a 403 whether or not its relay is on, so the later addresses are not
     // a fallback for this loop. Passing the whole string through reaches a URL
     // parser, which reads the commas as part of one very strange hostname.
+    scan::upload::warn_if_cleartext(&args.url);
     let Some(hopper_url) = scan::upload::worker_endpoint(&args.url) else {
         anyhow::bail!("--url names no hopper address");
     };
