@@ -1094,7 +1094,8 @@ fn one_step_toward(ml: Classification, target: Classification) -> Classification
 ///   corroborated malice raises the score, a corroborated clean file lowers it.
 /// - **LLM less severe** → step one rung down and steer the score down, but only
 ///   when its read is trustworthy. Two things make it untrustworthy, and either
-///   discards the clear outright, leaving the ML verdict exactly as it was:
+///   discards the clear outright, leaving the ML verdict exactly as it was (a
+///   third, a cleave hostile finding, is below):
 ///   an **opaque render** (packed/escaped bytes — a text model cannot clear what
 ///   it cannot read) or **analyzer-directed text** in the sample (see
 ///   [`addresses_the_analyzer`]; a clear is precisely what an injected sample is
@@ -1103,6 +1104,9 @@ fn one_step_toward(ml: Classification, target: Classification) -> Classification
 /// The trust requirement covers *every* softening, not just a class drop — an
 /// agreed-benign score also moves down, so it is gated the same way. The
 /// resulting invariant is the one worth remembering:
+///
+/// A third discards it too: a **cleave hostile finding**, which the LLM's prose
+/// cannot overrule.
 ///
 /// > When the LLM's read is untrusted, the blend never lowers the class and never
 /// > lowers the score.
@@ -1117,8 +1121,11 @@ fn blend(ml: Classification, ml_prob: f32, llm: LlmGrade, ev: Evidence) -> (Clas
     // make it look *better* only when its read is credible: the render must be
     // readable (a text model cannot honestly clear escaped bytes) and free of
     // text aimed at the grader. Either failing discards the softening entirely,
-    // leaving ML's class and score exactly as they were.
-    let may_soften = ev.readable && !ev.analyzer_directed;
+    // leaving ML's class and score exactly as they were. So does an independent
+    // cleave hostile finding: the LLM reads text the author wrote, so a prompt
+    // injection the phrase list misses must still not argue a sample past a
+    // detector that never read its prose.
+    let may_soften = ev.readable && !ev.analyzer_directed && !ev.hostile_finding;
     // A class move is capped at one rung *and* has to clear the proximity gate;
     // when it does not, the score still steers but the band holds.
     let stepped = |toward_severe: bool| {
@@ -4567,6 +4574,26 @@ mod tests {
         };
         let (out, _) = blend(Classification::Hostile, 0.99, LlmGrade::Benign, ev);
         assert_eq!(out, Classification::Hostile);
+    }
+
+    /// A prompt injection the phrase list misses still cannot clear a sample
+    /// cleave independently flagged hostile, on any rung: the class and the
+    /// score both hold.
+    #[test]
+    fn a_hostile_finding_vetoes_every_softening() {
+        for (ml, fired) in [
+            (Classification::Hostile, Level::At(1)),
+            (Classification::Suspicious, Level::At(1000)),
+            (Classification::Benign, Level::At(5000)),
+        ] {
+            let ev = Evidence {
+                hostile_finding: true,
+                ..ev_at(fired)
+            };
+            let (out, conf) = blend(ml, 0.6, LlmGrade::Benign, ev);
+            assert_eq!(out, ml, "{ml:?} at {fired:?}");
+            assert!((conf - 0.6).abs() < 1e-6, "{ml:?} at {fired:?}: {conf}");
+        }
     }
 
     #[test]

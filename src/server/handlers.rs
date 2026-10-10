@@ -69,8 +69,13 @@ pub(super) fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
     fletch::purl::normalize(&prefixed).ok_or("not a package URL")
 }
 
+/// Whether `raw` is an absolute http(s) URL. Callers keep and log `raw`
+/// itself, and `Url::parse` silently drops tab, CR and LF, so a raw control
+/// character (a forged log line, a terminal escape) is refused outright; a
+/// real URL percent-encodes them.
 pub(super) fn valid_http_url(raw: &str) -> bool {
-    reqwest::Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    !raw.chars().any(char::is_control)
+        && reqwest::Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// Render the shared outcome as this request's response. `elapsed_ms` is the
@@ -222,7 +227,15 @@ async fn receive_upload(
     let mut size = 0usize;
     let mut digest = Sha256::new();
     loop {
-        match field.chunk().await {
+        let Ok(next) = tokio::time::timeout(super::BODY_IDLE_TIMEOUT, field.chunk()).await else {
+            tracing::warn!(
+                id = request_id,
+                received = size,
+                "upload stalled; abandoned"
+            );
+            return Err(super::body_idle_timeout());
+        };
+        match next {
             Ok(Some(chunk)) => {
                 size += chunk.len();
                 if size > max_upload {
@@ -1214,6 +1227,22 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Url::parse` drops tab/CR/LF, but the raw string is what gets stored and
+    /// logged: a raw control character must be refused, not normalized away.
+    #[test]
+    fn submitted_urls_refuse_raw_control_characters() {
+        assert!(valid_http_url("https://a.example/x?q=%0A"));
+        for raw in [
+            "https://a.example/x\nINFO forged",
+            "https://a.example/x\r\n",
+            "https://a.example/\tx",
+            "https://a.example/\u{1b}[2J",
+            "file:///etc/passwd",
+        ] {
+            assert!(!valid_http_url(raw), "{raw:?}");
+        }
+    }
 
     /// A follower renders the leader's failure verbatim: same status, same body,
     /// no second analysis and no second error.

@@ -438,11 +438,16 @@ async fn read_body(
     let mut stream = body.into_data_stream();
     let mut digest = Sha256::new();
     let mut buf = bytes::BytesMut::new();
-    while let Some(chunk) = std::future::poll_fn(|cx| {
-        futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
-    })
-    .await
-    {
+    loop {
+        let next = std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
+        });
+        let Ok(next) = tokio::time::timeout(super::BODY_IDLE_TIMEOUT, next).await else {
+            return Err(super::body_idle_timeout());
+        };
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.map_err(|e| {
             tracing::warn!(error = %e, "request body could not be read");
             ApiError::bad_request("unreadable_body", "The request body could not be read.")

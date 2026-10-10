@@ -826,6 +826,21 @@ const MAX_REPAIRS: usize = 4;
 /// Comfortably inside systemd's default 90-second stop timeout.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest an upload may go without delivering a byte. An idle bound, not a
+/// total one: a large artifact on a slow link still arrives, but a client
+/// dripping a body (or stalling mid-upload) cannot hold its buffer and its
+/// busy mark open indefinitely.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The refusal for a body that stalled past [`BODY_IDLE_TIMEOUT`].
+fn body_idle_timeout() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::REQUEST_TIMEOUT,
+        "body_timeout",
+        "The request body stalled.",
+    )
+}
+
 struct AppState {
     config: ServerConfig,
     /// Process uptime anchor — captured when the app is built, very close to
@@ -1313,6 +1328,10 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
     state.tasks.spawn(load_resources(Arc::clone(&state)));
     spawn_watchdog(&state);
 
+    // `{"purl": …}` needs a few hundred bytes; the router-wide upload limit
+    // would let it buffer a full artifact's worth of JSON before rejecting it.
+    const PURL_BODY_MAX: usize = 64 * 1024;
+
     // No ConcurrencyLimitLayer: each analyze handler refuses past capacity
     // with a 429 rather than queueing. Layers apply bottom-up, so the last
     // `.layer()` runs first per request; the ACL runs before the body limit so
@@ -1331,7 +1350,10 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
         .route("/v1/lookup", get(v1::v1_lookup))
         .route("/v1/analyze", post(v1::v1_analyze))
         .route("/analyze", post(handlers::analyze))
-        .route("/analyze-purl", post(handlers::analyze_purl))
+        .route(
+            "/analyze-purl",
+            post(handlers::analyze_purl).layer(DefaultBodyLimit::max(PURL_BODY_MAX)),
+        )
         .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(state.config.max_body_size))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))

@@ -1310,7 +1310,7 @@ fn log_startup_diagnostics(d: &StartupDiagnostics<'_>) {
 
     let max_rss_bytes = d.max_rss.map_or(0, NonZeroU64::get);
     tracing::info!(
-        argv = ?redact_zip_passwords(std::env::args()),
+        argv = ?redact_secrets(std::env::args()),
         hopper_url = d.hopper_url,
         worker_name = d.name,
         workers = d.workers.get(),
@@ -1341,18 +1341,24 @@ fn log_startup_diagnostics(d: &StartupDiagnostics<'_>) {
     );
 }
 
-/// The command line with every `--zip-password` value replaced, fit for a log.
-fn redact_zip_passwords(args: impl IntoIterator<Item = String>) -> Vec<String> {
+/// Flags whose value is a secret: an archive password or an LLM bearer token.
+const SECRET_FLAGS: &[&str] = &["--zip-password", "--llm-key"];
+
+/// The command line with every [`SECRET_FLAGS`] value replaced, fit for a log.
+fn redact_secrets(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut args = args.into_iter();
     let mut redacted = Vec::new();
     while let Some(arg) = args.next() {
-        if arg == "--zip-password" {
+        if SECRET_FLAGS.contains(&arg.as_str()) {
             redacted.push(arg);
             if args.next().is_some() {
                 redacted.push("<redacted>".to_string());
             }
-        } else if arg.starts_with("--zip-password=") {
-            redacted.push("--zip-password=<redacted>".to_string());
+        } else if let Some(flag) = SECRET_FLAGS
+            .iter()
+            .find(|f| arg.strip_prefix(**f).is_some_and(|v| v.starts_with('=')))
+        {
+            redacted.push(format!("{flag}=<redacted>"));
         } else {
             redacted.push(arg);
         }
@@ -6435,7 +6441,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_diagnostics_redact_archive_passwords() {
+    fn worker_diagnostics_redact_secrets() {
         let args = [
             "atomscan",
             "worker",
@@ -6443,11 +6449,14 @@ mod tests {
             "secret one",
             "--zip-password=secret-two",
             "--verbose",
+            "--llm-key",
+            "sk-one",
+            "--llm-key=sk-two",
         ]
         .map(str::to_string);
 
         assert_eq!(
-            redact_zip_passwords(args),
+            redact_secrets(args),
             [
                 "atomscan",
                 "worker",
@@ -6455,6 +6464,9 @@ mod tests {
                 "<redacted>",
                 "--zip-password=<redacted>",
                 "--verbose",
+                "--llm-key",
+                "<redacted>",
+                "--llm-key=<redacted>",
             ]
         );
     }

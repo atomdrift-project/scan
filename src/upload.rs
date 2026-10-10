@@ -109,6 +109,37 @@ pub fn endpoints(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Warn, once per address, when the hopper token would cross the network in
+/// cleartext: a plain `http://` hopper that is not on loopback. The token is
+/// fleet-wide write access to the corpus, so it should only travel over TLS or
+/// a network that encrypts on its own (a WireGuard/Tailscale address, which
+/// this cannot tell apart and so still names).
+pub fn warn_if_cleartext(raw: &str) {
+    if hopper_token().is_none() {
+        return;
+    }
+    for endpoint in endpoints(raw) {
+        let Ok(url) = reqwest::Url::parse(&endpoint) else {
+            continue;
+        };
+        let host = url
+            .host_str()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if url.scheme() == "http" && !loopback {
+            tracing::warn!(
+                hopper = %endpoint,
+                "the hopper token is sent to this address in cleartext; use https unless the network itself is encrypted"
+            );
+        }
+    }
+}
+
 /// The one address a worker may poll: the primary, which [`endpoints`] puts
 /// last.
 ///

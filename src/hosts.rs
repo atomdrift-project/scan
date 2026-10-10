@@ -55,14 +55,17 @@ const THIRD_PARTY: &[&str] = &[
     "apps.nextcloud.com",          // third-party Nextcloud apps
     "appsource.microsoft.com",     // third-party Microsoft business applications
     "aur.archlinux.org",           // Arch User Repository: unvetted PKGBUILDs
+    "bugs.debian.org",             // user-attached files on bug reports
     "bugs.documentfoundation.org", // user-attached files on bug reports
     "bugs.freedesktop.org",        // user-attached files on bug reports
     "bugs.kde.org",                // user-attached files on bug reports
     "bugs.wireshark.org",          // user-attached files on bug reports
     "bugzilla.kernel.org",         // user-attached files on bug reports
     "bugzilla.mozilla.org",        // user-attached files on bug reports
+    "bugzilla.redhat.com",         // user-attached files on bug reports
     "build.opensuse.org",          // Open Build Service: user-built packages
     "cran.r-project.org",          // user-published R packages
+    "download.opensuse.org",       // OBS home: projects: user-built packages
     "exchange.adobe.com",          // third-party Adobe plugins
     "extensions.blender.org",      // user-submitted Blender extensions
     "extensions.gnome.org",        // user-submitted Shell extensions
@@ -78,6 +81,7 @@ const THIRD_PARTY: &[&str] = &[
     "hub.docker.com",              // user-published container images
     "invent.kde.org",              // user-hosted repositories
     "issues.apache.org",           // user-attached files on issues
+    "lists.gnu.org",               // mailing-list attachment archives
     "marketplace.atlassian.com",   // third-party Atlassian apps
     "marketplace.eclipse.org",     // third-party Eclipse solutions
     "marketplace.qt.io",           // third-party Qt components
@@ -96,8 +100,10 @@ const THIRD_PARTY: &[&str] = &[
     "proxy.golang.org",            // user-published Go modules
     "registry.terraform.io",       // user-published providers and modules
     "repo.maven.apache.org",       // Maven Central: user-published artifacts
+    "salsa.debian.org",            // user-hosted repositories
     "savannah.gnu.org",            // project and user-hosted code repositories
     "splunkbase.splunk.com",       // third-party Splunk apps
+    "src.fedoraproject.org",       // user forks of package sources
     "storage.cloud.google.com",    // Cloud Storage objects
     "store.kde.org",               // user-submitted themes and widgets
     "sum.golang.org",              // Go checksum database

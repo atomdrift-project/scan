@@ -55,7 +55,7 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn io::Write, r: &ScanResult) -
             writeln!(
                 out,
                 "  embedded {} ({}): routes (raw) {}",
-                ef.path,
+                output::tty_text(&ef.path),
                 ef.file_type,
                 output::format_route_scores(&ef.model_scores),
             )?;
@@ -138,7 +138,7 @@ pub(crate) fn format_llm_line(llm: &Interpretation, color: bool) -> String {
 fn terminal_safe_text(text: &str) -> String {
     crate::deptree::strip_ansi(text)
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !output::tty_hostile(c))
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()

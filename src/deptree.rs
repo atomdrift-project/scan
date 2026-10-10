@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::engine::{PROGRESS_TICK, SPINNER, bar_active, term_dims};
-use crate::output::{Rgb, fg};
+use crate::output::{Rgb, fg, tty_text};
 
 /// The lifecycle state a caller drives a dependency through. `Fetching` and
 /// `Analyzing` render with a live spinner; `Done` is terminal and carries its
@@ -478,9 +478,10 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
             glyph,
             color,
             detail,
-        } => (*glyph, *color, detail.clone()),
+        } => (*glyph, *color, tty_text(detail).into_owned()),
     };
-    let name = elide_middle(&entry.name, namew);
+    // Names, sources and details come from hostile manifests and servers.
+    let name = elide_middle(&tty_text(&entry.name), namew);
     let namecol = namew.max(name.width());
     let pad = " ".repeat(namecol - name.width());
     let detail_col = if detail.is_empty() {
@@ -505,7 +506,7 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     let source = if entry.source.is_empty() || avail < SOURCE_MIN {
         String::new()
     } else {
-        elide_middle(&entry.source, avail)
+        elide_middle(&tty_text(&entry.source), avail)
     };
     let (source_col, source_width) = if source.is_empty() {
         (String::new(), 0)

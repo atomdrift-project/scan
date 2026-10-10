@@ -869,6 +869,25 @@ impl<'a> Coordinate<'a> {
     }
 }
 
+/// Whether a PURL names one immutable release: a concrete version
+/// (`1.2.3`, `v0.0.0-2024…`) or a full commit hash. A version-less PURL
+/// (`npx foo` → `pkg:npm/foo`), a dist-tag (`@latest`), a range (`^1.0`) or a
+/// branch moves under the caller: a corpus answer for it may describe a
+/// different, older release than the one a fetch would get, so it must never
+/// stand in for that fetch.
+fn pins_exact_version(purl: &str) -> bool {
+    let Some(version) = Coordinate::of(purl).and_then(|c| c.version) else {
+        return false;
+    };
+    let numeric = version.strip_prefix('v').unwrap_or(version);
+    let commit = matches!(version.len(), 40 | 64) && version.bytes().all(|b| b.is_ascii_hexdigit());
+    (numeric.starts_with(|c: char| c.is_ascii_digit()) || commit)
+        && !version.contains(['*', '^', '~', '<', '>', '=', '|', ',', ' '])
+        && !version
+            .split('.')
+            .any(|part| part.eq_ignore_ascii_case("x"))
+}
+
 /// The root sample's imperative hunt re-reads it from disk and re-parses it.
 /// Skip that for large roots — the win is scripts/manifests/Dockerfiles, which
 /// are small; a multi-megabyte binary root has no imperative install commands to
@@ -1398,9 +1417,23 @@ fn redirect_destinations(bytes: &[u8]) -> Vec<String> {
     {
         return Vec::new();
     }
+    let (html, lower): (&str, &str) = (&html, &lower);
+    // A match inside an earlier same-name tag's body is attribute text, not a
+    // tag, and once no `>` remains no later tag can close. Skipping both keeps the scan
+    // linear: a hostile page of `<input <input <input …` with one `>` at the
+    // end would otherwise re-scan and copy the whole tail per match.
     let tags = |name: &'static str| {
-        lower.match_indices(name).filter_map(|(at, _)| {
-            let end = at + html.get(at..)?.find('>')?;
+        let mut consumed = 0;
+        lower.match_indices(name).filter_map(move |(at, _)| {
+            if at < consumed {
+                return None;
+            }
+            let Some(close) = html.get(at..).and_then(|rest| rest.find('>')) else {
+                consumed = html.len();
+                return None;
+            };
+            let end = at + close;
+            consumed = end;
             html.get(at + name.len()..end)
                 .filter(|body| body.starts_with(|c: char| c.is_ascii_whitespace()))
         })
@@ -2359,6 +2392,7 @@ impl FetchSession {
                 r.kind != RefKind::UrlFetch
                     && matches!(r.locator, RefLocator::Purl(_))
                     && r.content_sha256.is_none()
+                    && pins_exact_version(locator(r))
             })
             .map(|r| locator(r).to_owned())
             .collect();
@@ -2677,11 +2711,16 @@ impl FetchSession {
             }
         }
         self.checkpoint(&pending, &completed);
+        // Only what the gate would admit: a reference `fetchable` rejects is
+        // never fetched, so it would never be completed and would sit in the
+        // backlog forever.
         let discovered: Vec<_> = next
             .iter()
             .flat_map(|(sha, refs)| {
                 refs.iter()
-                    .filter(|r| r.is_fetch_target() && self.policy.wants(r.kind))
+                    .filter(|r| {
+                        r.is_fetch_target() && self.policy.wants(r.kind) && self.fetchable(r)
+                    })
                     .map(|r| {
                         self.pending_entry(sha, r, self.current_hop.saturating_add(1), "discovered")
                     })
@@ -2956,6 +2995,8 @@ fn attribute_reference_outcomes(
     struct Tally<'a> {
         declared: u64,
         unresolved: Vec<&'a str>,
+        unavailable_commands: u64,
+        unavailable_command_spans: Vec<filefacts::Span>,
     }
 
     let mut touched: Vec<String> = Vec::new();
@@ -2966,6 +3007,19 @@ fn attribute_reference_outcomes(
         };
         let tally = by_source.entry(source).or_default();
         tally.declared += 1;
+        // Only an actual command edge with an explicit absent-artifact HTTP
+        // response counts. Unknown resolution, 403, timeouts and docs do not.
+        if rec.kind == RefKind::Command
+            && matches!(rec.outcome, Outcome::Failed(FetchError::Status(404 | 410)))
+            && artifact_absent(rec)
+        {
+            tally.unavailable_commands += 1;
+            if let Some(offset) = rec.source_offset {
+                tally
+                    .unavailable_command_spans
+                    .push(filefacts::Span::new(offset, 1));
+            }
+        }
         if matches!(rec.outcome, Outcome::Unresolved(_)) {
             tally.unresolved.push(rec.locator.as_str());
         }
@@ -2989,6 +3043,10 @@ fn attribute_reference_outcomes(
         let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
         metrics.insert("references.declared_count".to_string(), declared as f64);
         metrics.insert("references.unresolved_count".to_string(), unresolved as f64);
+        metrics.insert(
+            "references.unavailable_command_count".to_string(),
+            fetched.map_or(0, |t| t.unavailable_commands) as f64,
+        );
         metrics.insert("references.security_hold_count".to_string(), held as f64);
         // Editor-marketplace removals get their own count, because they do not
         // mean what a registry 404 means. npm serves a 404 for a private name,
@@ -3021,7 +3079,21 @@ fn attribute_reference_outcomes(
     // facts. Re-run it for just the files whose facts changed, so the rules that
     // read `references.*` get their pass.
     for sha in touched {
-        match cleave::graft_reference_outcome_traits(report, &sha, &AnalysisOptions::default()) {
+        let spans = by_source
+            .get(sha.as_str())
+            .map(|t| {
+                BTreeMap::from([(
+                    "references.unavailable_command_count".to_string(),
+                    t.unavailable_command_spans.clone(),
+                )])
+            })
+            .unwrap_or_default();
+        match cleave::graft_located_reference_outcome_traits(
+            report,
+            &sha,
+            &AnalysisOptions::default(),
+            &spans,
+        ) {
             Ok(0) => {}
             Err(e) => tracing::warn!(sha = %sha, "reference-outcome pass failed: {e:#}"),
             Ok(n) => tracing::debug!(
@@ -3631,7 +3703,7 @@ fn report_fetch(rec: &FetchRecord) {
         "    {} {}  {}{redirect}",
         fg(row.color, &format!("{} {:<6}", row.glyph, row.label)),
         fg(DETAIL, &format!("{column:>10}")),
-        fetch_target(rec)
+        crate::output::tty_text(fetch_target(rec))
     );
 }
 
@@ -4113,6 +4185,36 @@ fn age_gate(
     // Unresolvable references bypass registry gating and retain the normal
     // unresolved fetch outcome, making incomplete coverage visible. Resolution
     // may ask a registry, so the references resolve concurrently, in order.
+    //
+    // Both network steps — resolving a range, and the registry record below —
+    // are capped per manifest at [`MAX_REGISTRY_LOOKUPS`]: a crafted lockfile
+    // declaring 100k names must not become 100k registry requests from this
+    // host. A reference past the cap is kept unresolved (fail open), so it
+    // still meets the fetch budget and stays visible in the outcome.
+    let mut unresolved = Vec::new();
+    let mut ranges = 0usize;
+    let selected: Vec<Reference> = selected
+        .into_iter()
+        .filter_map(|r| {
+            if let RefLocator::Purl(purl) = &r.locator
+                && !pins_exact_version(purl)
+            {
+                ranges += 1;
+                if ranges > MAX_REGISTRY_LOOKUPS {
+                    unresolved.push(r);
+                    return None;
+                }
+            }
+            Some(r)
+        })
+        .collect();
+    if ranges > MAX_REGISTRY_LOOKUPS {
+        tracing::warn!(
+            declared = ranges,
+            cap = MAX_REGISTRY_LOOKUPS,
+            "manifest declares more unpinned dependencies than the lookup cap; the rest are not resolved"
+        );
+    }
     let resolved: Vec<(Reference, Option<Reference>)> = {
         use rayon::prelude::*;
         selected
@@ -4123,7 +4225,6 @@ fn age_gate(
             })
             .collect()
     };
-    let mut unresolved = Vec::new();
     let mut selected = Vec::with_capacity(resolved.len());
     for (r, exact) in resolved {
         match exact {
@@ -4179,6 +4280,15 @@ fn age_gate(
     }
     // The network round-trips run concurrently up front; the gate decision below
     // is then pure, so it stays deterministic in `selected` order.
+    let mut selected = selected;
+    if selected.len() > MAX_REGISTRY_LOOKUPS {
+        tracing::warn!(
+            declared = selected.len(),
+            cap = MAX_REGISTRY_LOOKUPS,
+            "manifest declares more dependencies than the registry lookup cap; the rest keep no registry record"
+        );
+        unresolved.extend(selected.split_off(MAX_REGISTRY_LOOKUPS));
+    }
     let lookups = lookup_registries(&selected, res, now);
     let mut keep = Vec::with_capacity(selected.len());
     let mut registries = Vec::new();
@@ -4219,6 +4329,12 @@ fn age_gate(
     keep.extend(unresolved);
     (keep, registries)
 }
+
+/// Most registry requests of each kind (range resolution, record lookup) one
+/// manifest may cost. Generous for real lockfiles — a large `Cargo.lock` is
+/// ~700 coordinates, a monorepo `package-lock.json` a few thousand — and a hard
+/// stop for a crafted one.
+const MAX_REGISTRY_LOOKUPS: usize = 5_000;
 
 /// Process-wide memo of registry lookups, keyed by locator string. A package
 /// named across many scanned files resolves once: the first lookup fills this,
@@ -4416,7 +4532,7 @@ fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
         "    {} {}  {}{detail}",
         fg(color, &format!("{glyph} {label:<10}")),
         fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
-        locator(r)
+        crate::output::tty_text(locator(r))
     );
 }
 
@@ -4772,6 +4888,12 @@ fn collect_references(
 /// packing many flagged members cannot turn the hunt into a decompression
 /// storm; the members past the cap keep their declared references.
 const MEMBER_HUNT_MAX: usize = 16;
+/// Largest member a text hunt reads. Bundled editor extensions commonly exceed
+/// [`ROOT_HUNT_MAX_BYTES`]; a member is still only admitted by an
+/// execution/download finding. The cap applies to the bytes actually
+/// re-extracted, not just the size the report recorded: an archive can carry
+/// two entries under one name, and re-extraction by name may return the other.
+const MEMBER_HUNT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// cleave trait ids this module reads. cleave owns the taxonomy; naming every
 /// id here keeps the module's dependence on it in one place.
@@ -4781,18 +4903,24 @@ const TRAIT_STEGO_LOADER: &str = "objectives/command-and-control/dropper/executi
 const TRAIT_STEGANOGRAPHY: &str = "objectives/anti-static/obfuscation/steganography/";
 const TRAIT_SHELL_PIPELINE: &str = "micro-behaviors/process/create/shell/pipeline";
 const TRAIT_PROCESS_CREATE: &str = "micro-behaviors/process/create/";
+const TRAIT_AUTOINSTALL: &str = "objectives/execution/autoinstall/";
+const TRAIT_GITHUB_RUNNER_SHELL: &str =
+    "micro-behaviors/process/create/shell/bridge::github-runner-shell-execution";
 const TRAIT_IMAGE_FILE_URL: &str = "micro-behaviors/communications/http/url/path::image-file-url";
 const TRAIT_SECURITY_HOLD_RECORD: &str = "registry-security-hold-record";
 
 /// Trait-id namespaces whose findings show that a file downloads something in
-/// order to run it: dropper objectives, a pipeline into a shell, and a process
-/// spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
+/// order to run it: dropper objectives, a pipeline into a shell or an
+/// auto-install / CI-runner shell bridge, and a process spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
 /// names the reason a member was hunted.
 fn download_intent(findings: &[Finding]) -> Option<&str> {
     let rank = |id: &str| {
         if id.starts_with(TRAIT_DROPPER) {
             Some(0)
-        } else if id.starts_with(TRAIT_SHELL_PIPELINE) {
+        } else if id.starts_with(TRAIT_SHELL_PIPELINE)
+            || id.starts_with(TRAIT_AUTOINSTALL)
+            || id == TRAIT_GITHUB_RUNNER_SHELL
+        {
             Some(1)
         } else if id.starts_with(TRAIT_PROCESS_CREATE)
             && (id.contains("curl") || id.contains("wget"))
@@ -4849,7 +4977,7 @@ fn hunt_download_members(
             );
             continue;
         };
-        if file.size > ROOT_HUNT_MAX_BYTES {
+        if file.size > MEMBER_HUNT_MAX_BYTES {
             tracing::debug!(
                 member,
                 trigger,
@@ -4867,7 +4995,17 @@ fn hunt_download_members(
         }
         hunted_members += 1;
         let bytes = match cleave::extract_member(root_path, member) {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) if bytes.len() as u64 <= MEMBER_HUNT_MAX_BYTES => bytes,
+            Ok(Some(bytes)) => {
+                tracing::warn!(
+                    member,
+                    trigger,
+                    recorded = file.size,
+                    extracted = bytes.len(),
+                    "re-read member exceeds the hunt ceiling (duplicate entry name?); text hunt skipped"
+                );
+                continue;
+            }
             Ok(None) => {
                 tracing::debug!(
                     member,
@@ -5430,13 +5568,16 @@ impl Payloads<'_> {
             return None;
         }
         let content_sha = rec.content_sha256.clone()?;
+        let name = payload_name(rec);
+        let cache_key = crate::analysis_cache::entry_key(&content_sha, &name);
 
-        // Warm-cache hit: reuse the prior analysis of these exact bytes,
-        // skipping the re-analysis (a minutes-long disassembly for a big native
-        // binary). Keyed by content sha under a ruleset-version namespace, so an
-        // entry is only ever one the current detector produced — a
-        // rules/engine change misses and re-scans.
-        if let Some(hit) = self.acache.and_then(|ac| ac.get(&content_sha)) {
+        // Warm-cache hit: reuse the prior analysis of these exact bytes under
+        // this name, skipping the re-analysis (a minutes-long disassembly for a
+        // big native binary). Keyed by content sha and name under a
+        // ruleset-version namespace, so an entry is only ever one the current
+        // detector produced for this input — a rules/engine change misses and
+        // re-scans.
+        if let Some(hit) = self.acache.and_then(|ac| ac.get(&cache_key)) {
             tracing::debug!(
                 locator = %rec.locator,
                 content_sha = %content_sha,
@@ -5485,7 +5626,6 @@ impl Payloads<'_> {
             tracing::debug!(locator = %rec.locator, "fetched bytes gone from the blob cache; not analyzed");
             return None;
         };
-        let name = payload_name(rec);
 
         // Next-hop references discovered in the payload's own bytes — the full
         // hunt, so a stage-2 script's `curl | bash` (or an encoded URL) is
@@ -5518,7 +5658,7 @@ impl Payloads<'_> {
         if let Some(ac) = self.acache
             && sub.is_some()
         {
-            ac.put(&content_sha, &sub, &next_from_bytes);
+            ac.put(&cache_key, &sub, &next_from_bytes);
         }
 
         Some(Analyzed {
@@ -6203,6 +6343,70 @@ mod tests {
         assert!(matches!(done_state(&rec), DepState::Hidden));
     }
 
+    /// A corpus answer may only stand in for a fetch of one immutable release:
+    /// hopper answers a version-less PURL with whatever version it saw last.
+    #[test]
+    fn purl_precheck_requires_an_exact_version() {
+        for purl in [
+            "pkg:npm/foo@1.2.3",
+            "pkg:npm/%40scope/pkg@2.0.0-beta.1",
+            "pkg:golang/github.com/a/b@v0.0.0-20240101000000-abcdef123456",
+            "pkg:pypi/foo@1!2.0?extra=x",
+            "pkg:github/o/r@0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(pins_exact_version(purl), "{purl}");
+        }
+        for purl in [
+            "pkg:npm/foo",
+            "pkg:npm/@scope/pkg",
+            "pkg:npm/foo@latest",
+            "pkg:npm/foo@^1.2.0",
+            "pkg:npm/foo@1.x",
+            "pkg:npm/foo@>=1.0.0",
+            "pkg:github/o/r@main",
+            "pkg:github/o/r",
+        ] {
+            assert!(!pins_exact_version(purl), "{purl}");
+        }
+    }
+
+    #[test]
+    fn unavailable_commands_are_typed_and_attributed_to_the_declaring_file() {
+        let sha = "a".repeat(64);
+        let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [{"id": 0, "path": "extension.js", "depth": 0,
+                "file_type": "javascript", "sha256": sha, "size": 100u64}]
+        }))
+        .expect("report");
+        let mut records = Vec::new();
+        for (kind, status) in [
+            (RefKind::Command, 404),
+            (RefKind::Command, 410),
+            (RefKind::Dependency, 404),
+            (RefKind::UrlFetch, 404),
+            (RefKind::Command, 403),
+            (RefKind::Command, 500),
+        ] {
+            let mut rec = fetched_record();
+            rec.source_sha256 = Some(sha.clone());
+            rec.kind = kind;
+            rec.outcome = Outcome::Failed(FetchError::Status(status));
+            rec.status = Some(status);
+            records.push(rec);
+        }
+        let mut transport = records[0].clone();
+        transport.status = None;
+        transport.outcome = Outcome::Failed(FetchError::Transport("404 in error text".into()));
+        records.push(transport);
+        let mut other_file = records[0].clone();
+        other_file.source_sha256 = Some("b".repeat(64));
+        records.push(other_file);
+        attribute_reference_outcomes(&mut report, &records, &BTreeMap::new());
+        let metrics = report.files[0].filefacts_metrics.as_ref().expect("metrics");
+        assert_eq!(metrics["references.unavailable_command_count"], 2.0);
+    }
+
     /// A 404 says the coordinate names nothing the registry carries — a fact
     /// about the manifest, not the artifact being scanned — and a big lockfile
     /// produces them by the dozen. A failure that should have worked stays.
@@ -6737,6 +6941,20 @@ mod tests {
         ] {
             assert!(redirect_destinations(page).is_empty());
         }
+    }
+
+    /// A page of unclosed tag openers must cost one pass, not one pass per
+    /// opener.
+    #[test]
+    fn redirect_tag_scan_is_linear() {
+        let mut hostile = b"<html>".to_vec();
+        while hostile.len() < REDIRECT_PAGE_MAX_BYTES - 64 {
+            hostile.extend_from_slice(b"<input <meta ");
+        }
+        hostile.push(b'>');
+        let started = std::time::Instant::now();
+        assert!(redirect_destinations(&hostile).is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

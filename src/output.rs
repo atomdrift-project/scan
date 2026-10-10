@@ -9,6 +9,33 @@ use crate::OutputFormat;
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
 use crate::model::{Classification, Level, RouteScore};
 
+/// Whether `c` can rewrite or disguise what a terminal shows: a C0/C1
+/// control (ESC opens CSI/OSC sequences that move the cursor, erase lines,
+/// write the clipboard or plant links) or a bidi override/isolate, which
+/// reorders the text around it.
+pub(crate) fn tty_hostile(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `text` safe to print to a terminal: every [`tty_hostile`] character is
+/// shown as its `\u{…}` escape instead of being interpreted. File names,
+/// paths, package names and URLs come from hostile samples; a member named
+/// `a\x1b[1A\x1b[2K✓ clean.js` must not erase the verdict printed above it.
+pub(crate) fn tty_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(tty_hostile) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if tty_hostile(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 const BLOCK: &str = "\u{2588}";
 const TERMINAL_MARKER_WIDTH: usize = 3;
 
@@ -685,6 +712,7 @@ pub(crate) fn terminal_artifact_line(
     size: u64,
     container: bool,
 ) -> String {
+    let label = tty_text(label);
     let glyph = if container {
         "\u{1f4e6}" // 📦
     } else {
@@ -699,7 +727,7 @@ pub(crate) fn terminal_artifact_line(
     format!(
         "{}{} {}",
         rail(1, glyph, ""),
-        fg_bold(p.path_name, label),
+        fg_bold(p.path_name, &label),
         fg(p.dim, &format!("\u{00b7} {meta}")),
     )
 }
@@ -714,7 +742,7 @@ pub(crate) fn terminal_reference_branch(
     body: &str,
     last: bool,
 ) -> String {
-    let relationship = format!("{subject} from {source}");
+    let relationship = format!("{} from {}", tty_text(subject), tty_text(source));
     let fork = if last {
         "\u{2514}\u{2500}"
     } else {
@@ -754,13 +782,13 @@ pub(crate) fn terminal_reference_status_heading(status: &str, subject: &str) -> 
         "  ↳ {} {} {}",
         fg_bold(p.warning, status),
         fg(p.very_dim, "·"),
-        fg(p.dim, subject),
+        fg(p.dim, &tty_text(subject)),
     )
 }
 
 /// The fetched locator as a secondary identity line in the nested branch.
 pub(crate) fn terminal_reference_locator(locator: &str) -> String {
-    format!("    {}", fg_bold(palette().path_name, locator))
+    format!("    {}", fg_bold(palette().path_name, &tty_text(locator)))
 }
 
 /// Locator row used inside a compact fetched-reference branch.
@@ -768,7 +796,7 @@ pub(crate) fn terminal_reference_locator_row(locator: &str) -> String {
     format!(
         "{}{}",
         terminal_marker_prefix(1, "\u{1f517}"), // 🔗
-        fg_bold(palette().path_name, locator)
+        fg_bold(palette().path_name, &tty_text(locator))
     )
 }
 
@@ -808,6 +836,7 @@ pub(crate) fn terminal_card(
     // stamps read as a stuck gauge. The one calibrated number lives on the
     // archive banner; the cards rank by severity (worst first) and by class.
     let word = verdict_word(classification);
+    let name = tty_text(name);
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
@@ -825,7 +854,7 @@ pub(crate) fn terminal_card(
         out.push_str(&format!(
             "{} {stamp} {} {}\n",
             fg(accent, "\u{256d}\u{2500}"), // ╭─
-            fg_bold(p.path_name, name),
+            fg_bold(p.path_name, &name),
             fg(p.dim, &format!("\u{00b7} {meta}")),
         ));
         for line in body.lines() {
@@ -863,6 +892,7 @@ pub(crate) fn terminal_embedded_branch(
     body: &str,
     last: bool,
 ) -> String {
+    let name = tty_text(name);
     let mut meta = file_type.to_uppercase();
     let size = human_size(size);
     if !size.is_empty() {
@@ -880,7 +910,7 @@ pub(crate) fn terminal_embedded_branch(
     let mut out = format!(
         "{indent}{} {} {}{}\n",
         fg(p.very_dim, fork),
-        fg_bold(p.path_name, name),
+        fg_bold(p.path_name, &name),
         fg(p.dim, &format!("\u{00b7} {meta} \u{00b7} ")),
         fg_bold(class_color(classification), verdict_word(classification)),
     );
@@ -939,7 +969,7 @@ pub fn print_ps_result(
 
     eprintln!(
         " {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
-        fg_bold(p.path_name, &result.path),
+        fg_bold(p.path_name, &tty_text(&result.path)),
     );
 
     if let Some(llm) = &result.interpretation {
@@ -1056,7 +1086,7 @@ fn print_extra(result: &ScanResult, p: &Palette) {
         eprintln!(
             "          {} {} {} {} {}",
             fg(p.dim, "embedded:"),
-            fg(p.dim, &ef.path),
+            fg(p.dim, &tty_text(&ef.path)),
             fg(p.dim, &format!("[{} {}]", ef.file_type, ef.level)),
             fg(p.dim, &format_route_scores(&ef.model_scores)),
             fg(p.very_dim, "(raw scores)"),
@@ -1247,7 +1277,7 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
     eprintln!(
         " {icon}  {name} {}  {}",
         fg(p.very_dim, reason),
-        fg(p.header_path, label),
+        fg(p.header_path, &tty_text(label)),
     );
 }
 

@@ -1,13 +1,14 @@
 //! Local, on-disk cache of fetched-dependency analysis results, keyed by content
-//! sha256.
+//! sha256 and the name the bytes were analyzed under.
 //!
 //! Fetching already caches a dependency's *bytes* (fletch's blob cache), so a
 //! warm re-run doesn't re-download — but the *analysis* of those bytes was
 //! recomputed every time, and for a dependency that ships a large native binary
 //! that is a minutes-long, single-threaded disassembly repeated on every scan.
 //! This memoizes the analysis: the finalized sub-report and the next-hop
-//! references a payload yields are serialized under its content sha256, so a
-//! later scan of the same bytes reuses them instead of re-running cleave.
+//! references a payload yields are serialized under its content sha256 and
+//! name ([`entry_key`]), so a later scan of the same bytes reuses them instead
+//! of re-running cleave.
 //!
 //! Correctness over speed: the cache is namespaced by a *ruleset version* token
 //! (scan release, traits commit, the content of the bloom set the
@@ -18,6 +19,7 @@
 //! A hit is only ever a result the *current* detector already produced. Set
 //! `SCAN_ANALYSIS_CACHE=0` to disable it entirely.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -51,7 +53,7 @@ pub(crate) struct AnalysisCache {
 /// Root of the analysis cache (`…/atomdrift/scan/analysis`), above the
 /// per-ruleset-version subdirectory. `None` when the OS has no cache directory.
 /// Used by [`crate::cache_cleanup`] to reclaim the store; entries live at
-/// `analysis/<version>/<sha>.zst` (two levels below this root).
+/// `analysis/<version>/<key>.zst` (two levels below this root).
 pub(crate) fn cache_base() -> Option<PathBuf> {
     Some(
         dirs::cache_dir()?
@@ -73,30 +75,31 @@ impl AnalysisCache {
         let base = cache_base()?;
         // Reference discovery/context changed independently of the trait set.
         // Historical next-hop lists can contain prose-derived package names.
-        let version = format!("dependency-v2-{}", ruleset_version());
+        // v3: entries are keyed by [`entry_key`], not the bare content sha.
+        let version = format!("dependency-v3-{}", ruleset_version());
         prune_stale_versions(&base, &version);
         let dir = base.join(version);
         std::fs::create_dir_all(&dir).ok()?;
         Some(Self { dir })
     }
 
-    /// Reuse a prior analysis of these exact bytes, or `None` on a miss (no
+    /// Reuse a prior analysis under `key` (see [`entry_key`]), or `None` on a miss (no
     /// entry, or an unreadable/garbled one — treated as a miss so a corrupt file
     /// self-heals on the next write).
-    pub(crate) fn get(&self, content_sha: &str) -> Option<Cached> {
-        let bytes = std::fs::read(self.path(content_sha)).ok()?;
+    pub(crate) fn get(&self, key: &str) -> Option<Cached> {
+        let bytes = std::fs::read(self.path(key)).ok()?;
         let json = zstd::decode_all(&bytes[..]).ok()?;
         let cached: Cached = serde_json::from_slice(&json).ok()?;
         (!cached.sub.as_ref().is_some_and(incomplete)).then_some(cached)
     }
 
-    /// Store an analysis under its content sha. Best-effort: any failure
+    /// Store an analysis under `key` (see [`entry_key`]). Best-effort: any failure
     /// (serialize, compress, write) leaves the cache untouched and is silent —
     /// the result is already in hand, the cache is only an optimization. An
     /// [`incomplete`] analysis is not stored.
     pub(crate) fn put(
         &self,
-        content_sha: &str,
+        key: &str,
         sub: &Option<AnalysisReport>,
         next: &[(String, Vec<Reference>)],
     ) {
@@ -120,13 +123,27 @@ impl AnalysisCache {
         if let Ok(mut tmp) = tmp
             && tmp.write_all(&compressed).is_ok()
         {
-            let _ = tmp.persist(self.path(content_sha));
+            let _ = tmp.persist(self.path(key));
         }
     }
 
-    fn path(&self, content_sha: &str) -> PathBuf {
-        self.dir.join(format!("{content_sha}.zst"))
+    fn path(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{key}.zst"))
     }
+}
+
+/// The cache key for `content_sha` analyzed under `name`. The name is part of
+/// the analysis: cleave types a file by its name before its content (a `.env`
+/// is text), and the reference hunt reads it too. Keyed by sha alone, bytes
+/// first fetched under a misleading name would serve that shallow result to
+/// every later fetch of the same bytes under their real name.
+pub(crate) fn entry_key(content_sha: &str, name: &str) -> String {
+    let digest = Sha256::digest(name.as_bytes());
+    let mut key = format!("{content_sha}-");
+    for b in &digest[..8] {
+        let _ = write!(key, "{b:02x}");
+    }
+    key
 }
 
 /// Whether `report` or any file in it is missing results a later run may
@@ -302,6 +319,18 @@ mod tests {
         assert_eq!(a.built, b.built);
         assert_ne!(bloom_token(&a), bloom_token(&b));
         assert_eq!(bloom_token(&a), bloom_token(&manifest("aa")));
+    }
+
+    #[test]
+    fn entry_key_separates_names_of_the_same_bytes() {
+        let sha = "ab".repeat(32);
+        assert_eq!(entry_key(&sha, "setup.py"), entry_key(&sha, "setup.py"));
+        assert_ne!(entry_key(&sha, "setup.py"), entry_key(&sha, ".env"));
+        assert!(
+            entry_key(&sha, "../x/y")
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-')
+        );
     }
 
     #[test]

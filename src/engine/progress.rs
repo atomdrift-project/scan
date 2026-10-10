@@ -322,6 +322,11 @@ impl Spinner {
         if !std::io::stderr().is_terminal() {
             return None;
         }
+        let label = if label.chars().any(crate::output::tty_hostile) {
+            crate::output::tty_text(&label).into_owned()
+        } else {
+            label
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let started = Instant::now();
@@ -386,6 +391,7 @@ impl Spinner {
 /// directories, the telling part — eliding the head with a leading `…`. A short
 /// path is returned unchanged.
 fn spinner_tail(path: &str, width: usize) -> String {
+    let path = crate::output::tty_text(path);
     let count = path.chars().count();
     if count <= width {
         return path.to_string();
