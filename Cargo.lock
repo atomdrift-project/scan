@@ -864,7 +864,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 dependencies = [
  "aes 0.9.3",
  "aho-corasick",
@@ -948,7 +948,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1775,7 +1775,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#06d18c2b6537b5df2ff451ff9a9695ff5573f681"
+source = "git+https://github.com/atomdrift-project/filefacts.git#6ebf1d6e3a94fa53a56038d039ad285584c9ca92"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -1892,7 +1892,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/fletch.git#a08efa1d4e75713b2355a73e7d4325878e439a94"
+source = "git+https://github.com/atomdrift-project/fletch.git#160423c0482ae92585fb66ca141756c0e3d66743"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3001,7 +3001,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 
 [[package]]
 name = "lzxd"
@@ -3021,7 +3021,7 @@ dependencies = [
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 dependencies = [
  "rustc-hash 2.1.3",
  "serde",
@@ -3883,7 +3883,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 dependencies = [
  "flate2",
  "memchr",
@@ -4570,7 +4570,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -4998,7 +4998,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#d945a9b774394939e1e0051a4f5781d33fd7e0d1"
+source = "git+https://github.com/atomdrift-project/stng.git#6e21883f647086053b3d4194021091b1d3a63dfd"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5140,7 +5140,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 
 [[package]]
 name = "tap"
@@ -5793,7 +5793,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#06d18c2b6537b5df2ff451ff9a9695ff5573f681"
+source = "git+https://github.com/atomdrift-project/filefacts.git#6ebf1d6e3a94fa53a56038d039ad285584c9ca92"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6967,7 +6967,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#fc97e00eab81f789910f1c59ec71de9bf3347843"
+source = "git+https://github.com/atomdrift-project/cleave.git#077b1b4c36ab5a1c8bbfa1f2a237fd76669eb3cb"
 
 [[package]]
 name = "yara-x"
