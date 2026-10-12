@@ -31,11 +31,11 @@ use crate::model::Level;
 
 /// Findings kept per verdict. The wire view serves the worst few; the rest are
 /// headroom so the projection can widen without re-analyzing everything.
-pub(crate) const MAX_STORED_HITS: usize = 10;
+pub const MAX_STORED_HITS: usize = 10;
 
 /// Criticality floor for a stored finding: 3 notable, 4 suspicious, 5 hostile.
 /// Anything below is baseline noise that no consumer gates on.
-pub(crate) const MIN_HIT_CRIT: u8 = 3;
+pub const MIN_HIT_CRIT: u8 = 3;
 
 /// Verdicts memoized in process, ahead of the on-disk read.
 const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
@@ -73,7 +73,7 @@ pub struct Hit {
 
 /// The stored answer for one artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Verdict {
+pub struct Verdict {
     /// Content digest of the artifact this verdict is about.
     pub sha256: String,
     /// `ml.lvl`: the tightest false-positive budget per 100M benigns at which
@@ -97,7 +97,7 @@ pub(crate) struct Verdict {
 impl Verdict {
     /// Project a finished scan into the stored answer. `purl` is the locator
     /// the artifact was requested by, when the request named one.
-    pub(crate) fn from_scan(result: &crate::engine::ScanResult, purl: Option<&str>) -> Self {
+    pub fn from_scan(result: &crate::engine::ScanResult, purl: Option<&str>) -> Self {
         let why = match &result.interpretation {
             Some(crate::interpret::Interpretation::Graded(graded))
                 if !graded.interpretation.trim().is_empty() =>
@@ -178,14 +178,14 @@ pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -
 
 /// Findings served on a lookup. The store keeps more (see
 /// [`MAX_STORED_HITS`]); a consumer acts on the worst few.
-pub(crate) const SERVED_HITS: usize = 3;
+pub const SERVED_HITS: usize = 3;
 
 /// The wire form of a lookup answer: the verdict plus the filter's opinion of
 /// the same key. `bloom` is present whether or not we hold a verdict — it is a
 /// separate, cheaper kind of knowledge, and collapsing the two would let a
 /// probabilistic filter hit read as an analysis we never ran.
 #[derive(Debug, Serialize)]
-pub(crate) struct View<'a> {
+pub struct View<'a> {
     pub sha: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub purl: Option<&'a str>,
@@ -204,12 +204,12 @@ pub(crate) struct View<'a> {
 /// for the reason hopper gives: those ids say what an artifact DOES, and this
 /// one says where a claim about it CAME FROM. A consumer resolving trait ids to
 /// documentation would otherwise look this up and find nothing.
-pub(crate) const FEED_TRAIT_ID: &str = "intel/feed/malicious";
+pub const FEED_TRAIT_ID: &str = "intel/feed/malicious";
 
 /// The finding id when our own catalogue is the source rather than an outside
 /// feed. Same namespace, different claim: the corpus convicted this artifact at
 /// some earlier point, and the filter remembers only that it did.
-pub(crate) const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
+pub const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 
 /// Synthesize the answer a bloom match justifies on its own, for an artifact no
 /// stored verdict covers.
@@ -243,7 +243,7 @@ pub(crate) const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 /// entirely, and its cache treats an engine-less body as short-lived and refuses
 /// to let it stand in for an analysis. Stamping a build here would make a filter
 /// hit read as a scan we never ran, which is the one thing this must not do.
-pub(crate) struct BloomClaim {
+pub struct BloomClaim {
     /// The level this claim justifies on its own: [`Level::Clean`] for a skip.
     pub lvl: Level,
     /// The synthesized finding naming why; `None` for a skip, which is an
@@ -252,7 +252,7 @@ pub(crate) struct BloomClaim {
 }
 
 /// The finding a filter hit is reported as.
-pub(crate) struct BloomFinding {
+pub struct BloomFinding {
     /// Criticality: 5 hostile, 4 suspicious.
     pub crit: u8,
     /// Which taxonomy made the claim.
@@ -270,7 +270,7 @@ pub(crate) struct BloomFinding {
 ///
 /// One definition, read by both the native lookup route and the `/v1` decision,
 /// so the two cannot drift into answering the same filter hit differently.
-pub(crate) fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> {
+pub fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> {
     use crate::bloom_repo::Decision;
     let convicted = |lvl, crit, id, desc| BloomClaim {
         lvl,
@@ -310,7 +310,7 @@ pub(crate) fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<Bloom
 
 /// The native-route projection of [`bloom_claim`]. `hits` is scratch the caller
 /// owns so the view can borrow from it.
-pub(crate) fn bloom_derived_view<'a>(
+pub fn bloom_derived_view<'a>(
     decision: crate::bloom_repo::Decision,
     bloom: &'a str,
     sha256: &'a str,
@@ -350,7 +350,7 @@ impl Verdict {
     /// Project the stored verdict onto the wire, worst findings first.
     /// `requested_purl` is what the caller asked by, which names the artifact
     /// more precisely than a locator recorded on some earlier analysis.
-    pub(crate) fn view<'a>(&'a self, bloom: &'a str, requested_purl: Option<&'a str>) -> View<'a> {
+    pub fn view<'a>(&'a self, bloom: &'a str, requested_purl: Option<&'a str>) -> View<'a> {
         View {
             sha: &self.sha256,
             purl: requested_purl.or(self.purl.as_deref()),
@@ -393,7 +393,7 @@ fn locate(
 }
 
 /// Handle to the index directory for the current ruleset version.
-pub(crate) struct Index {
+pub struct Index {
     dir: PathBuf,
     /// Recently served verdicts, keyed by content sha. A PURL hit resolves to a
     /// sha first, so both key kinds share one memo.
@@ -403,7 +403,7 @@ pub(crate) struct Index {
 /// Root of the verdict index (`…/atomdrift/scan/lookup`), above the
 /// per-ruleset-version subdirectory. Entries live at `lookup/<version>/…`, two
 /// levels below this root — the shape [`crate::cache_cleanup`] reclaims.
-pub(crate) fn index_base() -> Option<PathBuf> {
+pub fn index_base() -> Option<PathBuf> {
     Some(
         dirs::cache_dir()?
             .join("atomdrift")
@@ -414,7 +414,7 @@ pub(crate) fn index_base() -> Option<PathBuf> {
 
 /// The process-wide index, opened once. `None` when disabled or unusable, in
 /// which case every lookup answers "unknown".
-pub(crate) fn global() -> Option<&'static Index> {
+pub fn global() -> Option<&'static Index> {
     static GLOBAL: OnceLock<Option<Index>> = OnceLock::new();
     GLOBAL
         .get_or_init(|| {
@@ -451,7 +451,7 @@ impl Index {
     }
 
     /// The verdict for a content digest, or `None` when we hold none.
-    pub(crate) fn get_sha(&self, sha256: &str) -> Option<Verdict> {
+    pub fn get_sha(&self, sha256: &str) -> Option<Verdict> {
         let sha = normalize_sha(sha256)?;
         if let Some(hit) = self.memo().get(&sha) {
             return hit.clone();
@@ -469,7 +469,7 @@ impl Index {
 
     /// The verdict for a PURL, resolved through the alias index. `None` when
     /// the PURL is unparseable, unseen, or its artifact has since been pruned.
-    pub(crate) fn get_purl(&self, purl: &str) -> Option<Verdict> {
+    pub fn get_purl(&self, purl: &str) -> Option<Verdict> {
         let key = purl_key(purl)?;
         let sha = std::fs::read_to_string(self.alias_path(&key)).ok()?;
         // An alias outliving its verdict (evicted by the cache sweeper) reads
@@ -482,14 +482,14 @@ impl Index {
     /// First write wins: the bytes are the identity, so a second analysis of
     /// them within one ruleset namespace has nothing new to say. Best-effort —
     /// the caller already holds the answer, so any failure here is silent.
-    pub(crate) fn put(&self, verdict: &Verdict) {
+    pub fn put(&self, verdict: &Verdict) {
         self.store(verdict, false);
     }
 
     /// Replace a verdict during an explicit refresh. The digest remains the
     /// identity, but the caller has deliberately asked to renew the judgment
     /// and the in-process index must not keep serving the pre-refresh value.
-    pub(crate) fn replace(&self, verdict: &Verdict) {
+    pub fn replace(&self, verdict: &Verdict) {
         self.store(verdict, true);
     }
 

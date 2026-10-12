@@ -33,8 +33,8 @@ use sha2::{Digest, Sha256};
 /// the bytes couldn't be analyzed) and the next-hop references found in them.
 #[derive(Deserialize)]
 pub(crate) struct Cached {
-    pub sub: Option<AnalysisReport>,
-    pub next: Vec<(String, Vec<Reference>)>,
+    pub(crate) sub: Option<AnalysisReport>,
+    pub(crate) next: Vec<(String, Vec<Reference>)>,
 }
 
 /// The same payload, borrowed for serialization — so storing never clones the

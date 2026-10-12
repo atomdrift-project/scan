@@ -22,26 +22,26 @@ use crate::provenance::RegistryProvenance;
 /// One analysis: what to label it, which bundle to run, and the per-request
 /// context the caller tracks it with. Build with [`Analysis::new`] and set the
 /// rest with struct update syntax.
-pub(crate) struct Analysis<'a> {
+pub struct Analysis<'a> {
     /// The result's `path`: the upload's name, not a temp file path.
-    pub(crate) label: &'a str,
-    pub(crate) resources: &'a ModelResources,
-    pub(crate) slow_rule_ms: u64,
-    pub(crate) cancellation: Option<&'a Arc<AtomicBool>>,
-    pub(crate) phase: Option<&'a RequestPhase>,
+    pub label: &'a str,
+    pub resources: &'a ModelResources,
+    pub slow_rule_ms: u64,
+    pub cancellation: Option<&'a Arc<AtomicBool>>,
+    pub phase: Option<&'a RequestPhase>,
     /// Registry facts collected at fetch time (worker provenance or a
     /// caller's registry map), so the scan reasons over them without refetching.
-    pub(crate) root_registry: Option<&'a RegistryProvenance>,
+    pub root_registry: Option<&'a RegistryProvenance>,
     /// Reference-following policy; [`Analysis::new`] takes the bundle's.
-    pub(crate) follow: FetchPolicy,
+    pub follow: FetchPolicy,
     /// Capture each fetched dependency's standalone report, for callers that
     /// renew results on hopper.
-    pub(crate) deps_for_upload: bool,
-    pub(crate) cpu_lease: Option<CpuLease>,
+    pub deps_for_upload: bool,
+    pub cpu_lease: Option<CpuLease>,
 }
 
 impl<'a> Analysis<'a> {
-    pub(crate) fn new(label: &'a str, resources: &'a ModelResources, slow_rule_ms: u64) -> Self {
+    pub fn new(label: &'a str, resources: &'a ModelResources, slow_rule_ms: u64) -> Self {
         Self {
             label,
             resources,
@@ -80,7 +80,7 @@ impl<'a> Analysis<'a> {
 
 /// Analyze the file at `path`. Runs on a blocking thread. `extract_dir`, when
 /// set, receives the samples cleave extracts.
-pub(crate) fn classify_file(
+pub fn classify_file(
     path: &Path,
     extract_dir: Option<&Path>,
     analysis: Analysis<'_>,
@@ -97,7 +97,7 @@ pub(crate) fn classify_file(
 
 /// Analyze `data` in memory. cleave adopts the refcounted buffer, so a
 /// downloaded sample is never copied.
-pub(crate) fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<ScanResult> {
+pub fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<ScanResult> {
     analysis.mark("cleave:init");
     let mut opts = analysis.options();
     // A whale analyzes on its own bounded pool so its members never fill the
@@ -166,7 +166,7 @@ fn finish(report: cleave::AnalysisReport, analysis: Analysis<'_>) -> Result<Scan
 /// percentile into an attribution: fetch-bound, registry-bound or
 /// analysis-bound, per request, without a profiler attached.
 #[derive(Clone)]
-pub(crate) struct RequestPhase(Arc<RequestPhaseInner>);
+pub struct RequestPhase(Arc<RequestPhaseInner>);
 
 #[derive(Debug)]
 struct RequestPhaseInner {
@@ -181,7 +181,7 @@ struct RequestPhaseInner {
 const PHASE_MARKS_MAX: usize = 64;
 
 impl RequestPhase {
-    pub(crate) fn with_label(label: impl Into<String>) -> Self {
+    pub fn with_label(label: impl Into<String>) -> Self {
         Self(Arc::new(RequestPhaseInner {
             tracker: cleave::PhaseTracker::with_label(label),
             started: Instant::now(),
@@ -190,7 +190,7 @@ impl RequestPhase {
     }
 
     /// Enter `phase`: updates the shared tracker and stamps the timeline.
-    pub(crate) fn set(&self, phase: &str) {
+    pub fn set(&self, phase: &str) {
         self.0.tracker.set(phase);
         let at = self.0.started.elapsed();
         let mut marks = self
@@ -204,19 +204,19 @@ impl RequestPhase {
     }
 
     /// The current phase name, as the tracker reports it.
-    pub(crate) fn get(&self) -> String {
+    pub fn get(&self) -> String {
         self.0.tracker.get()
     }
 
     /// The underlying tracker, for cleave's own phase reporting.
-    pub(crate) fn tracker(&self) -> &cleave::PhaseTracker {
+    pub fn tracker(&self) -> &cleave::PhaseTracker {
         &self.0.tracker
     }
 
     /// Milliseconds spent in each phase, first-entered order, as
     /// `name=ms name=ms …`. Time before the first mark is `pre`, so the
     /// figures sum to the request's elapsed time.
-    pub(crate) fn timeline(&self) -> String {
+    pub fn timeline(&self) -> String {
         let now = self.0.started.elapsed();
         let marks = self
             .0
@@ -255,21 +255,21 @@ impl RequestPhase {
 ///
 /// Shared by the server and the pull worker, each of which holds one behind an
 /// `Arc` and swaps it on reload.
-pub(crate) struct ModelResources {
-    pub(crate) model: Model,
-    pub(crate) shap: Option<ShapImportance>,
+pub struct ModelResources {
+    pub model: Model,
+    pub shap: Option<ShapImportance>,
     /// LLM interpretation config (`--interpret`); `None` disables the pass.
-    pub(crate) interpret: Option<crate::interpret::InterpretConfig>,
+    pub interpret: Option<crate::interpret::InterpretConfig>,
     /// External-reference fetch policy; default (empty) disables fetching.
-    pub(crate) fetch: crate::fetch::FetchPolicy,
+    pub fetch: crate::fetch::FetchPolicy,
     /// Additional passwords to try for encrypted archives.
-    pub(crate) zip_passwords: crate::ArchivePasswords,
+    pub zip_passwords: crate::ArchivePasswords,
 }
 
 /// Payloads at or below this many bytes count as small — for the slot lanes
 /// and for [`whale_lane_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
 /// worker's cleave gate reads; 1 MiB unless set.
-pub(crate) fn small_job_max_bytes() -> u64 {
+pub fn small_job_max_bytes() -> u64 {
     std::env::var("SCAN_SMALL_JOB_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -282,7 +282,7 @@ pub(crate) fn small_job_max_bytes() -> u64 {
 /// 4 cores → 2, 64 → 16, 128 → 16. Several whales in flight each get their
 /// own; the global pool keeps every core for everything else.
 #[must_use]
-pub(crate) fn whale_pool_threads(physical_cores: usize) -> usize {
+pub fn whale_pool_threads(physical_cores: usize) -> usize {
     (physical_cores / 4).clamp(2, 16)
 }
 
@@ -292,7 +292,7 @@ pub(crate) fn whale_pool_threads(physical_cores: usize) -> usize {
 /// eight is where its p50 was best (0.29 s vs 0.44 s on 16, measured
 /// 2026-09-05 at concurrency 8 over 256 PURLs).
 #[must_use]
-pub(crate) fn small_pool_threads(physical_cores: usize) -> usize {
+pub fn small_pool_threads(physical_cores: usize) -> usize {
     (physical_cores / 8).clamp(2, 8)
 }
 
@@ -303,7 +303,7 @@ pub(crate) fn small_pool_threads(physical_cores: usize) -> usize {
 /// while a whale is in a serial phase, not so much that the global pool's
 /// small work loses its cores.
 #[must_use]
-pub(crate) fn whale_slots(physical_cores: usize) -> usize {
+pub fn whale_slots(physical_cores: usize) -> usize {
     (physical_cores / 8).clamp(1, 8)
 }
 
@@ -323,7 +323,7 @@ fn big_job_min_bytes() -> u64 {
 /// Whale-lane sizing, read once from the environment.
 /// Analyses admitted and not yet finished, process-wide — what a new lane
 /// shares the cores with. Kept by [`RequestGuard`].
-pub(crate) static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+pub static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Threads a private lane of tier minimum `floor` gets when `active`
 /// requests (this one included) are in flight on a host with `physical`
@@ -339,7 +339,7 @@ pub(crate) static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 /// share reproduces both ends: 64 physical cores / 8 in flight = 8 (the
 /// small floor), / 4 = 16, / 2 = 32, alone = everything.
 #[must_use]
-pub(crate) fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
+pub fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
     if active <= 1 {
         return None;
     }
@@ -423,7 +423,7 @@ struct WhaleSlot;
 /// Every big-whale slot is taken. Surfaced as 429 so the router places the
 /// analysis on a worker with a free slot instead of queueing it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WhaleSlotBusy {
+pub struct WhaleSlotBusy {
     slots: usize,
 }
 
@@ -495,7 +495,7 @@ impl Drop for WhaleSlot {
 /// `SCAN_WHALE_POOL_THREADS` sets the per-whale width (0 sends whales to the
 /// global pool); `SCAN_WHALE_SLOTS` the big-whale concurrency;
 /// `SCAN_SMALL_JOB_MB` (shared with the slot lanes) says where whale starts.
-pub(crate) struct WhaleLane {
+pub struct WhaleLane {
     pool: rayon::ThreadPool,
     /// Held for the pool's life when the payload is a big whale.
     _slot: Option<WhaleSlot>,
@@ -503,13 +503,13 @@ pub(crate) struct WhaleLane {
 
 impl WhaleLane {
     /// Run `f` on this lane's pool, blocking until it returns.
-    pub(crate) fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+    pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
         self.pool.install(f)
     }
 }
 
 /// Big-whale slots in use and available, for `/_/stats`.
-pub(crate) fn whale_slot_usage() -> (usize, usize) {
+pub fn whale_slot_usage() -> (usize, usize) {
     (WhaleSlot::in_use(), whale_config().slots)
 }
 
@@ -540,7 +540,7 @@ pub(crate) fn whale_slot_usage() -> (usize, usize) {
 ///
 /// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
 /// than queued; the handler turns that into a retry-later response.
-pub(crate) fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
+pub fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
     let cfg = whale_config();
     let floor = if bytes <= cfg.small_max_bytes {
         cfg.small_threads

@@ -8,6 +8,12 @@
 //!
 //! The other public modules exist for the `atomscan` binary and the
 //! integration tests, and change with them.
+
+#![cfg_attr(not(feature = "daemon-support"), allow(dead_code, unreachable_pub))]
+#![cfg_attr(
+    feature = "daemon-support",
+    allow(missing_docs, missing_debug_implementations)
+)]
 //!
 //! # Example
 //! ```no_run
@@ -21,8 +27,10 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-pub(crate) mod admission;
-pub(crate) mod allocator;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod analysis;
+#[cfg(not(feature = "daemon-support"))]
 mod analysis;
 pub(crate) mod analysis_cache;
 pub(crate) mod analyzer;
@@ -34,18 +42,33 @@ pub mod bloom_update;
 pub mod cache_cleanup;
 mod civil;
 pub mod cli;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod corpus_precheck;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod corpus_precheck;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod crash_dump;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod crash_dump;
 pub(crate) mod deptree;
 pub mod engine;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod explain;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod explain;
 pub mod features;
 pub mod fetch;
 pub mod heap_profile;
 pub(crate) mod hosts;
-pub(crate) mod inflight;
 pub mod interpret;
 mod interrupt;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod lookup;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod lookup;
 pub mod memory;
 pub mod model;
@@ -56,10 +79,16 @@ pub mod pkg;
 pub mod provenance;
 pub mod ps;
 pub mod runtime;
-pub mod server;
-pub(crate) mod suspend;
 pub mod sys;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod thread_dump;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod thread_dump;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub mod thread_priority;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) mod thread_priority;
 pub mod tools;
 pub mod traits_repo;
@@ -67,7 +96,6 @@ pub mod update_check;
 pub(crate) mod update_manifest;
 pub mod upload;
 pub mod validate;
-pub mod worker;
 
 pub use analyzer::Analyzer;
 pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
@@ -117,6 +145,15 @@ impl std::fmt::Debug for ArchivePasswords {
 /// Avoids the `u128 as u64` truncating cast that `as_millis()` requires.
 /// In practice elapsed durations are always tiny (seconds to minutes), so
 /// saturation never fires — this is purely for lint-cleanliness.
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub fn duration_ms(d: std::time::Duration) -> u64 {
+    d.as_secs()
+        .saturating_mul(1_000)
+        .saturating_add(u64::from(d.subsec_millis()))
+}
+
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) fn duration_ms(d: std::time::Duration) -> u64 {
     d.as_secs()
         .saturating_mul(1_000)
@@ -124,7 +161,18 @@ pub(crate) fn duration_ms(d: std::time::Duration) -> u64 {
 }
 
 /// The 1-minute system load average, or `None` on unsupported platforms.
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub fn system_load_avg() -> Option<f64> {
+    system_load_avg_impl()
+}
+
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) fn system_load_avg() -> Option<f64> {
+    system_load_avg_impl()
+}
+
+fn system_load_avg_impl() -> Option<f64> {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
@@ -188,8 +236,8 @@ pub enum Mode {
 
 /// Stack size for every analysis thread pool, in MiB. cleave's archive
 /// analysis is nested-parallel and deep; 256 MB is what the global rayon pool
-/// has always used, and the whale pools (`server::whale_lane_for`) must match it
-/// or a member that recurses fine on one pool overflows on the other.
+/// has always used, and every analysis pool must match it or a member that
+/// recurses fine on one pool overflows on another.
 pub const RAYON_STACK_MB: usize = 256;
 
 /// Refresh the model and traits bundles before a daemon starts serving.

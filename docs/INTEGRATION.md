@@ -4,8 +4,7 @@ Atomdrift Scan reads a file and calls it **benign**, **suspicious**, or
 **hostile**. It works offline and gives the same answer every time. It makes
 no network calls unless you ask it to.
 
-This guide is for wiring it into a pipeline: a registry gating uploads, a CI
-check, an ingestion worker.
+This guide is for wiring the Scan CLI or Rust library into a pipeline.
 
 ## Start in one minute
 
@@ -33,19 +32,16 @@ notice with `SCAN_NO_UPDATE_CHECK`.
 
 ## Choose a path
 
-All four paths return the **same JSON envelope** ([JSON.md](JSON.md)). Start
-with the CLI; move to a server or worker when volume demands it. Nothing
-about how you parse results changes.
+The CLI and Rust library are the supported Scan interfaces. Both use the
+same result model ([JSON.md](JSON.md)). For a hosted HTTP service or hopper
+workers, see Postdoc's deployment and API documentation.
 
 | Path         | Use when                                                  | Cost                                            | Reference                          |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------- | ---------------------------------- |
 | **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `atomscan --help`                 |
-| **HTTP server** | Sustained traffic past ~5 scans/min.                 | You run a long-lived process.                   | [SERVER_API.md](SERVER_API.md)     |
-| **Worker**   | Distributed ingestion: workers pull jobs from a [hopper](https://github.com/atomdrift-project/hopper) queue. | You run a hopper for them to poll. | [WORKERS.md](WORKERS.md)           |
 | **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | source — `classify_file`, `classify_bytes` |
 
-A registry gating uploads on ingest should start with the **CLI** and grow
-into the **Worker**.
+A registry gating uploads on ingest can start with the **CLI**.
 
 ## Gate on the exit code
 
@@ -103,8 +99,7 @@ If you would rather set the raw probability cutoffs yourself,
 that directly. They replace `-l`; you use one approach or the other, not
 both.
 
-Whichever you pick is fixed when the process starts. A running server picks
-up a new setting with `POST /_/reload` — no restart.
+Whichever you pick is fixed when the process starts.
 
 ## Output formats
 
@@ -152,8 +147,7 @@ file. `~/.tok/llm` is *our* endpoint's credential and is never sent to
 OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
 endpoint answers 401, which costs the second opinion but not the scan: the
 verdict falls back to ML alone and the reason appears in the `llm` section.
-The deploy scripts install `~/.tok/llm` into the service account's home, so
-servers and workers pick it up the same way.
+Place `~/.tok/llm` in the account that runs the process.
 
 ### Failing over between endpoints
 

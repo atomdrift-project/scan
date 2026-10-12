@@ -672,7 +672,7 @@ fn write_error_record(file_path: &Path, msg: &str) -> io::Result<()> {
 
 /// Cleave context density for machine/LLM output. The primary terminal artifact
 /// and its fetched appendix use Scan's own global three-trait cards.
-pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
+pub fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     if matches!(
         config.format(),
         OutputFormat::Tiny | OutputFormat::Interpret
@@ -763,7 +763,7 @@ pub(crate) fn bloom_gate(
 /// scans, which decide before analysis; path scans apply the same override in
 /// [`Session::record`], where cleave has already produced a minimal report by
 /// the time the decision is known and a fresh known-good is re-analyzed in place.
-pub(crate) fn bloom_gate_fresh(
+pub fn bloom_gate_fresh(
     config: &ScanConfig,
     path: &Path,
     decision: BloomDecision,
@@ -880,15 +880,15 @@ fn is_attached_sidecar(path: &Path) -> bool {
 /// The two distinct detection inventories shown in the banner. Bloom entries
 /// are SHA-256/PURL signatures; traits, composites, and YARA are actual rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetectionCounts {
-    pub(crate) hashes_and_purls: u64,
-    pub(crate) rules: u64,
+pub struct DetectionCounts {
+    pub hashes_and_purls: u64,
+    pub rules: u64,
 }
 
 /// Detection inventory after resource load. `cleave::version_info()` loads (or
 /// reuses) shared resources; `hashes_and_purls` comes from the already-loaded
 /// Bloom repository.
-pub(crate) fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
+pub fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
     let info = cleave::version_info();
     DetectionCounts {
         hashes_and_purls,
@@ -898,7 +898,7 @@ pub(crate) fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
 
 /// Detection inventory already resident in memory for the scan banner. Shared
 /// by [`run`], [`run_paths`], and `ps` so every scanner reports the same counts.
-pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
+pub fn detection_counts(config: &ScanConfig) -> DetectionCounts {
     let hashes_and_purls = config
         .bloom()
         .map_or(0, crate::bloom_repo::Lookup::rule_count);

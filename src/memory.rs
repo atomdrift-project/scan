@@ -2,10 +2,9 @@
 //! against, and how `--max-rss-gb` is interpreted.
 //!
 //! This lives in the library, not in a binary, because every process that drives
-//! [`crate::worker`] needs the same answer. It previously lived in atomscan's
-//! `main.rs`, which meant a second front end — postdoc, which builds a
-//! [`crate::worker::Startup`] directly — could not reuse it and passed its raw
-//! CLI value straight through instead. That is a silent, severe failure: an
+//! analysis needs the same answer. Postdoc builds its own startup configuration
+//! and reuses this policy rather than passing a raw CLI value through. Otherwise
+//! the meanings of `0` can silently collide: an
 //! already-resolved ceiling uses `0` for *unlimited*, while every CLI spells
 //! `0` as *resolve one for me*. The two meanings collide on the default value,
 //! so the worker ran with memory admission disabled entirely. Which is why
@@ -21,9 +20,8 @@
 //! analyses — until the cgroup OOM-killed the process every ~20 minutes. It was
 //! never a leak; memory was returned whenever work drained. The budget was a lie.
 //!
-//! Note that the *host floor* in `crate::admission` deliberately stays
-//! host-scoped: it protects the machine from all tenants at once, so `MemTotal`
-//! is the right basis there. Only this process's own ceiling is clamped here.
+//! The process ceiling is clamped to the memory available to its cgroup, with
+//! reserve for the operating system and other tenants.
 
 use std::num::NonZeroU64;
 // Paths are only walked where cgroups exist -- and under test, which exercises

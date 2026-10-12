@@ -275,7 +275,8 @@ impl EmbeddedFile {
 
     /// The `n` highest-probability evaluations, for diagnostics displays.
     /// A view — the table itself is never sorted or truncated.
-    pub(crate) fn top_offenders(evals: &MemberEvals, n: usize) -> Vec<&EmbeddedFile> {
+    #[must_use]
+    pub fn top_offenders(evals: &MemberEvals, n: usize) -> Vec<&EmbeddedFile> {
         let mut v: Vec<&EmbeddedFile> = evals.values().collect();
         v.sort_by(|a, b| b.probability.total_cmp(&a.probability));
         v.truncate(n);
@@ -295,7 +296,7 @@ impl EmbeddedFile {
 /// # Errors
 /// The dependency's report does not parse. Posting an empty report in its place
 /// would read to hopper as a dependency with no files.
-pub(crate) fn dep_envelope(
+pub fn dep_envelope(
     dep: &DepResult,
     version: &str,
     analyzed_at: &str,
@@ -331,24 +332,24 @@ pub(crate) fn dep_envelope(
 /// One row of `ml.files`: a report node and, when it was evaluated, its own
 /// verdict.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub(crate) struct MlFile {
-    pub(crate) id: u64,
+pub struct MlFile {
+    pub id: u64,
     #[serde(rename = "type")]
-    pub(crate) file_type: String,
+    pub file_type: String,
     /// Absent, not defaulted, for a node nobody evaluated: hopper reads a
     /// prob-less row as "not analyzed", which is the truth.
     #[serde(flatten)]
-    pub(crate) verdict: Option<MlFileVerdict>,
+    pub verdict: Option<MlFileVerdict>,
 }
 
 /// The verdict fields of an evaluated [`MlFile`] row.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-pub(crate) struct MlFileVerdict {
+pub struct MlFileVerdict {
     /// Widened to `f64` because these rows were built with `json!`, which
     /// widens; a direct `f32` would print fewer digits and change the bytes.
-    pub(crate) prob: f64,
-    pub(crate) lvl: Level,
-    pub(crate) conf: Option<u8>,
+    pub prob: f64,
+    pub lvl: Level,
+    pub conf: Option<u8>,
 }
 
 /// Build the `ml.files` rows, one per analyzed report node.
@@ -421,29 +422,40 @@ pub struct ScanResultEnvelopeRef<'a> {
 /// The `ml` section of the response envelope.
 #[derive(Debug, serde::Serialize)]
 pub struct MlSection {
-    pub(crate) v: &'static str,
+    /// Result schema version.
+    pub v: &'static str,
+    /// Probability assigned to the selected classification.
     #[serde(rename = "prob")]
-    pub(crate) probability: f32,
+    pub probability: f32,
     /// Level-independent verdict marker, always serialized (`null` in
     /// manual-threshold mode). See [`ScanResult::level`].
     #[serde(rename = "lvl")]
-    pub(crate) level: Level,
+    pub level: Level,
     /// Pessimistic integer confidence percent derived from `level`; `null` when no
     /// level table applies (manual-threshold mode).
-    pub(crate) conf: Option<u8>,
+    /// Optional model confidence percent.
+    pub conf: Option<u8>,
+    /// Scores from models that ran.
     #[serde(rename = "mods", skip_serializing_if = "Vec::is_empty")]
-    pub(crate) model_scores: Vec<RouteScore>,
+    pub model_scores: Vec<RouteScore>,
+    /// Models skipped while producing this result.
     #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
-    pub(crate) skipped_models: Vec<SkippedRoute>,
-    pub(crate) version: String,
+    pub skipped_models: Vec<SkippedRoute>,
+    /// Model bundle version.
+    pub version: String,
     /// Scan engine build (`CARGO_PKG_VERSION`) that produced this report.
-    pub(crate) eng: &'static str,
-    pub(crate) analyzed_at: String,
-    pub(crate) files: Vec<MlFile>,
+    /// Scan engine version.
+    pub eng: &'static str,
+    /// UTC analysis timestamp.
+    pub analyzed_at: String,
+    /// Per-file ML results.
+    pub files: Vec<MlFile>,
+    /// Process identifiers, when analyzing a live process.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) pids: Option<Vec<u32>>,
+    pub pids: Option<Vec<u32>>,
+    /// Whether the analyzed process was deleted, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) deleted: Option<bool>,
+    pub deleted: Option<bool>,
 }
 
 impl ScanResult {
@@ -698,7 +710,7 @@ pub(super) mod tests {
         );
     }
 
-    pub(crate) fn base_result() -> ScanResult {
+    pub fn base_result() -> ScanResult {
         ScanResult {
             v: SCHEMA_VERSION,
             model: Decision {

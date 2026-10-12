@@ -197,7 +197,7 @@ fn settings() -> Settings {
 ///
 /// # Errors
 /// When there is no OS cache directory.
-pub(crate) fn open_blob_cache() -> std::io::Result<BlobCache> {
+pub fn open_blob_cache() -> std::io::Result<BlobCache> {
     let settings = settings();
     Ok(BlobCache::open()?
         .with_max_bytes(settings.max_fetch_bytes)
@@ -551,21 +551,21 @@ impl Default for FetchPolicy {
 impl FetchPolicy {
     /// True when at least one kind is selected — the master switch.
     #[must_use]
-    pub(crate) const fn enabled(&self) -> bool {
+    pub const fn enabled(&self) -> bool {
         self.urls || self.packages || self.deps || self.ci
     }
 
     /// Parse the customer-facing `follow` vocabulary. Unlike [`FromStr`], this
     /// deliberately rejects the old CLI aliases so the HTTP contract has one
     /// clear spelling for each concept.
-    pub(crate) fn parse_follow(value: &str) -> Result<Self, String> {
+    pub fn parse_follow(value: &str) -> Result<Self, String> {
         Self::parse_selection(value, false)
     }
 
     /// Copy only the selected reference kinds onto an operator-configured
     /// policy, preserving depth, age, byte, platform, and fan-out ceilings.
     #[must_use]
-    pub(crate) const fn with_selection(mut self, selected: Self) -> Self {
+    pub const fn with_selection(mut self, selected: Self) -> Self {
         self.urls = selected.urls;
         self.packages = selected.packages;
         self.deps = selected.deps;
@@ -575,7 +575,7 @@ impl FetchPolicy {
 
     /// Compact identity for single-flight keys and structured logs.
     #[must_use]
-    pub(crate) const fn selection_bits(&self) -> u8 {
+    pub const fn selection_bits(&self) -> u8 {
         (self.urls as u8)
             | ((self.packages as u8) << 1)
             | ((self.deps as u8) << 2)
@@ -597,7 +597,7 @@ impl FetchPolicy {
     /// absent one, because the absent one falls back to the caller's own
     /// resolution while the approximate one silently misfiles.
     #[must_use]
-    pub(crate) fn follow_name(&self) -> Option<String> {
+    pub fn follow_name(&self) -> Option<String> {
         if self.urls != self.packages {
             return None;
         }
@@ -1557,7 +1557,8 @@ fn mark_redirect_destinations(bytes: &[u8], refs: &mut Vec<Reference>) {
 /// plus the shas of every file in it — so the caller can harvest the dependency's
 /// aggregate verdict from the embedded-classification pass it already runs over
 /// the merged report, without re-running the model.
-pub(crate) struct FetchedDependency {
+#[derive(Debug)]
+pub struct FetchedDependency {
     /// The reference locator (PURL or URL) the bytes were fetched from.
     pub locator: String,
     /// The URL the locator resolved to — drives the stored filename/type sniff.
@@ -1582,22 +1583,30 @@ pub(crate) struct FetchedDependency {
 /// therefore never fetched. `file_id` ties the record to the exact sidecar node
 /// cleave analyzed, including composite-source attribution.
 #[derive(Debug, Clone)]
-pub(crate) struct DependencyRegistry {
+pub struct DependencyRegistry {
+    /// Package or URL locator associated with this registry result.
     pub locator: String,
+    /// Normalized provenance collected from the registry.
     pub provenance: crate::provenance::RegistryProvenance,
+    /// ID of the cleave report node associated with this result.
     pub file_id: u32,
+    /// Why the artifact was not fetched, if it was skipped.
     pub artifact_skip: Option<&'static str>,
 }
 
 /// What one fetch phase produced: the edges it recorded, the dependencies it
 /// captured for upload, the registry documents it materialized, and the corpus
 /// verdicts it adopted in place of analyzing bytes (keyed by content sha).
-#[derive(Default)]
-pub(crate) struct FetchOutcome {
-    pub(crate) records: Vec<FetchRecord>,
-    pub(crate) dependencies: Vec<FetchedDependency>,
-    pub(crate) registries: Vec<DependencyRegistry>,
-    pub(crate) adopted: HashMap<String, crate::corpus_precheck::Verdict>,
+#[derive(Debug, Default)]
+pub struct FetchOutcome {
+    /// Fetch edges observed while processing the dependency graph.
+    pub records: Vec<FetchRecord>,
+    /// Downloaded dependencies to include in the result upload.
+    pub dependencies: Vec<FetchedDependency>,
+    /// Registry provenance records collected during graph traversal.
+    pub registries: Vec<DependencyRegistry>,
+    /// Existing corpus verdicts adopted instead of analyzing these bytes.
+    pub adopted: HashMap<String, crate::corpus_precheck::Verdict>,
 }
 
 /// References to fetch, grouped by the sha256 of the file that declared them.
@@ -1753,7 +1762,7 @@ struct Landed {
 /// plain JSON scan with no upload target drops them unread, so skipping the
 /// capture (and the downstream re-parse + per-dep model pass it feeds) is pure
 /// saved work. Grafting, verdicts, and fetch edges are unaffected.
-pub(crate) fn orchestrate(
+pub fn orchestrate(
     report: &mut AnalysisReport,
     root_path: &Path,
     policy: FetchPolicy,
@@ -3434,7 +3443,8 @@ fn delivered_bytes(rec: &FetchRecord) -> bool {
 
 /// What a fetch is shown and filed under: the URL it resolved to, or the bare
 /// locator when it never resolved to one.
-pub(crate) fn fetch_target(rec: &FetchRecord) -> &str {
+#[must_use]
+pub fn fetch_target(rec: &FetchRecord) -> &str {
     rec.resolved_url.as_deref().unwrap_or(&rec.locator)
 }
 
@@ -3593,7 +3603,7 @@ pub fn registry_with_sources(
 /// tree, [`apply_package_composites`] correlates the artifact's behavior with the
 /// registry's account of it. A no-op if the report has no root or the record
 /// can't be analyzed.
-pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
+pub fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
     let Some(root_sha) = report.files.first().map(|f| f.sha256.clone()) else {
         return;
     };
@@ -3616,7 +3626,8 @@ pub(crate) fn graft_root_registry(report: &mut AnalysisReport, reg: &Registry) {
 /// One reader for both places a scan states them — the one-shot `pkg`/`url`
 /// banner and the card of a locally collected sample — so the same package
 /// reads the same way whichever way it was reached.
-pub(crate) fn registry_summary(reg: &Registry) -> Vec<String> {
+#[must_use]
+pub fn registry_summary(reg: &Registry) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if !reg.version.is_empty() {
         parts.push(format!("v{}", reg.version.trim_start_matches('v')));
@@ -3929,7 +3940,7 @@ fn dep_pulled(reg: &Registry) -> bool {
 /// for the hours right after a release, where a compromise is freshest and
 /// least-vetted, and insurance against the bloom itself being wrong about a
 /// brand-new package. Hours, not days, is the right size for that.
-pub(crate) const FRESH_WINDOW_SECS: u64 = 4 * 3_600;
+pub const FRESH_WINDOW_SECS: u64 = 4 * 3_600;
 
 /// Whether this version was published inside [`FRESH_WINDOW_SECS`].
 fn freshly_published(reg: &Registry, now: u64) -> bool {
@@ -3939,7 +3950,8 @@ fn freshly_published(reg: &Registry, now: u64) -> bool {
 
 /// A known-good dependency is normally skipped; re-scan it anyway when its trust
 /// may be stale — the version was pulled/yanked, or published very recently.
-pub(crate) fn must_rescan(reg: &Registry, now: u64) -> bool {
+#[must_use]
+pub fn must_rescan(reg: &Registry, now: u64) -> bool {
     dep_pulled(reg) || freshly_published(reg, now)
 }
 
@@ -4537,7 +4549,8 @@ fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
 }
 
 /// Wall-clock now as Unix seconds, saturating to `0` before the epoch.
-pub(crate) fn unix_now() -> u64 {
+#[must_use]
+pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -4545,7 +4558,8 @@ pub(crate) fn unix_now() -> u64 {
 
 /// Unix seconds for a UTC civil time, or `None` for a field out of range or a
 /// time before 1970.
-pub(crate) fn utc_epoch(
+#[must_use]
+pub fn utc_epoch(
     year: u32,
     month: u32,
     day: u32,
@@ -5462,7 +5476,8 @@ fn locator(r: &Reference) -> &str {
 
 /// A locator's text: the PURL, URL or path as written. Empty for a locator
 /// kind this scan predates, which names nothing it can look up.
-pub(crate) fn locator_str(locator: &RefLocator) -> &str {
+#[must_use]
+pub fn locator_str(locator: &RefLocator) -> &str {
     match locator {
         RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
         _ => "",
@@ -6005,7 +6020,8 @@ fn prepare_dependency_report_with(
 
 /// The URL a fetch's bytes came from: where the redirects ended, else where
 /// the locator resolved. `None` when it never reached one.
-pub(crate) fn fetched_url(rec: &FetchRecord) -> Option<&str> {
+#[must_use]
+pub fn fetched_url(rec: &FetchRecord) -> Option<&str> {
     rec.final_url.as_deref().or(rec.resolved_url.as_deref())
 }
 

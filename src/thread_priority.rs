@@ -20,7 +20,17 @@
 /// Linux and Windows have a per-thread priority. Elsewhere this is a no-op:
 /// FreeBSD's `setpriority` acts on the whole process, which the worker already
 /// nices.
+#[cfg(feature = "daemon-support")]
+pub fn demote_current_thread() {
+    demote_current_thread_impl();
+}
+
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) fn demote_current_thread() {
+    demote_current_thread_impl();
+}
+
+fn demote_current_thread_impl() {
     #[cfg(target_os = "linux")]
     {
         // A tid always fits in id_t; the fallible conversion only keeps the

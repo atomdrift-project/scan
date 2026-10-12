@@ -130,7 +130,7 @@ impl Breaker {
 
 /// The hopper this process asks, and how it weighs the answers.
 #[derive(Debug)]
-pub(crate) struct Precheck {
+pub struct Precheck {
     lookup_url: String,
     max_age: Duration,
     /// `SCAN_PURL_PRECHECK=0` turns off only the batch PURL negotiation.
@@ -145,7 +145,7 @@ static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 /// Arm the precheck against the hopper this process already talks to. Called
 /// where the uploader is built — the one place every `--hopper` mode passes
 /// through — so enablement follows `--hopper` with no second setting.
-pub(crate) fn configure(hopper_base_url: &str) {
+pub fn configure(hopper_base_url: &str) {
     let max_age_days = match std::env::var("SCAN_CORPUS_MAX_AGE_DAYS") {
         Ok(days) => days.trim().parse().unwrap_or_else(|_| {
             tracing::warn!(value = %days, default = DEFAULT_MAX_AGE_DAYS, "SCAN_CORPUS_MAX_AGE_DAYS is not a number of days; using the default");
@@ -175,7 +175,7 @@ pub(crate) fn configure(hopper_base_url: &str) {
 }
 
 /// The armed precheck, or `None` when this process has no hopper.
-pub(crate) fn armed() -> Option<Arc<Precheck>> {
+pub fn armed() -> Option<Arc<Precheck>> {
     ARMED.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
@@ -212,7 +212,7 @@ struct PurlAnswer {
 /// reports it: a stable id, its criticality (4 suspicious, 5 hostile), and a
 /// sentence for the findings that are not the analyzer's own.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub(crate) struct Finding {
+pub struct Finding {
     pub id: String,
     #[serde(default)]
     pub desc: String,
@@ -223,9 +223,9 @@ pub(crate) struct Finding {
 /// analyzer we are running, so re-deriving it locally would reach the same
 /// answer. `fires_at` is the tightest false-positive budget at which the
 /// artifact grades hostile; grading it against a caller's budget is
-/// [`crate::server::decision::decide`]'s job, never this module's.
+/// Postdoc's request handler's job, never this module's.
 #[derive(Debug, Clone)]
-pub(crate) struct Verdict {
+pub struct Verdict {
     pub fires_at: Level,
     pub reason: Option<String>,
     pub findings: Vec<Finding>,
@@ -238,7 +238,7 @@ pub(crate) struct Verdict {
 /// someone else's judgment — good enough to skip re-deriving a benign result,
 /// not good enough to publish as this scan's finding.
 #[derive(Debug, Clone)]
-pub(crate) enum Standing {
+pub enum Standing {
     /// Rule 1: the same analyzer already judged these bytes. Adopt its verdict.
     Adopt(Verdict),
     /// Rule 2: benign under some other analyzer, and fresh. Skip the work; there
@@ -250,7 +250,7 @@ pub(crate) enum Standing {
 
 impl Standing {
     /// Whether this standing spares us the analysis at all.
-    pub(crate) const fn skips_analysis(&self) -> bool {
+    pub const fn skips_analysis(&self) -> bool {
         !matches!(self, Self::Analyze)
     }
 }
@@ -259,7 +259,7 @@ impl Standing {
 /// records the fetch edge, and what the corpus lets us skip for it — never
 /// [`Standing::Analyze`].
 #[derive(Debug, Clone)]
-pub(crate) struct PurlHit {
+pub struct PurlHit {
     pub sha: String,
     pub standing: Standing,
 }
@@ -267,7 +267,7 @@ pub(crate) struct PurlHit {
 /// This worker's 5-char traits commit prefix — the same value the /api/next
 /// heartbeat sends, truncated the way hopper truncates, so string equality
 /// against a stored `traits_version` means "same analyzer".
-pub(crate) fn local_traits() -> Option<&'static str> {
+pub fn local_traits() -> Option<&'static str> {
     static TRAITS: OnceLock<Option<String>> = OnceLock::new();
     TRAITS
         .get_or_init(|| cleave::traits_repo::version().map(|v| v.chars().take(5).collect()))
@@ -296,7 +296,7 @@ impl Precheck {
     /// build may adopt (same analyzer), a benign result worth skipping but not
     /// reporting, or nothing. Any failure — unreachable, non-200, unparseable,
     /// neither rule met — is [`Standing::Analyze`].
-    pub(crate) fn standing(&self, content_sha: &str) -> Standing {
+    pub fn standing(&self, content_sha: &str) -> Standing {
         if content_sha.len() != 64 || !self.breaker.allows(unix_now()) {
             return Standing::Analyze;
         }
@@ -343,7 +343,7 @@ impl Precheck {
     /// with no usable sha is dropped — the fetch edge (`source → content sha`)
     /// must stay recordable — so the dependency falls through to a normal fetch.
     /// Fail-open everywhere; an open breaker stops the batch.
-    pub(crate) fn purls(&self, purls: &[String]) -> HashMap<String, PurlHit> {
+    pub fn purls(&self, purls: &[String]) -> HashMap<String, PurlHit> {
         let mut out = HashMap::new();
         if !self.purls || purls.is_empty() {
             return out;
@@ -471,7 +471,7 @@ fn standing_of(rec: Record, my_traits: Option<&str>, max_age_s: u64, now: u64) -
 
 /// `(lookups attempted, analyses skipped)` since process start, for the worker
 /// summary line.
-pub(crate) fn counters() -> (u64, u64) {
+pub fn counters() -> (u64, u64) {
     (
         CHECKS.load(Ordering::Relaxed),
         SKIPS.load(Ordering::Relaxed),
@@ -479,7 +479,7 @@ pub(crate) fn counters() -> (u64, u64) {
 }
 
 /// `(purl_checks, purl_skips)` lifetime counters for the batch negotiation.
-pub(crate) fn purl_counters() -> (u64, u64) {
+pub fn purl_counters() -> (u64, u64) {
     (
         PURL_CHECKS.load(Ordering::Relaxed),
         PURL_SKIPS.load(Ordering::Relaxed),

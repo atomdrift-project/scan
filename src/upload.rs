@@ -78,7 +78,7 @@ pub fn hopper_token() -> Option<&'static str> {
 /// dropping the half-built one. A static is never dropped there either. `None`,
 /// said once, when it cannot be built: callers then stop rather than fall back
 /// to a client without timeouts.
-pub(crate) fn hopper_http() -> Option<&'static reqwest::blocking::Client> {
+pub fn hopper_http() -> Option<&'static reqwest::blocking::Client> {
     static HTTP: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
     HTTP.get_or_init(|| {
         reqwest::blocking::Client::builder()
@@ -358,13 +358,18 @@ const MAX_WORKER_NAME_LEN: usize = 64;
 /// envelope is flattened onto the payload so the wire form is
 /// `{sha256, worker, duration_ms, ml, llm, raw}` — byte-for-byte the shape the
 /// pull-based worker sends, so hopper handles both identically.
-#[derive(Serialize)]
-pub(crate) struct ResultPayload {
+#[derive(Debug, Serialize)]
+pub struct ResultPayload {
+    /// SHA-256 of the analyzed artifact.
     pub sha256: String,
+    /// Name of the worker that produced the result.
     pub worker: String,
+    /// Error reported instead of an analysis envelope, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Analysis duration in milliseconds.
     pub duration_ms: i64,
+    /// The ML, LLM and raw report fields.
     #[serde(flatten)]
     pub envelope: Option<ScanResultEnvelope>,
 }
@@ -377,7 +382,7 @@ pub(crate) struct ResultPayload {
 /// If the serialized envelope exceeds hopper's body limit, the raw cleave report
 /// is dropped and the ML verdict is sent alone: hopper still records the verdict
 /// and only skips archive explosion, which beats losing the whole result.
-pub(crate) fn encode_result_body(
+pub fn encode_result_body(
     mut payload: ResultPayload,
     sha256: &str,
 ) -> Option<(Vec<u8>, Option<&'static str>)> {
@@ -837,7 +842,7 @@ impl Drop for Uploader {
 /// top-level `Display` is just "error sending request for url (...)"; the real
 /// cause (connection refused, DNS failure, timeout) lives one or more links down
 /// the chain, so log the whole chain to make a failed upload diagnosable.
-pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
+pub fn error_chain(err: &dyn std::error::Error) -> String {
     use std::fmt::Write;
     let mut out = err.to_string();
     let mut source = err.source();
@@ -850,7 +855,8 @@ pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
 
 /// Whether hopper refused a request for good: any 4xx but 408 and 429, which
 /// ask to be retried. Resending a permanent refusal can never succeed.
-pub(crate) fn is_permanent(status: StatusCode) -> bool {
+#[must_use]
+pub fn is_permanent(status: StatusCode) -> bool {
     status.is_client_error()
         && status != StatusCode::REQUEST_TIMEOUT
         && status != StatusCode::TOO_MANY_REQUESTS
@@ -1212,8 +1218,8 @@ impl Hopper {
                             sha256 = %art.sha256,
                             kind,
                             %status,
-                            body = %body,
-                            provenance = %crate::worker::body_excerpt(&String::from_utf8_lossy(&art.sidecar)),
+                            body = %body_excerpt(&body),
+                            provenance = %body_excerpt(&String::from_utf8_lossy(&art.sidecar)),
                             "upload: hopper rejected artifact write; not retrying"
                         );
                         return false;
@@ -1306,6 +1312,17 @@ impl Hopper {
         );
         self.tally.failed.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Bound and flatten untrusted response bodies before writing them to logs.
+fn body_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let compact = body.replace(['\r', '\n', '\t'], " ");
+    let mut excerpt: String = compact.chars().take(MAX_CHARS).collect();
+    if compact.chars().count() > MAX_CHARS {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 /// Remove uploader-owned staging directories after a job has been fully
@@ -1440,12 +1457,12 @@ fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
 /// Look up whether hopper already holds real content for a purl coordinate —
 /// synchronously, for `scan purl`/`scan url`'s registry-metadata fallback
 /// (`crate::pkg::run`), which has no async runtime to bridge into
-/// [`crate::server::corpus::Corpus`]'s async reader the server side of this
+/// Postdoc's async corpus reader, the daemon side of this
 /// same fix uses. Returns the sha256 of the sample hopper already has
 /// analyzed under this purl, if any; `None` on any failure or absence — the
 /// caller's fallback is to post nothing, never to guess.
 #[must_use]
-pub(crate) fn known_sha_for_purl(
+pub fn known_sha_for_purl(
     client: &reqwest::blocking::Client,
     hopper_url: &str,
     purl: &str,

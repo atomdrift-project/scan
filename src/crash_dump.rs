@@ -16,7 +16,11 @@
 //! offending file is one of the in-flight set, not necessarily the last to
 //! start — dumping them all is the honest answer.
 
-pub(crate) use imp::{install, register};
+#[cfg(not(feature = "daemon-support"))]
+pub(crate) use imp::install;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub use imp::{install, register};
 
 #[cfg(unix)]
 mod imp {
@@ -60,7 +64,7 @@ mod imp {
     /// stack overflow `abort()`s without unwinding, so the entry is still live
     /// when the handler runs — which is exactly what we want to report.
     #[derive(Debug)]
-    pub(crate) struct Guard {
+    pub struct Guard {
         slot: Option<usize>,
     }
 
@@ -75,7 +79,7 @@ mod imp {
     /// Record an analysis as in flight. The line is formatted here, on the
     /// normal worker thread; the signal handler only ever copies bytes and
     /// calls `write(2)`, both async-signal-safe.
-    pub(crate) fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
+    pub fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
         let mut buf = [0u8; LINE];
         let n = format_line(&mut buf, analysis_id, thread_id, sha, file);
 
@@ -152,7 +156,7 @@ mod imp {
     /// `has overflowed its stack` line, then calls `abort()`. Catching the
     /// resulting `SIGABRT` adds our dump *after* that message while preserving
     /// it, and also covers panics-as-abort and OOM aborts.
-    pub(crate) fn install() {
+    pub fn install() {
         // SAFETY: a zeroed `sigaction` is a valid empty disposition; we set the
         // handler, an empty mask, and run on the alternate signal stack the
         // Rust runtime already established (the faulting thread's own stack is

@@ -35,14 +35,28 @@ pub use self::verdict::{
     FloorArm, FloorDecision, level_confidence, synthesized_level, trait_floor,
 };
 
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub use self::envelope::dep_envelope;
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) use self::envelope::dep_envelope;
-pub(crate) use self::hopper::{
+#[cfg(not(feature = "daemon-support"))]
+pub(crate) use self::hopper::artifact_filename;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub use self::hopper::{
     Origin, artifact_filename, collect_upload_artifacts, registry_fallback_artifact,
     upload_collector, upload_scan_result,
 };
-pub(crate) use self::pipeline::{
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub use self::pipeline::{
     ClassifiedReport, ClassifyRequest, CpuLease, OutputNeeds, apply_pending_interpretation,
     classify_report,
+};
+#[cfg(not(feature = "daemon-support"))]
+pub(crate) use self::pipeline::{
+    ClassifiedReport, ClassifyRequest, CpuLease, OutputNeeds, classify_report,
 };
 pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,
@@ -50,6 +64,12 @@ pub(crate) use self::progress::{
 };
 pub(crate) use self::render_cards::{format_llm_line, write_tiny};
 pub(crate) use self::render_context::recategorize_annotations;
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub use self::run::{
+    DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, tiny_opts_for,
+};
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) use self::run::{
     DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, tiny_opts_for,
 };
@@ -489,6 +509,21 @@ fn is_inside(path: &str, container: &str) -> bool {
 /// Engine settings an operator sets through the environment. They are
 /// deploy-time switches, not request input, so they are read once per process.
 #[derive(Debug, Clone)]
+#[cfg(feature = "daemon-support")]
+#[doc(hidden)]
+pub struct Tuning {
+    /// `SCAN_INTERPRET_DUMP_DIR`: also write each LLM render to
+    /// `<dir>/<sha256>.render`, for offline prompt tuning (`hacks/interpret-tune`).
+    pub(crate) interpret_dump_dir: Option<PathBuf>,
+    /// `SCAN_KEEP_ALL_MEMBERS=1`: store whole reports, skipping retention.
+    pub(crate) keep_all_members: bool,
+    /// `SCAN_INTERPRET_BUDGET_BYTES`: the primary subject's render budget for
+    /// the LLM; `0` disables the cap.
+    pub(crate) interpret_budget_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(not(feature = "daemon-support"))]
 pub(crate) struct Tuning {
     /// `SCAN_INTERPRET_DUMP_DIR`: also write each LLM render to
     /// `<dir>/<sha256>.render`, for offline prompt tuning (`hacks/interpret-tune`).

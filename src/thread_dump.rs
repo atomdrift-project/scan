@@ -23,13 +23,10 @@
 //! taken on a process that is already wedged or about to exit, never as
 //! routine telemetry.
 //!
-//! Triggered two ways, both on an already-wedged process so the blast radius is
-//! the same: by an operator sending `SIGUSR1`, and automatically by the worker's
-//! stall abort immediately before it exits (see `worker::Exit::Stalled`) — the
-//! stacks are the artifact that names the runaway leaf, and a process about to
-//! die is exactly when they are worth capturing. It is never called on a healthy
-//! process. On platforms without per-thread signalling (macOS) it prints a
-//! pointer to the breadcrumb/wait-channel census instead.
+//! Triggered by an operator sending `SIGUSR1`, or by Postdoc's stalled-job
+//! abort immediately before exit. It is never called on a healthy process. On
+//! platforms without per-thread signalling (macOS) it prints a pointer to the
+//! breadcrumb/wait-channel census instead.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +73,7 @@ thread_local! {
 /// and idempotent; call it from each rayon worker's start handler and at the top
 /// of each blocking analysis. The registration is dropped automatically when the
 /// thread exits.
-pub(crate) fn register_self() {
+pub fn register_self() {
     let tid = os_thread_id();
     REGISTERED.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -94,7 +91,7 @@ pub(crate) fn register_self() {
 /// Matches what `/proc/<pid>/task`, `ps`, and a debugger report, so log lines,
 /// the in-flight census, and the wait-channel lookup can all correlate on it.
 /// The single canonical implementation for the crate.
-pub(crate) fn os_thread_id() -> u64 {
+pub fn os_thread_id() -> u64 {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `gettid` takes no arguments and cannot fail; the tid is positive.
@@ -251,7 +248,7 @@ mod capture {
 /// Install the capture-signal handler. Call once at startup, before the
 /// `SIGUSR1` dump path can run. No-op on platforms without per-thread
 /// signalling.
-pub(crate) fn install() {
+pub fn install() {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         // SAFETY: a zeroed `sigaction` with our handler and an empty mask is a
@@ -279,7 +276,7 @@ pub(crate) fn install() {
 /// For a process that is already wedged or about to exit — an operator's
 /// `SIGUSR1`, or the stall abort. See the module docs for why it is not for
 /// anything else.
-pub(crate) fn dump_all_threads() {
+pub fn dump_all_threads() {
     if DUMPING.swap(true, Ordering::AcqRel) {
         return;
     }

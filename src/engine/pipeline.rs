@@ -39,7 +39,7 @@ use crate::model::{Classification, Decision, Level, Model, RouteScore, SkippedRo
 /// What [`classify_report`] needs besides the report itself. Build one with
 /// [`ClassifyRequest::new`] and override the optional context with struct
 /// update syntax.
-pub(crate) struct ClassifyRequest<'a> {
+pub struct ClassifyRequest<'a> {
     /// Display label; becomes the result's path.
     pub label: &'a str,
     /// The artifact on disk, for the root imperative-reference hunt. Callers
@@ -73,7 +73,7 @@ pub(crate) struct ClassifyRequest<'a> {
 impl<'a> ClassifyRequest<'a> {
     /// A request with every optional input absent: no SHAP, LLM, fetching,
     /// renders, or tracking.
-    pub(crate) fn new(label: &'a str, root_path: &'a std::path::Path, model: &'a Model) -> Self {
+    pub fn new(label: &'a str, root_path: &'a std::path::Path, model: &'a Model) -> Self {
         Self {
             label,
             root_path,
@@ -99,7 +99,7 @@ impl<'a> ClassifyRequest<'a> {
 /// skips building anything no consumer looks at. The default is none of them —
 /// the bare JSON-verdict shape (server and validation).
 #[derive(Clone, Copy, Default)]
-pub(crate) struct OutputNeeds {
+pub struct OutputNeeds {
     /// Render `rendered_context` as the LLM query payload (`--format
     /// interpret`): byte-for-byte the user message a live `--interpret` query
     /// sends (the sanitized tiny render), without the system prompt.
@@ -125,31 +125,26 @@ pub(crate) struct OutputNeeds {
 /// usually the LLM `interpret` time when an endpoint is contended, or `fetch`
 /// on a wide `--fetch`.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct PhaseTimings {
-    pub(crate) fetch: Duration,
-    pub(crate) interpret: Duration,
-    pub(crate) render: Duration,
-    pub(crate) total: Duration,
+pub struct PhaseTimings {
+    pub fetch: Duration,
+    pub interpret: Duration,
+    pub render: Duration,
+    pub total: Duration,
 }
 
 /// What [`classify_report`] produced: the result, and where its time went.
-pub(crate) struct ClassifiedReport {
-    pub(crate) phase: PhaseTimings,
+pub struct ClassifiedReport {
+    pub phase: PhaseTimings,
     /// The verdict, with `path` set to the request label and the build fields
     /// (`version`, `analyzed_at`) left for [`Self::into_scan_result`].
-    pub(crate) result: ScanResult,
+    pub result: ScanResult,
 }
 
 impl ClassifiedReport {
     /// The wire result for this classification of `path` under `bundle`.
     /// `keep_report` retains the raw cleave report, which JSON output and
     /// hopper renewals need and terminal output does not.
-    pub(crate) fn into_scan_result(
-        self,
-        path: String,
-        bundle: &Model,
-        keep_report: bool,
-    ) -> ScanResult {
+    pub fn into_scan_result(self, path: String, bundle: &Model, keep_report: bool) -> ScanResult {
         let mut result = self.result;
         result.path = path;
         result.version = model_version_string(bundle.info());
@@ -163,7 +158,7 @@ impl ClassifiedReport {
 
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
-pub(crate) fn classify_report(
+pub fn classify_report(
     report: AnalysisReport,
     mut req: ClassifyRequest<'_>,
 ) -> Result<ClassifiedReport> {
@@ -1244,7 +1239,7 @@ fn log_interpretation(file: &str, sha256: &str, graded: &Graded) {
 /// majority of every permit's lifetime: 16 slots, 5 permits, ~2 of 16 cores
 /// busy. Calling the lease there lets the next analysis start its CPU work
 /// while this one waits on the endpoint. `None` for callers with no gate.
-pub(crate) type CpuLease = Box<dyn FnOnce() + Send>;
+pub type CpuLease = Box<dyn FnOnce() + Send>;
 
 /// An LLM second opinion the caller has agreed to run itself, after the
 /// analysis has been posted with its ML verdict. Produced by
@@ -1265,7 +1260,7 @@ pub struct PendingLlm {
 /// and therefore needs re-posting: the LLM section itself is new information,
 /// so any interpretation counts. `false` when nothing was pending or the
 /// render was empty.
-pub(crate) fn apply_pending_interpretation(
+pub fn apply_pending_interpretation(
     result: &mut ScanResult,
     cfg: &crate::interpret::InterpretConfig,
     model: &Model,
