@@ -78,17 +78,10 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// Analyze the file at `path`. Runs on a blocking thread. `extract_dir`, when
-/// set, receives the samples cleave extracts.
-pub fn classify_file(
-    path: &Path,
-    extract_dir: Option<&Path>,
-    analysis: Analysis<'_>,
-) -> Result<ScanResult> {
+/// Analyze the file at `path`. Runs on a blocking thread.
+pub fn classify_file(path: &Path, analysis: Analysis<'_>) -> Result<ScanResult> {
     analysis.mark("cleave:init");
-    let mut opts = analysis.options();
-    opts.sample_extraction =
-        extract_dir.map(|d| cleave::SampleExtractionConfig::new(d.to_path_buf()));
+    let opts = analysis.options();
     analysis.mark("cleave:analyze");
     let report = cleave::analyze_file(path, &opts)
         .with_context(|| format!("cleave analysis of {}", analysis.label))?;
