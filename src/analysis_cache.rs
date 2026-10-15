@@ -11,7 +11,7 @@
 //! of re-running cleave.
 //!
 //! Correctness over speed: the cache is namespaced by a *ruleset version* token
-//! (scan release, traits commit, the content of the bloom set the
+//! (scan release, Cleave's rule-content/build fingerprint, the bloom set the
 //! skip-predicate consults, and the installed model bundle, whose output the
 //! cached verdict is). Any change to what the detector would find lands in a
 //! different namespace, so a stale result can never mask a detection a newer
@@ -167,21 +167,13 @@ fn incomplete(report: &AnalysisReport) -> bool {
 
 /// A token identifying the analysis-producing detector, so a rules, model, or
 /// engine update invalidates cached results. Folds in the scan release, the
-/// traits commit, the content of the installed bloom set (which the dependency
-/// skip-predicate consults), and the installed model bundle — any of these
-/// changing the analysis lands cached results in a fresh namespace.
+/// rule contents and analyzer build, the installed bloom set (which the
+/// dependency skip-predicate consults), and the installed model bundle.
 ///
-/// Every part is read from a small file, never derived from the rules
-/// themselves: the verdict index opens on a server's first lookup, which must
-/// be answered — or refused — while the rules are still loading. Until
-/// 2026-10-09 the rules were named by cleave's trait, composite and YARA rule
-/// counts, and counting meant compiling every rule: tens of seconds on a cold
-/// cache, spent in front of a request that only needed a refusal. Hashing the
-/// rule files was tried too: reading them all took over 10s on a loaded
-/// machine. The commit is also what hopper records a
-/// verdict's rules by, so the two agree on when a verdict is stale. A traits
-/// checkout with uncommitted edits shares its commit's namespace; set
-/// `SCAN_ANALYSIS_CACHE=0` while editing rules.
+/// Reuse Cleave's content fingerprint, shared with rule loading and memoized
+/// until reload. It does not compile rules or read their sources a second
+/// time. A Git commit alone misses uncommitted edits; directories without
+/// Git metadata would all share a single namespace.
 ///
 /// The model belongs here for the same reason the rules do: a cached entry
 /// holds the *verdict*, and the verdict is the model's output. Until
@@ -191,12 +183,11 @@ fn incomplete(report: &AnalysisReport) -> bool {
 /// OpenDocument files graded hostile at every deploy level) would have
 /// outlived the corrected bundle that fixed it.
 pub(crate) fn ruleset_version() -> String {
-    let traits =
-        cleave::traits_repo::version().map_or_else(|| "none".to_string(), |v| sanitize(&v));
+    let traits = cleave::cache::traits_revision_fingerprint();
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
     format!(
-        "{}-{traits}-{bloom}-m{}",
+        "{}-r{traits:016x}-{bloom}-m{}",
         env!("CARGO_PKG_VERSION"),
         model_version(),
     )
@@ -288,6 +279,99 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run in a child process: changing Cleave's process-wide traits source
+    /// must not affect other tests running concurrently.
+    #[test]
+    fn local_trait_edits_invalidate_cached_results() {
+        const PROBE: &str = "SCAN_TEST_LOCAL_TRAITS_CACHE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "analysis_cache::tests::local_trait_edits_invalidate_cached_results",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let traits = root.path().join("traits");
+        let yaml = traits.join("objectives/probe/local.yaml");
+        std::fs::create_dir_all(yaml.parent().unwrap()).unwrap();
+        std::fs::create_dir(traits.join(".git")).unwrap();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        std::fs::write(traits.join(".git/HEAD"), head).unwrap();
+        let original = "traits:\n  - id: local\n    if: {type: text, exact: cache_aaa}\n";
+        std::fs::write(&yaml, original).unwrap();
+        let mtime = std::fs::metadata(&yaml).unwrap().modified().unwrap();
+        let version = || {
+            // A fresh CLI invocation or an explicit reload re-reads the tree.
+            cleave::traits_repo::set_override_dir(Some(traits.clone()));
+            ruleset_version()
+        };
+        let cache = |version: &str| {
+            let dir = root.path().join(format!("dependency-v3-{version}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            AnalysisCache { dir }
+        };
+        let before = version();
+        let warm = cache(&before);
+        let report = AnalysisReport::new(cleave::TargetInfo {
+            path: "sample.txt".into(),
+            file_type: "text".into(),
+            size_bytes: 1,
+            sha256: "sample".into(),
+            architectures: None,
+        });
+        warm.put("sample", &Some(report), &[]);
+        assert!(
+            cache(&version()).get("sample").is_some(),
+            "unchanged rules hit"
+        );
+
+        // Same commit, same path, same size, same mtime; different rule bytes.
+        std::fs::write(&yaml, original.replace("cache_aaa", "cache_bbb")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&yaml)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(traits.join(".git/HEAD")).unwrap(),
+            head
+        );
+        let edited = version();
+        assert_ne!(before, edited, "local edits must move the cache namespace");
+        assert!(
+            cache(&edited).get("sample").is_none(),
+            "old findings must miss"
+        );
+
+        // Newly added rules count even though Git does not track them yet.
+        let untracked = traits.join("objectives/probe/new.yar");
+        std::fs::write(&untracked, "rule added { condition: true }\n").unwrap();
+        assert_ne!(edited, version(), "untracked rules must invalidate");
+        std::fs::remove_file(&untracked).unwrap();
+        assert_eq!(edited, version(), "removing the rule restores the key");
+
+        // Git metadata is not an input: archive snapshots use the same key.
+        std::fs::remove_dir_all(traits.join(".git")).unwrap();
+        assert_eq!(edited, version(), "snapshots must use rule contents");
+        std::fs::write(&yaml, original).unwrap();
+        assert_eq!(before, version(), "reverting rules restores the warm cache");
+        assert!(cache(&version()).get("sample").is_some());
+    }
 
     #[test]
     fn pruning_spares_live_namespaces_of_other_versions() {
