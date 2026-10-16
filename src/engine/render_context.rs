@@ -2233,3 +2233,96 @@ mod tests {
         ));
     }
 }
+
+/// Replay an artifact-only interpretation input with the live prompt budget and
+/// annotation rewrite. Reports with fetched/registry subjects need the complete
+/// saved presentation envelope; failing is preferable to silently dropping them.
+pub(super) fn render_saved_interpret(
+    loaded: &cleave::report_input::LoadedReport,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        loaded.fetched.is_empty()
+            && loaded
+                .report
+                .files
+                .iter()
+                .all(|f| f.rel != Rel::Fetched && f.role != cleave::types::Role::Sidecar),
+        "package-aware interpretation replay requires saved fetch verdicts and registry provenance; this input is incomplete"
+    );
+    let report = &loaded.report;
+    let root = report
+        .files
+        .iter()
+        .find(|f| f.parent_id.is_none())
+        .ok_or_else(|| anyhow::anyhow!("report has no root artifact"))?;
+    let primary = Primary {
+        label: &root.path,
+        sha256: &root.sha256,
+        fetch: None,
+        registry: None,
+    };
+    let fetched = Fetched {
+        edges: &[],
+        deps: &[],
+        registries: &[],
+    };
+    let index = ReportIndex::new(report);
+    let rendered = render_interpret_context(&primary, fetched, report, &index, &Tuning::from_env());
+    Ok(recategorize_annotations(&rendered))
+}
+
+#[cfg(test)]
+mod saved_render_tests {
+    use super::*;
+
+    #[test]
+    fn saved_interpret_keeps_bytes_and_rewrites_annotation_authority() {
+        let mut report = AnalysisReport::new(cleave::TargetInfo::default());
+        report.files.push(FileAnalysis {
+            id: 0,
+            path: "/does/not/exist/payload.js".into(),
+            file_type: "javascript".into(),
+            sha256: "a".repeat(64),
+            size: 12,
+            findings: vec![cleave::Finding::new(
+                "micro-behaviors/process/interpreter::eval",
+                cleave::FindingKind::Indicator,
+                "Executes a variable",
+                0.95,
+            )],
+            ..FileAnalysis::default()
+        });
+        report.files[0].findings[0].crit = Criticality::Notable;
+        report.files[0].context = serde_json::from_value(serde_json::json!([{
+            "ln":0,"line":1,"col":1,
+            "b":"wP?G#c$D+dvjsnB",
+            "n":[{"c":3,"i":"micro-behaviors/process/interpreter::eval",
+                "d":"Executes a variable","o":0,"z":4,"cf":0.95}]
+        }]))
+        .unwrap();
+        let loaded = cleave::report_input::decode(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let rendered = render_saved_interpret(&loaded).unwrap();
+        assert!(rendered.starts_with("== PRIMARY payload.js ==\nprovenance="));
+        assert!(rendered.contains("Possible process/interpreter"));
+        assert!(!rendered.contains("// N "));
+        assert!(rendered.contains("eval(data)"));
+    }
+
+    #[test]
+    fn saved_interpret_rejects_missing_dependency_presentation_state() {
+        let mut report = AnalysisReport::new(cleave::TargetInfo::default());
+        report.files.push(FileAnalysis {
+            id: 0,
+            path: "payload.js".into(),
+            file_type: "javascript".into(),
+            sha256: "a".repeat(64),
+            ..FileAnalysis::default()
+        });
+        let mut loaded =
+            cleave::report_input::decode(&serde_json::to_vec(&report).unwrap()).unwrap();
+        loaded
+            .fetched
+            .push(serde_json::json!({"source_sha256":"a"}));
+        assert!(render_saved_interpret(&loaded).is_err());
+    }
+}

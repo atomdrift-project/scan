@@ -429,6 +429,13 @@ fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<S
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Experimental: render saved JSON locally, without models, updates, fetching, or LLM calls.
+    Render {
+        /// Saved report input.
+        #[command(flatten)]
+        args: cleave::report_input::RenderArgs,
+    },
+
     /// Scan files or directories for hostile/suspicious content
     #[command(aliases = ["fs", "scan"])]
     Path {
@@ -649,6 +656,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
+    if let Commands::Render { args } = &command {
+        let rendered = cleave::report_input::run(args, |loaded| {
+            scan::engine::render_saved_report(loaded, global.format)
+        })?;
+        use std::io::Write as _;
+        std::io::stdout().lock().write_all(rendered.as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     configure_process(&global)?;
     init_logging(&global);
 
@@ -710,6 +726,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     let fetch = fetch_policy(&global);
     match command {
+        Commands::Render { .. } => anyhow::bail!("render must run before analysis bootstrap"),
         Commands::Path {
             paths,
             hopper,

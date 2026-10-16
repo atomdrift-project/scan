@@ -3230,6 +3230,40 @@ impl Model {
         self.predict_for_report_detailed(file_type, &features, &parsed)
     }
 
+    /// Classify a diagnostic flat/shared wire report directly. Context is never
+    /// decoded; consulted routes share one prepared model summary. Rejects
+    /// retained facts that cannot satisfy any consulted route's feature layout.
+    pub fn predict_wire(
+        &self,
+        report: &cleave::file_wire::features::FeatureReport,
+    ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        self.ctx.ensure_fact_profile(report.fp.as_deref())?;
+        let file_type = report
+            .files
+            .first()
+            .map(|p| {
+                report
+                    .analyses
+                    .get(p.a)
+                    .map(|a| a.file_type.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid model analysis index"))
+            })
+            .transpose()?
+            .unwrap_or("unknown");
+        let (type_key, group_key) = self.routes.specialist_keys(file_type);
+        let group = group_key.and_then(|name| self.routes.filegroups.get(name));
+        let filetype = self.routes.filetypes.get(&type_key);
+        let mut needs = self.ctx.raw_needs();
+        for (_, route) in group.iter().chain(filetype.iter()) {
+            route.ctx.ensure_fact_profile(report.fp.as_deref())?;
+            needs = needs.union(route.ctx.raw_needs());
+        }
+        let parsed = ParsedReport::from_wire(report, needs)?;
+        let mut features = self.ctx.extract_from_parsed(&parsed);
+        self.spec.standardize(&mut features);
+        self.predict_for_report_detailed(file_type, &features, &parsed)
+    }
+
     /// Routed prediction from a parsed cleave report (a whole sample or one
     /// archive member), with per-route scores retained for JSON and `--extra`
     /// output.

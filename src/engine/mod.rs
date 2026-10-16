@@ -639,3 +639,18 @@ mod tests {
         );
     }
 }
+
+/// Render a saved report through the live presentation functions without models.
+/// Compact historical reports reconstruct capture notes and warn on stderr.
+pub fn render_saved_report(
+    loaded: &cleave::report_input::LoadedReport,
+    format: crate::OutputFormat,
+) -> anyhow::Result<String> {
+    use cleave::output::{TinyOpts, format_context};
+    match format {
+        crate::OutputFormat::Terminal => Ok(format_context(&loaded.report, &TinyOpts::terminal())),
+        crate::OutputFormat::Tiny => Ok(format_context(&loaded.report, &TinyOpts::tiny())),
+        crate::OutputFormat::Interpret => render_context::render_saved_interpret(loaded),
+        _ => anyhow::bail!("render supports --format terminal, tiny, or interpret"),
+    }
+}

@@ -246,3 +246,52 @@ A benign verdict (sentinel `lvl = -1`):
 The hostile envelope above fired because `prob` (0.998) crossed the
 level-3 hostile cutoff. The `az/native` specialist route drove the
 decision; the general `az` route alone would have been suspicious.
+
+
+## Render saved reports locally
+
+**Experimental:** the `render` command and its candidate JSON formats may change.
+
+`atomscan render report.json --format interpret` reads a saved cleave report
+(or a scan envelope's `raw` report) and uses the live primary-context budget and
+annotation rewrite. It does not load models, analyze the original files, fetch
+references, update rules, or call an LLM. `--format tiny` and `terminal` render
+cleave's corresponding context views; they do not synthesize an ML verdict.
+Use `-` as the input path to read one JSON document from stdin.
+
+For a byte-for-byte comparison, use:
+
+```sh
+atomscan render before.json --format interpret > before.txt
+atomscan render after.json --format interpret > after.txt
+diff -u before.txt after.txt
+```
+
+Rendered output goes to stdout, and warnings go to stderr. Run both inputs with the
+same renderer build and `SCAN_INTERPRET_BUDGET_BYTES` setting.
+
+Capture exact baselines with `cleave --format snapshot SAMPLE -o before.json`.
+That diagnostic format retains the capture annotations the live renderer uses.
+Historical compact v8 reports can be reconstructed from their spans, but omitted
+annotations/provenance prevent certifying parity with their original live
+render; they warn on stderr. Unknown schemas fail.
+
+The reader also accepts cleave's opt-in `file-1` typed candidate and the earlier
+`context-1` replay prototype, including trimmed context and local annotations. Generate it with
+`cleave render before.json --format json --trim-context -o after.json`, then
+compare with the commands above. Normal scan JSON output is unchanged. See
+[cleave context retention](../../cleave/docs/JSON.md#experimental-context-retention)
+for the scope and storage measurements.
+
+The reader additionally accepts the opt-in `joined-1` form produced by
+`cleave render before.json --format json --trim-context --model-facts --share-analyses`.
+Its local analysis pool preserves every occurrence. The selective model reader
+and `Model::predict_wire` bypass rendering/compact compatibility copies, checking
+the explicit retained-facts contract for every consulted route. New diagnostic
+wire formats are not enabled for normal scan uploads or production caches.
+
+The initial interpretation replay supports artifacts and their archive members.
+Fetched subjects and registry sidecars additionally require saved dependency
+verdicts and registry provenance, which the compact report does not fully carry;
+those inputs are rejected rather than rendered with missing subjects. Existing
+scan JSON `raw` remains the compact storage representation.

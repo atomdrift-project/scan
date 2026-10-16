@@ -931,6 +931,8 @@ struct MetricSlot {
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
+    /// Whether this layout is supported by the bundled retained-facts contract.
+    model_facts_supported: bool,
     presence_lookup: HashMap<String, usize>,
     /// Global feature name → index lookup for name-written features.
     absolute_lookup: HashMap<String, usize>,
@@ -1050,6 +1052,11 @@ impl ExtractContext {
         let has_name = |name: &str| absolute_lookup.contains_key(name);
 
         Self {
+            model_facts_supported: cleave::model_facts::supports(
+                cleave::model_facts::profile_id(),
+                &spec.feature_names,
+            )
+            .is_ok(),
             metric_slots: metric_slots(&absolute_lookup, &spec.metric_vocab),
             ghost_slots: spec
                 .ghost_vocab
@@ -1084,6 +1091,28 @@ impl ExtractContext {
     pub fn extract(&self, report: &cleave::types::CompactReport) -> Vec<f32> {
         let parsed = ParsedReport::from_compact_report(report, self.raw_needs(), None);
         self.extract_from_parsed(&parsed)
+    }
+
+    /// Extract directly from selective typed wire inputs, without rebuilding a
+    /// rendering AnalysisReport or serializing a CompactReport compatibility copy.
+    pub fn extract_wire(
+        &self,
+        report: &cleave::file_wire::features::FeatureReport,
+    ) -> Result<Vec<f32>> {
+        self.ensure_fact_profile(report.fp.as_deref())?;
+        let parsed = ParsedReport::from_wire(report, self.raw_needs())?;
+        Ok(self.extract_from_parsed(&parsed))
+    }
+
+    pub(crate) fn ensure_fact_profile(&self, profile: Option<&str>) -> Result<()> {
+        if let Some(profile) = profile {
+            cleave::model_facts::supports(profile, &[])?;
+        }
+        anyhow::ensure!(
+            profile.is_none() || self.model_facts_supported,
+            "model feature layout requires facts omitted by this profile"
+        );
+        Ok(())
     }
 
     /// This route's active raw-subtree needs (which optional families it emits).
@@ -1524,24 +1553,91 @@ impl ParsedReport {
                 .map(|&f| FileSummary::from_compact(f, needs))
                 .collect()
         };
-        // If no files, we need at least one empty summary for structural logic.
+        let primary = files
+            .iter()
+            .copied()
+            .find(|f| f.depth == 0)
+            .map(|f| (f.formula.as_deref().unwrap_or(""), f.risk));
+        Self::from_summaries(file_summaries, primary)
+    }
+
+    pub(crate) fn from_wire(
+        report: &cleave::file_wire::features::FeatureReport,
+        needs: RawNeeds,
+    ) -> Result<Self> {
+        // A shared analysis is summarized once; occurrence multiplicity remains
+        // unchanged. Move unique summaries rather than cloning them.
+        let mut summaries = report
+            .analyses
+            .iter()
+            .map(|a| {
+                let findings = a
+                    .findings()?
+                    .into_iter()
+                    .map(|f| RawFinding {
+                        id: f.id.into(),
+                        conf: f64::from(f.conf),
+                        crit: u32::from(f.crit),
+                        atk: f.atk.map(str::to_owned),
+                        mbc: f.mbc.map(str::to_owned),
+                    })
+                    .collect();
+                Ok(Some(FileSummary::from_model(
+                    "",
+                    &a.file_type,
+                    a.size,
+                    &a.facts,
+                    findings,
+                    needs,
+                )))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut uses = vec![0usize; summaries.len()];
+        for f in &report.files {
+            *uses
+                .get_mut(f.a)
+                .ok_or_else(|| anyhow::anyhow!("invalid model analysis index"))? += 1;
+        }
+        let mut files = Vec::with_capacity(report.files.len());
+        for f in &report.files {
+            uses[f.a] -= 1;
+            let summary = &mut summaries[f.a];
+            let mut placed = if uses[f.a] == 0 {
+                summary.take()
+            } else {
+                summary.clone()
+            }
+            .ok_or_else(|| anyhow::anyhow!("missing model analysis"))?;
+            placed.path = f.path.clone();
+            files.push(placed);
+        }
+        let primary = report
+            .files
+            .iter()
+            .find(|f| f.depth == 0)
+            .map(|f| &report.analyses[f.a])
+            .map(|a| (a.mol.as_deref().unwrap_or(""), a.risk));
+        Ok(Self::from_summaries(files, primary))
+    }
+
+    fn from_summaries(file_summaries: Vec<FileSummary>, primary: Option<(&str, i64)>) -> Self {
         let summaries = if file_summaries.is_empty() {
             vec![FileSummary::default()]
         } else {
             file_summaries
         };
-        let (formula_str, elements_str, sample_score) =
-            files.iter().copied().find(|f| f.depth == 0).map_or_else(
-                || (String::new(), String::new(), 0),
-                |f| {
-                    let formula = f.formula.clone().unwrap_or_default();
-                    let elements: String = formula
-                        .chars()
+        let (formula_str, elements_str, sample_score) = primary.map_or_else(
+            || (String::new(), String::new(), 0),
+            |(f, risk)| {
+                (
+                    f.to_owned(),
+                    f.chars()
                         .filter(|c| !('\u{2080}'..='\u{2089}').contains(c))
-                        .collect();
-                    (formula, elements, f.risk)
-                },
-            );
+                        .collect(),
+                    risk,
+                )
+            },
+        );
 
         let combined = summarize_report_summaries(&summaries);
         let merged_metrics = merge_metric_summaries(&summaries);
@@ -1582,14 +1678,46 @@ impl ParsedReport {
 impl FileSummary {
     /// Summarize one compact file entry.
     fn from_compact(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
-        let finding_views: Vec<FindingView<'_>> = file
+        let raw_findings = file
             .findings
             .iter()
-            .map(FindingView::from_compact)
+            .map(|f| RawFinding {
+                id: f.id.clone(),
+                conf: f64::from(f.confidence),
+                crit: u32::from(f.criticality),
+                atk: f.attack.clone(),
+                mbc: f.mbc.clone(),
+            })
+            .collect();
+        Self::from_model(
+            &file.path,
+            &file.file_type,
+            file.size,
+            &file.facts,
+            raw_findings,
+            needs,
+        )
+    }
+
+    fn from_model(
+        path: &str,
+        file_type: &str,
+        size: u64,
+        facts: &cleave::types::CompactFacts,
+        raw_findings: Vec<RawFinding>,
+        needs: RawNeeds,
+    ) -> Self {
+        let finding_views: Vec<FindingView<'_>> = raw_findings
+            .iter()
+            .map(|f| FindingView {
+                id: &f.id,
+                conf: f.conf,
+                crit: f.crit,
+            })
             .collect();
         let findings = summarize_findings(&finding_views);
 
-        let size_bytes = file.size as f64;
+        let size_bytes = size as f64;
         let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
         let denom = findings.filtered_finding_count.max(1) as f32;
         let max_crit = findings.sample_paths.values().copied().max().unwrap_or(0);
@@ -1615,8 +1743,7 @@ impl FileSummary {
             .collect();
         unique_3level_paths.sort();
 
-        let metrics_value = file
-            .facts
+        let metrics_value = facts
             .metrics
             .as_ref()
             .map(|m| &m.0)
@@ -1628,28 +1755,15 @@ impl FileSummary {
             .copied()
             .unwrap_or(0.0);
 
-        let imports: HashSet<String> = file
-            .facts
+        let imports: HashSet<String> = facts
             .imports
             .iter()
             .flat_map(|imp| import_tokens_from_parts(&imp.library, &imp.name))
             .collect();
 
-        let raw_findings: Vec<RawFinding> = file
-            .findings
-            .iter()
-            .map(|f| RawFinding {
-                id: f.id.clone(),
-                conf: f64::from(f.confidence),
-                crit: u32::from(f.criticality),
-                atk: f.attack.clone(),
-                mbc: f.mbc.clone(),
-            })
-            .collect();
-
         Self {
-            path: file.path.clone(),
-            file_type: file.file_type.clone(),
+            path: path.to_owned(),
+            file_type: file_type.to_owned(),
             size_bytes,
             overall_entropy,
             metrics,
@@ -1663,7 +1777,7 @@ impl FileSummary {
                 Vec::new()
             },
             symbols: if needs.symbol {
-                file_symbols(&file.facts)
+                file_symbols(facts)
             } else {
                 Vec::new()
             },
@@ -1747,19 +1861,6 @@ struct FindingView<'a> {
     id: &'a str,
     conf: f64,
     crit: u32,
-}
-
-impl<'a> FindingView<'a> {
-    /// Project a typed compact finding. `criticality` is already the same
-    /// 0-5 ordinal the wire `crit` field carries, and `conf` is always
-    /// written, so both read straight through.
-    fn from_compact(finding: &'a cleave::types::CompactTrait) -> Self {
-        Self {
-            id: &finding.id,
-            conf: f64::from(finding.confidence),
-            crit: u32::from(finding.criticality),
-        }
-    }
 }
 
 fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
