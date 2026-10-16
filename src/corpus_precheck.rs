@@ -8,7 +8,7 @@
 //! "result renewed with no analyzer change; the re-analysis learned nothing".
 //!
 //! This module asks the one cache the whole fleet shares — hopper — before
-//! analyzing a fetched payload. Two independent rules, either sufficient:
+//! analyzing a fetched payload or resolving a package coordinate:
 //!
 //!   1. TRAITS MATCH: the stored verdict was produced under this worker's own
 //!      analyzer version (`traits_version` equals our 5-char traits commit,
@@ -17,7 +17,10 @@
 //!      happens — so this skips ANY verdict, hostile included.
 //!   2. BENIGN AND FRESH: `fires_at` is `-1` (clean), analyzed within the last 30 days
 //!      (see `DEFAULT_MAX_AGE_DAYS` for why that long), regardless of
-//!      analyzer version. The coarse rule that keeps working through a
+//!      analyzer version. This applies only to package-coordinate lookups
+//!      before fetching. Once bytes have been fetched, another analyzer's
+//!      clean verdict cannot replace analysis under the current rules.
+//!      The coarse rule that keeps working through a
 //!      mixed-version fleet or a release that just bumped every traits hash:
 //!      dependency universes are overwhelmingly benign.
 //!
@@ -43,7 +46,7 @@ use crate::model::Level;
 
 /// Lookups attempted (a hit or a miss, but the wire was asked).
 static CHECKS: AtomicU64 = AtomicU64::new(0);
-/// Analyses skipped because the corpus already held a benign, fresh verdict.
+/// Analyses skipped because the corpus held a matching-analyzer verdict.
 static SKIPS: AtomicU64 = AtomicU64::new(0);
 /// PURLs asked of hopper by the pre-fetch batch negotiation.
 static PURL_CHECKS: AtomicU64 = AtomicU64::new(0);
@@ -168,7 +171,7 @@ pub fn configure(hopper_base_url: &str) {
         tracing::info!(
             url = %p.lookup_url,
             max_age_days,
-            "corpus precheck enabled: same-analyzer or benign+fresh dependencies will not be re-analyzed"
+            "corpus precheck enabled: matching-analyzer verdicts may be reused; fresh benign package coordinates may skip fetching"
         );
     }
     *armed = precheck.map(Arc::new);
@@ -196,6 +199,14 @@ struct Record {
     reason: Option<String>,
     #[serde(default)]
     findings: Vec<Finding>,
+}
+
+/// Downloaded bytes require current-analyzer coverage; package coordinates
+/// may use the bounded fresh-benign shortcut before any download takes place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    DownloadedBytes,
+    PackageCoordinate,
 }
 
 /// One answer of a batch PURL lookup: the record plus the two keys that pair
@@ -235,8 +246,8 @@ pub struct Verdict {
 ///
 /// The distinction is the whole point: a verdict is only ours to report when it
 /// was produced by the analyzer we are running. Anything else is evidence about
-/// someone else's judgment — good enough to skip re-deriving a benign result,
-/// not good enough to publish as this scan's finding.
+/// someone else's judgment — usable for a package-coordinate fetch shortcut,
+/// not a substitute for analyzing bytes already downloaded by this scan.
 #[derive(Debug, Clone)]
 pub enum Standing {
     /// Rule 1: the same analyzer already judged these bytes. Adopt its verdict.
@@ -292,10 +303,10 @@ impl Precheck {
         })
     }
 
-    /// What hopper's corpus already holds for these exact bytes: a verdict this
-    /// build may adopt (same analyzer), a benign result worth skipping but not
-    /// reporting, or nothing. Any failure — unreachable, non-200, unparseable,
-    /// neither rule met — is [`Standing::Analyze`].
+    /// What hopper's corpus already holds for these downloaded bytes: a verdict
+    /// this build may adopt (same analyzer), or [`Standing::Analyze`]. A clean
+    /// verdict from another analyzer does not cover the current rules. Any
+    /// failure — unreachable, non-200, unparseable — also means analyze.
     pub fn standing(&self, content_sha: &str) -> Standing {
         if content_sha.len() != 64 || !self.breaker.allows(unix_now()) {
             return Standing::Analyze;
@@ -328,7 +339,13 @@ impl Precheck {
                 return Standing::Analyze;
             }
         };
-        let standing = standing_of(rec, local_traits(), self.max_age.as_secs(), unix_now());
+        let standing = standing_of(
+            rec,
+            local_traits(),
+            self.max_age.as_secs(),
+            unix_now(),
+            Lookup::DownloadedBytes,
+        );
         if standing.skips_analysis() {
             SKIPS.fetch_add(1, Ordering::Relaxed);
         }
@@ -410,6 +427,7 @@ impl Precheck {
                 local_traits(),
                 self.max_age.as_secs(),
                 unix_now(),
+                Lookup::PackageCoordinate,
             );
             if !standing.skips_analysis() {
                 continue;
@@ -436,8 +454,14 @@ impl Precheck {
 }
 
 /// The policy, pure so the tests can hold it still: rule 1 (same analyzer,
-/// verdict adopted) or rule 2 (benign and fresh, work skipped).
-fn standing_of(rec: Record, my_traits: Option<&str>, max_age_s: u64, now: u64) -> Standing {
+/// verdict adopted) or, for package coordinates only, rule 2 (benign and fresh).
+fn standing_of(
+    rec: Record,
+    my_traits: Option<&str>,
+    max_age_s: u64,
+    now: u64,
+    lookup: Lookup,
+) -> Standing {
     // Rule 1: same analyzer already judged these bytes. A verdict is only a
     // dedupe key when it EXISTS — fires_at is null for a record that was
     // never classified, and traits equality on an unclassified record would
@@ -453,6 +477,13 @@ fn standing_of(rec: Record, my_traits: Option<&str>, max_age_s: u64, now: u64) -
             findings: rec.findings,
         });
     }
+    // Downloaded bytes need current-analyzer coverage. Returning SkipBenign
+    // here used to discard the payload report, lose its next-hop references,
+    // and make the caller report "analysis unavailable" for a successful fetch.
+    if lookup == Lookup::DownloadedBytes {
+        return Standing::Analyze;
+    }
+
     // Rule 2: benign, and fresh enough that staleness is bounded. Deliberately
     // NOT adopted: a different analyzer's judgment is not this scan's finding.
     // It can hide nothing — the rule requires a clean record.
@@ -651,7 +682,9 @@ mod tests {
         let week = 7 * 86_400;
         let fresh = Some("2026-08-23T00:00:00Z"); // 1 day old
         let stale = Some("2026-08-01T00:00:00Z"); // 23 days old
-        let standing = |r: Record, mine: Option<&str>| standing_of(r, mine, week, now);
+        let standing = |r: Record, mine: Option<&str>| {
+            standing_of(r, mine, week, now, Lookup::PackageCoordinate)
+        };
 
         // Rule 1: the same analyzer's verdict is adopted, hostile included, at
         // any age — it is the verdict this build would have computed.
@@ -717,7 +750,7 @@ mod tests {
         )
         .expect("parse");
         let now = parse_rfc3339_epoch("2026-08-24T00:00:00Z").unwrap();
-        let v = match standing_of(rec, Some("b8c1c"), 7 * 86_400, now) {
+        let v = match standing_of(rec, Some("b8c1c"), 7 * 86_400, now, Lookup::DownloadedBytes) {
             Standing::Adopt(v) => Some(v),
             _ => None,
         }
@@ -727,6 +760,50 @@ mod tests {
         assert_eq!(v.findings.len(), 2);
         assert_eq!(v.findings[0].crit, 5);
         assert_eq!(v.findings[1].desc, "cited by OSV");
+    }
+
+    #[test]
+    fn downloaded_bytes_require_current_analyzer_even_when_corpus_is_fresh_and_clean() {
+        let now = parse_rfc3339_epoch("2026-10-16T00:00:00Z").unwrap();
+        let record = |traits: Option<&str>| Record {
+            fires_at: Level::Clean,
+            analyzed_at: Some("2026-10-15T00:00:00Z".to_string()),
+            traits_version: traits.map(String::from),
+            reason: None,
+            findings: Vec::new(),
+        };
+        for traits in [Some("older"), Some(""), None] {
+            assert!(matches!(
+                standing_of(
+                    record(traits),
+                    Some("local"),
+                    30 * 86_400,
+                    now,
+                    Lookup::DownloadedBytes
+                ),
+                Standing::Analyze
+            ));
+            assert!(matches!(
+                standing_of(
+                    record(traits),
+                    Some("local"),
+                    30 * 86_400,
+                    now,
+                    Lookup::PackageCoordinate
+                ),
+                Standing::SkipBenign
+            ));
+        }
+        assert!(matches!(
+            standing_of(
+                record(Some("local")),
+                Some("local"),
+                30 * 86_400,
+                now,
+                Lookup::DownloadedBytes
+            ),
+            Standing::Adopt(_)
+        ));
     }
 
     #[test]

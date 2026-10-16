@@ -103,6 +103,12 @@ atomscan will never send telemetry data. It will however reach out to the Intern
 - **rule updates**: every 24h, can be disabled using `--no-update` or `SCAN_NO_UPDATE_CHECK=1`
 - **following discovered references**: to detect if a benign package depends on or downloads a compromised payload. Set `--follow=none` to analyze only the requested artifact.
 
+Downloaded dependencies are analyzed under the current rules unless a local
+analysis report or a matching-analyzer corpus verdict can be reused. A recent
+clean verdict from another analyzer does not replace analysis of downloaded
+bytes. Package-coordinate lookups may still use that recent clean verdict to
+avoid downloading an already-known dependency.
+
 ## Tune the false-positive level
 
 Unlike other malware scanners, Atomdrift allows you to adjust sensitivity in terms of an acceptable false-positive level using the `-l` flag:
