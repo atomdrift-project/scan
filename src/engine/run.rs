@@ -5,7 +5,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use cleave::{AnalysisOptions, AnalysisReport};
@@ -980,6 +980,7 @@ fn file_touched_within(path: &Path, window: Duration, now: SystemTime) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::time::UNIX_EPOCH;
         let ctime = md.ctime();
         if ctime >= 0 && recent(UNIX_EPOCH + Duration::from_secs(ctime.unsigned_abs())) {
             return true;

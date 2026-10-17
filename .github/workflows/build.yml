@@ -522,10 +522,8 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
             "/tmp/target/$BUILD_PROFILE/atomscan" --version
             cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
-            # Non-fatal during bring-up: this is the first time the suite has
-            # run on FreeBSD in CI, and we want the artifact either way. Make
-            # it fatal once we know it's green.
-            cargo test --locked --lib || echo "::warning::FreeBSD unit tests failed"
+            # Keep test failures visible in the job's conclusion.
+            cargo test --locked --lib
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -634,7 +632,8 @@ jobs:
   # nothing here; the unit tests below are what would surface it.
   openbsd:
     name: x86_64-unknown-openbsd
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd') }}
+    # Disabled until the VM provides Rust >= 1.97 (currently 1.94.1).
+    if: ${{ false && (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -653,9 +652,8 @@ jobs:
           # Newest image available. OpenBSD makes no cross-release ABI promise,
           # so there is no reach argument for staying back — the artifact is
           # effectively single-release either way, and this pin needs bumping
-          # every six months. 7.8's ports rust was 1.90, below this crate's
-          # 1.94 MSRV. OpenBSD 7.9 ships rust 1.94.1, making it the first image
-          # new enough to build this release.
+          # every six months. OpenBSD 7.9 ships rust 1.94.1, below this crate's
+          # 1.97 MSRV; the job stays disabled until a compatible compiler ships.
           release: "7.9"
           cpu: "4"
           mem: "12288"
@@ -708,7 +706,8 @@ jobs:
   # and pkgsrc rust is the same deal as FreeBSD ports rust.
   netbsd:
     name: x86_64-unknown-netbsd
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd') }}
+    # Disabled until the VM provides Rust >= 1.97 (currently 1.96.1).
+    if: ${{ false && (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
