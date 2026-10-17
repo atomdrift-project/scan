@@ -363,8 +363,8 @@ mod imp {
         // SAFETY: `kill(2)` with a pid this process spawned; no memory effects.
         if unsafe { libc::kill(pid, sig) } < 0 {
             let e = io::Error::last_os_error();
-            // Already gone is the outcome we wanted.
-            if e.raw_os_error() != Some(libc::ESRCH) {
+            // A missing worker satisfies kill, but cannot be frozen or resumed.
+            if sig != libc::SIGKILL || e.raw_os_error() != Some(libc::ESRCH) {
                 return Err(e);
             }
         }
@@ -621,6 +621,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "freebsd")]
+    fn freeze_rejects_an_exited_worker() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let Some(mut idle) = spawn_or_skip(cmd) else {
+            return;
+        };
+        let start = Instant::now();
+        while idle.exited().expect("try_wait").is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "child never exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            idle.freeze()
+                .expect_err("an exited worker cannot be frozen")
+                .raw_os_error(),
+            Some(libc::ESRCH),
+        );
+    }
+
+    #[test]
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn descendants_stop_with_the_worker() {
         // The property a process group would not give us: a grandchild that
@@ -638,12 +662,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("ticks");
         let mut cmd = Command::new("/bin/sh");
+        // daemon's launcher exits after forking, so `wait` alone lets the
+        // worker/reaper exit too. Keep it alive on a pipe owned by this test.
         cmd.arg("-c")
             .arg(format!(
-                "{detach} sh -c 'while :; do printf . >>\"$OUT\"; done' & wait"
+                "{detach} sh -c 'while :; do printf . >>\"$OUT\"; done' & read -r release"
             ))
-            .env("OUT", &out);
-        let Some(idle) = spawn_or_skip(cmd) else {
+            .env("OUT", &out)
+            .stdin(std::process::Stdio::piped());
+        let Some(mut idle) = spawn_or_skip(cmd) else {
             return;
         };
 
@@ -656,6 +683,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        assert!(
+            idle.exited().expect("try_wait").is_none(),
+            "worker exited before freeze"
+        );
         idle.freeze().expect("freeze");
         std::thread::sleep(Duration::from_millis(100));
         let frozen_at = progress(&out);
@@ -666,5 +697,13 @@ mod tests {
             "a grandchild in its own session kept running",
         );
         idle.thaw().expect("thaw");
+        let start = Instant::now();
+        while progress(&out) == frozen_at {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "a thawed grandchild never resumed",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
