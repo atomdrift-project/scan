@@ -17,7 +17,7 @@
 //! start — dumping them all is the honest answer.
 
 #[cfg(not(feature = "daemon-support"))]
-pub(crate) use imp::install;
+pub(crate) use imp::{install, register};
 #[cfg(feature = "daemon-support")]
 #[doc(hidden)]
 pub use imp::{install, register};

@@ -1,7 +1,8 @@
 # Atomdrift Scan JSON Report
 
-The CLI writes this envelope; Postdoc uses it for HTTP responses and hopper
-reports as well:
+Every analysis — whether returned by [the server](SERVER_API.md), posted
+by [a worker](WORKERS.md), or written to disk by the CLI — uses the
+same envelope:
 
     {
       "ml":  { ... curated classification ... },
@@ -125,7 +126,7 @@ bundle's own `default_severity_level` (`25` on current bundles; see
 - **hostile** when `lvl <= N` (default: `lvl <= 25`),
 - **suspicious** when `lvl <= min(grid_max, 3000)` (default: `lvl <= 3000`).
   The suspicious ceiling is a **flat constant** (`SUSPICIOUS_LEVEL_CEILING`,
-  also used by Postdoc's HTTP service), *not* a multiple of
+  mirrored as `SUSPICIOUS_CEILING` in `server/decision.rs`), *not* a multiple of
   `N` — it does not move when the operator changes `-l`. It is currently set
   wide (an EXPERIMENTAL 2026-07 widening to surface the weak-signal tail), which
   knowingly re-admits a low-precision band; see the note on the constant before
@@ -135,9 +136,9 @@ bundle's own `default_severity_level` (`25` on current bundles; see
   the *hostile* line only: it can turn that same envelope hostile, but the
   suspicious ceiling stays where it is.
 
-The Atomdrift Scan CLI applies these caps internally to pick exit codes and
-terminal output; Postdoc applies the same caps to HTTP responses. Downstream
-consumers reading stored envelopes apply whichever caps they prefer.
+The Atomdrift Scan CLI/server applies these caps internally to pick exit codes
+and terminal output; downstream consumers reading stored envelopes
+apply whichever caps they prefer.
 
 `prob` is the value the firing decision was made on — the firing
 route's probability for OR-rule policies, the blend's sigmoid output
@@ -196,7 +197,8 @@ Errors share a single shape regardless of status code:
 
     { "error": "string", "detail": "optional chain" }
 
-The status code carries the category; see Postdoc's API documentation.
+The status code carries the category; see
+[SERVER_API.md#status-codes](SERVER_API.md#status-codes).
 
 ## A complete example
 
