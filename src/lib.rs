@@ -27,6 +27,8 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub(crate) mod admission;
+pub(crate) mod allocator;
 #[cfg(feature = "daemon-support")]
 #[doc(hidden)]
 pub mod analysis;
@@ -63,6 +65,7 @@ pub mod features;
 pub mod fetch;
 pub mod heap_profile;
 pub(crate) mod hosts;
+pub(crate) mod inflight;
 pub mod interpret;
 mod interrupt;
 #[cfg(feature = "daemon-support")]
@@ -79,6 +82,8 @@ pub mod pkg;
 pub mod provenance;
 pub mod ps;
 pub mod runtime;
+pub mod server;
+pub(crate) mod suspend;
 pub mod sys;
 #[cfg(feature = "daemon-support")]
 #[doc(hidden)]
@@ -96,6 +101,7 @@ pub mod update_check;
 pub(crate) mod update_manifest;
 pub mod upload;
 pub mod validate;
+pub mod worker;
 
 pub use analyzer::Analyzer;
 pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};

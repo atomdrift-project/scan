@@ -41,7 +41,10 @@ pub use self::envelope::dep_envelope;
 #[cfg(not(feature = "daemon-support"))]
 pub(crate) use self::envelope::dep_envelope;
 #[cfg(not(feature = "daemon-support"))]
-pub(crate) use self::hopper::artifact_filename;
+pub(crate) use self::hopper::{
+    Origin, artifact_filename, collect_upload_artifacts, registry_fallback_artifact,
+    upload_collector, upload_scan_result,
+};
 #[cfg(feature = "daemon-support")]
 #[doc(hidden)]
 pub use self::hopper::{
@@ -56,7 +59,8 @@ pub use self::pipeline::{
 };
 #[cfg(not(feature = "daemon-support"))]
 pub(crate) use self::pipeline::{
-    ClassifiedReport, ClassifyRequest, CpuLease, OutputNeeds, classify_report,
+    ClassifiedReport, ClassifyRequest, CpuLease, OutputNeeds, apply_pending_interpretation,
+    classify_report,
 };
 pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,

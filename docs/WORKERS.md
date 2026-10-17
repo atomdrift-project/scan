@@ -1,0 +1,145 @@
+# Atomdrift Scan Workers
+
+`atomscan worker` is the pull-based counterpart to `atomscan serve`. It
+exposes no HTTP. It polls a [hopper](https://github.com/atomdrift-project/hopper)
+instance for jobs, analyses each file, and posts the result back.
+
+The classifier, thresholds, and response shape are identical to the
+server. See [SERVER_API.md](SERVER_API.md) for the server, and
+[JSON.md](JSON.md) for the JSON envelope every worker
+result carries.
+
+## Running a worker
+
+    atomscan worker --url http://hopper-host:8081
+
+`--url` is required. Everything else has a sensible default.
+
+| Flag             | Default          | Meaning                                                                  |
+| ---------------- | ---------------- | ------------------------------------------------------------------------ |
+| `--url`          | (required)       | Hopper base URL.                                                         |
+| `--name`         | hostname         | Worker identity reported to hopper.                                      |
+| `--workers` (`-j`) | auto           | Concurrent analysis slots.                                               |
+| `--poll-secs`    | `2`              | Sleep between polls when the queue is empty.                             |
+| `--max-rss-gb`   | `0` (auto)       | RSS ceiling. Auto = 85 % of total system RAM. `-1` disables.             |
+| `--data-dir`     | none             | Local file root. When set, the worker reads files locally instead of fetching them; SHA-256 is verified before use. |
+| `--max-jobs`     | unlimited        | Exit after this many jobs. Useful for cron-style batches.                |
+| `--traits-dir`   | none             | Writable cleave traits directory. Cloned on first run if missing.        |
+| `--nice`         | `18`             | `nice(2)` value applied at startup. `0` leaves priority unchanged.       |
+| `--no-update`    | off              | Skip the startup model/traits `git pull`; run against on-disk rules.    |
+| `--no-validate`  | off              | Skip the strict startup trait-validation gate (dev/benchmark runs).      |
+| `--exit-if-empty`| off              | Exit cleanly once hopper reports no work and the prefetch queue drains.  |
+
+The same environment variables apply as for the server:
+`CLEAVE_TRAITS_DIR`, `CLEAVE_RAYON_THREADS`, `SCAN_MODELS_REPO`.
+
+### Authenticating to hopper
+
+Hopper requires `Authorization: Bearer <token>` on every API route, so a
+worker needs the token before it can claim work. The same token authenticates
+`scan <path> --hopper` / `--upload` and `serve --hopper`, which renew results
+over the same API. It is attached to every call: `/api/next`,
+`/api/heartbeat`, `/api/result`, `/api/upload`, `/api/known`, `/api/file`,
+`/api/provenance`, and `/data/`.
+
+It is resolved once per process, in this order:
+
+1. `$HOPPER_TOKEN` — the token itself, for callers that inject it some other way.
+2. `$HOPPER_TOKEN_FILE` — a path to the token file.
+3. `~/.tok/hopper` in the process's own home — the default, and what the
+   deploy scripts install.
+
+Loopback is not exempt on hopper's side, so a worker supervised on the hopper
+host authenticates exactly like a remote one. The startup log names the source
+it resolved (never the secret); with no token it warns that every request will
+be rejected with 401.
+
+Every worker installer copies the deploying user's `~/.tok/hopper` into the
+account the service runs as, mode 0600 — `make deploy-worker` on macOS,
+Linux (systemd), FreeBSD (host and Bastille jail), Debian-over-SSH, OmniOS,
+Alpine, and OpenBSD. Point them at a different source with
+`make deploy-worker URL=... HOPPER_TOKEN_FILE=/path/to/token`. Where the
+service account has no usable home of its own — macOS `_scan`, whose directory
+record is `/var/empty`, and the systemd units, which run with
+`ProtectHome=true` — the installer sets `HOME` to the service state directory
+and puts the token in its `.tok`. Alpine and OpenBSD run the worker as the
+deploying user under cron, which already has the right `HOME`.
+
+`deploy-workers.sh` and `update-nodes.sh` run `make deploy-worker` over SSH on
+each node, so each node needs the token in the deploying account's
+`~/.tok/hopper` there. Nothing ships it between hosts for you.
+
+Rotation is an edit plus a worker restart — the token is read once per
+process. Re-running the installer with a changed token restarts the service on
+its own.
+
+A worker on the hopper host used to pick the token up from
+`/usr/local/etc/hopper/env` (as `HOPPER_UPLOAD_TOKEN`, later `HOPPER_TOKEN`).
+That path is gone: `~/.tok/hopper` is the only file the worker reads.
+
+## Job lifecycle
+
+1. **Claim.** The worker calls hopper to claim a job. The job carries
+   the file path (relative to `--data-dir`, if set) or a download URL,
+   plus the expected SHA-256.
+2. **Fetch.** If `--data-dir` is set and the file exists there, the
+   worker hashes it and uses it directly. Otherwise it downloads.
+   Mismatched SHA-256 fails the claim.
+3. **Analyse.** Same `classify_file` / `classify_bytes` path used by
+   the server.
+4. **Report.** The worker posts the [response envelope](JSON.md)
+   back to hopper. The shape is the same as the server's `/analyze`
+   response.
+5. **Sleep.** If the queue was empty on the last claim, the worker
+   sleeps `--poll-secs` before trying again.
+
+## Resource discipline
+
+The worker is designed to share a host with other work.
+
+- **Nice.** The default `--nice 18` keeps analysis bursts from
+  starving interactive processes. Unprivileged callers can only raise
+  the nice value, never lower it; pass `0` when profiling.
+- **RSS ceiling.** When current RSS exceeds the limit, the worker
+  *pauses claims* — it does not abort jobs in flight. It will resume
+  once memory drops. Auto-resolves to 85 % of total system RAM. Set
+  `-1` only behind an external supervisor (`MemoryMax=`, jail
+  `memoryuse`, cgroup, etc.) that already enforces a hard cap.
+- **Concurrency.** `--workers` is the hard limit on simultaneous
+  analyses. There is no queue beyond hopper itself.
+- **Rayon stack.** Worker startup installs an 8 MB rayon stack;
+  cleave's archive recursion exhausts the default 2 MB stack on
+  pathological inputs.
+
+## Operations
+
+- **Idempotent deploys.** The worker tolerates repeated launches and
+  trait/model directories that already exist; it does not re-clone if
+  the working tree is current.
+- **FreeBSD.** `make deploy-worker` installs natively on the host: an
+  unprivileged `scan` user and an rc.d service supervised by
+  `daemon(8)`, which restarts the worker forever (5s back-off) after an
+  OOM kill or panic. `make deploy-jail-worker` instead builds in a
+  Bastille build jail and runs the same rc.d service in a separate run
+  jail. Both share one service definition
+  (`scripts/worker/lib/freebsd-rcd.sh`).
+- **Bastille jails.** Before upgrading the binary inside a jail,
+  force-kill the worker with `kill -9`. Graceful shutdown can stall
+  during rizin teardown.
+- **Profiling.** `profile_worker.sh` at the repo root runs a worker
+  under `samply` with the right stack and env settings.
+
+## Security
+
+The worker is a client of hopper. It does not listen on any port.
+
+- **Outbound only.** The trust boundary is the hopper URL; treat it
+  the way you treat the rest of your service mesh.
+- **File integrity.** Both download and local-file paths verify
+  SHA-256 before analysis. A worker will not analyse a file whose
+  hash does not match the job claim.
+- **No code execution.** Same static-analysis-only guarantees as the
+  server. See [SERVER_API.md#security](SERVER_API.md#security).
+- **Worker identity.** `--name` is purely identifying. The bearer token
+  is what hopper authenticates; it is shared by the whole fleet and
+  says "a worker", not "which worker".
