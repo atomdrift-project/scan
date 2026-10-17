@@ -162,13 +162,17 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
-      # `--lib` only, mirroring `make test-unit`. The integration tests in
-      # tests/ each link their own copy of a very large binary; enabling them
-      # here needs a look at wall-clock and disk first. The model-dependent
-      # tests are already #[ignore]d.
+      # Keep the full integration suite separate: most cases require models.
       - name: Test
         if: matrix.test
         run: cargo test --locked --lib
+
+      - name: CLI integration tests (including live R2 updates)
+        if: matrix.test
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       # --- macOS signing ------------------------------------------------------
       # Unsigned path: an ad-hoc signature, matching what `make release` does on
@@ -1167,6 +1171,12 @@ jobs:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: file "target/$TARGET/$PROFILE/atomscan.exe"
+
+      - name: CLI integration tests (including live R2 updates)
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       - name: Smoke test
         env:

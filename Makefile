@@ -1012,6 +1012,10 @@ test:
 		$(CARGO) test --workspace; \
 	fi
 
+.PHONY: test-cli
+test-cli:
+	$(CARGO) test --locked --test cli_smoke
+
 test-unit:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
