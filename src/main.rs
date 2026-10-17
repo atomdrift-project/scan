@@ -226,10 +226,20 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use scan::cli::GlobalArgs;
 use scan::interpret::InterpretConfig;
+use scan::memory::{MaxRssPolicy, log_max_rss_resolution};
 use std::ffi::OsString;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use tracing_subscriber::prelude::*;
+
+/// How long a daemon's runtime waits, once it returns, for blocking work —
+/// cancelled analyses unwinding, their temp files coming off disk — before the
+/// process exits anyway. Dropping the runtime instead waits forever, and one
+/// wedged analysis would then hold the process past every drain deadline.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 const EXPECTED_YARA_CACHE_MISMATCH: &str =
     "compiled YARA rules do not match the rule sources on disk; ignoring them and recompiling";
@@ -333,7 +343,11 @@ fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
 /// mode wants the dependency skip, but only a bulk walk wants its own input
 /// answered from a bless.
 ///
-/// `--mode slow` means "consult no filters", so it publishes nothing.
+/// `--mode slow` means "consult no filters", so it publishes nothing. Note this
+/// reads the operator's `--mode` rather than the effective mode: `serve` and
+/// `worker` force themselves slow so a submitted job is always analyzed on its
+/// own merits, and that internal choice must not also switch off their
+/// dependency skip — only an explicit `--mode slow` does.
 ///
 /// Returns the loaded filters so `fs`/`ps` can hand the same copy to
 /// `ScanConfig::with_bloom` instead of loading a second one.
@@ -544,8 +558,199 @@ enum Commands {
         skip_traits: bool,
     },
 
+    /// Run as an HTTP classification server
+    Serve(ServeArgs),
+
+    /// Run as a pull-based worker, polling a hopper instance for analysis jobs
+    Worker(WorkerArgs),
+
     /// Print version information
     Version,
+}
+
+// `serve`'s flags. No doc comment: clap would promote it onto the subcommand,
+// replacing the variant's own description in `--help`.
+#[derive(Debug, clap::Args)]
+struct ServeArgs {
+    /// Address to listen on
+    #[arg(long, default_value = "127.0.0.1:49999")]
+    bind: SocketAddr,
+
+    /// Maximum upload size in megabytes
+    #[arg(long, default_value = "100")]
+    max_size_mb: usize,
+
+    /// Maximum RSS in gigabytes before rejecting requests.
+    /// 0 (default) auto-resolves to the process memory limit; -1 disables
+    /// in-process throttling entirely (use when an external supervisor
+    /// like systemd `MemoryMax=` already enforces a hard cap).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    max_rss_gb: i64,
+
+    /// Comma-separated directories allowed for /analyze-path requests
+    #[arg(long)]
+    allowed_dirs: Option<String>,
+
+    /// Maximum concurrent analyses (defaults to the physical
+    /// performance-core count, min 2)
+    #[arg(long)]
+    workers: Option<NonZeroUsize>,
+
+    /// Comma-separated CIDR networks (in addition to loopback) allowed to
+    /// reach the server. /analyze-path is always restricted to loopback
+    /// regardless of this list. Pair with --bind 0.0.0.0:PORT to actually
+    /// accept remote connections.
+    #[arg(long)]
+    allow_cidr: Option<String>,
+
+    /// Require `Authorization: Bearer <token>` on every route except
+    /// /_/health, reading the token from the first non-empty line of
+    /// PATH. Loopback is not exempt: behind a Cloudflare tunnel every
+    /// request arrives from loopback. A missing, empty, or unreadable
+    /// file is a startup error — never a silent drop to unauthenticated.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
+
+    /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
+    /// Use when running as a restricted user whose $HOME is not writable
+    /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
+    /// cloned automatically if the directory does not yet exist.
+    #[arg(long)]
+    traits_dir: Option<PathBuf>,
+
+    /// The hopper this server reads from and files to.
+    ///
+    /// Every analyzed result (parent and members) is renewed by POSTing to
+    /// <URL>/api/result as analyses complete — the warm-server equivalent of
+    /// `scan path --hopper` — and a lookup this server's own index cannot
+    /// answer is deferred to the same place.
+    ///
+    /// Several addresses may be given, comma-separated, in preference
+    /// order: put the replica first and the primary behind it. Reads try
+    /// them in that order, and a retry on a write walks down the list, so a
+    /// replica that stops answering costs one attempt rather than a lost
+    /// verdict. Reads and writes deliberately take the same list — routing
+    /// them apart is a topology this server would have to know, and
+    /// hopper's write relay exists so that it does not: a replica answers
+    /// lookups locally and forwards the renewals.
+    ///
+    ///   --hopper https://hops-ro.example,http://hopper.internal:8081
+    ///
+    /// Upload failures are reported as errors, but never make the scan
+    /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
+    /// with `~/.tok/hopper` (or
+    /// `$HOPPER_TOKEN_FILE` / `$HOPPER_TOKEN`); hopper rejects an
+    /// unauthenticated request with 401.
+    #[arg(
+        long,
+        visible_alias = "upload",
+        value_name = "URL",
+        env = "SCAN_HOPPER"
+    )]
+    hopper: Option<String>,
+
+    /// Fill idle capacity with queue work from `--hopper`, pausing the
+    /// moment an analysis request arrives.
+    ///
+    /// A serve process spends most of its life waiting while hopper holds a
+    /// backlog, so the spare capacity is otherwise wasted. Analysis
+    /// requests always win: the worker stops claiming while any is in
+    /// flight and remains paused for 7 seconds after the latest analysis
+    /// request, so a new burst does not compete with background work.
+    ///
+    /// Defaults to half of `--workers` (rounded down), leaving the other
+    /// half reserved for requests. The requested value is capped at that
+    /// same half-slot limit. 0 disables it.
+    /// Requires `--hopper`.
+    ///
+    /// When `--hopper` names several addresses this claims from the
+    /// primary — the last of them — and only from it. A replica refuses
+    /// worker routes with a 403 even with its relay enabled, so unlike
+    /// lookups and renewals there is no second address to fall back to.
+    #[arg(long, value_name = "N", env = "SCAN_IDLE_WORKER_SLOTS")]
+    idle_worker_slots: Option<usize>,
+
+    /// Per-request analysis timeout in seconds; 0 disables. Raise when
+    /// `--fetch` is on and dependency analysis can exceed the default.
+    #[arg(
+        long,
+        default_value_t = scan::server::DEFAULT_ANALYSIS_TIMEOUT_SECS,
+        value_name = "SECS",
+        env = "SCAN_ANALYSIS_TIMEOUT"
+    )]
+    analysis_timeout: u64,
+}
+
+// `worker`'s flags; undocumented for the same reason as `ServeArgs`.
+#[derive(Debug, clap::Args)]
+struct WorkerArgs {
+    /// Hopper API base URL (e.g. http://hopper-host:8081). Every call
+    /// authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
+    /// `$HOPPER_TOKEN`); without it hopper rejects the poll with 401.
+    ///
+    /// Accepts the comma list `serve --hopper` takes, so one deploy
+    /// variable can feed both, but a worker uses only the primary — the
+    /// last address. A replica refuses worker routes outright, so the
+    /// earlier ones are not a fallback here.
+    /// Also settable via `SCAN_HOPPER`.
+    #[arg(long, env = "SCAN_HOPPER")]
+    url: String,
+
+    /// Worker name (defaults to hostname)
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Number of concurrent analysis slots
+    #[arg(short = 'j', long)]
+    workers: Option<NonZeroUsize>,
+
+    /// Poll interval in seconds when no work is available
+    #[arg(long, default_value = "2")]
+    poll_secs: u64,
+
+    /// Maximum RSS in gigabytes before pausing claims.
+    /// 0 (default) auto-resolves to 85% of total system RAM; -1 disables
+    /// in-process throttling entirely (use when an external supervisor
+    /// like systemd `MemoryMax=` already enforces a hard cap).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    max_rss_gb: i64,
+
+    /// Local data directory. Hopper returns relative paths; the worker
+    /// joins them with this root to find files locally instead of
+    /// downloading. SHA256 is verified before using a local file.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Exit after this many jobs have been analyzed (default: run forever)
+    #[arg(long)]
+    max_jobs: Option<u64>,
+
+    /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
+    /// Use when running as a restricted user whose $HOME is not writable
+    /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
+    /// cloned automatically if the directory does not yet exist.
+    #[arg(long)]
+    traits_dir: Option<PathBuf>,
+
+    /// Nice value applied to the worker process at startup. Default 18
+    /// keeps analysis bursts from starving other work on the host. Pass 0
+    /// to leave priority unchanged (e.g. when profiling). Unprivileged
+    /// processes can only raise the nice value.
+    #[arg(long, default_value = "18", allow_hyphen_values = true)]
+    nice: i32,
+
+    /// Skip the strict startup trait-validation gate. Use for benchmarking
+    /// or dev runs against locally-edited (possibly not-yet-valid) traits;
+    /// the analysis path tolerates lint-level issues the pre-flight rejects.
+    #[arg(long)]
+    no_validate: bool,
+
+    /// Exit cleanly once the hopper reports no further work and the prefetch
+    /// queue drains. For benchmarks / batch runs over a finite dataset;
+    /// unlike `--max-jobs` it needs no job count and can't wedge on a
+    /// blocked claim.
+    #[arg(long)]
+    exit_if_empty: bool,
 }
 
 impl Commands {
@@ -557,9 +762,14 @@ impl Commands {
         )
     }
 
+    /// A long-lived role that scans on behalf of other hosts.
+    fn is_daemon(&self) -> bool {
+        matches!(self, Self::Serve(_) | Self::Worker(_))
+    }
+
     /// Whether this command runs cleave, and so needs its external tools.
     fn runs_analysis(&self) -> bool {
-        self.is_scan() || matches!(self, Self::Validate { .. })
+        self.is_scan() || self.is_daemon() || matches!(self, Self::Validate { .. })
     }
 }
 
@@ -578,7 +788,8 @@ impl Commands {
 /// only symptom is throughput death, which is why this check exists.
 ///
 /// Warn rather than fail: the setting is harmless (merely ignored) on the
-/// platforms that link the bundled jemalloc.
+/// platforms that link the bundled jemalloc, and an operator override should
+/// never be able to refuse to boot a worker.
 fn warn_on_broken_freebsd_malloc_conf() {
     if !cfg!(target_os = "freebsd") {
         return;
@@ -665,8 +876,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    configure_process(&global)?;
-    init_logging(&global);
+    configure_process(&global, &command)?;
+    init_logging(&global, command.is_daemon());
 
     // Resolved after logging is up: with no hardcoded default, the model comes
     // from the endpoint's own listing, so which one was picked has to be
@@ -706,15 +917,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
     if command.runs_analysis() {
         scan::tools::warn_missing();
     }
-    // Interactive commands get a once-a-day, zero-telemetry update notice;
-    // `validate` skips it because it manages its own startup checks.
-    if !matches!(command, Commands::Validate { .. }) {
+    // Interactive commands get a once-a-day, zero-telemetry update notice. The
+    // long-running daemons are excluded — they refresh on restart and shouldn't
+    // print transient notices into their logs — and so is `validate`.
+    if !command.is_daemon() && !matches!(command, Commands::Validate { .. }) {
         scan::update_check::maybe_notify(false);
     }
     // Default-on refresh: bring rules + models (+ bloom) current when the local
     // ruleset is over 24h stale — or immediately with `-u/--update` — unless
-    // `--no-update`/`SCAN_NO_UPDATE` disables it. Scanning commands only;
-    // `version` and `update-rules` manage updates themselves.
+    // `--no-update`/`SCAN_NO_UPDATE` disables it. Scanning commands only: the
+    // daemons refresh on restart, and `version`/`update-rules` manage updates
+    // themselves.
     if command.is_scan() {
         scan::auto_update::refresh_if_stale(
             global.update,
@@ -724,7 +937,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         );
     }
 
-    let fetch = fetch_policy(&global);
+    let fetch = fetch_policy(&global, &command);
     match command {
         Commands::Render { .. } => anyhow::bail!("render must run before analysis bootstrap"),
         Commands::Path {
@@ -763,6 +976,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             publish_bloom_filters(global.mode);
             Ok(finish_scan(&scan::pkg::run_pkg(&purl, &config)?))
         }
+        Commands::Serve(args) => serve(&global, args, interpret, fetch),
+        Commands::Worker(args) => worker(&global, args, interpret, fetch),
         Commands::UpdateRules { models_only, check } => Ok(update_rules(models_only, check)),
         Commands::Validate { skip_traits } => {
             let model_dir = scan::cli::resolve_model_dir(global.model_dir.clone())?;
@@ -787,7 +1002,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
 /// The process-global settings every command shares: the Rizin deadline, the
 /// fetch ceilings, and the cache sweeper.
-fn configure_process(global: &GlobalArgs) -> Result<()> {
+fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
     if let Some(path) = &global.fetch_pending {
         scan::fetch::configure_pending(path)?;
     }
@@ -797,29 +1012,39 @@ fn configure_process(global: &GlobalArgs) -> Result<()> {
         scan::engine::set_rizin_retry_timeout(std::time::Duration::from_secs(seconds));
     }
     // The fetch client and blob cache are built once per process, on first use,
-    // so their settings are fixed here for every interactive scan.
+    // so their settings are fixed here: every mode (interactive scan and worker
+    // alike) honors `--fetch-max-size` and `--registry-ttl`.
     scan::fetch::configure(scan::fetch::Settings {
         max_fetch_bytes: global.fetch_max_size,
         registry_ttl: global.registry_ttl,
     });
-    // A one-shot sweep reclaims stale and oversized caches without keeping the
-    // CLI process alive.
-    scan::cache_cleanup::start(false);
-    scan::fetch::set_total_budget(global.fetch_max_total_fetches, global.fetch_max_total_size);
+    // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
+    // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
+    // loop for the never-exiting daemons. Non-blocking either way.
+    scan::cache_cleanup::start(command.is_daemon());
+    // Per-execution fetch ceiling: a hard cap across the whole invocation. The
+    // daemons scan unboundedly many jobs over their lifetime, so they're exempt
+    // — each job is bounded by `--fetch-max-file-*` instead.
+    if !command.is_daemon() {
+        scan::fetch::set_total_budget(global.fetch_max_total_fetches, global.fetch_max_total_size);
+    }
     Ok(())
 }
 
 /// Install the tracing subscriber and quiet the `log` bridge.
-fn init_logging(global: &GlobalArgs) {
+fn init_logging(global: &GlobalArgs, daemon: bool) {
     // RUST_LOG (when set) wins over the mode-derived defaults, so profiling
     // runs can surface targeted modules (e.g. `cleave::mem_profile=info`)
     // without paying for full `--verbose` debug output.
     // `atomscan` is this binary's own target: startup diagnostics logged from
-    // main.rs are not in the `scan` library.
+    // main.rs (rule refresh, authentication, LLM configuration) are not in the
+    // `scan` library and were being filtered out of the daemons' logs.
     let explicit = global.verbose || std::env::var_os("RUST_LOG").is_some();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if global.verbose {
             tracing_subscriber::EnvFilter::new("atomscan=debug,scan=debug,cleave=debug")
+        } else if daemon {
+            tracing_subscriber::EnvFilter::new("atomscan=info,scan=info,cleave=warn")
         } else {
             tracing_subscriber::EnvFilter::new("atomscan=warn,scan=warn,cleave=error")
         }
@@ -831,10 +1056,17 @@ fn init_logging(global: &GlobalArgs) {
     let layer = tracing_subscriber::fmt::layer()
         .with_thread_names(true)
         .with_writer(std::io::stderr);
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(layer.without_time().with_filter(quiet_expected_yara_cache))
-        .init();
+    if daemon {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(layer.with_filter(quiet_expected_yara_cache))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(layer.without_time().with_filter(quiet_expected_yara_cache))
+            .init();
+    }
 
     // Silence the `log` -> `tracing` bridge that `init()` just installed.
     //
@@ -861,7 +1093,8 @@ fn init_logging(global: &GlobalArgs) {
 
 /// Pick the terminal color theme. Detection is only for an interactive scan
 /// drawing to a terminal: the OSC color-scheme query blocks on a TTY response
-/// and hangs in any environment that doesn't reply (SSH, some tmux configs).
+/// and hangs in any environment that doesn't reply (SSH, some tmux configs,
+/// worker daemons).
 fn set_theme(global: &GlobalArgs, command: &Commands) {
     if global.light {
         scan::output::set_theme(scan::output::Theme::Light);
@@ -872,14 +1105,35 @@ fn set_theme(global: &GlobalArgs, command: &Commands) {
     }
 }
 
-/// The interactive command's follow/fetch policy. When `--follow` or
-/// `SCAN_FOLLOW` is unset, scans follow what an installed artifact can reach;
-/// CI actions remain opt-in. An explicit selection is honored verbatim.
-fn fetch_policy(global: &GlobalArgs) -> scan::fetch::FetchPolicy {
+/// The follow/fetch policy for `command`.
+///
+/// When `--follow`/`SCAN_FOLLOW` is unset, an interactive scan follows what an
+/// installed artifact can reach (CI actions remain opt-in), while `serve` and
+/// `worker` follow everything (see [`scan::fetch::default_service_follow_policy`]).
+/// A worker exists to populate the shared corpus, not to answer one question
+/// quickly: every resolvable dependency it pulls becomes a hopper sample with
+/// a package coordinate, which is what later grows known-good bloom coverage,
+/// so it takes no dependency age ceiling. An explicit selection is honored
+/// verbatim; the knobs always apply.
+fn fetch_policy(global: &GlobalArgs, command: &Commands) -> scan::fetch::FetchPolicy {
+    let (default_follow, max_age): (fn() -> scan::fetch::FetchPolicy, u32) = match command {
+        Commands::Worker(_) => (
+            scan::fetch::default_service_follow_policy,
+            scan::fetch::WORKER_MAX_DEP_AGE_DAYS,
+        ),
+        Commands::Serve(_) => (
+            scan::fetch::default_service_follow_policy,
+            scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+        ),
+        _ => (
+            default_cli_follow_policy,
+            scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+        ),
+    };
     global.fetch_policy(
-        global.follow.unwrap_or_else(default_cli_follow_policy),
-        scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
-        false,
+        global.follow.unwrap_or_else(default_follow),
+        max_age,
+        command.is_daemon(),
     )
 }
 
@@ -929,7 +1183,7 @@ fn scan_paths(
     }
     // `--registry-map <file>`: a JSON object {sha256: provenance}. Preserve each
     // complete value and derive the normalized record beside it, so map-backed
-    // scans have the same provider data as live scans. Entries
+    // scans have the same provider data as live and worker scans. Entries
     // without a record are skipped — registry provenance is best-effort, never
     // required.
     let registry_map = match registry_map {
@@ -983,6 +1237,132 @@ fn finish_scan(summary: &scan::ScanSummary) -> ExitCode {
         0
     };
     ExitCode::from(code)
+}
+
+/// A multi-threaded runtime for a daemon.
+///
+/// Its blocking threads run small analyses inline (`classify_bytes` without a
+/// whale lane), so they get the same stack as every analysis pool
+/// ([`scan::RAYON_STACK_MB`]): a hostile sample that recurses fine on a pool
+/// must not overflow tokio's 2 MiB default and abort the whole daemon.
+fn daemon_runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(scan::RAYON_STACK_MB * 1024 * 1024)
+        .build()?)
+}
+
+/// `atomscan serve`.
+fn serve(
+    global: &GlobalArgs,
+    args: ServeArgs,
+    interpret: Option<InterpretConfig>,
+    fetch: scan::fetch::FetchPolicy,
+) -> Result<ExitCode> {
+    let hopper = resolve_hopper(args.hopper);
+    let max_rss = MaxRssPolicy::from_cli(args.max_rss_gb);
+    log_max_rss_resolution(
+        "server",
+        max_rss,
+        max_rss
+            .process_ceiling()
+            .map_or(0, std::num::NonZeroU64::get),
+    );
+    // `resolve` also refreshes rules on restart. That is the step that
+    // populates a `--traits-dir` pointing at an empty state directory on a
+    // fresh deploy — without it the server starts, reports healthy, and fails
+    // every analysis on a traits path that never got created.
+    let config = scan::server::Startup {
+        bind: args.bind,
+        max_size_mb: args.max_size_mb,
+        max_rss,
+        allowed_dirs: args.allowed_dirs,
+        workers: args.workers,
+        allow_cidr: args.allow_cidr,
+        token_file: args.token_file,
+        hopper: hopper.clone(),
+        idle_worker_slots: args.idle_worker_slots,
+        analysis_timeout_secs: args.analysis_timeout,
+        rules: scan::worker::RulesStartup {
+            model_dir: global.model_dir.clone(),
+            level: global.level,
+            thresholds: global.thresholds(),
+            traits_dir: args.traits_dir,
+            refresh: global.refresh(),
+            slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
+            interpret,
+            fetch,
+            zip_passwords: global.zip_passwords.clone().into(),
+        },
+    }
+    .resolve()?;
+    if let Some(url) = hopper.as_deref() {
+        eprintln!("Renewing results on hopper at {url}");
+        eprintln!("Deferring unknown lookups to the corpus at {url}");
+    }
+    // Serve never bloom-skips an /analyze job (Mode::Slow), but the membership
+    // endpoint and the --fetch dependency gate read the process-wide handle.
+    // Missing files fail closed (no skip).
+    publish_bloom_filters(global.mode);
+    eprintln!("Starting Atomdrift Scan server on http://{} ...", args.bind);
+    let runtime = daemon_runtime()?;
+    let served = runtime.block_on(scan::server::run(config));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    served?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `atomscan worker`.
+fn worker(
+    global: &GlobalArgs,
+    args: WorkerArgs,
+    interpret: Option<InterpretConfig>,
+    fetch: scan::fetch::FetchPolicy,
+) -> Result<ExitCode> {
+    // Claimed jobs are always analyzed in full (a worker never gets
+    // `with_bloom`), but the *dependency* gate in `fetch::age_gate` consults
+    // the process-wide bloom handle: a fetched dep whose resolved coordinate is
+    // vouched known-good (and not vetoed by the known-bad channel) skips its
+    // artifact fetch+scan, keeping only the registry-metadata node.
+    publish_bloom_filters(global.mode);
+    // Accept the comma list `serve --hopper` takes, so one deploy variable can
+    // feed both, but keep only the primary: a replica refuses worker routes
+    // with a 403 whether or not its relay is on, so the later addresses are not
+    // a fallback for this loop. Passing the whole string through reaches a URL
+    // parser, which reads the commas as part of one very strange hostname.
+    scan::upload::warn_if_cleartext(&args.url);
+    let Some(hopper_url) = scan::upload::worker_endpoint(&args.url) else {
+        anyhow::bail!("--url names no hopper address");
+    };
+    let config = scan::worker::Startup {
+        hopper_url,
+        name: args.name,
+        workers: args.workers,
+        poll_interval: Duration::from_secs(args.poll_secs),
+        max_rss: MaxRssPolicy::from_cli(args.max_rss_gb),
+        nice: args.nice,
+        data_dir: args.data_dir,
+        max_jobs: args.max_jobs,
+        exit_if_empty: args.exit_if_empty,
+        no_validate: args.no_validate,
+        rules: scan::worker::RulesStartup {
+            model_dir: global.model_dir.clone(),
+            level: global.level,
+            thresholds: global.thresholds(),
+            traits_dir: args.traits_dir,
+            refresh: global.refresh(),
+            slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
+            interpret,
+            fetch,
+            zip_passwords: global.zip_passwords.clone().into(),
+        },
+    }
+    .resolve()
+    .inspect_err(|e| eprintln!("Worker startup failed: {e:#}"))?;
+    let runtime = daemon_runtime()?;
+    let exit = runtime.block_on(scan::worker::run(config));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    Ok(ExitCode::from(exit?.code()))
 }
 
 /// `atomscan update-rules`: check for, or apply, model, traits and bloom
@@ -1184,15 +1564,15 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, default_cli_follow_policy, is_expected_yara_cache_mismatch,
+        Cli, Commands, MaxRssPolicy, default_cli_follow_policy, is_expected_yara_cache_mismatch,
         resolve_hopper_value, with_default_subcommand,
     };
     use anyhow::{Context, Result};
     use clap::Parser;
     use scan::OutputFormat;
     use scan::cli::{DEFAULT_RIZIN_TIMEOUT_SECS, LlmEnv};
-    use scan::memory::MaxRssPolicy;
     use std::ffi::OsString;
+    use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
 
@@ -1255,6 +1635,63 @@ mod tests {
         Ok(())
     }
 
+    /// A service follows everything it can reach, because the corpus it fills
+    /// is asked about artifacts nobody has looked at yet: a category left
+    /// unfollowed is one nobody ever learns about.
+    #[test]
+    fn serve_and_worker_follow_everything_by_default() {
+        let service = scan::fetch::default_service_follow_policy();
+        assert!(
+            service.urls && service.packages && service.deps && service.ci,
+            "a cache-population role must follow every category"
+        );
+
+        // The interactive default stays narrow: CI actions never reach an
+        // installed artifact, so one person's scan should not pay for them.
+        let interactive = default_cli_follow_policy();
+        assert!(
+            !interactive.ci,
+            "the interactive default must not widen with the service one"
+        );
+        assert_ne!(
+            (
+                interactive.urls,
+                interactive.packages,
+                interactive.deps,
+                interactive.ci
+            ),
+            (service.urls, service.packages, service.deps, service.ci),
+            "the two defaults are deliberately different; if they converge, say so on purpose"
+        );
+    }
+
+    /// The roles that get the wide default are exactly the ones that scan on
+    /// behalf of other hosts. Keeping the two in step is what stops a new
+    /// service subcommand from quietly populating the corpus with a narrow
+    /// verdict.
+    #[test]
+    fn the_wide_default_covers_every_service_role() {
+        for args in [
+            vec!["scan", "serve"],
+            vec!["scan", "worker", "--url", "http://hopper.invalid"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("service command should parse");
+            assert!(
+                cli.command.as_ref().is_some_and(Commands::is_daemon),
+                "{args:?} scans for other hosts and must take the wide follow default"
+            );
+        }
+        let interactive = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+            .expect("path scan should parse");
+        assert!(
+            !interactive
+                .command
+                .as_ref()
+                .is_some_and(Commands::is_daemon),
+            "an interactive path scan keeps the narrow default"
+        );
+    }
+
     #[test]
     fn old_fetch_flag_and_target_names_remain_aliases() -> Result<()> {
         let old = Cli::try_parse_from(with_default_subcommand([
@@ -1310,11 +1747,13 @@ mod tests {
     }
 
     #[test]
-    fn dependency_platform_scope_defaults_to_current_host() -> Result<()> {
+    fn dependency_platform_scope_follows_scanner_role() -> Result<()> {
         let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
             .context("default should parse")?;
         assert!(
-            default.global.host_platform_only(false),
+            default
+                .global
+                .host_platform_only(default.command.as_ref().is_some_and(Commands::is_daemon)),
             "interactive scans optimize for the current host"
         );
         assert!(
@@ -1337,6 +1776,18 @@ mod tests {
         .context("host-only opt-out should parse")?;
         assert!(host_only.global.host_platform_only(true));
 
+        for daemon in [
+            Cli::try_parse_from(["scan", "serve"]).context("serve should parse")?,
+            Cli::try_parse_from(["scan", "worker", "--url", "http://hopper.test"])
+                .context("worker should parse")?,
+        ] {
+            let role = daemon.command.as_ref().is_some_and(Commands::is_daemon);
+            assert!(role);
+            assert!(
+                !daemon.global.host_platform_only(role),
+                "serve/worker scan on behalf of other hosts"
+            );
+        }
         Ok(())
     }
 
@@ -1391,6 +1842,7 @@ mod tests {
         for line in [
             vec!["scan", "fs", "/tmp/a"],
             vec!["scan", "purl", "pkg:npm/left-pad@1.3.0"],
+            vec!["scan", "serve"],
             vec!["scan", "help"],
             vec!["scan", "--help"],
             vec!["scan", "--version"],
@@ -1554,6 +2006,41 @@ mod tests {
     }
 
     #[test]
+    fn serve_and_worker_accept_negative_max_rss_disable() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "scan",
+            "serve",
+            "--bind",
+            "127.0.0.1:49999",
+            "--max-rss-gb",
+            "-1",
+        ])
+        .context("serve -1 should parse")?;
+        match cli.command.context("serve subcommand expected")? {
+            Commands::Serve(args) => {
+                assert_eq!(args.bind, "127.0.0.1:49999".parse::<SocketAddr>()?);
+                assert_eq!(args.max_rss_gb, -1);
+            }
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "scan",
+            "worker",
+            "--url",
+            "http://127.0.0.1:8081",
+            "--max-rss-gb",
+            "-1",
+        ])
+        .context("worker -1 should parse")?;
+        match cli.command.context("worker subcommand expected")? {
+            Commands::Worker(args) => assert_eq!(args.max_rss_gb, -1),
+            other => anyhow::bail!("unexpected command: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn max_rss_policy_classifies_cli_inputs() {
         assert_eq!(MaxRssPolicy::from_cli(-1), MaxRssPolicy::Disabled);
         assert_eq!(MaxRssPolicy::from_cli(i64::MIN), MaxRssPolicy::Disabled);
@@ -1625,6 +2112,22 @@ mod tests {
 
         assert_eq!(cli.global.zip_passwords, ["one", "two"]);
         Ok(())
+    }
+
+    #[test]
+    fn concurrency_flags_reject_zero() {
+        assert!(Cli::try_parse_from(["atomscan", "serve", "--workers", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "atomscan",
+                "worker",
+                "--url",
+                "http://hopper",
+                "--workers",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1707,6 +2210,42 @@ mod tests {
         assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
         assert_eq!(cfg.model, "qwen/qwen3.8-27b");
         assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+        Ok(())
+    }
+
+    #[test]
+    fn llm_flags_are_global_on_serve_and_worker() -> Result<()> {
+        let env = llm_env(None);
+        let serve = Cli::try_parse_from([
+            "atomscan",
+            "--llm",
+            "openrouter",
+            "--llm-model",
+            "qwen/qwen3.8-27b",
+            "--llm-key",
+            "sk-test",
+            "serve",
+        ])?;
+        assert_eq!(serve.global.llm.as_deref(), Some("openrouter"));
+        let cfg = serve
+            .global
+            .interpret_config_with(&env)?
+            .context("serve inherits --llm")?;
+        assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
+
+        let worker = Cli::try_parse_from([
+            "atomscan",
+            "worker",
+            "--url",
+            "http://hopper.test",
+            "--llm",
+            "openrouter",
+            "--llm-model",
+            "qwen/qwen3.8-27b",
+            "--llm-key",
+            "sk-test",
+        ])?;
+        assert_eq!(worker.global.llm.as_deref(), Some("openrouter"));
         Ok(())
     }
 

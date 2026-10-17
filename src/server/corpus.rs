@@ -1,0 +1,1055 @@
+//! Deferring a lookup to hopper when the local index has nothing.
+//!
+//! A scan worker holds a verdict index and a set of filters; hopper holds the
+//! corpus behind them. Asking one question and getting one answer is the point:
+//! a caller should not have to know that two services exist, nor which of them
+//! to reconcile against the other, so a worker that does not know finds out
+//! rather than reporting absence.
+//!
+//! `--hopper` may name several addresses for the same corpus, in preference
+//! order: put the replica first and the primary behind it. Reads and writes
+//! take the same list, because routing them separately is a topology this
+//! worker would have to know and hopper's write relay exists so that it does
+//! not — a replica answers lookups locally and forwards the renewals.
+//!
+//! A head that fails is rested rather than retried on the next request: the
+//! cost of an unreachable address is a timeout, and paying that in front of
+//! every lookup would be worse than the outage it is reacting to.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+/// How long a hopper read may take before the endpoint counts as unreachable.
+///
+/// Short on purpose. Hopper answers this route from an in-memory record pool
+/// and never reads its largest column, so a slow answer means something is
+/// wrong rather than something is big — and there is a caller waiting on the
+/// far end of two hops.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A transient Hopper failure gets a small, bounded retry before the reader
+/// gives the next address a chance. This catches a restarted backend without
+/// turning a lookup into an unbounded wait.
+const READ_RETRIES: usize = 2;
+const READ_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How stale the preferred address may be before its silence stops counting as
+/// an answer.
+///
+/// A replica 404 is taken as "nothing known" so that the miss load — which for
+/// a caller gating installs is most of the load — stays off the primary. That
+/// bargain assumes the replica is current. When it is not, a verdict the
+/// primary already holds reads as absence: analyze a package, get `block`, look
+/// it up a minute later and be told nobody has ever seen it.
+///
+/// The replica remains an acceptable read source while it is within the
+/// four-hour operational freshness window. A miss inside that window can
+/// still be a replication race, but the caller's contract is to fall through
+/// to local analysis when Hopper has no analyzed verdict; a stale replica is
+/// different because its absence cannot be trusted at all.
+const MAX_REPLICA_LAG: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// How long a lag reading is trusted before asking again. Short enough to catch
+/// a replica falling behind, long enough that it costs one request a minute
+/// rather than one per lookup.
+const LAG_TTL: Duration = Duration::from_secs(30);
+
+/// How long the preferred address stops leading after a failure.
+///
+/// Long enough that a restart or a failover is not fronted by a timeout on
+/// every lookup, short enough that a recovered address takes the load back
+/// without an operator doing anything.
+const REST: Duration = Duration::from_secs(10);
+
+/// What hopper said about an artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Reached {
+    /// The corpus holds a record for it.
+    Record(Box<CorpusRecord>),
+    /// The corpus answered and holds nothing, or holds bytes nobody has
+    /// analyzed. Either way there is no verdict — and nothing is wrong.
+    Nothing,
+    /// No endpoint could be reached. Says nothing about the artifact, which is
+    /// the whole reason it is distinct from [`Self::Nothing`].
+    Unreachable,
+}
+
+/// Where a reachable corpus answer was served. Hopper supplies this header so
+/// a replica relay can distinguish its local database from the primary it
+/// contacted for a `fresh=1` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorpusSource {
+    Replica,
+    Primary,
+}
+
+/// One artifact as hopper's `/v1/lookup` reports it.
+///
+/// Every field is optional because the corpus spans several eras of stored
+/// record: `fires_at` in particular is absent for rows written before levels
+/// existed, and a missing level must stay missing rather than become a zero.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub(crate) struct CorpusRecord {
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub purl: Option<String>,
+    #[serde(default)]
+    pub fires_at: crate::model::Level,
+    #[serde(default)]
+    pub engine_version: Option<String>,
+    #[serde(default)]
+    pub traits_version: Option<String>,
+    #[serde(default)]
+    pub analyzed_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub findings: Vec<CorpusFinding>,
+}
+
+/// One of the artifact's strongest traits, as the corpus stores them.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub(crate) struct CorpusFinding {
+    pub id: String,
+    #[serde(default)]
+    pub crit: u8,
+    /// A sentence for a person, present only on findings the analyzer did not
+    /// produce. A trait id describes itself; a citation does not, and the
+    /// record's `reason` is already taken when the verdict was also measured.
+    #[serde(default)]
+    pub desc: Option<String>,
+}
+
+/// Sample bytes hopper served, and their digest.
+#[derive(Debug)]
+pub(crate) struct Sample {
+    pub(crate) bytes: bytes::Bytes,
+    /// Lowercase hex SHA-256 of `bytes`, computed as they arrived.
+    pub(crate) sha256: String,
+}
+
+/// Where corpus lookups went, for `/_/stats`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct CorpusStats {
+    /// Every deferral, and what came back. `unreachable` is the one that
+    /// reaches a caller as a decision about us rather than the artifact.
+    found: u64,
+    nothing: u64,
+    unreachable: u64,
+    /// Non-zero `failed` on the first address with traffic on a later one is
+    /// a failover in progress, whether or not anyone has noticed.
+    preferred_resting: bool,
+    by_address: Vec<AddressStats>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AddressStats {
+    address: String,
+    asked: u64,
+    answered: u64,
+    failed: u64,
+}
+
+/// The corpus behind this worker's index.
+#[derive(Debug)]
+pub(crate) struct Corpus {
+    /// Every address the corpus can be reached at, in preference order.
+    bases: Vec<String>,
+    /// Per-address traffic, parallel to `bases`.
+    ///
+    /// Failover is otherwise invisible: a fleet quietly reading from the
+    /// primary because the replica stopped answering looks exactly like one
+    /// reading from the replica, and the first sign is the primary's load. This
+    /// is what turns that into a number an operator can see before it becomes a
+    /// page.
+    traffic: Vec<Address>,
+    client: reqwest::Client,
+    /// When the preferred address may lead again, or `None` while it leads.
+    rested: Mutex<Option<Instant>>,
+    /// The preferred address's data lag when last asked, and when we asked.
+    /// `None` inside means it could not tell us.
+    lag: Mutex<Option<(Instant, Option<Duration>)>>,
+    /// What the corpus said, across every address.
+    found: AtomicU64,
+    nothing: AtomicU64,
+    unreachable: AtomicU64,
+}
+
+/// One address's share of the traffic.
+#[derive(Debug, Default)]
+struct Address {
+    asked: AtomicU64,
+    answered: AtomicU64,
+    failed: AtomicU64,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Corpus {
+    /// A corpus reader, or `None` when `--hopper` named nothing and there is
+    /// nothing behind this worker to defer to.
+    pub(crate) fn new(hopper: Option<&str>) -> Option<Arc<Self>> {
+        let bases = crate::upload::endpoints(hopper.unwrap_or(""));
+        if bases.is_empty() {
+            return None;
+        }
+        // No fallback to `Client::default()`: it has no timeout, and it panics
+        // on the same TLS-backend failure that failed this build.
+        let client = reqwest::Client::builder()
+            .timeout(READ_TIMEOUT)
+            .build()
+            .inspect_err(|e| {
+                tracing::error!(error = %e, "cannot build the corpus HTTP client; lookups answer from the local index alone");
+            })
+            .ok()?;
+        let traffic = bases.iter().map(|_| Address::default()).collect();
+        Some(Arc::new(Self {
+            bases,
+            traffic,
+            client,
+            rested: Mutex::new(None),
+            lag: Mutex::new(None),
+            found: AtomicU64::new(0),
+            nothing: AtomicU64::new(0),
+            unreachable: AtomicU64::new(0),
+        }))
+    }
+
+    /// The addresses this corpus can be reached at, for a startup log line.
+    pub(crate) fn addresses(&self) -> String {
+        self.bases.join(", ")
+    }
+
+    /// Read immutable sample bytes from Hopper's authoritative side, hashing
+    /// them as they arrive.
+    ///
+    /// The response is accumulated only up to Scan's configured upload limit;
+    /// callers pass that limit so this path has the same memory bound as a
+    /// direct `/v1/analyze` upload. Sample bytes are immutable, so a replica
+    /// miss can simply fall through to the next configured address. The error
+    /// names internal addresses: log it, do not serve it.
+    pub(crate) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<Sample, String> {
+        use sha2::Digest as _;
+        let path = format!("/api/file/{sha}");
+        let mut last = "Hopper did not serve the sample".to_string();
+        for base in self.order_at(Instant::now()) {
+            let mut request = self
+                .client
+                .get(format!("{base}{path}"))
+                .timeout(Duration::from_secs(5 * 60));
+            if let Some(token) = crate::upload::hopper_token() {
+                request = request.bearer_auth(token);
+            }
+            let mut response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last = format!("Hopper sample request failed: {error}");
+                    self.note_at(base, false, Instant::now());
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                last = format!("Hopper sample request returned {}", response.status());
+                if response.status().is_server_error() {
+                    self.note_at(base, false, Instant::now());
+                }
+                // A replica may know the row but not have the backing file.
+                // Unlike a lookup 404, that is not an authoritative absence:
+                // let the next configured address (normally the primary) try.
+                continue;
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_bytes as u64)
+            {
+                return Err(format!("Hopper sample exceeds the {max_bytes} byte limit"));
+            }
+            let mut body = bytes::BytesMut::new();
+            let mut digest = sha2::Sha256::new();
+            let mut complete = false;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len().saturating_add(chunk.len()) > max_bytes {
+                            return Err(format!(
+                                "Hopper sample exceeds the {max_bytes} byte limit"
+                            ));
+                        }
+                        digest.update(&chunk);
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        last = format!("Hopper sample download failed: {error}");
+                        break;
+                    }
+                }
+            }
+            if complete && !body.is_empty() {
+                self.note_at(base, true, Instant::now());
+                return Ok(Sample {
+                    bytes: body.freeze(),
+                    sha256: format!("{:x}", digest.finalize()),
+                });
+            }
+        }
+        Err(last)
+    }
+
+    /// The addresses to try, in order.
+    ///
+    /// A rested head goes last rather than being dropped: if everything behind
+    /// it is also down, an address we believe to be failing still beats no
+    /// address, and trying it costs nothing when something earlier answers.
+    fn order_at(&self, now: Instant) -> Vec<&str> {
+        let mut order: Vec<&str> = self.bases.iter().map(String::as_str).collect();
+        if order.len() > 1 && lock(&self.rested).is_some_and(|until| now < until) {
+            order.rotate_left(1);
+        }
+        order
+    }
+
+    /// Record how an address behaved. Only the preferred one's standing
+    /// changes: everything else is where it falls back to, and demoting those
+    /// would leave nowhere to fall.
+    fn note_at(&self, base: &str, reachable: bool, now: Instant) {
+        if self.bases.first().map(String::as_str) != Some(base) {
+            return;
+        }
+        let mut rested = lock(&self.rested);
+        *rested = if reachable { None } else { Some(now + REST) };
+    }
+
+    /// Ask the corpus and retain the serving source for the HTTP response.
+    pub(crate) async fn known_with_source(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+    ) -> (Reached, Option<CorpusSource>) {
+        self.known_with_source_inner(sha, purl, false).await
+    }
+
+    /// Ask Hopper's authoritative side even when the preferred endpoint is a
+    /// replica. Used by an explicit refresh, where accepting replication lag
+    /// would defeat the caller's read-after-write request.
+    pub(crate) async fn known_fresh_with_source(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+    ) -> (Reached, Option<CorpusSource>) {
+        self.known_with_source_inner(sha, purl, true).await
+    }
+
+    async fn known_with_source_inner(
+        &self,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        fresh: bool,
+    ) -> (Reached, Option<CorpusSource>) {
+        let mut query = Vec::with_capacity(2);
+        if let Some(sha) = sha {
+            query.push(format!("sha256={sha}"));
+        }
+        if let Some(purl) = purl {
+            query.push(format!("purl={}", percent_encode(purl)));
+        }
+        if query.is_empty() {
+            return (Reached::Nothing, None);
+        }
+        let mut path = format!("/v1/lookup?{}", query.join("&"));
+        // A replica too far behind cannot be believed about an absence, so its
+        // reads are relayed to the primary until it catches up. `fresh=1` is
+        // hopper's own read-after-write hatch and a no-op on the primary, which
+        // has no relay to forward to — so this is safe to send to whichever
+        // address answers.
+        let force_primary = fresh || self.preferred_is_stale().await;
+        if force_primary {
+            path.push_str("&fresh=1");
+        }
+
+        for base in self.order_at(Instant::now()) {
+            match self.ask(base, &path).await {
+                // An answer, whichever kind. A 404 from the replica is taken as
+                // the answer rather than re-asked at the primary: "we hold
+                // nothing" is the common reply for a caller gating installs,
+                // and confirming every one of them against the primary would
+                // put the whole miss load back on the machine the replica
+                // exists to spare. The cost is a narrow window after a write
+                // where replication lag reads as absence.
+                Some((reached, source)) => {
+                    self.note_at(base, true, Instant::now());
+                    self.count(base, |a| &a.answered);
+                    let outcome = match &reached {
+                        Reached::Record(_) => &self.found,
+                        _ => &self.nothing,
+                    };
+                    outcome.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        endpoint = %base,
+                        sha256 = sha.unwrap_or(""),
+                        purl = purl.unwrap_or(""),
+                        force_primary,
+                        outcome = match &reached {
+                            Reached::Record(_) => "record",
+                            Reached::Nothing => "nothing",
+                            Reached::Unreachable => "unreachable",
+                        },
+                        source = source.map_or("unknown", |s| match s {
+                            CorpusSource::Replica => "replica",
+                            CorpusSource::Primary => "primary",
+                        }),
+                        "corpus lookup answered",
+                    );
+                    return (reached, source);
+                }
+                None => {
+                    self.note_at(base, false, Instant::now());
+                    self.count(base, |a| &a.failed);
+                    tracing::warn!(
+                        endpoint = %base,
+                        sha256 = sha.unwrap_or(""),
+                        purl = purl.unwrap_or(""),
+                        "corpus unreachable",
+                    );
+                }
+            }
+        }
+        // Every address failed, which the per-address warnings above say one at
+        // a time and nobody reads that way. Say it once, plainly: this is the
+        // case where a caller gating installs gets `unavailable` and has to
+        // decide what to do without us.
+        tracing::error!(
+            endpoints = %self.addresses(),
+            sha256 = sha.unwrap_or(""),
+            purl = purl.unwrap_or(""),
+            "corpus unreachable at every address; answering unavailable",
+        );
+        self.unreachable.fetch_add(1, Ordering::Relaxed);
+        (Reached::Unreachable, None)
+    }
+
+    /// Whether the preferred address is too far behind to be trusted about an
+    /// absence.
+    ///
+    /// Only the preferred address is asked: it is the one whose 404 we would
+    /// otherwise believe, and the addresses behind it are where a stale reading
+    /// sends the traffic. A reading is cached for [`LAG_TTL`] so this costs a
+    /// request a minute rather than one per lookup.
+    ///
+    /// An address that cannot tell us its lag is trusted as before. The other
+    /// choice — treat silence as staleness — relays every read to the primary
+    /// the moment this endpoint has a bad day, which is the load the replica
+    /// exists to prevent. A single address is never stale by this measure:
+    /// there is nowhere to send the traffic instead.
+    async fn preferred_is_stale(&self) -> bool {
+        if self.bases.len() < 2 {
+            return false;
+        }
+        let Some(base) = self.bases.first() else {
+            return false;
+        };
+        let now = Instant::now();
+        let cached = lock(&self.lag)
+            .filter(|(at, _)| now.duration_since(*at) < LAG_TTL)
+            .map(|(_, lag)| lag);
+        let lag = match cached {
+            Some(lag) => lag,
+            None => {
+                let fresh = self.ask_lag(base).await;
+                *lock(&self.lag) = Some((now, fresh));
+                if let Some(lag) = fresh.filter(|lag| *lag > MAX_REPLICA_LAG) {
+                    tracing::warn!(
+                        endpoint = %base,
+                        lag_secs = lag.as_secs(),
+                        max_secs = MAX_REPLICA_LAG.as_secs(),
+                        "corpus replica is behind; relaying reads to the primary",
+                    );
+                }
+                fresh
+            }
+        };
+        lag.is_some_and(|lag| lag > MAX_REPLICA_LAG)
+    }
+
+    /// One address's reported data lag, or `None` when it did not say.
+    async fn ask_lag(&self, base: &str) -> Option<Duration> {
+        #[derive(serde::Deserialize)]
+        struct Status {
+            #[serde(default)]
+            lag_seconds: Option<i64>,
+        }
+        let mut request = self.client.get(format!("{base}/_/replica"));
+        if let Some(token) = crate::upload::hopper_token() {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let status = response.json::<Status>().await.ok()?;
+        status
+            .lag_seconds
+            .filter(|secs| *secs >= 0)
+            .and_then(|secs| u64::try_from(secs).ok())
+            .map(Duration::from_secs)
+    }
+
+    /// Bump one of an address's counters.
+    fn count(&self, base: &str, pick: impl Fn(&Address) -> &AtomicU64) {
+        if let Some(i) = self.bases.iter().position(|b| b == base) {
+            pick(&self.traffic[i]).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A snapshot for `/_/stats`.
+    pub(crate) fn stats(&self) -> CorpusStats {
+        CorpusStats {
+            found: self.found.load(Ordering::Relaxed),
+            nothing: self.nothing.load(Ordering::Relaxed),
+            unreachable: self.unreachable.load(Ordering::Relaxed),
+            preferred_resting: lock(&self.rested).is_some_and(|until| Instant::now() < until),
+            by_address: self
+                .bases
+                .iter()
+                .zip(&self.traffic)
+                .map(|(base, a)| AddressStats {
+                    address: base.clone(),
+                    asked: a.asked.load(Ordering::Relaxed),
+                    answered: a.answered.load(Ordering::Relaxed),
+                    failed: a.failed.load(Ordering::Relaxed),
+                })
+                .collect(),
+        }
+    }
+
+    /// One endpoint's answer, or `None` when it could not give one.
+    async fn ask(&self, base: &str, path: &str) -> Option<(Reached, Option<CorpusSource>)> {
+        for attempt in 0..=READ_RETRIES {
+            self.count(base, |a| &a.asked);
+            let mut request = self.client.get(format!("{base}{path}"));
+            if let Some(token) = crate::upload::hopper_token() {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) if attempt < READ_RETRIES => {
+                    tracing::warn!(
+                        endpoint = %base,
+                        path = %path,
+                        attempt = attempt + 1,
+                        max_attempts = READ_RETRIES + 1,
+                        %error,
+                        "retrying transient corpus read",
+                    );
+                    tokio::time::sleep(read_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(endpoint = %base, %error, "corpus read failed");
+                    return None;
+                }
+            };
+            let status = response.status().as_u16();
+            let source = hopper_source(&response);
+            if (status == 408 || status == 429 || status >= 500) && attempt < READ_RETRIES {
+                tracing::warn!(
+                    endpoint = %base,
+                    path = %path,
+                    status,
+                    attempt = attempt + 1,
+                    max_attempts = READ_RETRIES + 1,
+                    "retrying transient corpus response",
+                );
+                tokio::time::sleep(read_backoff(attempt)).await;
+                continue;
+            }
+            return match status {
+                200 => match response.json::<CorpusRecord>().await {
+                    Ok(record) => Some((Reached::Record(Box::new(record)), source)),
+                    // Reachable, but not speaking our protocol. Not a reason to try
+                    // the other endpoint, which is running the same build.
+                    Err(error) => {
+                        tracing::warn!(endpoint = %base, %error, "corpus record did not parse");
+                        Some((Reached::Nothing, source))
+                    }
+                },
+                // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
+                // Neither is a verdict, and neither is a failure.
+                404 | 202 => Some((Reached::Nothing, source)),
+                // Being turned away is about this endpoint, not about the query:
+                // a credential can be wrong for one address and right for the
+                // next, and 403 is exactly how a replica declines a route it will
+                // not serve. Answering "nothing known" here would be a claim about
+                // the artifact made on the strength of never having asked, and it
+                // would strand every lookup on a replica whose token went stale.
+                401 | 403 => {
+                    tracing::warn!(endpoint = %base, status = response.status().as_u16(), "corpus turned us away");
+                    None
+                }
+                // Any other 4xx is this request being wrong, which the next
+                // endpoint would also say. 5xx is the endpoint being unwell, which
+                // it might not.
+                status if (400..500).contains(&status) => {
+                    tracing::warn!(endpoint = %base, status, "corpus refused the query");
+                    Some((Reached::Nothing, source))
+                }
+                status => {
+                    tracing::warn!(endpoint = %base, status, "corpus returned an error");
+                    None
+                }
+            };
+        }
+        None
+    }
+}
+
+fn hopper_source(response: &reqwest::Response) -> Option<CorpusSource> {
+    match response
+        .headers()
+        .get("X-Hopper-Source")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("replica") => Some(CorpusSource::Replica),
+        Some("primary") => Some(CorpusSource::Primary),
+        _ => None,
+    }
+}
+
+fn read_backoff(attempt: usize) -> Duration {
+    READ_BACKOFF.saturating_mul(1u32 << attempt.min(4))
+}
+
+/// Percent-encode a PURL for a query string. A PURL's own grammar carries `?`,
+/// `#` and `&`, every one of which would otherwise end the value early and ask
+/// about a different artifact than the caller named.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn corpus(addresses: &str) -> Arc<Corpus> {
+        Corpus::new(Some(addresses)).expect("configured")
+    }
+
+    #[test]
+    fn nothing_configured_is_no_corpus() {
+        assert!(Corpus::new(None).is_none());
+        // A blank setting is not an address, and treating it as one would put a
+        // doomed request in front of every lookup.
+        assert!(Corpus::new(Some("  ")).is_none());
+        assert!(Corpus::new(Some(" , , ")).is_none());
+    }
+
+    #[test]
+    fn lookup_records_retain_the_traits_version() {
+        let record: CorpusRecord = serde_json::from_str(
+            r#"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","traits_version":"abc12"}"#,
+        )
+        .expect("corpus record");
+        assert_eq!(record.traits_version.as_deref(), Some("abc12"));
+    }
+
+    /// Reads belong on the replica; the primary is where they fall back to.
+    #[test]
+    fn the_replica_leads() {
+        let c = corpus("http://ro, http://rw/");
+        assert_eq!(c.order_at(Instant::now()), vec!["http://ro", "http://rw"]);
+    }
+
+    /// A failing replica must not be retried in front of every lookup: the cost
+    /// of an unreachable endpoint is a timeout, and paying it on the way to
+    /// every answer is worse than the outage it reacts to.
+    #[test]
+    fn a_failed_replica_stops_leading_then_takes_it_back() {
+        let c = corpus("http://ro, http://rw/");
+        let t0 = Instant::now();
+
+        c.note_at("http://ro", false, t0);
+        assert_eq!(
+            c.order_at(t0),
+            vec!["http://rw", "http://ro"],
+            "a failing replica still leads",
+        );
+
+        // Tried last rather than not at all: if the primary is down too, an
+        // endpoint we doubt beats no endpoint.
+        assert_eq!(
+            c.order_at(t0 + REST - Duration::from_millis(1)).first(),
+            Some(&"http://rw")
+        );
+        assert_eq!(
+            c.order_at(t0 + REST).first(),
+            Some(&"http://ro"),
+            "a rested replica never took the load back",
+        );
+    }
+
+    /// A replica that answers is trusted again immediately — the rest is a
+    /// reaction to failure, not a penalty to serve out.
+    #[test]
+    fn a_recovered_replica_leads_again_at_once() {
+        let c = corpus("http://ro, http://rw/");
+        let t0 = Instant::now();
+        c.note_at("http://ro", false, t0);
+        c.note_at("http://ro", true, t0);
+        assert_eq!(c.order_at(t0).first(), Some(&"http://ro"));
+    }
+
+    /// The primary is the floor. Demoting it on a failure would leave the
+    /// fallback order pointing at nothing.
+    #[test]
+    fn the_primary_is_never_demoted() {
+        let c = corpus("http://ro, http://rw/");
+        let t0 = Instant::now();
+        c.note_at("http://rw", false, t0);
+        assert_eq!(c.order_at(t0), vec!["http://ro", "http://rw"]);
+    }
+
+    /// One address is the ordinary deployment, and it must not be demoted into
+    /// nothing: with nowhere to fall back to, resting the only address we have
+    /// would answer `unavailable` for the whole cooldown.
+    #[test]
+    fn one_address_is_a_valid_deployment() {
+        let c = corpus("http://only");
+        let t0 = Instant::now();
+        assert_eq!(c.order_at(t0), vec!["http://only"]);
+        c.note_at("http://only", false, t0);
+        assert_eq!(
+            c.order_at(t0),
+            vec!["http://only"],
+            "the only address stopped being tried",
+        );
+    }
+
+    /// The distinction the whole reliability contract rests on, at the layer
+    /// that decides it. A corpus that cannot be reached must report exactly
+    /// that: `Nothing` would become `unknown` one layer up and tell a caller
+    /// nobody has analyzed the package — a claim about the package rather than
+    /// about us, and the one that lets a gate fail open during an outage.
+    #[tokio::test]
+    async fn an_unreachable_corpus_reports_itself() {
+        // Port 1 refuses immediately, so this measures the decision rather than
+        // a timeout.
+        let c = corpus("http://127.0.0.1:1");
+        assert_eq!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
+            Reached::Unreachable,
+        );
+    }
+
+    /// And a failed read rests the address, so the next lookup does not pay the
+    /// same timeout again before falling back.
+    #[tokio::test]
+    async fn a_failed_read_rests_the_address() {
+        let c = corpus("http://127.0.0.1:1, http://127.0.0.1:2");
+        let before = c.order_at(Instant::now());
+        assert_eq!(before.first(), Some(&"http://127.0.0.1:1"));
+        let _ = c
+            .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            .await;
+        assert_eq!(
+            c.order_at(Instant::now()).first(),
+            Some(&"http://127.0.0.1:2"),
+            "the address that just failed is still being tried first",
+        );
+    }
+
+    /// A scoped endpoint for the failover tests. Joining its server thread on
+    /// drop keeps nextest's leak detector quiet and prevents one test's fixture
+    /// from surviving into another test process.
+    struct TestEndpoint {
+        url: String,
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl std::fmt::Display for TestEndpoint {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.url)
+        }
+    }
+
+    impl std::ops::Deref for TestEndpoint {
+        type Target = str;
+
+        fn deref(&self) -> &Self::Target {
+            &self.url
+        }
+    }
+
+    impl Drop for TestEndpoint {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn endpoint_with_response(
+        mut response: impl FnMut(u64) -> (&'static str, &'static str) + Send + 'static,
+    ) -> TestEndpoint {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut request = 0;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // On macOS/BSD an accepted socket inherits the listener's
+                        // non-blocking flag, so a request still in flight reads as
+                        // `WouldBlock` and the fixture answers and closes with the
+                        // request unread — which sends an RST and fails the client's
+                        // read. Serve each connection blocking (bounded, so a client
+                        // that never sends cannot wedge the join on drop).
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = stream.read(&mut [0u8; 2048]);
+                        let (status, body) = response(request);
+                        request += 1;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        TestEndpoint {
+            url: format!("http://127.0.0.1:{port}"),
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// An endpoint that answers every request with `status`, for the failover
+    /// tests. Stays up for the life of the fixture: a corpus may ask it twice.
+    fn endpoint(status: &'static str, body: &'static str) -> TestEndpoint {
+        endpoint_with_response(move |_| (status, body))
+    }
+
+    /// An endpoint that fails once and then answers, for the retry test.
+    fn flaky_endpoint() -> (TestEndpoint, Arc<Mutex<u64>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let seen = Arc::clone(&attempts);
+        let endpoint = endpoint_with_response(move |_| {
+            let mut attempts = lock(&seen);
+            let attempt = *attempts;
+            *attempts += 1;
+            drop(attempts);
+            if attempt == 0 {
+                ("500 Internal Server Error", "{}")
+            } else {
+                ("200 OK", r#"{"sha256":"recovered"}"#)
+            }
+        });
+        (endpoint, attempts)
+    }
+
+    /// A transient 5xx is retried with backoff before the lookup is failed over.
+    #[tokio::test]
+    async fn a_transient_read_is_retried_before_failing_over() {
+        let (base, attempts) = flaky_endpoint();
+        let c = corpus(&base);
+        assert!(matches!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
+            Reached::Record(_)
+        ));
+        assert_eq!(*lock(&attempts), 2);
+    }
+
+    #[tokio::test]
+    async fn sample_bytes_fall_through_a_replica_miss_and_stay_bounded() {
+        let replica = endpoint("404 Not Found", r#"{"error":"not found"}"#);
+        let primary = endpoint("200 OK", "hello");
+        let c = corpus(&format!("{replica},{primary}"));
+        let sample = c
+            .sample(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                5,
+            )
+            .await
+            .expect("primary bytes");
+        assert_eq!(sample.bytes, bytes::Bytes::from_static(b"hello"));
+        assert_eq!(
+            sample.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "hashed as it arrived"
+        );
+
+        let c = corpus(&primary);
+        assert!(
+            c.sample(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                4,
+            )
+            .await
+            .expect_err("over-limit response")
+            .contains("byte limit")
+        );
+    }
+
+    /// A replica beyond the four-hour window cannot be believed about an absence.
+    ///
+    /// The bargain is that a replica's 404 is taken as the answer so the miss
+    /// load stays off the primary. It holds only while the replica is current.
+    /// Measured at 27 minutes behind in production, during which a verdict the
+    /// primary already held read as `unknown` — analyze a package, get a
+    /// decision, look it up a minute later and be told nobody has seen it.
+    #[tokio::test]
+    async fn a_replica_that_is_behind_has_its_reads_relayed() {
+        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":14401}"#);
+        let c = corpus(&format!("{behind},http://127.0.0.1:1"));
+        assert!(
+            c.preferred_is_stale().await,
+            "four hours plus one second was believed"
+        );
+
+        // Cached, so this costs a request a minute and not one per lookup.
+        assert!(c.preferred_is_stale().await);
+    }
+
+    /// A replica that is keeping up is believed, which is the whole point of
+    /// having one.
+    #[tokio::test]
+    async fn a_current_replica_is_still_trusted() {
+        let current = endpoint("200 OK", r#"{"replica":true,"lag_seconds":2}"#);
+        let c = corpus(&format!("{current},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// The policy boundary is inclusive: exactly four hours remains a valid
+    /// replica source, while the next second forces a primary relay.
+    #[tokio::test]
+    async fn exactly_four_hours_of_replica_lag_is_still_trusted() {
+        let current = endpoint("200 OK", r#"{"replica":true,"lag_seconds":14400}"#);
+        let c = corpus(&format!("{current},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// And one that cannot say is trusted as before. Treating silence as
+    /// staleness would relay every read to the primary the moment this endpoint
+    /// had a bad day — the exact load the replica exists to prevent.
+    #[tokio::test]
+    async fn an_address_that_cannot_report_its_lag_is_trusted() {
+        let quiet = endpoint("404 Not Found", r#"{}"#);
+        let c = corpus(&format!("{quiet},http://127.0.0.1:1"));
+        assert!(!c.preferred_is_stale().await);
+
+        // Unreachable is the same answer, not a worse one.
+        let c = corpus("http://127.0.0.1:1,http://127.0.0.1:2");
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// A single address is never stale by this measure: `fresh=1` would ask the
+    /// same machine the same question, and there is nowhere else to send it.
+    #[tokio::test]
+    async fn one_address_is_never_relayed_past_itself() {
+        let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":9999}"#);
+        let c = corpus(&behind);
+        assert!(!c.preferred_is_stale().await);
+    }
+
+    /// A stale token on the replica must not read as an empty corpus.
+    ///
+    /// 401 and 403 are the endpoint declining us, not the corpus reporting on
+    /// the artifact — and a credential can be wrong for one address and right
+    /// for the next. Taking either as "nothing known" would answer `unknown`
+    /// for every package in the corpus, indefinitely, without ever asking the
+    /// primary sitting one line down the list.
+    #[tokio::test]
+    async fn a_refused_credential_falls_through_to_the_primary() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let replica = endpoint(status, r#"{"error":"nope"}"#);
+            let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
+            let c = corpus(&format!("{replica},{primary}"));
+            let reached = c
+                .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0;
+            let Reached::Record(record) = reached else {
+                panic!("{status} at the replica became {reached:?}");
+            };
+            assert_eq!(record.sha256.as_deref(), Some("abc"));
+        }
+    }
+
+    /// And when every address turns us away there is no answer to give. Saying
+    /// `Nothing` there would be a statement about the artifact resting on
+    /// nothing but our own inability to ask.
+    #[tokio::test]
+    async fn a_corpus_that_refuses_everywhere_is_unreachable() {
+        let a = endpoint("401 Unauthorized", r#"{"error":"nope"}"#);
+        let b = endpoint("403 Forbidden", r#"{"error":"nope"}"#);
+        let c = corpus(&format!("{a},{b}"));
+        assert_eq!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
+            Reached::Unreachable,
+        );
+    }
+
+    /// A malformed query, though, really is wrong everywhere: the next address
+    /// is running the same build and would say the same thing. Failing over on
+    /// it would double every bad request against the primary.
+    #[tokio::test]
+    async fn a_bad_request_is_not_retried_elsewhere() {
+        let replica = endpoint("400 Bad Request", r#"{"error":"nope"}"#);
+        let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
+        let c = corpus(&format!("{replica},{primary}"));
+        assert_eq!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .await
+                .0,
+            Reached::Nothing,
+        );
+    }
+
+    /// A PURL carries `?`, `#` and `&` in its own grammar. Left raw, everything
+    /// after the first of them is parsed as somebody else's query parameter and
+    /// the corpus is asked about a different artifact than the caller named.
+    #[test]
+    fn a_purl_survives_the_query_string() {
+        assert_eq!(
+            percent_encode("pkg:npm/@scope/name@1.0.0?arch=x64#sub"),
+            "pkg%3Anpm%2F%40scope%2Fname%401.0.0%3Farch%3Dx64%23sub",
+        );
+    }
+}
