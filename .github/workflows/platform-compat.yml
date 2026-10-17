@@ -51,7 +51,7 @@ jobs:
             --dir compat
 
       - name: Smoke test on OpenIndiana
-        uses: vmactions/openindiana-vm@d82e6302d027df92e66e4fec862e5236c89b305f # v1.1.7
+        uses: vmactions/openindiana-vm@f0ed27ca85a6d1f5b11e4242eba1d6effa5aaae2 # v1.1.8
         with:
           release: "202604"
           usesh: true
@@ -154,7 +154,7 @@ jobs:
           chmod +x compat/atomscan
 
       - name: Smoke test on openEuler
-        uses: vmactions/openeuler-vm@d1b89f7539fc9fb90010f740d56edb52f754febc # v1.0.3
+        uses: vmactions/openeuler-vm@87b5f241a9f6c408a66662a31b69b7c6a0334aec # v1.0.4
         with:
           release: "25.09"
           usesh: true
