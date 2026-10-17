@@ -978,7 +978,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Commands::Serve(args) => serve(&global, args, interpret, fetch),
         Commands::Worker(args) => worker(&global, args, interpret, fetch),
-        Commands::UpdateRules { models_only, check } => Ok(update_rules(models_only, check)),
+        Commands::UpdateRules { models_only, check } => Ok(update_rules(
+            models_only,
+            check,
+            global.model_dir.as_deref(),
+        )),
         Commands::Validate { skip_traits } => {
             let model_dir = scan::cli::resolve_model_dir(global.model_dir.clone())?;
             let level = operating_level(&global, &model_dir);
@@ -1368,10 +1372,10 @@ fn worker(
 /// `atomscan update-rules`: check for, or apply, model, traits and bloom
 /// updates. Models and traits failing is an error; bloom filters are an
 /// optional fast path, so their failure is only a warning.
-fn update_rules(models_only: bool, check: bool) -> ExitCode {
+fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> ExitCode {
     // R2-backed: model_update validates the staged bundle (Model::load) before
     // swapping it in, so a broken bundle never goes live.
-    let dir = scan::models_repo::install_target();
+    let dir = model_dir.map_or_else(scan::models_repo::install_target, Path::to_path_buf);
     let bloom_dir = scan::bloom_repo::install_dir();
     if check {
         if let Err(e) = scan::model_update::check(&dir) {
