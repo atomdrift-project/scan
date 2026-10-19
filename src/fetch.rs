@@ -2164,7 +2164,7 @@ impl FetchSession {
                 continue;
             }
             let corpus = self.precheck_purls(&plans);
-            let batch: Vec<GroupFetch> = plans
+            let mut batch: Vec<GroupFetch> = plans
                 .into_iter()
                 .map(|plan| self.fetch_group(plan, &corpus))
                 .collect();
@@ -2172,7 +2172,7 @@ impl FetchSession {
                 self.stop_after_fetch(batch);
                 return Vec::new();
             }
-            let analyzed = self.analyze_batch(&batch);
+            let analyzed = self.analyze_batch(&mut batch);
             for (group, analysis) in batch.into_iter().zip(analyzed) {
                 self.merge_group(report, group, analysis, &mut next);
             }
@@ -2597,7 +2597,7 @@ impl FetchSession {
     /// throttle is written for. Each `registry_node` is an independent cleave
     /// analysis of one small JSON document at ~23 ms; a payload is a full
     /// cleave pass. Results align with `batch`.
-    fn analyze_batch(&self, batch: &[GroupFetch]) -> Vec<GroupAnalysis> {
+    fn analyze_batch(&self, batch: &mut [GroupFetch]) -> Vec<GroupAnalysis> {
         let analyzes_bytes = batch
             .iter()
             .flat_map(|g| &g.landed)
@@ -2613,32 +2613,43 @@ impl FetchSession {
             precheck: self.precheck.as_deref(),
         };
         let fanout = self.knobs.fanout;
-        let registries_of = |g: &GroupFetch| -> Vec<Option<AnalysisReport>> {
-            g.registries
-                .iter()
-                .map(|gated| registry_node(&gated.record, &self.registry_opts))
+        let registries_of = |registries: &mut [Gated]| -> Vec<Option<AnalysisReport>> {
+            registries
+                .iter_mut()
+                .map(|gated| {
+                    let sub = registry_node(&gated.record, &self.registry_opts);
+                    gated.finish_registry_analysis(sub.as_ref());
+                    sub
+                })
                 .collect()
         };
-        let payloads_of = |g: &GroupFetch| -> Vec<Option<Analyzed>> {
+        let payloads_of = |landed: &[Landed]| -> Vec<Option<Analyzed>> {
             // Settles each payload row from "analyzing" to its final glyph as
             // its scan finishes.
             let on_analyzed = |i: usize| {
-                if let Some(l) = g.landed.get(i) {
+                if let Some(l) = landed.get(i) {
                     self.reporter.analyzed(&l.reference, &l.record);
                 }
             };
-            payloads.analyze_all(&g.landed, fanout, &on_analyzed)
+            payloads.analyze_all(landed, fanout, &on_analyzed)
         };
+        // The two branches touch disjoint fields. Registry analysis can now
+        // release provider buffers without waiting for the slowest payload;
+        // all report grafting still happens later in the original group order.
+        let (registries, landed): (Vec<_>, Vec<_>) = batch
+            .iter_mut()
+            .map(|group| (group.registries.as_mut_slice(), group.landed.as_slice()))
+            .unzip();
         let (subs, payloads): (Vec<_>, Vec<_>) = if fanout.allowed() {
             use rayon::prelude::*;
             rayon::join(
-                || batch.par_iter().map(&registries_of).collect(),
-                || batch.par_iter().map(&payloads_of).collect(),
+                || registries.into_par_iter().map(&registries_of).collect(),
+                || landed.into_par_iter().map(&payloads_of).collect(),
             )
         } else {
             (
-                batch.iter().map(&registries_of).collect(),
-                batch.iter().map(&payloads_of).collect(),
+                registries.into_iter().map(&registries_of).collect(),
+                landed.into_iter().map(&payloads_of).collect(),
             )
         };
         subs.into_iter()
@@ -2756,9 +2767,11 @@ impl FetchSession {
             reference,
             record,
             sources,
+            provenance,
             skip,
         } = gated;
         if let Some(sub) = sub {
+            let retain_provenance = keep_registry_provenance(skip, &sub);
             let findings = sub_findings(&sub);
             // Every registry record we materialized for this file is a
             // reference whose outcome the declarer should carry. Tallied here
@@ -2780,10 +2793,6 @@ impl FetchSession {
             // provenance output when its registry node is notable. Drop its raw
             // provider document when neither applies; lockfiles can contain
             // hundreds of ordinary aged-out records.
-            let retain_provenance = skip.is_none()
-                || findings
-                    .iter()
-                    .any(|finding| finding.crit >= cleave::Criticality::Notable);
             registry_findings
                 .entry(locator(&reference).to_owned())
                 .or_default()
@@ -2794,17 +2803,20 @@ impl FetchSession {
                 // A memo hit kept only the record; its provider documents are
                 // recovered from fletch's bounded blob cache now that they are
                 // needed, and only now.
-                let sources = sources.unwrap_or_else(|| {
-                    fletch::registry_with_sources(
-                        &reference.locator,
-                        &self.res.net,
-                        &self.res.cache,
-                    )
-                    .1
+                let provenance = provenance.unwrap_or_else(|| {
+                    let sources = sources.unwrap_or_else(|| {
+                        fletch::registry_with_sources(
+                            &reference.locator,
+                            &self.res.net,
+                            &self.res.cache,
+                        )
+                        .1
+                    });
+                    RegistryProvenance::from_record_sources(record.clone(), &sources)
                 });
                 self.out.registries.push(DependencyRegistry {
                     locator: locator(&reference).to_owned(),
-                    provenance: RegistryProvenance::from_record_sources(record.clone(), &sources),
+                    provenance,
                     file_id,
                     artifact_skip: skip.map(SkipReason::artifact_note),
                 });
@@ -4069,9 +4081,40 @@ struct Gated {
     record: Registry,
     /// The provider documents a fresh lookup read. `None` after a memo hit,
     /// whose documents stay in fletch's blob cache until a kept record needs
-    /// them.
+    /// them. Also cleared once registry analysis releases or compacts them.
     sources: Option<Vec<RecordedSource>>,
+    /// A kept fresh lookup, compacted as soon as registry analysis completes.
+    provenance: Option<RegistryProvenance>,
     skip: Option<SkipReason>,
+}
+
+impl Gated {
+    fn finish_registry_analysis(&mut self, sub: Option<&AnalysisReport>) {
+        let Some(sources) = self.sources.take() else {
+            return; // A memo hit still recovers sources only if merging needs them.
+        };
+        if sub.is_some_and(|sub| {
+            sub.files.iter().any(|file| file.parent_id.is_none())
+                && keep_registry_provenance(self.skip, sub)
+        }) {
+            self.provenance = Some(RegistryProvenance::from_record_sources(
+                self.record.clone(),
+                &sources,
+            ));
+        }
+        // Even a batch with a very slow payload no longer pins raw documents
+        // that registry analysis has finished using. Kept documents retain all
+        // their original evidence in the compact provenance representation.
+    }
+}
+
+fn keep_registry_provenance(skip: Option<SkipReason>, sub: &AnalysisReport) -> bool {
+    skip.is_none()
+        || sub.files.iter().any(|file| {
+            file.findings
+                .iter()
+                .any(|finding| finding.crit >= cleave::Criticality::Notable)
+        })
 }
 
 /// One registry lookup's result, as [`Gated`] carries it.
@@ -4330,6 +4373,7 @@ fn age_gate(
                     reference: r,
                     record,
                     sources,
+                    provenance: None,
                     skip,
                 });
             }
@@ -8148,6 +8192,89 @@ mod tests {
     fn report_of(files: &serde_json::Value) -> AnalysisReport {
         serde_json::from_value(serde_json::json!({"version": "3", "files": files}))
             .expect("report deserializes")
+    }
+
+    #[test]
+    fn registry_sources_are_released_before_payloads_finish() {
+        for skip in [None, Some(SkipReason::AgedOut)] {
+            for crit in [cleave::Criticality::Baseline, cleave::Criticality::Notable] {
+                let record = Registry {
+                    ecosystem: "npm".to_string(),
+                    name: "fixture".to_string(),
+                    version: "1".to_string(),
+                    ..Default::default()
+                };
+                let body = format!(
+                    r#"{{"future_provider_field":"{}"}}"#,
+                    "history".repeat(50_000)
+                )
+                .into_bytes();
+                let sources = vec![RecordedSource {
+                    url: "https://registry.example/fixture".to_string(),
+                    status: 200,
+                    content_type: Some("application/json".to_string()),
+                    size: body.len() as u64,
+                    bytes: Some(body),
+                }];
+                let expected = RegistryProvenance::from_record_sources(record.clone(), &sources)
+                    .document()
+                    .to_vec();
+                let mut gated = Gated {
+                    reference: purl_ref("pkg:npm/fixture@1"),
+                    record,
+                    sources: Some(sources),
+                    provenance: None,
+                    skip,
+                };
+                let mut sub = report_of(&serde_json::json!([
+                    {"id":0,"path":"fixture.registry.json","depth":0,"file_type":"registry","sha256":"a".repeat(64),"size":1u64}
+                ]));
+                sub.files[0]
+                    .findings
+                    .push(test_finding("provider-finding", crit));
+                gated.finish_registry_analysis(Some(&sub));
+                assert!(
+                    gated.sources.is_none(),
+                    "raw responses must not wait for payload scans"
+                );
+                if skip.is_none() || crit >= cleave::Criticality::Notable {
+                    assert_eq!(gated.provenance.unwrap().document(), expected);
+                } else {
+                    assert!(
+                        gated.provenance.is_none(),
+                        "ordinary skipped records need no raw provenance"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_registry_analysis_drops_sources_and_memo_hits_stay_lazy() {
+        let mut gated = Gated {
+            reference: purl_ref("pkg:npm/fixture@1"),
+            record: Registry::default(),
+            sources: Some(vec![RecordedSource {
+                url: "https://registry.example/fixture".to_string(),
+                status: 200,
+                content_type: None,
+                size: 2,
+                bytes: Some(b"{}".to_vec()),
+            }]),
+            provenance: None,
+            skip: None,
+        };
+        gated.finish_registry_analysis(None);
+        assert!(gated.sources.is_none());
+        assert!(gated.provenance.is_none());
+        let sub = report_of(&serde_json::json!([
+            {"id":0,"path":"fixture.registry.json","depth":0,"file_type":"registry","sha256":"a".repeat(64),"size":1u64}
+        ]));
+        gated.finish_registry_analysis(Some(&sub));
+        assert!(
+            gated.provenance.is_none(),
+            "a memo hit must not fetch sources during analysis"
+        );
     }
 
     /// The batch PURL negotiation's answer is its own case: nothing was

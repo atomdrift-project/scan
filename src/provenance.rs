@@ -11,6 +11,7 @@ use fletch::Registry;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 /// The sidecar schema version hopper validates against ([`hopper.SidecarSchemaVersion`]).
 const SCHEMA_VERSION: &str = "1.0";
@@ -400,18 +401,32 @@ impl Upload<'_> {
         &self,
         provenance: &RegistryProvenance,
     ) -> Result<Vec<u8>, serde_json::Error> {
-        if serde_json::from_slice::<CompleteSidecarProbe>(provenance.document()).is_ok() {
-            return rebind(
-                serde_json::from_slice(provenance.document())?,
-                self.artifact(),
-            );
+        if matches!(&provenance.document, ProvenanceDocument::Compressed(document)
+            if document.raw_exceeds_upload_cap)
+        {
+            // The live builder knows these source bodies already exceed the
+            // existing raw upload cap. Avoid decoding/scanning a whole npm
+            // packument only to reach the same raw=None result.
+            return self.registry_sidecar(&provenance.record, None);
         }
-        let record = &provenance.record;
-        // RawValue points directly into the compact document. Its length is a
-        // safe cap check (conservative only when an external producer included
-        // whitespace) and it serializes verbatim, with no Value tree.
-        let raw =
-            registry_raw_json(provenance.document()).filter(|raw| raw.get().len() <= MAX_RAW_BYTES);
+        provenance.document.with_bytes(|document| {
+            if serde_json::from_slice::<CompleteSidecarProbe>(document).is_ok() {
+                return rebind(serde_json::from_slice(document)?, self.artifact());
+            }
+            let record = &provenance.record;
+            // RawValue points directly into the compact document. Its length is a
+            // safe cap check (conservative only when an external producer included
+            // whitespace) and it serializes verbatim, with no Value tree.
+            let raw = registry_raw_json(document).filter(|raw| raw.get().len() <= MAX_RAW_BYTES);
+            self.registry_sidecar(record, raw)
+        })
+    }
+
+    fn registry_sidecar(
+        &self,
+        record: &Registry,
+        raw: Option<&serde_json::value::RawValue>,
+    ) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(&Sidecar {
             schema_version: SCHEMA_VERSION,
             artifact: self.artifact(),
@@ -592,7 +607,8 @@ fn take_registry_raw(document: &mut serde_json::Value) -> Option<serde_json::Val
 /// operational parse from silently discarding provider-specific or future
 /// provenance fields.
 ///
-/// The document stays serialized. Registry responses are often much larger as a
+/// The document stays serialized. Large live-lookup documents are also compressed
+/// until a consumer requests the raw document. Registry responses are much larger as a
 /// `serde_json::Value` tree (roughly 3–6× in practice), and most scans never need
 /// to inspect their raw fields. Cloning this type is an atomic refcount bump; raw
 /// JSON is parsed only for a selected interpret/terminal subject or an upload.
@@ -600,7 +616,76 @@ fn take_registry_raw(document: &mut serde_json::Value) -> Option<serde_json::Val
 pub struct RegistryProvenance {
     /// Normalized registry facts used by analysis and processed displays.
     pub record: Registry,
-    document: bytes::Bytes,
+    document: ProvenanceDocument,
+}
+
+#[derive(Debug, Clone)]
+enum ProvenanceDocument {
+    Plain(bytes::Bytes),
+    Compressed(Arc<CompressedProvenance>),
+}
+
+#[derive(Debug)]
+struct CompressedProvenance {
+    encoded: Vec<u8>,
+    decoded_len: usize,
+    decoded: OnceLock<Vec<u8>>,
+    raw_exceeds_upload_cap: bool,
+}
+
+impl CompressedProvenance {
+    fn decode(&self) -> Vec<u8> {
+        // These bytes were encoded here and never left this process; failure
+        // is an internal invariant violation. Do not replace capture-time
+        // evidence with an empty or partial document.
+        #[expect(clippy::expect_used, reason = "in-process encoder/decoder invariant")]
+        zstd::bulk::decompress(&self.encoded, self.decoded_len)
+            .expect("internally compressed registry provenance must decode")
+    }
+}
+
+impl ProvenanceDocument {
+    fn compact(document: Vec<u8>, raw_exceeds_upload_cap: bool) -> Self {
+        // Full npm packuments can be tens of megabytes and contain repeated
+        // version records. Keep small documents on the existing zero-copy
+        // path; these large ones live through dependency fetching even though
+        // most consumers need only the already-parsed normalized record.
+        if document.len() > MAX_RAW_BYTES
+            && let Ok(mut encoded) = zstd::bulk::compress(&document, 1)
+            && encoded.len() < document.len() / 2
+        {
+            // bulk::compress reserves its worst-case bound. Retaining that
+            // capacity would keep the original-sized allocation alive.
+            encoded.shrink_to_fit();
+            return Self::Compressed(Arc::new(CompressedProvenance {
+                encoded,
+                decoded_len: document.len(),
+                decoded: OnceLock::new(),
+                raw_exceeds_upload_cap,
+            }));
+        }
+        Self::Plain(document.into())
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Plain(bytes) => bytes,
+            Self::Compressed(document) => document.decoded.get_or_init(|| document.decode()),
+        }
+    }
+
+    /// Consumers returning owned values need the decoded bytes only for the
+    /// duration of that read. Do not retain whole packuments after producing
+    /// a URL list or the capped upload sidecar.
+    fn with_bytes<T>(&self, read: impl FnOnce(&[u8]) -> T) -> T {
+        match self {
+            Self::Plain(bytes) => read(bytes),
+            Self::Compressed(document) => match document.decoded.get() {
+                Some(bytes) => read(bytes),
+                None => read(&document.decode()),
+            },
+        }
+    }
 }
 
 impl RegistryProvenance {
@@ -609,7 +694,10 @@ impl RegistryProvenance {
     #[must_use]
     pub fn from_bytes(document: bytes::Bytes) -> Option<Self> {
         let record = parse_registry_record(&document)?;
-        Some(Self { record, document })
+        Some(Self {
+            record,
+            document: ProvenanceDocument::Plain(document),
+        })
     }
 
     /// Preserve borrowed JSON. Prefer [`Self::from_bytes`] when the caller
@@ -638,12 +726,23 @@ impl RegistryProvenance {
             sources: Vec<EncodedSource<'a>>,
         }
 
+        let sources = encoded_sources(sources);
+        // A lower bound on the actual serialized sources, without counting
+        // outer JSON whitespace that RawValue strips from provider bodies.
+        let raw_exceeds_upload_cap = sources.iter().fold(0usize, |size, source| {
+            size.saturating_add(match source {
+                EncodedSource::Json { body, .. } => body.get().len(),
+                EncodedSource::Binary { body_b64, .. } => body_b64.len(),
+                EncodedSource::Unkept { .. } => 0,
+            })
+        }) > MAX_RAW_BYTES;
+
         // Every field serializes infallibly; should that ever change, the
         // document stays empty — unparseable, so no consumer mistakes it for
         // provenance — and the failure is said here.
         let document = serde_json::to_vec(&LiveDocument {
             record: &record,
-            sources: encoded_sources(sources),
+            sources,
         })
         .unwrap_or_else(|e| {
             tracing::error!(package = %record.name, error = %e, "registry provenance could not be serialized");
@@ -651,20 +750,21 @@ impl RegistryProvenance {
         });
         Self {
             record,
-            document: bytes::Bytes::from(document),
+            document: ProvenanceDocument::compact(document, raw_exceeds_upload_cap),
         }
     }
 
     /// The complete provenance JSON as received or created at the boundary.
     #[must_use]
     pub fn document(&self) -> &[u8] {
-        &self.document
+        self.document.bytes()
     }
 
     /// Parse the complete document on demand.
     #[must_use]
     pub fn document_value(&self) -> Option<serde_json::Value> {
-        serde_json::from_slice(&self.document).ok()
+        self.document
+            .with_bytes(|bytes| serde_json::from_slice(bytes).ok())
     }
 
     /// Raw provider data, regardless of whether it arrived in a hopper sidecar
@@ -678,31 +778,33 @@ impl RegistryProvenance {
     /// order. Terminal rendering uses this instead of re-querying a registry.
     #[must_use]
     pub fn source_urls(&self) -> Vec<String> {
-        let Ok(document) = serde_json::from_slice::<UrlDocument<'_>>(&self.document) else {
-            return Vec::new();
-        };
-        let mut urls = Vec::new();
-        let (registry_url, raw) = if let Some(registry) = document.registry {
-            (registry.url, registry.raw.or(registry.sources))
-        } else {
-            (None, document.raw.or(document.sources))
-        };
-        if let Some(url) = registry_url {
-            urls.push(url);
-        }
-        if let Some(raw) = raw
-            && let Ok(sources) = serde_json::from_str::<Vec<SourceUrl>>(raw.get())
-        {
-            for source in sources {
-                if let Some(url) = source.url
-                    && !url.is_empty()
-                    && !urls.iter().any(|existing| existing == &url)
-                {
-                    urls.push(url);
+        self.document.with_bytes(|bytes| {
+            let Ok(document) = serde_json::from_slice::<UrlDocument<'_>>(bytes) else {
+                return Vec::new();
+            };
+            let mut urls = Vec::new();
+            let (registry_url, raw) = if let Some(registry) = document.registry {
+                (registry.url, registry.raw.or(registry.sources))
+            } else {
+                (None, document.raw.or(document.sources))
+            };
+            if let Some(url) = registry_url {
+                urls.push(url);
+            }
+            if let Some(raw) = raw
+                && let Ok(sources) = serde_json::from_str::<Vec<SourceUrl>>(raw.get())
+            {
+                for source in sources {
+                    if let Some(url) = source.url
+                        && !url.is_empty()
+                        && !urls.iter().any(|existing| existing == &url)
+                    {
+                        urls.push(url);
+                    }
                 }
             }
-        }
-        urls
+            urls
+        })
     }
 }
 
@@ -939,6 +1041,76 @@ mod tests {
     }
 
     #[test]
+    fn large_live_provenance_stays_compressed_until_raw_access() {
+        let body = format!(
+            r#"{{ "future_provider_field": "{}", "nested": [1, true, null] }}"#,
+            "version history ".repeat(40_000)
+        )
+        .into_bytes();
+        let provenance = super::RegistryProvenance::from_record_sources(
+            serde_json::from_str(RECORD).unwrap(),
+            &[fletch::fetch::RecordedSource {
+                url: "https://registry.example/left-pad".to_string(),
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                size: body.len() as u64,
+                bytes: Some(body.clone()),
+            }],
+        );
+        let super::ProvenanceDocument::Compressed(storage) = &provenance.document else {
+            panic!("large repetitive documents should not remain resident in full");
+        };
+        assert!(storage.encoded.len() < body.len() / 4);
+        assert_eq!(storage.encoded.capacity(), storage.encoded.len());
+        assert!(storage.decoded.get().is_none());
+        assert_eq!(provenance.record.name, "left-pad");
+        let cloned = provenance.clone();
+        let super::ProvenanceDocument::Compressed(cloned_storage) = &cloned.document else {
+            panic!("clone should share compressed storage");
+        };
+        assert!(std::sync::Arc::ptr_eq(storage, cloned_storage));
+        assert!(storage.decoded.get().is_none());
+        assert_eq!(
+            provenance.raw().unwrap()[0]["body"],
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        );
+        assert!(
+            storage.decoded.get().is_none(),
+            "owned reads must release decoded storage"
+        );
+        assert_eq!(
+            provenance.source_urls(),
+            vec!["https://registry.example/left-pad"]
+        );
+        assert!(storage.decoded.get().is_none());
+        assert_eq!(provenance.document().as_ptr(), cloned.document().as_ptr());
+        assert!(
+            std::str::from_utf8(provenance.document())
+                .unwrap()
+                .contains(std::str::from_utf8(&body).unwrap())
+        );
+        assert_eq!(
+            provenance.source_urls(),
+            vec!["https://registry.example/left-pad"]
+        );
+    }
+
+    #[test]
+    fn compact_provenance_preserves_every_byte() {
+        let document = format!(
+            " {{ \"provider\" : \"{}\" }} \n",
+            "verbatim ".repeat(40_000)
+        )
+        .into_bytes();
+        let compact = super::ProvenanceDocument::compact(document.clone(), false);
+        assert!(matches!(&compact, super::ProvenanceDocument::Compressed(_)));
+        assert_eq!(compact.bytes(), document);
+        let small = super::ProvenanceDocument::compact(b"small".to_vec(), false);
+        assert!(matches!(&small, super::ProvenanceDocument::Plain(_)));
+        assert_eq!(small.bytes(), b"small");
+    }
+
+    #[test]
     fn wrapping_bare_provenance_applies_hopper_raw_cap() {
         let large = format!(r#"{{"blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES)).into_bytes();
         let provenance = super::RegistryProvenance::from_record_sources(
@@ -956,7 +1128,7 @@ mod tests {
                 bytes: Some(large),
             }],
         );
-        let sidecar = super::Upload {
+        let upload = super::Upload {
             filename: "large.tgz",
             sha256: &"a".repeat(64),
             size_bytes: 123,
@@ -964,9 +1136,17 @@ mod tests {
             at: "2026-07-30T00:00:00Z",
             url: "https://registry.example/large.tgz",
             purl: Some("pkg:npm/large@1"),
-        }
-        .sidecar_from_provenance(&provenance)
-        .unwrap();
+        };
+        let sidecar = upload.sidecar_from_provenance(&provenance).unwrap();
+        let super::ProvenanceDocument::Compressed(storage) = &provenance.document else {
+            panic!("large live source should be compressed");
+        };
+        assert!(
+            storage.decoded.get().is_none(),
+            "capped upload must not decode raw bodies"
+        );
+        let original = super::RegistryProvenance::from_json(provenance.document()).unwrap();
+        assert_eq!(sidecar, upload.sidecar_from_provenance(&original).unwrap());
         let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
         assert_eq!(sidecar["registry"]["status"], "partial");
         assert!(sidecar["registry"].get("raw").is_none());
