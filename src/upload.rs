@@ -400,10 +400,16 @@ pub fn encode_result_body(
         if let Some(envelope) = payload.envelope.as_mut() {
             envelope.raw = cleave::types::CompactReport::default();
         }
+        // Moving/dropping the old buffer matters: shadowing it alone keeps
+        // the oversized JSON allocation alive through the compression step.
+        drop(json);
         serialize(&payload, sha256)?
     } else {
         json
     };
+    // The JSON now owns everything needed for upload. Release the complete
+    // typed report before allocating the compressor and its output buffer.
+    drop(payload);
     match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
         Ok(compressed) => Some((compressed, Some("zstd"))),
         Err(e) => {
@@ -1869,6 +1875,50 @@ mod tests {
         assert_eq!(value["worker"], "scan-fs");
         assert_eq!(value["duration_ms"], 0);
         assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn encode_result_body_preserves_the_full_typed_report() {
+        let raw: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+            "files": [
+                {"id": 0, "path": "fixture.zip", "type": "zip", "sha": "root", "size": 128, "depth": 0},
+                {"id": 1, "parent": 0, "path": format!("fixture.zip!!{}.py", "member".repeat(4096)),
+                 "type": "python", "sha": "child", "size": 32, "depth": 1}
+            ]
+        }))
+        .expect("typed raw report");
+        assert_eq!(raw.files.len(), 2);
+        let payload = ResultPayload {
+            sha256: "a".repeat(64),
+            worker: "fixture".into(),
+            error: None,
+            duration_ms: 42,
+            envelope: Some(ScanResultEnvelope {
+                ml: crate::engine::MlSection {
+                    v: "7",
+                    probability: 0.0,
+                    level: crate::model::Level::Clean,
+                    conf: Some(100),
+                    model_scores: Vec::new(),
+                    skipped_models: Vec::new(),
+                    version: "fixture".into(),
+                    eng: "fixture",
+                    analyzed_at: "2026-10-19T00:00:00Z".into(),
+                    files: Vec::new(),
+                    pids: None,
+                    deleted: None,
+                },
+                llm: None,
+                raw,
+            }),
+        };
+        let expected = serde_json::to_vec(&payload).expect("expected JSON");
+        let (body, encoding) = encode_result_body(payload, "test").expect("encode full report");
+        assert_eq!(encoding, Some("zstd"));
+        assert_eq!(
+            zstd::decode_all(body.as_slice()).expect("valid zstd"),
+            expected
+        );
     }
 
     #[test]

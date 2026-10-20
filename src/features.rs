@@ -75,12 +75,13 @@ impl FeatureWriter<'_> {
 /// Feature spec version this build was compiled against.
 /// Must match the version in the loaded feature_spec.json.
 ///
-/// v18 grows the extended-metrics block by `ast_depth_capped` (collimator's
+/// v19 reads per-model trait_path_depth, preserving depth-3 defaults for older
+/// bundles. v18 grows the extended-metrics block by `ast_depth_capped` (collimator's
 /// ALWAYS_KEEP_METRICS allowlist keeps that rare anti-analysis signal past the
 /// frequency prune). The metric is read by name from the spec vocab, so older
 /// v16/v17 bundles still load — the extractor just doesn't place a slot they
 /// don't list.
-pub const EXPECTED_SPEC_VERSION: u32 = 18;
+pub const EXPECTED_SPEC_VERSION: u32 = 19;
 
 /// Earliest spec version this build can still load. v16/v17 specs are
 /// loadable too: each newer version added feature families/columns the
@@ -183,6 +184,7 @@ pub struct FeatureSpec {
     mbc_trigram_vocab: Vec<String>,
     tiered_bigram_vocab: Vec<String>,
     tiered_trigram_vocab: Vec<String>,
+    tiered_quadgram_vocab: Vec<String>,
     kv_vocab: Vec<String>,
     symbol_vocab: Vec<String>,
     symbol_bigram_vocab: Vec<String>,
@@ -192,6 +194,9 @@ pub struct FeatureSpec {
     feature_means: Option<Vec<f32>>,
     feature_stds: Option<Vec<f32>>,
     standardized: bool,
+    trait_path_depth: usize,
+    tiered_min_crit: [u32; 3],
+    tiered_branch_min_crit: HashMap<String, u32>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -237,6 +242,8 @@ struct RawFeatureSpec {
     #[serde(default)]
     tiered_trigram_vocab: Vec<String>,
     #[serde(default)]
+    tiered_quadgram_vocab: Vec<String>,
+    #[serde(default)]
     kv_vocab: Vec<String>,
     #[serde(default)]
     symbol_vocab: Vec<String>,
@@ -252,6 +259,20 @@ struct RawFeatureSpec {
     feature_stds: Option<Vec<f32>>,
     #[serde(default = "default_standardized")]
     standardized: bool,
+    #[serde(default = "default_trait_path_depth")]
+    trait_path_depth: usize,
+    #[serde(default = "default_tiered_min_crit")]
+    tiered_min_crit: [u32; 3],
+    #[serde(default)]
+    tiered_branch_min_crit: HashMap<String, u32>,
+}
+
+const fn default_tiered_min_crit() -> [u32; 3] {
+    [3; 3]
+}
+
+fn default_trait_path_depth() -> usize {
+    3
 }
 
 const fn default_standardized() -> bool {
@@ -304,6 +325,7 @@ impl FeatureSpec {
             mbc_trigram_vocab: raw.mbc_trigram_vocab,
             tiered_bigram_vocab: raw.tiered_bigram_vocab,
             tiered_trigram_vocab: raw.tiered_trigram_vocab,
+            tiered_quadgram_vocab: raw.tiered_quadgram_vocab,
             kv_vocab: raw.kv_vocab,
             symbol_vocab: raw.symbol_vocab,
             symbol_bigram_vocab: raw.symbol_bigram_vocab,
@@ -313,6 +335,9 @@ impl FeatureSpec {
             feature_means: raw.feature_means,
             feature_stds: raw.feature_stds,
             standardized: raw.standardized,
+            trait_path_depth: raw.trait_path_depth,
+            tiered_min_crit: raw.tiered_min_crit,
+            tiered_branch_min_crit: raw.tiered_branch_min_crit,
         };
         spec.validate()?;
         Ok(spec)
@@ -375,6 +400,10 @@ impl FeatureSpec {
     }
 
     fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.trait_path_depth > 0,
+            "trait_path_depth must be positive"
+        );
         if self.presence_vocab.is_empty() {
             anyhow::bail!("feature spec missing presence_vocab entries");
         }
@@ -385,7 +414,7 @@ impl FeatureSpec {
                 self.total_features
             );
         }
-        if self.abi_version != EXPECTED_MODEL_ABI_VERSION {
+        if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
             anyhow::bail!(
                 "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{}",
                 self.abi_version,
@@ -544,6 +573,13 @@ impl FeatureSpec {
         vocab(&mut names, "bigrams:", &self.bigram_vocab);
         vocab(&mut names, "tierbi:", &self.tiered_bigram_vocab);
         vocab(&mut names, "tiertri:", &self.tiered_trigram_vocab);
+        vocab(&mut names, "tierquad:", &self.tiered_quadgram_vocab);
+        names.extend(
+            self.feature_names
+                .iter()
+                .filter(|n| n.starts_with("mbc:"))
+                .cloned(),
+        );
         vocab(&mut names, "ghost:", &self.ghost_vocab);
         vocab(&mut names, "skeleton:", &self.skeleton_vocab);
         vocab(&mut names, "rare:", &self.rare_element_vocab);
@@ -686,6 +722,16 @@ const AGG_FEATURES: &[&str] = &[
     "agg:top1_file_hostile_category_breadth_sum",
     // Size-invariant crit-tier severity fractions (collimator's
     // include_severity_fractions group).
+    "agg:confidence_mean",
+    "agg:confidence_std",
+    "agg:confidence_skew",
+    "agg:confidence_kurtosis",
+    "agg:trait_id_lexical_distance",
+    "agg:docobf_obfuscation_count",
+    "agg:docobf_eval_count",
+    "agg:docobf_lure_count",
+    "agg:docobf_total_count",
+    "agg:docobf_has_any",
     "agg:crit3_finding_fraction",
     "agg:crit4_finding_fraction",
     "agg:hostile_finding_fraction",
@@ -933,6 +979,9 @@ struct MetricSlot {
 pub struct ExtractContext {
     /// Whether this layout is supported by the bundled retained-facts contract.
     model_facts_supported: bool,
+    trait_path_depth: usize,
+    tiered_min_crit: [u32; 3],
+    tiered_branch_min_crit: HashMap<String, u32>,
     presence_lookup: HashMap<String, usize>,
     /// Global feature name → index lookup for name-written features.
     absolute_lookup: HashMap<String, usize>,
@@ -945,11 +994,15 @@ pub struct ExtractContext {
     /// Optional families this spec carries; their inputs are only gathered
     /// (and their writers only run) when a route needs them.
     kv: bool,
+    kv_shape: bool,
+    kv_split: bool,
     /// Any of the `symbol:`, `symbol_bi:` and `symbol_tri:` families.
     symbols: bool,
     symbol_bigrams: bool,
     symbol_trigrams: bool,
     suspicious_ngram_counts: bool,
+    optional_finding_features: bool,
+    tiered_slots: Vec<(usize, Vec<String>)>,
 
     // Optimized bigram/trigram lookups
     path_to_id: HashMap<String, u32>,
@@ -1052,6 +1105,9 @@ impl ExtractContext {
         let has_name = |name: &str| absolute_lookup.contains_key(name);
 
         Self {
+            trait_path_depth: spec.trait_path_depth,
+            tiered_min_crit: spec.tiered_min_crit,
+            tiered_branch_min_crit: spec.tiered_branch_min_crit.clone(),
             model_facts_supported: cleave::model_facts::supports(
                 cleave::model_facts::profile_id(),
                 &spec.feature_names,
@@ -1068,9 +1124,36 @@ impl ExtractContext {
                 .collect(),
             total_features: spec.total_features,
             kv: has_prefix("kv:"),
+            kv_shape: spec
+                .kv_vocab
+                .iter()
+                .any(|v| v.split('=').next().is_some_and(|key| key.contains(':'))),
+            kv_split: spec.kv_vocab.iter().any(|v| v.contains("=part:")),
             symbols: has_prefix("symbol:") || has_prefix("symbol_bi:") || has_prefix("symbol_tri:"),
             symbol_bigrams: has_prefix("symbol_bi:"),
             symbol_trigrams: has_prefix("symbol_tri:"),
+            tiered_slots: spec
+                .feature_names
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, name)| {
+                    let (family, value) = name.split_once(':')?;
+                    ["tierbi", "tiertri", "tierquad"]
+                        .contains(&family)
+                        .then(|| (slot, value.split(" + ").map(str::to_owned).collect()))
+                })
+                .collect(),
+            optional_finding_features: has_prefix("mbc:")
+                || has_prefix("agg:docobf_")
+                || [
+                    "agg:confidence_mean",
+                    "agg:confidence_std",
+                    "agg:confidence_skew",
+                    "agg:confidence_kurtosis",
+                    "agg:trait_id_lexical_distance",
+                ]
+                .iter()
+                .any(|name| has_name(name)),
             suspicious_ngram_counts: has_name("agg:suspicious_bigram_count")
                 || has_name("agg:suspicious_trigram_count"),
             presence_lookup,
@@ -1119,12 +1202,18 @@ impl ExtractContext {
     pub(crate) const fn raw_needs(&self) -> RawNeeds {
         RawNeeds {
             kv: self.kv,
+            kv_shape: self.kv_shape,
+            kv_split: self.kv_split,
             symbol: self.symbols,
         }
     }
 
     /// Allocate and fill this route's feature vector from a shared [`ParsedReport`].
     pub(crate) fn extract_from_parsed(&self, parsed: &ParsedReport) -> Vec<f32> {
+        if parsed.trait_path_depth != self.trait_path_depth {
+            let adjusted = parsed.at_trait_path_depth(self.trait_path_depth);
+            return self.extract_from_parsed(&adjusted);
+        }
         let mut vec = vec![0.0f32; self.total_features];
         self.write_features(parsed, &mut vec);
         vec
@@ -1144,6 +1233,9 @@ impl ExtractContext {
 
         self.write_path_features(combined, parsed.sample_score, w); // G1, G2
         write_aggregate_features(parsed, w); // G3
+        if self.optional_finding_features {
+            write_optional_finding_features(parsed, w);
+        }
         write_crit_ngrams(&parsed.crit_tokens, w);
         write_ngrams(w, &parsed.attack_codes, "atkbi:", "atktri:", "ATT&CK");
         write_ngrams(w, &parsed.mbc_codes, "mbcbi:", "mbctri:", "MBC");
@@ -1154,8 +1246,35 @@ impl ExtractContext {
         write_structural_features(w, summaries, combined.filtered_finding_count); // G7
         self.write_formula_features(parsed, w); // G8–G10, G12–G14
         self.write_bigram_features(summaries, w, &self.bigram_slots); // G11
-        write_tiered_bigram_features(&parsed.tiered_tokens, w); // G11b
-        write_tiered_trigram_features(&parsed.tiered_tokens, w); // G11c
+        for (index, order) in [2, 3, 4].into_iter().enumerate() {
+            if !self
+                .tiered_slots
+                .iter()
+                .any(|(_, parts)| parts.len() == order)
+            {
+                continue;
+            }
+            let tokens =
+                if self.tiered_min_crit[index] == 3 && self.tiered_branch_min_crit.is_empty() {
+                    std::borrow::Cow::Borrowed(parsed.tiered_tokens.as_slice())
+                } else {
+                    std::borrow::Cow::Owned(tiered_path_tokens_with_options(
+                        combined,
+                        self.tiered_min_crit[index],
+                        &self.tiered_branch_min_crit,
+                    ))
+                };
+            if tokens.len() > if order == 4 { 64 } else { 512 } {
+                continue;
+            }
+            for (slot, parts) in &self.tiered_slots {
+                if parts.len() == order
+                    && parts.iter().all(|part| tokens.binary_search(part).is_ok())
+                {
+                    w.set_slot(*slot, 1.0);
+                }
+            }
+        }
         write_structural_extensions(summaries, combined, w); // G15
         self.write_trigram_features(summaries, w); // G16
         write_logic_gap_features(combined, summaries, w); // G19
@@ -1464,6 +1583,8 @@ struct FileSummary {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RawNeeds {
     kv: bool,
+    kv_shape: bool,
+    kv_split: bool,
     symbol: bool,
 }
 
@@ -1472,6 +1593,8 @@ impl RawNeeds {
     pub(crate) const fn all() -> Self {
         Self {
             kv: true,
+            kv_shape: true,
+            kv_split: true,
             symbol: true,
         }
     }
@@ -1482,6 +1605,8 @@ impl RawNeeds {
     pub(crate) const fn union(self, other: Self) -> Self {
         Self {
             kv: self.kv || other.kv,
+            kv_shape: self.kv_shape || other.kv_shape,
+            kv_split: self.kv_split || other.kv_split,
             symbol: self.symbol || other.symbol,
         }
     }
@@ -1496,6 +1621,8 @@ impl RawNeeds {
 /// `ParsedReport` instead of each re-summarizing the same report.
 #[derive(Debug)]
 pub(crate) struct ParsedReport {
+    trait_path_depth: usize,
+    depth_variants: std::sync::Mutex<HashMap<usize, std::sync::Arc<ParsedReport>>>,
     summaries: Vec<FileSummary>,
     combined: FindingSummary,
     merged_metrics: MetricMap,
@@ -1512,6 +1639,42 @@ pub(crate) struct ParsedReport {
 }
 
 impl ParsedReport {
+    /// Reuse decoded facts while rebuilding depth-dependent summaries for a
+    /// route. The shared default-depth parse remains untouched for other routes.
+    fn at_trait_path_depth(&self, depth: usize) -> std::sync::Arc<Self> {
+        let mut variants = self
+            .depth_variants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(
+            variants
+                .entry(depth)
+                .or_insert_with(|| std::sync::Arc::new(self.rebuild_at_trait_path_depth(depth))),
+        )
+    }
+
+    fn rebuild_at_trait_path_depth(&self, depth: usize) -> Self {
+        let mut summaries = self.summaries.clone();
+        for file in &mut summaries {
+            let views: Vec<_> = file
+                .raw_findings
+                .iter()
+                .map(|f| FindingView {
+                    id: &f.id,
+                    conf: f.conf,
+                    crit: f.crit,
+                })
+                .collect();
+            file.findings = summarize_findings_at_depth(&views, depth);
+            file.risk.suspicious_category_breadth = file.findings.suspicious_category_breadth;
+            file.risk.hostile_category_breadth = file.findings.hostile_category_breadth;
+        }
+        let mut adjusted =
+            Self::from_summaries(summaries, Some((&self.formula_str, self.sample_score)));
+        adjusted.trait_path_depth = depth;
+        adjusted
+    }
+
     /// Featurize a typed compact report.
     ///
     /// `keep` restricts the pass to the sample's own files by sha — used when
@@ -1661,6 +1824,8 @@ impl ParsedReport {
         let attack_codes = sorted(attack_codes);
         let mbc_codes = sorted(mbc_codes);
         Self {
+            trait_path_depth: default_trait_path_depth(),
+            depth_variants: std::sync::Mutex::default(),
             summaries,
             combined,
             merged_metrics,
@@ -1772,7 +1937,7 @@ impl FileSummary {
             unique_3level_paths,
             imports,
             kv_tokens: if needs.kv {
-                kv_tokens(metrics_value)
+                kv_tokens_with_options(metrics_value, needs.kv_shape, needs.kv_split)
             } else {
                 Vec::new()
             },
@@ -1864,6 +2029,10 @@ struct FindingView<'a> {
 }
 
 fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
+    summarize_findings_at_depth(findings, default_trait_path_depth())
+}
+
+fn summarize_findings_at_depth(findings: &[FindingView<'_>], depth: usize) -> FindingSummary {
     let mut summary = FindingSummary::default();
     let mut notable_ids: HashSet<&str> = HashSet::new();
     let mut suspicious_ids: HashSet<&str> = HashSet::new();
@@ -1921,7 +2090,7 @@ fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
         // share path prefixes, so hitting an existing entry is the common
         // case — `get_mut` + conditional `insert` pays for the allocation
         // only on first insert.
-        for path in finding_paths(fid) {
+        for path in finding_paths(fid, depth) {
             match summary.sample_paths.get_mut(path) {
                 Some(v) => *v = (*v).max(crit_ord),
                 None => {
@@ -2057,6 +2226,114 @@ struct FileRiskStats {
 }
 
 /// G3: report-level aggregates.
+/// Optional finding features consume the retained raw fields without another parse.
+fn write_optional_finding_features(parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
+    for code in &parsed.mbc_codes {
+        w.set_token(&format!("mbc:{code}"), 1.0);
+    }
+    let needs_moments = [
+        "agg:confidence_mean",
+        "agg:confidence_std",
+        "agg:confidence_skew",
+        "agg:confidence_kurtosis",
+    ]
+    .iter()
+    .any(|name| w.lookup.contains_key(*name));
+    if needs_moments {
+        let values: Vec<f64> = parsed
+            .summaries
+            .iter()
+            .flat_map(|s| &s.raw_findings)
+            .filter(|f| !f.id.is_empty() && f.conf >= MIN_CONFIDENCE)
+            .map(|f| f.conf)
+            .collect();
+        if !values.is_empty() {
+            let n = values.len() as f64;
+            let mean = values.iter().sum::<f64>() / n;
+            let variance = values.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / n;
+            let std = variance.sqrt();
+            let (skew, kurtosis) = if std > 1e-9 {
+                (
+                    values.iter().map(|c| (c - mean).powi(3)).sum::<f64>() / n / std.powi(3),
+                    values.iter().map(|c| (c - mean).powi(4)).sum::<f64>() / n / std.powi(4) - 3.0,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            w.set("agg:confidence_mean", mean as f32);
+            w.set("agg:confidence_std", std as f32);
+            w.set("agg:confidence_skew", skew as f32);
+            w.set("agg:confidence_kurtosis", kurtosis as f32);
+        }
+    }
+    if w.lookup.contains_key("agg:trait_id_lexical_distance") {
+        let mut ids: Vec<&str> = parsed
+            .summaries
+            .iter()
+            .flat_map(|s| &s.raw_findings)
+            .map(|f| f.id.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let total: usize = ids
+            .windows(2)
+            .map(|pair| lexical_distance(pair[0], pair[1]))
+            .sum();
+        let average = if ids.len() > 1 {
+            total as f64 / (ids.len() - 1) as f64
+        } else {
+            0.0
+        };
+        w.set("agg:trait_id_lexical_distance", average as f32);
+    }
+    if [
+        "agg:docobf_obfuscation_count",
+        "agg:docobf_eval_count",
+        "agg:docobf_lure_count",
+        "agg:docobf_total_count",
+        "agg:docobf_has_any",
+    ]
+    .iter()
+    .any(|name| w.lookup.contains_key(*name))
+    {
+        let mut counts = [0u32; 3];
+        let prefixes = [
+            "objectives/anti-static/obfuscation/document",
+            "objectives/execution/interpreter/eval",
+            "objectives/execution/lure/document",
+        ];
+        for finding in parsed.summaries.iter().flat_map(|s| &s.raw_findings) {
+            if let Some(index) = prefixes.iter().position(|p| finding.id.starts_with(p)) {
+                counts[index] += 1;
+            }
+        }
+        let total = counts.iter().sum::<u32>();
+        w.set("agg:docobf_obfuscation_count", counts[0] as f32);
+        w.set("agg:docobf_eval_count", counts[1] as f32);
+        w.set("agg:docobf_lure_count", counts[2] as f32);
+        w.set("agg:docobf_total_count", total as f32);
+        w.set("agg:docobf_has_any", f32::from(total > 0));
+    }
+}
+
+fn lexical_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let previous = row[j + 1];
+            row[j + 1] = (row[j] + 1)
+                .min(previous + 1)
+                .min(diagonal + usize::from(ca != cb));
+            diagonal = previous;
+        }
+    }
+    row[b.len()]
+}
+
 fn write_aggregate_features(parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
     let summary = &parsed.combined;
     let summaries = parsed.summaries.as_slice();
@@ -2520,22 +2797,25 @@ fn crit_category_tokens(summary: &FindingSummary) -> Vec<String> {
     tokens
 }
 
-/// Sorted `tier:path` tokens (crit-3+ findings, paths truncated to depth 3),
+/// Sorted `tier:path` tokens from prefixes at the model's trait depth,
 /// shared by the tiered bigram and trigram feature builders.
 fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
-    let mut token_max_crit: HashMap<String, u32> = HashMap::new();
-    for (path, &max_ord) in &summary.sample_paths {
-        if max_ord < CRIT_NOTABLE {
-            continue;
-        }
-        let key = truncate_path_depth(path, 3);
-        let entry = token_max_crit.entry(key).or_insert(0);
-        *entry = (*entry).max(max_ord);
-    }
+    tiered_path_tokens_with_options(summary, 3, &HashMap::new())
+}
 
-    let mut tokens: Vec<String> = token_max_crit
-        .into_iter()
-        .map(|(path, crit)| format!("{}:{path}", tier_prefix(crit)))
+fn tiered_path_tokens_with_options(
+    summary: &FindingSummary,
+    minimum: u32,
+    branches: &HashMap<String, u32>,
+) -> Vec<String> {
+    let mut tokens: Vec<String> = summary
+        .sample_paths
+        .iter()
+        .filter_map(|(path, &crit)| {
+            let branch = path.split('/').next().unwrap_or("");
+            let floor = branches.get(branch).copied().unwrap_or(minimum);
+            (crit > 0 && crit >= floor).then(|| format!("{}:{path}", tier_prefix(crit)))
+        })
         .collect();
     tokens.sort();
     tokens
@@ -2580,49 +2860,6 @@ fn write_ngrams(w: &mut FeatureWriter<'_>, tokens: &[String], bi: &str, tri: &st
     }
 }
 
-fn write_tiered_bigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
-    if tokens.len() > 512 {
-        tracing::warn!(
-            tokens = tokens.len(),
-            "too many tiered bigram tokens; skipping generation"
-        );
-        return;
-    }
-    let mut key = String::new();
-    for (i, t1) in tokens.iter().enumerate() {
-        for t2 in &tokens[i + 1..] {
-            key.clear();
-            let _ = write!(key, "tierbi:{t1} + {t2}");
-            w.set_token(&key, 1.0);
-        }
-    }
-}
-
-fn write_tiered_trigram_features(tokens: &[String], w: &mut FeatureWriter<'_>) {
-    if tokens.len() > 512 {
-        tracing::warn!(
-            tokens = tokens.len(),
-            "too many tiered trigram tokens; skipping generation"
-        );
-        return;
-    }
-    let mut key = String::new();
-    for (i, t1) in tokens.iter().enumerate() {
-        for j in i + 1..tokens.len() {
-            let t2 = &tokens[j];
-            for t3 in &tokens[j + 1..] {
-                key.clear();
-                let _ = write!(key, "tiertri:{t1} + {t2} + {t3}");
-                w.set_token(&key, 1.0);
-            }
-        }
-    }
-}
-
-/// The `top1` block's eight values: the single highest-risk file by each
-/// ordering. min_by with the descending comparators below returns the same
-/// first-maximum file a stable sort + take(1) would; summing over more than
-/// one file would need a partial sort.
 fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
     let top_susp = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
         (
@@ -3085,75 +3322,42 @@ fn write_structural_features(
     );
 }
 
-fn finding_paths(finding_id: &str) -> FindingPaths<'_> {
+fn finding_paths(finding_id: &str, depth: usize) -> FindingPaths<'_> {
     let base = finding_id.split("::").next().unwrap_or(finding_id);
-    let mut slash_ends = [0; 2];
-    let mut n_slashes = 0;
-    for (i, ch) in base.char_indices() {
-        if ch == '/' {
-            if n_slashes < 2 {
-                slash_ends[n_slashes] = i;
-            }
-            n_slashes += 1;
-        }
-    }
-    let third_end = if n_slashes >= 3 {
-        let mut count = 0;
-        let mut pos = base.len();
-        for (i, ch) in base.char_indices() {
-            if ch == '/' {
-                count += 1;
-                if count == 3 {
-                    pos = i;
-                    break;
-                }
-            }
-        }
-        pos
-    } else {
-        base.len()
-    };
-
     FindingPaths {
         base,
-        slash_ends,
-        n_slashes: n_slashes.min(2),
-        third_end,
-        step: 0,
+        slashes: base.match_indices('/'),
+        remaining: depth,
+        finished: false,
     }
 }
 
 struct FindingPaths<'a> {
     base: &'a str,
-    slash_ends: [usize; 2],
-    n_slashes: usize,
-    third_end: usize,
-    step: usize,
+    slashes: std::str::MatchIndices<'a, char>,
+    remaining: usize,
+    finished: bool,
 }
 
 impl<'a> Iterator for FindingPaths<'a> {
     type Item = &'a str;
     #[expect(
         clippy::string_slice,
-        reason = "the offsets are of ASCII '/' bytes, so always char boundaries"
+        reason = "ASCII slash offsets are UTF-8 boundaries"
     )]
     fn next(&mut self) -> Option<Self::Item> {
-        let result = match self.step {
-            0 => Some(if self.n_slashes >= 1 {
-                &self.base[..self.slash_ends[0]]
-            } else {
-                self.base
-            }),
-            1 if self.n_slashes >= 1 => Some(if self.n_slashes >= 2 {
-                &self.base[..self.slash_ends[1]]
-            } else {
-                self.base
-            }),
-            2 if self.n_slashes >= 2 => Some(&self.base[..self.third_end]),
-            _ => return None,
-        };
-        self.step += 1;
-        result
+        if self.remaining == 0 || self.finished {
+            return None;
+        }
+        self.remaining -= 1;
+        let end = self.slashes.next().map_or_else(
+            || {
+                self.finished = true;
+                self.base.len()
+            },
+            |(i, _)| i,
+        );
+        Some(&self.base[..end])
     }
 }
 
@@ -3194,15 +3398,55 @@ fn normalize_vocab_token(value: &str, max_len: usize) -> String {
     out
 }
 
-/// The `kv:` tokens of a metrics block. Mirrors collimator's
-/// `_metric_kv_tokens` with shape mode off (its runtime default): a boolean
-/// becomes `kv:<group>.<field>=true|false`, a string
-/// `kv:<group>.<field>=<normalized value>`; numbers, lists and nested
-/// objects only contribute in shape mode, so they emit nothing. Models
-/// trained with shape tokens see those slots as zeros (graceful degradation).
-fn kv_tokens(metrics: Option<&serde_json::Value>) -> Vec<String> {
+fn count_bucket(n: usize) -> &'static str {
+    match n {
+        0 => "0",
+        1 => "1",
+        2..=3 => "2_3",
+        4..=7 => "4_7",
+        8..=15 => "8_15",
+        16..=31 => "16_31",
+        32..=63 => "32_63",
+        64..=127 => "64_127",
+        _ => "128_plus",
+    }
+}
+
+fn number_bucket(n: f64) -> String {
+    if !n.is_finite() {
+        return "nonfinite".into();
+    }
+    if n == 0.0 {
+        return "zero".into();
+    }
+    let magnitude = n.abs();
+    let bucket = if magnitude < 1.0 {
+        "lt1"
+    } else if magnitude < 10.0 {
+        "1_9"
+    } else if magnitude < 100.0 {
+        "10_99"
+    } else if magnitude < 1000.0 {
+        "100_999"
+    } else if magnitude < 10000.0 {
+        "1k_9k"
+    } else if magnitude < 1000000.0 {
+        "10k_999k"
+    } else {
+        "1m_plus"
+    };
+    format!("{}_{bucket}", if n < 0.0 { "neg" } else { "pos" })
+}
+
+/// Emit only bounded categorical/shape tokens; the model selects its slots.
+fn kv_tokens_with_options(
+    metrics: Option<&serde_json::Value>,
+    shape: bool,
+    split: bool,
+) -> Vec<String> {
+    use serde_json::Value;
     let mut tokens = Vec::new();
-    let Some(groups) = metrics.and_then(serde_json::Value::as_object) else {
+    let Some(groups) = metrics.and_then(Value::as_object) else {
         return tokens;
     };
     for (group, fields) in groups {
@@ -3210,19 +3454,66 @@ fn kv_tokens(metrics: Option<&serde_json::Value>) -> Vec<String> {
             continue;
         };
         for (key, value) in fields {
+            let base = format!("kv:{group}.{key}");
+            if shape {
+                tokens.push(format!("{base}:exists"));
+            }
             match value {
-                serde_json::Value::Bool(b) => tokens.push(format!("kv:{group}.{key}={b}")),
-                serde_json::Value::String(s) => {
-                    let val = normalize_vocab_token(s, 80);
-                    if !val.is_empty() {
-                        tokens.push(format!("kv:{group}.{key}={val}"));
+                Value::Bool(b) => {
+                    tokens.push(format!("{base}={b}"));
+                    if shape {
+                        tokens.push(format!("{base}:bool={b}"));
                     }
                 }
+                Value::String(s) => {
+                    let val = normalize_vocab_token(s, 80);
+                    if !val.is_empty() {
+                        tokens.push(format!("{base}={val}"));
+                    }
+                    if shape {
+                        tokens.push(format!("{base}:strlen={}", count_bucket(s.chars().count())));
+                        tokens.push(format!(
+                            "{base}:{}",
+                            if s.is_empty() { "empty" } else { "nonempty" }
+                        ));
+                    }
+                    if split {
+                        for part in s.split(|c: char| c.is_whitespace() || ",;:/\\|".contains(c)) {
+                            let part = normalize_vocab_token(part, 64);
+                            if !part.is_empty() {
+                                tokens.push(format!("{base}=part:{part}"));
+                            }
+                        }
+                    }
+                }
+                Value::Number(n) if shape => {
+                    if let Some(n) = n.as_f64() {
+                        tokens.push(format!("{base}:number={}", number_bucket(n)));
+                    }
+                }
+                Value::Array(items) if shape => {
+                    tokens.push(format!("{base}:len={}", count_bucket(items.len())));
+                    if items.is_empty() {
+                        tokens.push(format!("{base}:empty"));
+                    }
+                }
+                Value::Object(items) if shape => {
+                    tokens.push(format!("{base}:len={}", count_bucket(items.len())));
+                    if items.is_empty() {
+                        tokens.push(format!("{base}:empty"));
+                    }
+                }
+                Value::Null if shape => tokens.push(format!("{base}:empty")),
                 _ => {}
             }
         }
     }
     tokens
+}
+
+#[cfg(test)]
+fn kv_tokens(metrics: Option<&serde_json::Value>) -> Vec<String> {
+    kv_tokens_with_options(metrics, false, false)
 }
 
 /// A file's normalized symbols, sorted and unique. Mirrors `_file_symbols`
@@ -3520,7 +3811,7 @@ mod tests {
     use std::io::Write;
 
     fn paths(id: &str) -> Vec<&str> {
-        finding_paths(id).collect()
+        finding_paths(id, default_trait_path_depth()).collect()
     }
 
     /// An ATT&CK ID whose first four bytes straddle a codepoint must not take
@@ -3574,6 +3865,72 @@ mod tests {
         tokens.sort();
         assert_eq!(tokens, ["kv:pe.signed=true", "kv:pe.subsystem=windows gui"]);
         assert!(kv_tokens(None).is_empty());
+    }
+
+    #[test]
+    fn trait_depth_spec_defaults_and_reads_explicit_value() {
+        let old: RawFeatureSpec = serde_json::from_str("{}").expect("legacy defaults");
+        assert_eq!(old.trait_path_depth, 3);
+        let new: RawFeatureSpec =
+            serde_json::from_str(r#"{"trait_path_depth":5}"#).expect("depth field");
+        assert_eq!(new.trait_path_depth, 5);
+    }
+
+    #[test]
+    fn trait_depth_prefixes_are_configurable() {
+        let id = "objectives/evasion/process/injection::method";
+        assert_eq!(finding_paths(id, 1).collect::<Vec<_>>(), ["objectives"]);
+        assert_eq!(
+            finding_paths(id, 2).collect::<Vec<_>>(),
+            ["objectives", "objectives/evasion"]
+        );
+        assert_eq!(
+            finding_paths(id, 4).collect::<Vec<_>>(),
+            [
+                "objectives",
+                "objectives/evasion",
+                "objectives/evasion/process",
+                "objectives/evasion/process/injection",
+            ]
+        );
+        assert_eq!(
+            finding_paths("métadata/format::x", 12).collect::<Vec<_>>(),
+            ["métadata", "métadata/format"]
+        );
+    }
+
+    #[test]
+    fn trait_depth_is_per_route_for_shared_report() {
+        let file: cleave::types::CompactFile = serde_json::from_value(serde_json::json!({
+            "id": 0, "sha": "fixture", "path": "fixture", "type": "go", "size": 1,
+            "traits": [{"id": "objectives/evasion/process/injection::method", "conf": 1.0, "crit": 4}]
+        }))
+        .expect("compact fixture");
+        let names = vec![
+            "present:objectives/evasion/process/injection".to_string(),
+            "maxcrit:objectives/evasion/process/injection".to_string(),
+            "tierbi:s:objectives + s:objectives/evasion/process/injection".to_string(),
+            "tiertri:s:objectives + s:objectives/evasion + s:objectives/evasion/process/injection"
+                .to_string(),
+        ];
+        let mut spec = anchor_spec(
+            vec!["objectives/evasion/process/injection".to_string()],
+            vec![],
+            vec![],
+            names,
+        );
+        let shared = ParsedReport::from_compact_file(&file, RawNeeds::all());
+        spec.trait_path_depth = 4;
+        let deep = ExtractContext::new(&spec);
+        assert_eq!(deep.extract_from_parsed(&shared), [1.0, 4.0, 1.0, 1.0]);
+        assert!(std::sync::Arc::ptr_eq(
+            &shared.at_trait_path_depth(4),
+            &shared.at_trait_path_depth(4)
+        ));
+        spec.trait_path_depth = 3;
+        let default = ExtractContext::new(&spec);
+        assert_eq!(default.extract_from_parsed(&shared), [0.0; 4]);
+        assert_eq!(deep.extract_from_parsed(&shared), [1.0, 4.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -3676,6 +4033,7 @@ mod tests {
             mbc_trigram_vocab: vec![],
             tiered_bigram_vocab: vec![],
             tiered_trigram_vocab: vec![],
+            tiered_quadgram_vocab: vec![],
             kv_vocab: vec![],
             symbol_vocab: vec![],
             symbol_bigram_vocab: vec![],
@@ -3685,6 +4043,9 @@ mod tests {
             feature_means: Some(vec![0.0, 1.0, 2.0]),
             feature_stds: Some(vec![1.0, 2.0, 0.5]),
             standardized: true,
+            trait_path_depth: default_trait_path_depth(),
+            tiered_min_crit: default_tiered_min_crit(),
+            tiered_branch_min_crit: HashMap::new(),
         };
         let mut features = vec![1.0, 3.0, 3.0];
         spec.standardize(&mut features);
@@ -3737,6 +4098,7 @@ mod tests {
             mbc_trigram_vocab: vec![],
             tiered_bigram_vocab: vec![],
             tiered_trigram_vocab: vec![],
+            tiered_quadgram_vocab: vec![],
             kv_vocab: vec![],
             symbol_vocab: vec![],
             symbol_bigram_vocab: vec![],
@@ -3744,6 +4106,9 @@ mod tests {
             feature_means: None,
             feature_stds: None,
             standardized: false,
+            trait_path_depth: default_trait_path_depth(),
+            tiered_min_crit: default_tiered_min_crit(),
+            tiered_branch_min_crit: HashMap::new(),
         }
     }
 

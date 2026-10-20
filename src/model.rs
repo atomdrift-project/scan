@@ -238,7 +238,7 @@ fn load_evaluation_thresholds(dir: &Path) -> Result<Option<Thresholds>> {
     let Some(eval) = read_json::<EvaluationJson>(&path)? else {
         return Ok(None);
     };
-    if eval.model_abi_version != EXPECTED_MODEL_ABI_VERSION {
+    if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&eval.model_abi_version) {
         anyhow::bail!(
             "{} has model_abi_version {} but this build expects {EXPECTED_MODEL_ABI_VERSION}",
             path.display(),
@@ -2524,7 +2524,7 @@ fn load_specialist(bundle_dir: &Path, name: &str, thresholds: Thresholds) -> Res
     let bundle = load_bundle(bundle_dir, Some(thresholds), /* is_general = */ false)
         .with_context(|| format!("specialist {name}"))?;
 
-    if bundle.spec.abi_version() != EXPECTED_MODEL_ABI_VERSION {
+    if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&bundle.spec.abi_version()) {
         anyhow::bail!(
             "ABI mismatch: specialist abi_version={} (build expects {})",
             bundle.spec.abi_version(),
