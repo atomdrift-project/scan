@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
@@ -3505,7 +3505,8 @@ fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
 }
 
 /// The artifact could not be retrieved: the registry refused it, the locator
-/// resolved to no URL, or the budget ran out before it was reached.
+/// resolved to no URL, the transport failed, or the budget ran out. The typed
+/// outcome distinguishes package refusals from retryable infrastructure faults.
 ///
 /// A distinct type rather than a message, because the difference between "this
 /// artifact is not available" and "this server is broken" decides an HTTP
@@ -3526,9 +3527,73 @@ pub struct Unretrievable {
     pub outcome: Outcome,
 }
 
+impl Unretrievable {
+    /// Whether a healthier worker may retrieve this artifact. Infrastructure
+    /// failures and local budget stops say nothing about the package.
+    pub(crate) fn infrastructure_failure(&self) -> bool {
+        match &self.outcome {
+            Outcome::Failed(error) => fetch_infrastructure_failure(error),
+            Outcome::BudgetExceeded => true,
+            _ => false,
+        }
+    }
+}
+
+fn fetch_infrastructure_failure(error: &FetchError) -> bool {
+    matches!(
+        error,
+        FetchError::Transport(_)
+            | FetchError::Timeout
+            | FetchError::Internal(_)
+            | FetchError::Status(408 | 429 | 500..=599)
+    )
+}
+
+// Registry resolution can turn a failed metadata request into NoRelease.
+// Keep its typed failure scoped to this fetch, without changing Fletch's
+// optional metadata API or mistaking a DNS outage for a missing package.
+struct FetchAttempt<'a> {
+    net: &'a dyn Fetch,
+    failure: Mutex<Option<FetchError>>,
+}
+
+impl Fetch for FetchAttempt<'_> {
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        let result = self.net.send(request);
+        if let Err(error) = &result
+            && fetch_infrastructure_failure(error)
+        {
+            *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(error.clone());
+        }
+        result
+    }
+
+    fn allows_oci(&self) -> bool {
+        self.net.allows_oci()
+    }
+}
+
+fn fetch_one_record(reference: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
+    let attempt = FetchAttempt {
+        net,
+        failure: Mutex::new(None),
+    };
+    let mut record = fetch_ref(reference, &attempt, cache);
+    if matches!(record.outcome, Outcome::Unresolved(_))
+        && let Some(error) = attempt
+            .failure
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+    {
+        record.outcome = Outcome::Failed(error);
+    }
+    record
+}
+
 impl std::fmt::Display for Unretrievable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let why = match &self.outcome {
+            Outcome::Failed(error) if fetch_infrastructure_failure(error) => error.to_string(),
             Outcome::Failed(error) => failure_detail(error),
             Outcome::Unresolved(reason) => format!("unresolved ({reason:?})"),
             Outcome::BudgetExceeded => "fetch budget exhausted".to_string(),
@@ -3539,6 +3604,57 @@ impl std::fmt::Display for Unretrievable {
 }
 
 impl std::error::Error for Unretrievable {}
+
+#[cfg(test)]
+mod retrieval_failure_tests {
+    use super::*;
+
+    struct FailingMetadata(FetchError);
+
+    impl Fetch for FailingMetadata {
+        fn send(&self, _request: &Request<'_>) -> Result<Fetched, FetchError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn metadata_outages_survive_resolution_as_infrastructure_failures() {
+        let reference = Reference::new(
+            RefLocator::Purl("pkg:pypi/dns-regression@1.0.0".into()),
+            RefKind::Dependency,
+            "test",
+            "",
+        );
+        for error in [
+            FetchError::Transport("lookup pypi.org: no such host".into()),
+            FetchError::Timeout,
+            FetchError::Status(429),
+            FetchError::Status(503),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = BlobCache::with_dir(dir.path());
+            let record = fetch_one_record(&reference, &FailingMetadata(error.clone()), &cache);
+            assert_eq!(record.outcome, Outcome::Failed(error));
+        }
+    }
+
+    #[test]
+    fn a_metadata_404_remains_a_missing_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = Reference::new(
+            RefLocator::Purl("pkg:pypi/missing-regression@1.0.0".into()),
+            RefKind::Dependency,
+            "test",
+            "",
+        );
+        let record = fetch_one_record(
+            &reference,
+            &FailingMetadata(FetchError::Status(404)),
+            &BlobCache::with_dir(dir.path()),
+        );
+        assert!(matches!(record.outcome, Outcome::Unresolved(_)));
+    }
+}
 
 /// Fetch a single external reference — a `pkg:` PURL or a URL — and return its
 /// bytes, a filename for cleave's type detection, and the fetch record. Powers
@@ -3560,7 +3676,7 @@ pub fn fetch_one(
         _ => RefKind::Undefined,
     };
     let reference = Reference::new(locator, kind, "cli", "");
-    let rec = fetch_ref(&reference, &res.net, &res.cache);
+    let rec = fetch_one_record(&reference, &res.net, &res.cache);
     if progress {
         eprintln!("\n  {}  {}", fg(LIVE, "\u{2b07}"), fg(LABEL, "fetching"));
         report_fetch(&rec);

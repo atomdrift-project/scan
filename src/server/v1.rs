@@ -1386,6 +1386,16 @@ impl Key {
         Ok(Self { sha, purl, url })
     }
 
+    /// A versioned PURL names every payload of that release. Only the corpus
+    /// can choose across the fleet; a local alias covers just one artifact.
+    fn needs_corpus(&self, configured: bool) -> bool {
+        configured
+            && self.sha.is_none()
+            && self.purl.as_deref().is_some_and(|purl| {
+                fletch::purl::Purl::parse(purl).is_ok_and(|purl| purl.version().is_some())
+            })
+    }
+
     fn unavailable(&self) -> (V1Decision, &'static str) {
         (
             V1Decision::unavailable(self.sha.as_deref(), self.purl.as_deref())
@@ -1410,7 +1420,10 @@ impl Key {
 /// PURL's verdict is accepted only when it describes the same bytes, because a
 /// release whose digest has moved is an answer about a different artifact than
 /// the one asked about. Blocking: the index is files.
-fn held(index: &crate::lookup::Index, key: &Key) -> Option<crate::lookup::Verdict> {
+fn held(index: &crate::lookup::Index, key: &Key, corpus: bool) -> Option<crate::lookup::Verdict> {
+    if key.needs_corpus(corpus) {
+        return None;
+    }
     let by_purl = || key.purl.as_deref().and_then(|p| index.get_purl(p));
     match key.sha.as_deref() {
         Some(sha) => pick_verdict(index.get_sha(sha), by_purl, sha),
@@ -1430,8 +1443,11 @@ async fn decide(
     budget: u16,
     fresh: bool,
 ) -> (V1Decision, &'static str) {
+    if key.needs_corpus(state.corpus.is_some()) {
+        return decide_unheld(state, key, budget, fresh).await;
+    }
     let lookup = key.clone();
-    match index_query(move |index| held(index, &lookup)).await {
+    match index_query(move |index| held(index, &lookup, false)).await {
         None => key.unavailable(),
         Some(Some(verdict)) => key.stored(&verdict, budget),
         Some(None) => decide_unheld(state, key, budget, fresh).await,
@@ -1449,21 +1465,22 @@ async fn decide_many(
     // A row whose task fails stays `unavailable`: we could not find out.
     let mut out: Vec<_> = keys.iter().map(Key::unavailable).collect();
     let lookup = keys.clone();
-    let Some(verdicts) = index_query(move |index| {
+    let corpus = state.corpus.is_some();
+    let verdicts = index_query(move |index| {
         lookup
             .iter()
-            .map(|key| held(index, key))
+            .map(|key| held(index, key, corpus))
             .collect::<Vec<_>>()
     })
-    .await
-    else {
-        return out;
-    };
+    .await;
+    let index_available = verdicts.is_some();
+    let verdicts = verdicts.unwrap_or_else(|| vec![None; keys.len()]);
     let mut misses = Vec::new();
     for (i, (key, verdict)) in keys.into_iter().zip(verdicts).enumerate() {
         match verdict {
             Some(verdict) => out[i] = key.stored(&verdict, budget),
-            None => misses.push((i, key)),
+            None if index_available || key.needs_corpus(corpus) => misses.push((i, key)),
+            None => {} // An unavailable local index cannot answer an exact-artifact lookup.
         }
     }
 
@@ -1543,6 +1560,7 @@ async fn decide_unheld(
     // the local scan path already takes: `bloom_skip_predicate` skips the
     // download outright on a good hit, without asking anyone.
     if bloom == crate::bloom_repo::Decision::Skip
+        && !key.needs_corpus(state.corpus.is_some())
         && let Some(d) = V1Decision::bloom(bloom, sha, purl, budget)
     {
         return (d.with_url(url), "scan:bloom");
@@ -1932,6 +1950,100 @@ const REPORT_LIMIT: usize = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn versioned_purl_uses_corpus_even_with_a_clean_local_alias() -> anyhow::Result<()> {
+        use super::super::ServerConfig;
+        use crate::lookup::Verdict;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let purl = "pkg:pypi/critical-release-choice@1.0.0";
+        let clean_sha = "c1".repeat(32);
+        let critical_sha = "d2".repeat(32);
+        let index = crate::lookup::global().expect("verdict index enabled");
+        index.replace(&Verdict {
+            sha256: clean_sha.clone(),
+            lvl: Level::Clean,
+            eng: "local".into(),
+            at: "2026-01-02T00:00:00Z".into(),
+            purl: Some(purl.into()),
+            why: None,
+            hits: Vec::new(),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let payload = serde_json::json!({
+            "sha256": critical_sha, "purl": purl, "fires_at": 0,
+            "engine_version": "corpus", "analyzed_at": "2026-01-01T00:00:00Z", "findings": []
+        });
+        let corpus = axum::Router::new().route(
+            "/v1/lookup",
+            axum::routing::get(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let payload = payload.clone();
+                async move { axum::Json(payload) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move { axum::serve(listener, corpus).await });
+        let (_router, state) = super::super::assemble(ServerConfig {
+            hopper: Some(format!("http://{address}")),
+            ..ServerConfig::default()
+        })?;
+        let key = Key::parse(None, Some(purl), None).expect("valid purl");
+        assert!(
+            held(index, &key, true).is_none(),
+            "one payload cannot stand for its release"
+        );
+        assert!(
+            held(index, &key, false).is_some(),
+            "standalone workers retain local lookups"
+        );
+        let (single, _) = decide(&state, &key, 25, false).await;
+        assert_eq!(single.fires_at, Level::At(0));
+        assert_eq!(single.sha256.as_deref(), Some(critical_sha.as_str()));
+        let batch = decide_many(&state, vec![key.clone(), key], 25, false).await;
+        for (decision, _) in batch {
+            assert_eq!(decision.fires_at, Level::At(0));
+            assert_eq!(decision.sha256.as_deref(), Some(critical_sha.as_str()));
+        }
+        let before = calls.load(Ordering::SeqCst);
+        assert!(
+            before >= 3,
+            "single and batch lookups must reach the corpus"
+        );
+        let exact = Key::parse(Some(&clean_sha), Some(purl), None).expect("valid keys");
+        let (decision, _) = decide(&state, &exact, 25, false).await;
+        assert_eq!(decision.fires_at, Level::Clean);
+        assert_eq!(decision.sha256.as_deref(), Some(clean_sha.as_str()));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "digest hits stay artifact-specific"
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn only_versioned_purl_only_keys_require_corpus_selection() {
+        for (sha, purl, expected) in [
+            (None, Some("pkg:pypi/litellm@1.107.0"), true),
+            (None, Some("pkg:npm/%40scope/name@1.0"), true),
+            (None, Some("pkg:pypi/litellm"), false),
+            (None, Some("pkg:npm/%40scope/name"), false),
+            (
+                Some("a".repeat(64)),
+                Some("pkg:pypi/litellm@1.107.0"),
+                false,
+            ),
+        ] {
+            let key = Key::parse(sha.as_deref(), purl, None).expect("valid keys");
+            assert_eq!(key.needs_corpus(true), expected, "{key:?}");
+            assert!(!key.needs_corpus(false));
+        }
+    }
 
     /// A pending analysis must send progress before it has an outcome. Use a
     /// paused clock and an unpublished flight so neither a fast refusal nor

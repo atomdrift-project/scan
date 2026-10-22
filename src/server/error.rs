@@ -126,10 +126,24 @@ impl ApiError {
         // An artifact that could not be retrieved is answered from the type
         // rather than from any wording, because that verdict is the one this
         // fleet cannot afford to get wrong: see [`crate::fetch::Unretrievable`].
-        if error
-            .downcast_ref::<crate::fetch::Unretrievable>()
-            .is_some()
-        {
+        if let Some(fetch) = error.downcast_ref::<crate::fetch::Unretrievable>() {
+            if fetch.infrastructure_failure() {
+                return Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "fetch_unavailable",
+                    "Artifact source temporarily unavailable",
+                );
+            }
+            if matches!(
+                fetch.outcome,
+                fletch::fetch::Outcome::Failed(fletch::fetch::FetchError::TooLarge)
+            ) {
+                return Self::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too_large",
+                    "Artifact exceeds the fetch size limit",
+                );
+            }
             return Self::new(StatusCode::UNPROCESSABLE_ENTITY, "unretrievable", cause());
         }
         match classify_analysis_error(&format!("{error:#}")) {
@@ -337,6 +351,67 @@ mod tests {
             ApiError::from_analysis(&error).status,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    #[test]
+    fn retrieval_infrastructure_failures_are_503_and_keep_internal_detail_private() {
+        use anyhow::Context as _;
+        use fletch::fetch::{FetchError, Outcome};
+
+        for outcome in [
+            Outcome::Failed(FetchError::Transport(
+                "lookup pypi.org: no such host".into(),
+            )),
+            Outcome::Failed(FetchError::Timeout),
+            Outcome::Failed(FetchError::Internal("parser fault".into())),
+            Outcome::Failed(FetchError::Status(408)),
+            Outcome::Failed(FetchError::Status(429)),
+            Outcome::Failed(FetchError::Status(500)),
+            Outcome::Failed(FetchError::Status(501)),
+            Outcome::Failed(FetchError::Status(503)),
+            Outcome::Failed(FetchError::Status(599)),
+            Outcome::BudgetExceeded,
+        ] {
+            let error = Err::<(), _>(anyhow::Error::new(crate::fetch::Unretrievable {
+                target: "https://pypi.org/pypi/x/1.0/json".into(),
+                outcome,
+            }))
+            .context("analyzing package")
+            .unwrap_err();
+            let response = ApiError::from_analysis(&error);
+            assert_eq!(
+                response.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{error:#}"
+            );
+            assert_eq!(response.code, "fetch_unavailable");
+            assert_eq!(response.message, "Artifact source temporarily unavailable");
+        }
+    }
+
+    #[test]
+    fn permanent_retrieval_failures_stay_package_errors() {
+        use fletch::fetch::{FetchError, Outcome};
+        for (error, expected) in [
+            (FetchError::Status(403), StatusCode::UNPROCESSABLE_ENTITY),
+            (FetchError::Status(404), StatusCode::UNPROCESSABLE_ENTITY),
+            (FetchError::Status(410), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                FetchError::Refused("private address".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (FetchError::TooLarge, StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let error = anyhow::Error::new(crate::fetch::Unretrievable {
+                target: "https://example.test/package".into(),
+                outcome: Outcome::Failed(error),
+            });
+            assert_eq!(
+                ApiError::from_analysis(&error).status,
+                expected,
+                "{error:#}"
+            );
+        }
     }
 
     /// The rest of the chain still classifies as it did: a fault this server
