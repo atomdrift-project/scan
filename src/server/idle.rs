@@ -335,6 +335,12 @@ pub(super) fn start(
     busy: &Arc<Busy>,
     stop: watch::Receiver<bool>,
 ) -> Option<Arc<Worker>> {
+    if cfg!(any(target_os = "macos", windows)) {
+        tracing::info!(
+            "idle worker disabled: this platform cannot suspend the complete analysis process tree"
+        );
+        return None;
+    }
     let Some(hopper) = hopper else {
         tracing::info!("idle worker disabled: no --hopper to claim work from");
         return None;

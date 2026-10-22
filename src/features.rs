@@ -81,7 +81,8 @@ impl FeatureWriter<'_> {
 /// frequency prune). The metric is read by name from the spec vocab, so older
 /// v16/v17 bundles still load — the extractor just doesn't place a slot they
 /// don't list.
-pub const EXPECTED_SPEC_VERSION: u32 = 19;
+// v20 retains strongest tiered tokens; older models keep overflow-drop semantics.
+pub const EXPECTED_SPEC_VERSION: u32 = 21;
 
 /// Earliest spec version this build can still load. v16/v17 specs are
 /// loadable too: each newer version added feature families/columns the
@@ -175,6 +176,10 @@ pub struct FeatureSpec {
     rare_element_vocab: Vec<String>,
     trigram_vocab: Vec<String>,
     metric_vocab: Vec<String>,
+    metric_transforms: Option<HashMap<String, String>>,
+    metric_getters: Vec<String>,
+    metric_reference_year: u32,
+    metric_correlations: HashMap<String, [[String; 2]; 2]>,
     crit_unigram_vocab: Vec<String>,
     crit_bigram_vocab: Vec<String>,
     crit_trigram_vocab: Vec<String>,
@@ -223,6 +228,14 @@ struct RawFeatureSpec {
     trigram_vocab: Vec<String>,
     #[serde(default)]
     metric_vocab: Vec<String>,
+    #[serde(default)]
+    metric_transforms: Option<HashMap<String, String>>,
+    #[serde(default)]
+    metric_getters: Vec<String>,
+    #[serde(default)]
+    metric_reference_year: u32,
+    #[serde(default)]
+    metric_correlations: HashMap<String, [[String; 2]; 2]>,
     #[serde(default)]
     crit_unigram_vocab: Vec<String>,
     #[serde(default)]
@@ -280,7 +293,7 @@ const fn default_standardized() -> bool {
 }
 
 const fn default_abi_version() -> u32 {
-    EXPECTED_MODEL_ABI_VERSION
+    0 // An omitted ABI inherits the spec version, never the serving version.
 }
 
 impl FeatureSpec {
@@ -306,7 +319,7 @@ impl FeatureSpec {
 
         let spec = Self {
             version: raw.version,
-            abi_version: raw.abi_version,
+            abi_version: if raw.abi_version == 0 { raw.version } else { raw.abi_version },
             presence_vocab: raw.presence_vocab,
             filetype_vocab: raw.filetype_vocab,
             element_vocab: raw.element_vocab,
@@ -316,6 +329,10 @@ impl FeatureSpec {
             rare_element_vocab: raw.rare_element_vocab,
             trigram_vocab: raw.trigram_vocab,
             metric_vocab: raw.metric_vocab,
+            metric_transforms: raw.metric_transforms,
+            metric_getters: raw.metric_getters,
+            metric_reference_year: raw.metric_reference_year,
+            metric_correlations: raw.metric_correlations,
             crit_unigram_vocab: raw.crit_unigram_vocab,
             crit_bigram_vocab: raw.crit_bigram_vocab,
             crit_trigram_vocab: raw.crit_trigram_vocab,
@@ -414,6 +431,19 @@ impl FeatureSpec {
                 self.total_features
             );
         }
+        anyhow::ensure!(self.abi_version < 21 || self.metric_transforms.is_some(),
+            "v21 feature spec requires metric_transforms");
+        if let Some(transforms) = &self.metric_transforms {
+            for name in self.feature_names.iter().filter_map(|n| n.strip_prefix("metrics:")) {
+                anyhow::ensure!(matches!(transforms.get(name).map(String::as_str), Some("identity" | "log1p_abs")),
+                    "missing or invalid metric transform: {name}");
+            }
+            anyhow::ensure!(!self.metric_getters.iter().any(|g| g == "pe_year_distance") || (1970..=9999).contains(&self.metric_reference_year), "pe_year_distance requires its training reference year");
+            for getter in &self.metric_getters {
+                anyhow::ensure!(known_metric_getter(getter) || self.metric_correlations.get(getter).is_some_and(|pair| pair.iter().flatten().all(|s| !s.is_empty())), "unknown metric getter: {getter}");
+            }
+        }
+
         if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
             anyhow::bail!(
                 "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{}",
@@ -972,6 +1002,8 @@ struct MetricSlot {
     group: String,
     field: String,
     log: bool,
+    getter: Option<String>,
+    correlation: Option<[[String; 2]; 2]>,
 }
 
 /// Pre-built lookup tables for fast repeated extraction against a spec.
@@ -979,6 +1011,10 @@ struct MetricSlot {
 pub struct ExtractContext {
     /// Whether this layout is supported by the bundled retained-facts contract.
     model_facts_supported: bool,
+    ranked_ngrams: bool,
+    relative_structure: bool,
+    explicit_metrics: bool,
+    metric_reference_year: u32,
     trait_path_depth: usize,
     tiered_min_crit: [u32; 3],
     tiered_branch_min_crit: HashMap<String, u32>,
@@ -1106,6 +1142,10 @@ impl ExtractContext {
 
         Self {
             trait_path_depth: spec.trait_path_depth,
+            ranked_ngrams: spec.abi_version >= 20,
+            relative_structure: spec.abi_version >= 21,
+            explicit_metrics: spec.metric_transforms.is_some(),
+            metric_reference_year: spec.metric_reference_year,
             tiered_min_crit: spec.tiered_min_crit,
             tiered_branch_min_crit: spec.tiered_branch_min_crit.clone(),
             model_facts_supported: cleave::model_facts::supports(
@@ -1113,7 +1153,7 @@ impl ExtractContext {
                 &spec.feature_names,
             )
             .is_ok(),
-            metric_slots: metric_slots(&absolute_lookup, &spec.metric_vocab),
+            metric_slots: metric_slots(&absolute_lookup, spec),
             ghost_slots: spec
                 .ghost_vocab
                 .iter()
@@ -1240,7 +1280,7 @@ impl ExtractContext {
         write_ngrams(w, &parsed.attack_codes, "atkbi:", "atktri:", "ATT&CK");
         write_ngrams(w, &parsed.mbc_codes, "mbcbi:", "mbctri:", "MBC");
         write_external_summary_features(combined, w); // G4
-        self.write_metric_features(&parsed.merged_metrics, w); // G5
+        self.write_metric_features(&parsed.merged_metrics, summaries, w); // G5
         // G6 (filetype one-hots) is blindfolded since v16.
         write_format_hint_features(summaries, w); // G6b
         write_structural_features(w, summaries, combined.filtered_finding_count); // G7
@@ -1254,16 +1294,22 @@ impl ExtractContext {
             {
                 continue;
             }
-            let tokens =
-                if self.tiered_min_crit[index] == 3 && self.tiered_branch_min_crit.is_empty() {
-                    std::borrow::Cow::Borrowed(parsed.tiered_tokens.as_slice())
-                } else {
-                    std::borrow::Cow::Owned(tiered_path_tokens_with_options(
-                        combined,
-                        self.tiered_min_crit[index],
-                        &self.tiered_branch_min_crit,
-                    ))
-                };
+            let tokens = if self.ranked_ngrams {
+                std::borrow::Cow::Owned(ranked_tiered_path_tokens(
+                    combined,
+                    self.tiered_min_crit[index],
+                    &self.tiered_branch_min_crit,
+                    order,
+                ))
+            } else if self.tiered_min_crit[index] == 3 && self.tiered_branch_min_crit.is_empty() {
+                std::borrow::Cow::Borrowed(parsed.tiered_tokens.as_slice())
+            } else {
+                std::borrow::Cow::Owned(tiered_path_tokens_with_options(
+                    combined,
+                    self.tiered_min_crit[index],
+                    &self.tiered_branch_min_crit,
+                ))
+            };
             if tokens.len() > if order == 4 { 64 } else { 512 } {
                 continue;
             }
@@ -1275,7 +1321,7 @@ impl ExtractContext {
                 }
             }
         }
-        write_structural_extensions(summaries, combined, w); // G15
+        write_structural_extensions(summaries, combined, self.relative_structure, w); // G15
         self.write_trigram_features(summaries, w); // G16
         write_logic_gap_features(combined, summaries, w); // G19
         // G20: signature synergy — the bigram block again, for unsigned samples.
@@ -1290,7 +1336,9 @@ impl ExtractContext {
         if self.suspicious_ngram_counts {
             write_suspicious_ngram_counts(combined, w);
         }
-        write_derived_metric_features(&parsed.merged_metrics, w);
+        if !self.explicit_metrics {
+            write_derived_metric_features(&parsed.merged_metrics, w);
+        }
         write_silent_packer_signal(summaries, combined.filtered_finding_count, w);
         if self.kv {
             for s in summaries {
@@ -1337,21 +1385,24 @@ impl ExtractContext {
     }
 
     /// G5: the base [`KEY_METRICS`] then the spec's extended metric vocab.
-    fn write_metric_features(&self, metrics: &MetricMap, w: &mut FeatureWriter<'_>) {
+    fn write_metric_features(&self, metrics: &MetricMap, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
         for m in &self.metric_slots {
-            let value = metrics
-                .get(&m.group)
-                .and_then(|g| g.get(&m.field))
-                .copied()
-                .unwrap_or(0.0) as f32;
-            w.set_slot(
-                m.slot,
-                if m.log {
-                    (value.abs() + 1.0).ln()
-                } else {
-                    value
-                },
-            );
+            let value = if let Some([[ga, ka], [gb, kb]]) = &m.correlation {
+                let get = |g: &String, k: &String| metrics.get(g).and_then(|fields| fields.get(k)).copied().unwrap_or(0.0);
+                get(ga, ka) * get(gb, kb)
+            } else if let Some(getter) = &m.getter {
+                derived_metric(getter, metrics, summaries, self.metric_reference_year)
+            } else {
+                metrics.get(&m.group).and_then(|g| g.get(&m.field)).copied().unwrap_or(0.0)
+            };
+            // Legacy models retain their f32-before-log contract.
+            let output = if self.explicit_metrics {
+                (if m.log { value.abs().ln_1p() } else { value }) as f32
+            } else {
+                let value = value as f32;
+                if m.log { (value.abs() + 1.0).ln() } else { value }
+            };
+            w.set_slot(m.slot, output);
         }
     }
 
@@ -1441,8 +1492,14 @@ impl ExtractContext {
         slots: &[Option<usize>],
     ) {
         for s in summaries {
-            let ids: Vec<u32> = s
-                .unique_3level_paths
+            let ranked;
+            let paths = if self.ranked_ngrams {
+                ranked = ranked_ngram_paths(&s.raw_findings, 512);
+                &ranked
+            } else {
+                &s.unique_3level_paths
+            };
+            let ids: Vec<u32> = paths
                 .iter()
                 .filter_map(|p| self.path_to_id.get(p).copied())
                 .collect();
@@ -1450,14 +1507,13 @@ impl ExtractContext {
                 tracing::warn!(path = %s.path, tokens = ids.len(), "too many unique paths; skipping bigram generation for file");
                 continue;
             }
-            for i in 0..ids.len() {
-                for j in (i + 1)..ids.len() {
-                    let key = (ids[i].min(ids[j]), ids[i].max(ids[j]));
-                    if let Some(&idx) = self.bigram_id_lookup.get(&key)
-                        && let Some(&Some(slot)) = slots.get(idx)
-                    {
-                        w.set_slot(slot, 1.0);
-                    }
+            let present: HashSet<_> = ids.into_iter().collect();
+            for (&(a, b), &idx) in &self.bigram_id_lookup {
+                if present.contains(&a)
+                    && present.contains(&b)
+                    && let Some(&Some(slot)) = slots.get(idx)
+                {
+                    w.set_slot(slot, 1.0);
                 }
             }
         }
@@ -1466,8 +1522,14 @@ impl ExtractContext {
     /// Path-triple features, as [`Self::write_bigram_features`].
     fn write_trigram_features(&self, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
         for s in summaries {
-            let ids: Vec<u32> = s
-                .unique_3level_paths
+            let ranked;
+            let paths = if self.ranked_ngrams {
+                ranked = ranked_ngram_paths(&s.raw_findings, 128);
+                &ranked
+            } else {
+                &s.unique_3level_paths
+            };
+            let ids: Vec<u32> = paths
                 .iter()
                 .filter_map(|p| self.path_to_id.get(p).copied())
                 .collect();
@@ -1476,19 +1538,14 @@ impl ExtractContext {
                 tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
                 continue;
             }
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    for k in (j + 1)..n {
-                        let mut sorted = [ids[i], ids[j], ids[k]];
-                        sorted.sort();
-                        if let Some(&idx) = self
-                            .trigram_id_lookup
-                            .get(&(sorted[0], sorted[1], sorted[2]))
-                            && let Some(&Some(slot)) = self.trigram_slots.get(idx)
-                        {
-                            w.set_slot(slot, 1.0);
-                        }
-                    }
+            let present: HashSet<_> = ids.into_iter().collect();
+            for (&(a, b, c), &idx) in &self.trigram_id_lookup {
+                if present.contains(&a)
+                    && present.contains(&b)
+                    && present.contains(&c)
+                    && let Some(&Some(slot)) = self.trigram_slots.get(idx)
+                {
+                    w.set_slot(slot, 1.0);
                 }
             }
         }
@@ -1498,7 +1555,19 @@ impl ExtractContext {
 /// Resolve the `metrics:` family to slots: every [`KEY_METRICS`] entry, then
 /// each extended-vocab key (`<group>_<field>`) that is not a base metric.
 /// Extended keys are log-scaled when the field names a count or size.
-fn metric_slots(lookup: &HashMap<String, usize>, metric_vocab: &[String]) -> Vec<MetricSlot> {
+fn metric_slots(lookup: &HashMap<String, usize>, spec: &FeatureSpec) -> Vec<MetricSlot> {
+    if let Some(transforms) = &spec.metric_transforms {
+        return lookup.iter().filter_map(|(name, &slot)| {
+            let suffix = name.strip_prefix("metrics:")?;
+            let (group, field) = suffix.split_once('_')?;
+            Some(MetricSlot { slot, group: group.into(), field: field.into(),
+                log: transforms.get(suffix).is_some_and(|t| t == "log1p_abs"),
+                getter: spec.metric_getters.iter().any(|g| g == suffix).then(|| suffix.to_owned()),
+                correlation: spec.metric_correlations.get(suffix).cloned(),
+            })
+        }).collect();
+    }
+    let metric_vocab = &spec.metric_vocab;
     let base = KEY_METRICS.iter().map(|&(group, field, log)| {
         (
             format!("metrics:{group}_{field}"),
@@ -1533,6 +1602,8 @@ fn metric_slots(lookup: &HashMap<String, usize>, metric_vocab: &[String]) -> Vec
                 group,
                 field,
                 log,
+                getter: None,
+                correlation: None,
             })
         })
         .collect()
@@ -1550,14 +1621,43 @@ struct RawFinding {
     mbc: Option<String>,
 }
 
+/// Select base paths before filtering against a model vocabulary, as in training.
+fn ranked_ngram_paths(findings: &[RawFinding], limit: usize) -> Vec<String> {
+    let mut scores: HashMap<&str, f64> = HashMap::new();
+    for finding in findings {
+        if finding.id.is_empty() || !(finding.conf >= MIN_CONFIDENCE) || finding.crit < 3 {
+            continue;
+        }
+        let path = finding.id.split("::").next().unwrap_or("");
+        let score = if finding.conf.is_finite() {
+            f64::from(finding.crit) * f64::from(finding.conf.min(1.0) as f32)
+        } else {
+            0.0
+        };
+        scores
+            .entry(path)
+            .and_modify(|v| *v = v.max(score))
+            .or_insert(score);
+    }
+    let mut paths: Vec<_> = scores.keys().copied().collect();
+    if paths.len() > limit {
+        paths.sort_unstable_by(|a, b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(b)));
+        paths.truncate(limit);
+    }
+    paths.sort_unstable();
+    paths.into_iter().map(str::to_owned).collect()
+}
+
 /// Pre-calculated data for a single file entry in a report.
 ///
-/// The compact schema carries no parent links, mtimes, flat values or
-/// strings, so the features collimator derives from those (nesting depth,
-/// inner-file fractions, mtime spreads, `textenc:`) are constants here; the
-/// writers say which.
+/// Compact placement metadata supplies archive structure. Timestamps and text
+/// encodings remain unavailable in the retained-facts contract.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct FileSummary {
+    id: Option<u32>,
+    parent: Option<u32>,
+    depth: u32,
+    entry_section_nontext: bool,
     path: String,
     file_type: String,
     size_bytes: f64,
@@ -1699,7 +1799,12 @@ impl ParsedReport {
 
     /// Featurize a single compact file entry (an archive member) on its own.
     pub(crate) fn from_compact_file(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
-        Self::from_compact_files(&[file], needs)
+        // Placement depth belongs to the enclosing archive. When grading this
+        // member alone, its own metadata must match its training database row.
+        Self::from_summaries(
+            vec![FileSummary::from_compact(file, needs)],
+            Some((file.formula.as_deref().unwrap_or(""), file.risk)),
+        )
     }
 
     fn from_compact_files(files: &[&cleave::types::CompactFile], needs: RawNeeds) -> Self {
@@ -1772,6 +1877,7 @@ impl ParsedReport {
             }
             .ok_or_else(|| anyhow::anyhow!("missing model analysis"))?;
             placed.path = f.path.clone();
+            placed.depth = f.depth;
             files.push(placed);
         }
         let primary = report
@@ -1854,14 +1960,18 @@ impl FileSummary {
                 mbc: f.mbc.clone(),
             })
             .collect();
-        Self::from_model(
+        let mut summary = Self::from_model(
             &file.path,
             &file.file_type,
             file.size,
             &file.facts,
             raw_findings,
             needs,
-        )
+        );
+        summary.id = Some(file.id);
+        summary.parent = file.parent;
+        summary.depth = file.depth;
+        summary
     }
 
     fn from_model(
@@ -1927,6 +2037,10 @@ impl FileSummary {
             .collect();
 
         Self {
+            id: None, parent: None, depth: 0,
+            entry_section_nontext: metrics_value.and_then(|v| v.get("pe"))
+                .and_then(|v| v.get("entry_section")).and_then(serde_json::Value::as_str)
+                .is_some_and(|v| !v.is_empty() && v != ".text"),
             path: path.to_owned(),
             file_type: file_type.to_owned(),
             size_bytes,
@@ -1955,6 +2069,7 @@ impl FileSummary {
 struct FindingSummary {
     sample_paths: HashMap<String, u32>,
     path_confidences: HashMap<String, f64>,
+    path_scores: HashMap<String, f64>,
     finding_confidences: Vec<f64>,
     filtered_finding_count: u32,
     notable_finding_count: u32,
@@ -1973,29 +2088,154 @@ struct FindingSummary {
     has_yara: bool,
 }
 
-/// Flatten a metrics object into `{group: {field: number}}`, keeping numbers
-/// and booleans (`true` → 1.0) and dropping strings/nulls.
-fn numeric_metrics(source: Option<&serde_json::Value>) -> HashMap<String, HashMap<String, f64>> {
-    source
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(group, fields)| {
-                    let group_map = fields
-                        .as_object()?
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            let val = v
-                                .as_f64()
-                                .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))?;
-                            Some((k.clone(), val))
-                        })
-                        .collect();
-                    Some((group.clone(), group_map))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+// Compatibility aliases for the August 2026 metric rename. Keep in sync with
+// collimator.features._METRIC_RENAMES: existing names (even null/zero) win.
+const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
+    ("archive", "total_compressed", "archive", "compressed_size"),
+    (
+        "archive",
+        "total_uncompressed",
+        "archive",
+        "uncompressed_size",
+    ),
+    ("ast", "array_literal_max_length", "ast", "max_array_len"),
+    (
+        "ast",
+        "numeric_array_max_length",
+        "ast",
+        "max_numeric_array",
+    ),
+    (
+        "ast",
+        "numeric_sequence_max_length",
+        "ast",
+        "max_numeric_seq",
+    ),
+    (
+        "ast",
+        "string_concat_chain_max_length",
+        "ast",
+        "max_concat_chain",
+    ),
+    (
+        "binary",
+        "embedded_archive_count",
+        "binary",
+        "embedded_archives",
+    ),
+    (
+        "binary",
+        "embedded_binary_count",
+        "binary",
+        "embedded_binaries",
+    ),
+    ("binary", "embedded_file_count", "binary", "embedded_files"),
+    ("binary", "overall_entropy", "file", "entropy"),
+    ("binary", "total_basic_blocks", "binary", "basic_blocks"),
+    ("comments", "base64_in_comments", "comments", "base64"),
+    ("comments", "code_in_comments", "comments", "code"),
+    ("comments", "empty_comments", "comments", "empty"),
+    (
+        "comments",
+        "high_entropy_comments",
+        "comments",
+        "high_entropy",
+    ),
+    ("comments", "total", "comments", "count"),
+    ("elf", "gnu_stack_section_absent", "elf", "no_gnu_stack"),
+    (
+        "elf",
+        "stripped_but_symtab_present",
+        "elf",
+        "stripped_with_symtab",
+    ),
+    ("file", "size_bytes", "file", "size"),
+    (
+        "functions",
+        "code_in_functions_ratio",
+        "functions",
+        "code_ratio",
+    ),
+    ("functions", "density_per_100_lines", "functions", "density"),
+    ("functions", "nested_functions", "functions", "nested"),
+    ("identifiers", "total", "identifiers", "count"),
+    ("identifiers", "unique_count", "identifiers", "unique"),
+    ("imports", "aliased_imports", "imports", "aliased"),
+    ("imports", "dynamic_imports", "imports", "dynamic"),
+    ("imports", "relative_imports", "imports", "relative"),
+    ("imports", "unique_modules", "imports", "count"),
+    ("imports", "wildcard_imports", "imports", "wildcard"),
+    ("pe", "headers_size_bytes", "pe", "headers_size"),
+    ("strings", "hex_strings", "strings", "hex"),
+    ("strings", "shell_command_strings", "strings", "shell"),
+    ("strings", "sql_strings", "strings", "sql"),
+    ("strings", "total", "strings", "count"),
+    ("strings", "total_bytes", "strings", "bytes"),
+    (
+        "strings",
+        "unicode_heavy_strings",
+        "strings",
+        "unicode_heavy",
+    ),
+    ("strings", "url_encoded_strings", "strings", "url_encoded"),
+    ("strings", "very_long_strings", "strings", "very_long"),
+    ("text", "high_byte_ratio", "text", "non_ascii_ratio"),
+    ("text", "max_inline_whitespace_run", "text", "max_ws_run"),
+    ("text", "most_common_char_codepoint", "text", "top_char"),
+    ("text", "most_common_char_is_null", "text", "top_char_null"),
+    ("text", "most_common_ratio", "text", "top_char_ratio"),
+    ("text", "total_lines", "text", "lines"),
+];
+
+/// Borrow metric values under their original names and missing legacy aliases.
+/// Both numeric features and categorical tokens use this view; no report copy
+/// or mutation is needed.
+fn metric_fields(
+    source: Option<&serde_json::Value>,
+) -> impl Iterator<Item = (&str, &str, &serde_json::Value)> {
+    let groups = source.and_then(serde_json::Value::as_object);
+    let original = groups
+        .into_iter()
+        .flat_map(|groups| groups.iter())
+        .flat_map(|(group, fields)| {
+            fields.as_object().into_iter().flat_map(move |fields| {
+                fields
+                    .iter()
+                    .map(move |(key, value)| (group.as_str(), key.as_str(), value))
+            })
+        });
+    let aliases =
+        METRIC_RENAMES
+            .iter()
+            .filter_map(move |&(old_group, old_key, new_group, new_key)| {
+                let groups = groups?;
+                if let Some(fields) = groups.get(old_group) {
+                    // Malformed old groups and explicitly present old values stay as-is.
+                    if fields.as_object()?.contains_key(old_key) {
+                        return None;
+                    }
+                }
+                let value = groups.get(new_group)?.as_object()?.get(new_key)?;
+                Some((old_group, old_key, value))
+            });
+    original.chain(aliases)
+}
+
+/// Keep numbers and booleans (`true` → 1.0), dropping strings/nulls.
+fn numeric_metrics(source: Option<&serde_json::Value>) -> MetricMap {
+    let mut result = MetricMap::new();
+    for (group, key, value) in metric_fields(source) {
+        if let Some(number) = value
+            .as_f64()
+            .or_else(|| value.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
+        {
+            result
+                .entry(group.to_owned())
+                .or_default()
+                .insert(key.to_owned(), number);
+        }
+    }
+    result
 }
 
 /// The tokens a `(library, name)` import pair contributes: the bare name and
@@ -2090,7 +2330,18 @@ fn summarize_findings_at_depth(findings: &[FindingView<'_>], depth: usize) -> Fi
         // share path prefixes, so hitting an existing entry is the common
         // case — `get_mut` + conditional `insert` pays for the allocation
         // only on first insert.
+        let score = if conf.is_finite() {
+            f64::from(crit_ord) * f64::from(conf.clamp(0.0, 1.0) as f32)
+        } else {
+            0.0
+        };
         for path in finding_paths(fid, depth) {
+            match summary.path_scores.get_mut(path) {
+                Some(v) => *v = v.max(score),
+                None => {
+                    summary.path_scores.insert(path.to_owned(), score);
+                }
+            }
             match summary.sample_paths.get_mut(path) {
                 Some(v) => *v = (*v).max(crit_ord),
                 None => {
@@ -2173,6 +2424,14 @@ fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
                 Some(v) => *v = v.max(conf),
                 None => {
                     combined.path_confidences.insert(path.clone(), conf);
+                }
+            }
+        }
+        for (path, &score) in &fs.path_scores {
+            match combined.path_scores.get_mut(path) {
+                Some(v) => *v = v.max(score),
+                None => {
+                    combined.path_scores.insert(path.clone(), score);
                 }
             }
         }
@@ -2821,6 +3080,33 @@ fn tiered_path_tokens_with_options(
     tokens
 }
 
+/// Keep real finding evidence, with deterministic lexical ties. The score for
+/// each path was accumulated as max(severity * confidence), never a product
+/// of unrelated maxima. Match collimator's v20 token budgets exactly.
+fn ranked_tiered_path_tokens(
+    summary: &FindingSummary,
+    minimum: u32,
+    branches: &HashMap<String, u32>,
+    order: usize,
+) -> Vec<String> {
+    let mut tokens = tiered_path_tokens_with_options(summary, minimum, branches);
+    let limit = match order {
+        2 => 512,
+        3 => 128,
+        _ => 64,
+    };
+    if tokens.len() > limit {
+        tokens.sort_unstable_by(|a, b| {
+            let score_a = summary.path_scores.get(&a[2..]).copied().unwrap_or(0.0);
+            let score_b = summary.path_scores.get(&b[2..]).copied().unwrap_or(0.0);
+            score_b.total_cmp(&score_a).then_with(|| a.cmp(b))
+        });
+        tokens.truncate(limit);
+        tokens.sort();
+    }
+    tokens
+}
+
 /// `crit:` unigrams over the category tokens, then their n-grams.
 fn write_crit_ngrams(tokens: &[String], w: &mut FeatureWriter<'_>) {
     let mut key = String::new();
@@ -2990,13 +3276,40 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
     );
 }
 
-/// G15: structural extensions. Compact files carry neither parent links nor
-/// mtimes, so the nesting and inner-file features are constant zero, the
-/// mtime-spread and anachronism features are never set, and every hostile
-/// file counts as one with no parent.
+/// Resolve each parent edge once; malformed cycles have no depth evidence.
+fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
+    let by_id: HashMap<_, _> = files.iter().enumerate().filter_map(|(i, f)| Some((f.id?, i))).collect();
+    let mut depths = vec![None; files.len()];
+    for start in 0..files.len() {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut i = start;
+        while depths[i].is_none() {
+            if !seen.insert(i) {
+                for &j in &chain { depths[j] = Some(0); }
+                break;
+            }
+            if files[i].depth > 0 { depths[i] = Some(files[i].depth); break; }
+            let parent = files[i].parent.and_then(|p| by_id.get(&p).copied()).filter(|&p| p != i);
+            let Some(parent) = parent else { depths[i] = Some(0); break; };
+            chain.push(i);
+            i = parent;
+        }
+        for &j in chain.iter().rev() {
+            if depths[j].is_none() {
+                depths[j] = Some(depths[by_id[&files[j].parent.expect("resolved parent")]].unwrap_or(0u32).saturating_add(1));
+            }
+        }
+    }
+    let base = depths.iter().flatten().copied().min().unwrap_or(0);
+    depths.into_iter().map(|d| d.unwrap_or(0).saturating_sub(base)).collect()
+}
+
+/// G15: structure relative to the graded artifact (legacy bundles keep zeros).
 fn write_structural_extensions(
     summaries: &[FileSummary],
     combined: &FindingSummary,
+    relative: bool,
     w: &mut FeatureWriter<'_>,
 ) {
     let binary_like = ["pe", "elf", "macho"];
@@ -3010,7 +3323,7 @@ fn write_structural_extensions(
     let mut hostile_files = 0;
     let mut total_loc: u64 = 0;
     let mut extension_mismatches = 0;
-    let mut has_source_files = false;
+    let mut has_source_files = relative && summaries.iter().any(|s| source_types.contains(&s.file_type.as_str()));
     let mut has_foreign_binaries = false;
 
     for s in summaries {
@@ -3058,8 +3371,13 @@ fn write_structural_extensions(
         "struct:packaged_capability",
         (combined.sample_paths.len() as f64 * max_entropy) as f32,
     );
-    w.set("struct:max_nesting_depth_log", 0.0);
-    w.set("struct:inner_file_ratio", 0.0);
+    let depths = if relative { relative_depths(summaries) } else { vec![0; summaries.len()] };
+    w.set("struct:max_nesting_depth_log", f64::from(*depths.iter().max().unwrap_or(&0)).ln_1p() as f32);
+    w.set("struct:inner_file_ratio", depths.iter().filter(|&&d| d > 0).count() as f32 / summaries.len().max(1) as f32);
+    if relative {
+        w.set("agg:hostile_depth_weight", summaries.iter().zip(&depths)
+            .map(|(s, &d)| f64::from(s.findings.hostile_finding_count) * f64::from(d)).sum::<f64>() as f32);
+    }
     if entropies.len() > 1 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
         let var =
@@ -3068,7 +3386,7 @@ fn write_structural_extensions(
         let mx = entropies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:entropy_max_diff", (mx - mean) as f32);
     }
-    w.set("struct:air_gap_signal", f32::from(hostile_files > 0));
+    w.set("struct:air_gap_signal", f32::from(hostile_files > 0 && !summaries.iter().zip(&depths).any(|(s, &d)| d > 0 && s.findings.hostile_finding_count > 0)));
     if !code_entropies.is_empty() {
         let avg_ent = if entropies.is_empty() {
             0.0
@@ -3446,66 +3764,58 @@ fn kv_tokens_with_options(
 ) -> Vec<String> {
     use serde_json::Value;
     let mut tokens = Vec::new();
-    let Some(groups) = metrics.and_then(Value::as_object) else {
-        return tokens;
-    };
-    for (group, fields) in groups {
-        let Some(fields) = fields.as_object() else {
-            continue;
-        };
-        for (key, value) in fields {
-            let base = format!("kv:{group}.{key}");
-            if shape {
-                tokens.push(format!("{base}:exists"));
-            }
-            match value {
-                Value::Bool(b) => {
-                    tokens.push(format!("{base}={b}"));
-                    if shape {
-                        tokens.push(format!("{base}:bool={b}"));
-                    }
+    for (group, key, value) in metric_fields(metrics) {
+        let base = format!("kv:{group}.{key}");
+        if shape {
+            tokens.push(format!("{base}:exists"));
+        }
+        match value {
+            Value::Bool(b) => {
+                tokens.push(format!("{base}={b}"));
+                if shape {
+                    tokens.push(format!("{base}:bool={b}"));
                 }
-                Value::String(s) => {
-                    let val = normalize_vocab_token(s, 80);
-                    if !val.is_empty() {
-                        tokens.push(format!("{base}={val}"));
-                    }
-                    if shape {
-                        tokens.push(format!("{base}:strlen={}", count_bucket(s.chars().count())));
-                        tokens.push(format!(
-                            "{base}:{}",
-                            if s.is_empty() { "empty" } else { "nonempty" }
-                        ));
-                    }
-                    if split {
-                        for part in s.split(|c: char| c.is_whitespace() || ",;:/\\|".contains(c)) {
-                            let part = normalize_vocab_token(part, 64);
-                            if !part.is_empty() {
-                                tokens.push(format!("{base}=part:{part}"));
-                            }
+            }
+            Value::String(s) => {
+                let val = normalize_vocab_token(s, 80);
+                if !val.is_empty() {
+                    tokens.push(format!("{base}={val}"));
+                }
+                if shape {
+                    tokens.push(format!("{base}:strlen={}", count_bucket(s.chars().count())));
+                    tokens.push(format!(
+                        "{base}:{}",
+                        if s.is_empty() { "empty" } else { "nonempty" }
+                    ));
+                }
+                if split {
+                    for part in s.split(|c: char| c.is_whitespace() || ",;:/\\|".contains(c)) {
+                        let part = normalize_vocab_token(part, 64);
+                        if !part.is_empty() {
+                            tokens.push(format!("{base}=part:{part}"));
                         }
                     }
                 }
-                Value::Number(n) if shape => {
-                    if let Some(n) = n.as_f64() {
-                        tokens.push(format!("{base}:number={}", number_bucket(n)));
-                    }
-                }
-                Value::Array(items) if shape => {
-                    tokens.push(format!("{base}:len={}", count_bucket(items.len())));
-                    if items.is_empty() {
-                        tokens.push(format!("{base}:empty"));
-                    }
-                }
-                Value::Object(items) if shape => {
-                    tokens.push(format!("{base}:len={}", count_bucket(items.len())));
-                    if items.is_empty() {
-                        tokens.push(format!("{base}:empty"));
-                    }
-                }
-                Value::Null if shape => tokens.push(format!("{base}:empty")),
-                _ => {}
             }
+            Value::Number(n) if shape => {
+                if let Some(n) = n.as_f64() {
+                    tokens.push(format!("{base}:number={}", number_bucket(n)));
+                }
+            }
+            Value::Array(items) if shape => {
+                tokens.push(format!("{base}:len={}", count_bucket(items.len())));
+                if items.is_empty() {
+                    tokens.push(format!("{base}:empty"));
+                }
+            }
+            Value::Object(items) if shape => {
+                tokens.push(format!("{base}:len={}", count_bucket(items.len())));
+                if items.is_empty() {
+                    tokens.push(format!("{base}:empty"));
+                }
+            }
+            Value::Null if shape => tokens.push(format!("{base}:empty")),
+            _ => {}
         }
     }
     tokens
@@ -3598,6 +3908,43 @@ fn write_symbol_features(
                     }
                 }
             }
+        }
+    }
+}
+
+fn known_metric_getter(name: &str) -> bool {
+    KEY_METRICS.iter().any(|(g, f, _)| name == format!("{g}_{f}"))
+        || matches!(name, "pe_is_dotnet" | "pe_linker_major_version" | "pe_subsystem" | "pe_checksum_missing" | "pe_entry_section_nontext" | "pe_year_distance" | "pe_year_pre_2000" | "pe_year_future"
+            | "text_mixed_indent" | "binary_has_overlay" | "binary_nonstandard_section_name_count"
+            | "derived_string_per_function" | "derived_imports_per_dependency" | "derived_wide_string_ratio"
+            | "derived_imports_per_kb" | "derived_sections_per_kb" | "derived_strings_per_kb"
+            | "text_lines_over_200" | "text_lines_over_500" | "text_lines_over_1000"
+            | "text_lines_in_200_499" | "text_lines_in_500_999")
+
+}
+
+fn derived_metric(name: &str, metrics: &MetricMap, files: &[FileSummary], year: u32) -> f64 {
+    let get = |group: &str, field: &str| metrics.get(group).and_then(|g| g.get(field)).copied().unwrap_or(0.0);
+    let ratio = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+    match name {
+        "pe_year_distance" => if get("pe", "timestamp_year") > 0.0 { (f64::from(year) - get("pe", "timestamp_year")).abs() } else { 0.0 },
+        "pe_entry_section_nontext" => f64::from(files.iter().any(|f| f.entry_section_nontext)),
+        "pe_year_pre_2000" => f64::from(get("pe", "timestamp_year") > 0.0 && get("pe", "timestamp_year") < 2000.0),
+        "pe_year_future" => f64::from(get("pe", "timestamp_year") > 2030.0),
+        "derived_string_per_function" => ratio(get("binary", "string_count"), get("binary", "function_count")),
+        "derived_imports_per_dependency" => ratio(get("binary", "import_count"), get("binary", "dependency_count")),
+        "derived_wide_string_ratio" => ratio(get("binary", "wide_string_count"), get("binary", "string_count")),
+        "derived_imports_per_kb" => ratio(get("binary", "import_count"), get("binary", "file_size") / 1024.0),
+        "derived_sections_per_kb" => ratio(get("binary", "section_count"), get("binary", "file_size") / 1024.0),
+        "derived_strings_per_kb" => ratio(get("binary", "string_count"), get("binary", "file_size") / 1024.0),
+        "text_lines_in_200_499" => (get("text", "lines_over_200") - get("text", "lines_over_500")).max(0.0),
+        "text_lines_in_500_999" => (get("text", "lines_over_500") - get("text", "lines_over_1000")).max(0.0),
+        _ => {
+            let (g, f) = name.split_once('_').unwrap_or(("", ""));
+            let value = get(g, f);
+            if matches!(name, "pe_is_dotnet" | "pe_checksum_missing" | "text_mixed_indent" | "binary_has_overlay") {
+                f64::from(value != 0.0)
+            } else { value }
         }
     }
 }
@@ -3810,6 +4157,65 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn ranked_tokens_keep_strongest_with_stable_ties() {
+        let mut summary = FindingSummary::default();
+        for i in (0..600).rev() {
+            let path = format!("path{i:04}");
+            summary.sample_paths.insert(path.clone(), 3);
+            summary.path_scores.insert(path, 3.0);
+        }
+        summary.sample_paths.insert("strong".into(), 5);
+        summary.path_scores.insert("strong".into(), 4.5);
+        for (order, limit) in [(2, 512), (3, 128), (4, 64)] {
+            let tokens = ranked_tiered_path_tokens(&summary, 3, &HashMap::new(), order);
+            let mut expected: Vec<_> = (0..limit - 1).map(|i| format!("n:path{i:04}")).collect();
+            expected.push("h:strong".into());
+            expected.sort();
+            assert_eq!(tokens, expected);
+        }
+    }
+
+    #[test]
+    fn ranked_score_uses_paired_severity_and_confidence() {
+        let summary = summarize_findings(&[
+            FindingView {
+                id: "a/b::one",
+                crit: 5,
+                conf: 0.7,
+            },
+            FindingView {
+                id: "a/b::two",
+                crit: 3,
+                conf: 1.0,
+            },
+            FindingView {
+                id: "a/b::low",
+                crit: 5,
+                conf: 0.1,
+            },
+        ]);
+        assert_eq!(summary.path_scores["a/b"], 5.0 * f64::from(0.7_f32));
+        assert_eq!(summary.path_scores["a"], 5.0 * f64::from(0.7_f32));
+    }
+
+    #[test]
+    fn ranked_base_paths_select_before_vocabulary_filtering() {
+        let findings: Vec<_> = (0..600)
+            .rev()
+            .map(|i| RawFinding {
+                id: format!("path{i:04}::trait"),
+                conf: 1.0,
+                crit: 3,
+                ..RawFinding::default()
+            })
+            .collect();
+        assert_eq!(
+            ranked_ngram_paths(&findings, 128),
+            (0..128).map(|i| format!("path{i:04}")).collect::<Vec<_>>()
+        );
+    }
+
     fn paths(id: &str) -> Vec<&str> {
         finding_paths(id, default_trait_path_depth()).collect()
     }
@@ -3897,6 +4303,230 @@ mod tests {
             finding_paths("métadata/format::x", 12).collect::<Vec<_>>(),
             ["métadata", "métadata/format"]
         );
+    }
+
+    #[test]
+    fn renamed_metrics_resolve_for_numbers_and_categorical_tokens() {
+        for &(old_group, old_key, new_group, new_key) in METRIC_RENAMES {
+            for value in [
+                serde_json::json!(5.27),
+                serde_json::json!(true),
+                serde_json::json!("signed"),
+            ] {
+                let mut metrics = serde_json::json!({});
+                metrics[new_group] = serde_json::json!({new_key: value});
+                let original = metrics.clone();
+                let fields: Vec<_> = metric_fields(Some(&metrics)).collect();
+                assert!(fields.contains(&(old_group, old_key, &value)));
+                if value.is_number() || value.is_boolean() {
+                    assert_eq!(
+                        numeric_metrics(Some(&metrics))[old_group][old_key],
+                        if value.is_boolean() { 1.0 } else { 5.27 }
+                    );
+                } else {
+                    assert!(
+                        kv_tokens(Some(&metrics))
+                            .contains(&format!("kv:{old_group}.{old_key}=signed"))
+                    );
+                }
+                assert!(
+                    kv_tokens_with_options(Some(&metrics), true, false)
+                        .contains(&format!("kv:{old_group}.{old_key}:exists"))
+                );
+                assert_eq!(metrics, original, "aliasing must not mutate the report");
+            }
+        }
+    }
+
+    #[test]
+    fn metric_aliases_preserve_explicit_values_and_malformed_groups() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!("old"),
+        ] {
+            let metrics = serde_json::json!({"file": {"entropy": 5.27}, "binary": {"overall_entropy": value}});
+            let fields: Vec<_> = metric_fields(Some(&metrics)).collect();
+            let old: Vec<_> = fields
+                .iter()
+                .filter(|(g, k, _)| *g == "binary" && *k == "overall_entropy")
+                .collect();
+            assert_eq!(old.len(), 1);
+            assert_eq!(old[0].2, &value);
+        }
+        for group in [
+            serde_json::Value::Null,
+            serde_json::json!(3),
+            serde_json::json!([]),
+        ] {
+            let metrics = serde_json::json!({"file": {"entropy": 5.27}, "binary": group});
+            assert!(
+                !metric_fields(Some(&metrics))
+                    .any(|(g, k, _)| g == "binary" && k == "overall_entropy")
+            );
+        }
+        assert_eq!(metric_fields(None).count(), 0);
+    }
+
+    #[test]
+    fn member_metadata_is_independent_of_archive_depth() {
+        let names = [
+            "present:objectives",
+            "maxcrit:objectives",
+            "score:hopper_score",
+            "score:density",
+            "inter:javascript*score",
+            "formula:skeleton_len",
+            "formula:unique_elements",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let spec = anchor_spec(vec!["objectives".into()], vec![], vec![], names);
+        let ctx = ExtractContext::new(&spec);
+        for score in [0, 124] {
+            for formula in [None, Some("O₂H₄")] {
+                let mut file: cleave::types::CompactFile =
+                    serde_json::from_value(serde_json::json!({
+                        "id": 7, "sha": "member", "path": "pkg.vsix!!main.js",
+                        "type": "javascript", "size": 2048, "risk": score,
+                        "mol": formula,
+                        "traits": [{"id": "objectives/execution::shell", "conf": 1.0, "crit": 4}]
+                    }))
+                    .expect("member fixture");
+                let expected = ctx.extract_from_parsed(&ParsedReport::from_compact_files(
+                    &[&file],
+                    ctx.raw_needs(),
+                ));
+                for depth in [0, 1, 3] {
+                    file.depth = depth;
+                    let parsed = ParsedReport::from_compact_file(&file, ctx.raw_needs());
+                    assert_eq!(parsed.sample_score, score);
+                    assert_eq!(parsed.formula_str, formula.unwrap_or(""));
+                    assert_eq!(
+                        parsed.elements_str,
+                        if formula.is_some() { "OH" } else { "" }
+                    );
+                    assert_eq!(ctx.extract_from_parsed(&parsed), expected, "depth {depth}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn archive_depths_are_relative_order_independent_and_cycle_safe() {
+        let root = FileSummary { id: Some(10), depth: 2, ..Default::default() };
+        let child = FileSummary { id: Some(20), parent: Some(10), depth: 3, ..Default::default() };
+        let nested = FileSummary { id: Some(30), parent: Some(20), ..Default::default() };
+        assert_eq!(relative_depths(&[root.clone(), child.clone(), nested.clone()]), vec![0, 1, 2]);
+        assert_eq!(relative_depths(&[nested, child.clone(), root]), vec![2, 1, 0]);
+        assert_eq!(relative_depths(&[child]), vec![0]);
+        let cycle = [FileSummary { id: Some(1), parent: Some(2), ..Default::default() },
+                     FileSummary { id: Some(2), parent: Some(1), ..Default::default() }];
+        assert_eq!(relative_depths(&cycle), vec![0, 0]);
+        let chain: Vec<_> = (0..5000u32).rev().map(|id| FileSummary {
+            id: Some(id), parent: id.checked_sub(1), ..Default::default()
+        }).collect();
+        assert_eq!(relative_depths(&chain)[0], 4999);
+    }
+
+    #[test]
+    fn explicit_metric_transform_overrides_legacy_defaults() -> Result<()> {
+        for (transform, expected) in [("identity", 9.0_f32), ("log1p_abs", 10.0_f32.ln())] {
+            let mut file = tempfile::NamedTempFile::new()?;
+            let value = serde_json::json!({
+                "version":21,"abi_version":21,"presence_vocab":["metadata"],
+                "feature_names":["metrics:text_max_inline_whitespace_run"],"total_features":1,
+                "metric_transforms":{"text_max_inline_whitespace_run":transform},"standardized":false
+            });
+            serde_json::to_writer(&mut file, &value)?;
+            let spec = FeatureSpec::load(file.path())?;
+            let report = serde_json::from_value(serde_json::json!({"v":"8","files":[{
+                "id":0,"path":"test.go","type":"go","sha":"fixture","size":100,
+                "facts":{"metrics":{"text":{"max_inline_whitespace_run":9}}}
+            }]}))?;
+            assert!((ExtractContext::new(&spec).extract(&report)[0] - expected).abs() < 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn new_metric_contract_is_required_and_legacy_abi_defaults_to_version() -> Result<()> {
+        for (version, transforms, succeeds) in [(20, None, true), (21, None, false),
+            (21, Some("identity"), true), (21, Some("log10"), false)] {
+            let mut file = tempfile::NamedTempFile::new()?;
+            let mut value = serde_json::json!({"version":version,"presence_vocab":["metadata"],
+                "feature_names":["metrics:text_max_inline_whitespace_run"],"total_features":1,"standardized":false});
+            if let Some(t) = transforms { value["metric_transforms"] = serde_json::json!({"text_max_inline_whitespace_run":t}); }
+            serde_json::to_writer(&mut file, &value)?;
+            let result = FeatureSpec::load(file.path());
+            assert_eq!(result.is_ok(), succeeds, "{value}");
+            if let Ok(spec) = result { assert_eq!(spec.abi_version, version); }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_metadata_still_comes_only_from_root() {
+        let report: cleave::types::CompactReport = serde_json::from_value(
+            serde_json::json!({"v": "8", "files": [
+                {"id": 1, "sha": "member", "path": "pkg.vsix!!main.js", "type": "javascript", "size": 2048,
+                 "depth": 1, "risk": 124, "mol": "O₂"},
+                {"id": 0, "sha": "root", "path": "pkg.vsix", "type": "vsix", "size": 4096,
+                 "depth": 0, "risk": 10, "mol": "H₄"}
+            ]}),
+        ).expect("aggregate fixture");
+        let parsed = ParsedReport::from_compact_report(&report, RawNeeds::all(), None);
+        assert_eq!(parsed.sample_score, 10);
+        assert_eq!(parsed.formula_str, "H₄");
+        assert_eq!(parsed.summaries.len(), 2);
+        let keep = ["member".to_owned()].into_iter().collect();
+        let filtered = ParsedReport::from_compact_report(&report, RawNeeds::all(), Some(&keep));
+        assert_eq!(filtered.sample_score, 0);
+        assert!(filtered.formula_str.is_empty());
+        assert_eq!(filtered.summaries.len(), 1);
+    }
+
+    /// Unlike report parity, this exercises the entry point used to grade an
+    /// embedded file. Expected vectors must come from its training DB row.
+    #[test]
+    #[ignore = "needs SCAN_MODELS_DIR with a member training extraction fixture"]
+    fn member_features_match_training_fixture() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Sample {
+            report: cleave::types::CompactReport,
+            expected_features: Vec<f32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            samples: Vec<Sample>,
+        }
+        let dir = std::path::PathBuf::from(std::env::var("SCAN_MODELS_DIR")?);
+        let spec = FeatureSpec::load(&dir.join("feature_spec.json"))?;
+        let fixture: Fixture =
+            serde_json::from_slice(&std::fs::read(dir.join("extraction_fixture.json"))?)?;
+        assert!(!fixture.samples.is_empty());
+        let ctx = ExtractContext::new(&spec);
+        for sample in fixture.samples {
+            assert_eq!(
+                sample.report.files.len(),
+                1,
+                "fixture must contain only the graded member"
+            );
+            let parsed = ParsedReport::from_compact_file(&sample.report.files[0], ctx.raw_needs());
+            let actual = ctx.extract_from_parsed(&parsed);
+            assert_eq!(actual.len(), sample.expected_features.len());
+            for (i, (actual, expected)) in actual.iter().zip(&sample.expected_features).enumerate()
+            {
+                assert!(
+                    actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-5,
+                    "{}: serving={actual}, training={expected}",
+                    spec.feature_names[i]
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -4024,6 +4654,10 @@ mod tests {
             rare_element_vocab: vec![],
             trigram_vocab: vec![],
             metric_vocab: vec![],
+            metric_transforms: None,
+            metric_getters: Vec::new(),
+            metric_reference_year: 0,
+            metric_correlations: HashMap::new(),
             crit_unigram_vocab: vec![],
             crit_bigram_vocab: vec![],
             crit_trigram_vocab: vec![],
@@ -4089,6 +4723,10 @@ mod tests {
             skeleton_vocab: vec![],
             rare_element_vocab: vec![],
             metric_vocab: vec![],
+            metric_transforms: None,
+            metric_getters: Vec::new(),
+            metric_reference_year: 0,
+            metric_correlations: HashMap::new(),
             crit_unigram_vocab: vec![],
             crit_bigram_vocab: vec![],
             crit_trigram_vocab: vec![],

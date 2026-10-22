@@ -1311,6 +1311,9 @@ fn serve(
     eprintln!("Starting Atomdrift Scan server on http://{} ...", args.bind);
     let runtime = daemon_runtime()?;
     let served = runtime.block_on(scan::server::run(config));
+    // Runtime shutdown may abandon blocking analyses. Close child admission
+    // and kill live tool groups while their supervisors still exist.
+    cleave::kill_all_rizin_groups();
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     served?;
     Ok(ExitCode::SUCCESS)
@@ -1365,6 +1368,7 @@ fn worker(
     .inspect_err(|e| eprintln!("Worker startup failed: {e:#}"))?;
     let runtime = daemon_runtime()?;
     let exit = runtime.block_on(scan::worker::run(config));
+    cleave::kill_all_rizin_groups();
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     Ok(ExitCode::from(exit?.code()))
 }

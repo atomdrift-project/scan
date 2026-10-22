@@ -23,12 +23,11 @@
 //!     own subtree before exec, and `PROC_REAP_KILL` delivers a signal to
 //!     every descendant however they have rearranged their process groups.
 //!
-//! Every other unix (macOS, for development) falls back to signalling the
-//! process group. That is best-effort and deliberately not the production
-//! story; the fleet is Linux and FreeBSD. Windows has neither a real primitive
-//! nor a best-effort one -- a job object can terminate, never suspend -- so it
-//! declines to run an idle worker at all rather than report a freeze it did
-//! not perform.
+//! Other Unix platforms fall back to signalling the process group. macOS
+//! declines to run an idle worker: rizin's private groups escape that fallback,
+//! leaving tools running while their timeout supervisor is stopped. Windows
+//! has neither a real primitive nor a best-effort one -- a job object can
+//! terminate, never suspend -- so it also declines to run an idle worker.
 //!
 //! Freezing is preferred to killing because it costs nothing: `SIGCONT` resumes
 //! a half-finished analysis where it stopped, so the latency win does not buy
@@ -402,7 +401,10 @@ mod imp {
     }
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))
+))]
 mod imp {
     use super::io;
     use std::os::unix::process::CommandExt;
@@ -457,13 +459,14 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod imp {
     use super::io;
     use std::process::Command;
 
-    /// Windows has no primitive this module can honestly use. A job object is
-    /// the right shape — membership, not a process group — but it can only
+    /// These platforms cannot suspend this worker's complete process tree.
+    /// macOS process-group signalling misses rizin's private groups. A Windows
+    /// job object acts on membership, but it can only
     /// terminate a job, never suspend one, and suspending is the whole point:
     /// freezing costs nothing because `SIGCONT` resumes a half-finished
     /// analysis where it stopped. There is no supported per-job equivalent.
@@ -481,7 +484,7 @@ mod imp {
     fn unsupported() -> io::Error {
         io::Error::new(
             io::ErrorKind::Unsupported,
-            "no idle worker on Windows: nothing here can suspend a process tree by membership",
+            "idle worker unavailable: this platform cannot suspend a process tree by membership",
         )
     }
 
@@ -549,6 +552,14 @@ mod tests {
             }
             Err(e) => panic!("spawn: {e}"),
         }
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn uncontained_platform_refuses_to_start_an_idle_worker() {
+        let err = Idle::spawn(Command::new("unused"))
+            .expect_err("a worker with escaping analysis groups must not start");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]
