@@ -34,14 +34,17 @@ struct Stamp {
     checked_unix: u64,
 }
 
-/// Path to the stamp (`<cache_dir>/atomdrift/scan/rules-update.toml`).
+/// Path to the stamp (`<cache_dir>/atomdrift/scan/rules-update.toml`), one per
+/// rules channel: the enriched tree goes stale on its own clock, and a host
+/// that switches to `--enriched` must not inherit the open-source tree's
+/// "checked an hour ago".
 fn stamp_path() -> Option<PathBuf> {
-    Some(
-        dirs::cache_dir()?
-            .join("atomdrift")
-            .join("scan")
-            .join("rules-update.toml"),
-    )
+    let name = if cleave::enriched::enabled() {
+        "rules-update-enriched.toml"
+    } else {
+        "rules-update.toml"
+    };
+    Some(dirs::cache_dir()?.join("atomdrift").join("scan").join(name))
 }
 
 /// Current Unix time in seconds (0 if the clock predates the epoch).
@@ -82,15 +85,25 @@ fn write_stamp() {
 /// banner's. `terminal` gates the transient/checkmark UI: a non-terminal run
 /// still refreshes, silently.
 ///
-/// Always best-effort: network or update failures are logged at debug level and
+/// Best-effort: network or update failures are logged at debug level and
 /// never block or fail the scan. Stamps every attempt so a stale or offline
 /// bucket can't cause a refresh storm.
-pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool) {
+///
+/// # Errors
+/// The one failure that is not best-effort: `--enriched` was asked for and the
+/// token is missing or refused. Scanning on with other rules would answer a
+/// question nobody asked.
+pub fn refresh_if_stale(
+    force: bool,
+    disabled: bool,
+    mode: Mode,
+    terminal: bool,
+) -> anyhow::Result<()> {
     if disabled || std::env::var_os("SCAN_NO_UPDATE").is_some() {
-        return;
+        return Ok(());
     }
     if !force && now_unix().saturating_sub(last_checked()) < CHECK_INTERVAL_SECS {
-        return;
+        return Ok(());
     }
 
     if terminal {
@@ -102,10 +115,17 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
     // Always stamp the attempt — success *or* failure — so an offline host
     // records that it tried and won't re-check (and re-time-out) every run; the
     // next attempt is a day away, or immediate with `-u`/`update-rules`.
+    if let Some(refused) = outcome.refused {
+        if terminal {
+            eprint!("\r\x1b[2K");
+        }
+        // Not stamped: the next run must try again, not wait a day.
+        return Err(anyhow::anyhow!(refused));
+    }
     write_stamp();
 
     if !terminal {
-        return;
+        return Ok(());
     }
     // Resolve the transient line:
     //   - a real update earns a checkmark;
@@ -123,6 +143,7 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
         eprint!("\r\x1b[2K");
         let _ = std::io::stderr().flush();
     }
+    Ok(())
 }
 
 /// Whether a refresh installed anything new, and whether any of the three
@@ -130,6 +151,8 @@ pub fn refresh_if_stale(force: bool, disabled: bool, mode: Mode, terminal: bool)
 struct Outcome {
     changed: bool,
     failed: bool,
+    /// Why `--enriched` cannot be honoured, when it cannot.
+    refused: Option<String>,
 }
 
 /// Refresh the three bundle types — traits, models, bloom filters — concurrently
@@ -155,11 +178,15 @@ fn refresh() -> Outcome {
     let mut outcome = Outcome {
         changed: false,
         failed: false,
+        refused: None,
     };
     for (bundle, result) in results {
         match result {
             Ok(Ok(changed)) => outcome.changed |= changed,
             Ok(Err(e)) => {
+                if let Some(why) = crate::traits_repo::enriched_refusal(&e) {
+                    outcome.refused = Some(why.to_owned());
+                }
                 outcome.failed = true;
                 tracing::debug!(bundle, error = format!("{e:#}"), "auto update failed");
             }

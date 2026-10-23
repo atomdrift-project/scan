@@ -22,8 +22,9 @@ use super::flight::{Attachment, FlightKey, Outcome};
 use super::handlers::{normalize_pkg_purl, pick_verdict, sanitize_upload_filename, valid_http_url};
 use crate::model::Level;
 
-/// Query for `GET /v1/lookup` and `POST /v1/analyze`. `purl` and `url` repeat;
-/// `sha256` names one artifact.
+/// Query for `GET /v1/lookup` and `POST /v1/analyze`. `purl`, `url` and
+/// `sha256` repeat; one `sha256` names one artifact, and only a lookup takes
+/// several.
 ///
 /// Parsed from the raw query rather than through `Query<T>`: a repeated key is
 /// a sequence, and `serde_urlencoded` — what axum's `Query` is built on —
@@ -32,7 +33,7 @@ use crate::model::Level;
 pub(super) struct V1LookupQuery {
     purl: Vec<String>,
     url: Vec<String>,
-    sha256: Option<String>,
+    sha256: Vec<String>,
     /// How many false positives per 100 million benign files the caller will
     /// tolerate. Chosen by them, unlike `fires_at`, which is measured.
     false_positive_budget: Option<u16>,
@@ -116,7 +117,7 @@ impl V1LookupQuery {
         let mut q = Self {
             purl: Vec::new(),
             url: Vec::new(),
-            sha256: None,
+            sha256: Vec::new(),
             false_positive_budget: None,
             bad_budget: None,
             force: false,
@@ -129,7 +130,7 @@ impl V1LookupQuery {
             match key.as_ref() {
                 "purl" => q.purl.push(value.into_owned()),
                 "url" => q.url.push(value.into_owned()),
-                "sha256" => q.sha256 = Some(value.into_owned()),
+                "sha256" => q.sha256.push(value.into_owned()),
                 "false_positive_budget" => match value.parse::<u16>() {
                     Ok(n) => q.false_positive_budget = Some(n),
                     Err(_) => q.bad_budget = Some(value.into_owned()),
@@ -233,14 +234,14 @@ impl V1Analyze {
             |code, message: &'static str| Box::new(ApiError::bad_request(code, message).v1());
         let locators = usize::from(!q.purl.is_empty())
             + usize::from(!q.url.is_empty())
-            + usize::from(q.sha256.is_some());
-        if locators > 1 {
+            + usize::from(!q.sha256.is_empty());
+        if locators > 1 || q.sha256.len() > 1 {
             return Err(reject(
                 "multiple_locators",
                 "Use ?purl=, ?url=, or ?sha256=, not more than one.",
             ));
         }
-        if let Some(raw_sha) = q.sha256.as_deref()
+        if let Some(raw_sha) = q.sha256.first()
             && burton::parse_sha256_hex(raw_sha).is_none()
         {
             return Err(reject(
@@ -248,13 +249,13 @@ impl V1Analyze {
                 "sha256 must be 64 hexadecimal characters.",
             ));
         }
-        if q.sha256.is_some() && !q.refresh {
+        if !q.sha256.is_empty() && !q.refresh {
             return Err(reject(
                 "refresh_required",
                 "?sha256= on /v1/analyze requires refresh=1.",
             ));
         }
-        if q.refresh && q.sha256.is_none() {
+        if q.refresh && q.sha256.is_empty() {
             return Err(if q.purl.is_empty() && q.url.is_empty() {
                 reject("missing_sha256", "refresh=1 requires ?sha256=.")
             } else {
@@ -623,7 +624,7 @@ fn repair(state: &AppState, request_id: u64, filename: &str, sha: &str, bytes: b
 /// when hopper's verdict is missing or from other traits.
 async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap) -> Response {
     let request_id = req.request_id;
-    let Some(sha) = req.q.sha256.as_deref().map(str::to_ascii_lowercase) else {
+    let Some(sha) = req.q.sha256.first().map(|sha| sha.to_ascii_lowercase()) else {
         return ApiError::bad_request("missing_sha256", "refresh=1 requires ?sha256=.").v1();
     };
     // The local index is already namespaced by the currently loaded traits
@@ -1256,7 +1257,18 @@ pub(super) async fn v1_lookup(
 
 async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Response, ApiError> {
     let budget = q.budget(state.config.level)?;
-    let sha = q.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let shas: Vec<&str> = q
+        .sha256
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // One digest pairs with a PURL naming the same bytes. Several digests are
+    // several artifacts, listed the way several PURLs are.
+    let sha = match shas.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    };
     let purls: Vec<&str> = q
         .purl
         .iter()
@@ -1276,19 +1288,25 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Res
             "Use ?purl= or ?url=, not both.",
         ));
     }
+    if shas.len() > 1 && (!purls.is_empty() || !urls.is_empty()) {
+        return Err(ApiError::bad_request(
+            "multiple_locators",
+            "Several sha256 values name several artifacts; send them without ?purl= or ?url=.",
+        ));
+    }
     if urls.iter().any(|url| !valid_http_url(url)) {
         return Err(ApiError::bad_request(
             "invalid_url",
             "url must be an absolute http or https URL.",
         ));
     }
-    if sha.is_none() && purls.is_empty() && urls.is_empty() {
+    if shas.is_empty() && purls.is_empty() && urls.is_empty() {
         return Err(ApiError::bad_request(
             "missing_package",
             "Name an artifact with ?purl=, ?url=, or ?sha256=.",
         ));
     }
-    let named = purls.len().max(urls.len());
+    let named = purls.len().max(urls.len()).max(shas.len());
     if named > V1_MAX_KEYS {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1314,7 +1332,7 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Res
 
     // One package named two ways is one question, so a lone sha256 and a lone
     // purl resolve together rather than as two entries.
-    if purls.len() <= 1 {
+    if shas.len() <= 1 && purls.len() <= 1 {
         let purl = purls.first().copied();
         let key = Key::parse(sha, purl, None)?;
         let (decided, source) = decide(state, &key, budget, q.fresh).await;
@@ -1323,20 +1341,32 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Res
 
     // A key we cannot parse is the caller's mistake and stops the whole call,
     // because answering the rest would hide it.
-    let keys = purls
-        .iter()
-        .map(|purl| Key::parse(None, Some(purl), None))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (keys, asked): (Vec<Key>, Vec<Option<&str>>) = if shas.len() > 1 {
+        (
+            shas.iter()
+                .map(|sha| Key::parse(Some(sha), None, None))
+                .collect::<Result<_, _>>()?,
+            vec![None; shas.len()],
+        )
+    } else {
+        (
+            purls
+                .iter()
+                .map(|purl| Key::parse(None, Some(purl), None))
+                .collect::<Result<_, _>>()?,
+            purls.iter().copied().map(Some).collect(),
+        )
+    };
     let decided = decide_many(state, keys, budget, q.fresh).await;
     let mut source = None;
     let mut out = Vec::with_capacity(decided.len());
-    for ((decided, row_source), purl) in decided.into_iter().zip(&purls) {
+    for ((decided, row_source), purl) in decided.into_iter().zip(asked) {
         source = Some(match source {
             None => row_source,
             Some(previous) if previous == row_source => previous,
             Some(_) => "scan:analysis",
         });
-        out.push(decided.asked_about(Some(purl)));
+        out.push(decided.asked_about(purl));
     }
     Ok(sourced(Json(out), source.unwrap_or("scan:analysis")))
 }

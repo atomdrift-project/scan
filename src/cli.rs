@@ -197,6 +197,30 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_update: bool,
 
+    /// Use isotope13 Enriched: the private ruleset, fresh the hour it clears
+    /// QA, and remote verdicts (see `--analyze`). Requires a subscription token
+    /// from `ISOTOPE13_TOKEN` or the saved one, and asks for one on a terminal.
+    /// Also settable via `ATOMDRIFT_ENRICHED=1`.
+    #[arg(long, global = true, env = "ATOMDRIFT_ENRICHED", value_parser = clap::builder::FalseyValueParser::new())]
+    pub enriched: bool,
+
+    /// Where artifacts are judged. `auto` (the default) asks isotope13 for a
+    /// verdict it already holds — sending only the SHA-256 of local files of
+    /// 1 MiB or more, and the PURLs of packages on mainstream public registries — and analyzes
+    /// locally whatever it does not know; it needs `--enriched`, and without
+    /// it is the same as `local`. `local` never asks, and is the reproducible
+    /// mode. `remote` sends everything to isotope13 for analysis, uploading
+    /// local files' contents, and needs `--enriched`. Also settable via
+    /// `SCAN_ANALYZE`.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "auto",
+        env = "SCAN_ANALYZE"
+    )]
+    pub analyze: crate::remote::Analyze,
+
     /// Force light-background color theme
     #[arg(long, global = true, conflicts_with = "dark")]
     pub light: bool,

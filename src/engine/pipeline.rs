@@ -1983,6 +1983,7 @@ mod tests {
             fires_at: Level::At(2),
             reason: reason.map(String::from),
             findings,
+            ..Verdict::default()
         };
         assert_eq!(
             adopted_detail(&verdict(Some("steals credentials"), Vec::new())).as_deref(),

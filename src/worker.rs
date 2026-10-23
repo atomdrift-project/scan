@@ -917,7 +917,7 @@ impl RulesStartup {
         crate::refresh_rules_at_startup(
             self.refresh == Refresh::Force,
             self.refresh == Refresh::Skip,
-        );
+        )?;
         let model_dir = crate::cli::resolve_model_dir(self.model_dir)?;
         let level = crate::cli::operating_level(self.level, self.thresholds.is_some(), &model_dir);
         Ok(Rules {
@@ -1386,6 +1386,16 @@ fn renew_resources_once(rules: &Rules) -> Result<Option<Arc<ModelResources>>> {
     };
     let traits_changed = match crate::traits_repo::update(false, true) {
         Ok(changed) => changed,
+        // A refused enriched token is not an outage to ride out quietly: the
+        // fleet goes on serving the rules it has, and says so at error level
+        // on every renewal until someone fixes the subscription.
+        Err(error) if crate::traits_repo::enriched_refusal(&error).is_some() => {
+            tracing::error!(
+                reason = crate::traits_repo::enriched_refusal(&error).unwrap_or_default(),
+                "enriched rules refused at renewal; serving the installed rules"
+            );
+            false
+        }
         Err(error) => {
             tracing::warn!(error = %error, "traits renewal fetch failed; treating traits as unchanged");
             false

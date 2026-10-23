@@ -81,6 +81,7 @@ pub mod output;
 pub mod pkg;
 pub mod provenance;
 pub mod ps;
+pub mod remote;
 pub mod runtime;
 pub mod server;
 pub(crate) mod suspend;
@@ -257,28 +258,39 @@ pub const RAYON_STACK_MB: usize = 256;
 /// This is also the step that populates a `--traits-dir` pointing at an empty
 /// state directory on a fresh deploy. Without it a server starts, reports
 /// healthy, and fails every analysis on a traits path that was never created.
-pub fn refresh_rules_at_startup(force: bool, no_update: bool) {
+///
+/// # Errors
+/// The one failure that is fatal: `--enriched` was asked for and the token is
+/// missing or refused. A daemon that came up anyway would serve rules nobody
+/// deployed it with.
+pub fn refresh_rules_at_startup(force: bool, no_update: bool) -> anyhow::Result<()> {
     if no_update {
         tracing::warn!("--no-update: skipping startup model/traits refresh");
-        return;
+        return Ok(());
     }
-    std::thread::scope(|s| {
+    let traits = std::thread::scope(|s| {
         s.spawn(|| {
             let dir = models_repo::install_target();
             if let Err(e) = model_update::update(&dir, force, false) {
                 tracing::warn!(dir = %dir.display(), error = format!("{e:#}"), "model update failed");
             }
         });
-        s.spawn(|| {
-            if let Err(e) = traits_repo::update(force, false) {
-                tracing::warn!(
-                    dir = %cleave::traits_repo::install_target().display(),
-                    error = format!("{e:#}"),
-                    "traits update failed",
-                );
-            }
-        });
+        s.spawn(|| traits_repo::update(force, false))
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("traits update panicked")))
     });
+    match traits {
+        Ok(_) => Ok(()),
+        Err(e) if traits_repo::enriched_refusal(&e).is_some() => Err(e),
+        Err(e) => {
+            tracing::warn!(
+                dir = %cleave::traits_repo::install_target().display(),
+                error = format!("{e:#}"),
+                "traits update failed",
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

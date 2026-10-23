@@ -43,6 +43,22 @@ pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
     let Some(purl) = fletch::purl::normalize(&prefixed) else {
         anyhow::bail!("not a package URL: {raw} (expected pkg:<type>/<name>[@version])");
     };
+    // isotope13 first, under `--enriched`: a package it already judges is
+    // answered without being fetched; under `remote` it fetches the package
+    // itself. Anything else goes through the fetch below, whose bytes get a
+    // second chance by digest.
+    match crate::remote::mode() {
+        crate::remote::Analyze::Auto => {
+            if let Some((sha, verdict)) = crate::remote::known_purl(&purl) {
+                return crate::engine::report_remote(config, &purl, &sha, Some(&purl), &verdict);
+            }
+        }
+        crate::remote::Analyze::Remote => {
+            let (sha, verdict) = crate::remote::analyze(crate::remote::Upload::Purl(&purl))?;
+            return crate::engine::report_remote(config, &purl, &sha, Some(&purl), &verdict);
+        }
+        crate::remote::Analyze::Local => {}
+    }
     run(RefLocator::Purl(purl), config)
 }
 

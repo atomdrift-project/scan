@@ -121,6 +121,42 @@ async fn repeated_purl_answers_with_a_list() -> Result<()> {
     Ok(())
 }
 
+/// Several digests are several artifacts — a directory of files — asked in
+/// one request and answered as a list in the order asked.
+#[tokio::test]
+async fn repeated_sha256_answers_with_a_list() -> Result<()> {
+    let (a, b) = ("1".repeat(64), "2".repeat(64));
+    let (status, body) = get(&format!(
+        "/v1/lookup?sha256={a}&sha256={}",
+        b.to_uppercase()
+    ))
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body
+        .as_array()
+        .context("repeated sha256 must answer with a list")?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["sha256"], a);
+    assert_eq!(rows[1]["sha256"], b);
+    Ok(())
+}
+
+/// One digest pairs with a PURL naming the same bytes; several cannot, because
+/// there is no saying which of them the PURL describes.
+#[tokio::test]
+async fn several_sha256_cannot_pair_with_a_purl() -> Result<()> {
+    let uri = format!(
+        "/v1/lookup?sha256={}&sha256={}&purl={}",
+        "1".repeat(64),
+        "2".repeat(64),
+        encoded_purl(UNKNOWN)
+    );
+    let (status, body) = get(&uri).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "multiple_locators");
+    Ok(())
+}
+
 /// Over the cap is a request we decline whole, naming the limit and the route
 /// that has no limit. Discovering it as a truncated query string instead would
 /// silently drop packages from a security decision.

@@ -19,10 +19,12 @@ use super::{
     prefetch_cleave_resources,
 };
 use crate::bloom_repo::Decision as BloomDecision;
+use crate::corpus_precheck::Verdict;
 use crate::explain::ShapImportance;
 use crate::model::{Classification, Model};
 use crate::output::BloomMark;
 use crate::provenance::RegistryProvenance;
+use crate::remote::Analyze;
 use crate::{Mode, OutputFormat};
 
 /// Run a scan against a file or directory tree.
@@ -83,6 +85,9 @@ pub fn run_paths(
         }
     }
     session.show_progress(files.len() + dir_files.len());
+    // Each batch keeps its own policy, so each is offered to isotope13 alone.
+    let files = session.judge_remotely(files);
+    let dir_files = session.judge_remotely(dir_files);
     scan_partitioned(&session, &files, dir_files, registry_map)?;
     session.finish()
 }
@@ -191,6 +196,27 @@ pub fn run_bytes(
     // lazy build then runs on this main thread, so there is no rayon re-entrancy
     // to guard against. Directory/worker paths still prefetch (they do fan out).
     let session = Session::start(config)?;
+    // isotope13 first, under `--enriched`: by digest in `auto`, by upload in
+    // `remote`. A registry document standing in for an unfetchable package is
+    // never asked about — its bytes differ on every fetch.
+    if registry_fallback_purl.is_none() {
+        match crate::remote::mode() {
+            Analyze::Auto => {
+                if let Some((sha, verdict)) = crate::remote::known_bytes(&bytes) {
+                    session.record_remote(label, &sha, None, &verdict);
+                    return session.finish();
+                }
+            }
+            Analyze::Remote => {
+                match crate::remote::analyze(crate::remote::Upload::Bytes(bytes)) {
+                    Ok((sha, verdict)) => session.record_remote(label, &sha, None, &verdict),
+                    Err(error) => session.report_error(Path::new(label), &error),
+                }
+                return session.finish();
+            }
+            Analyze::Local => {}
+        }
+    }
     // Content-digest short-circuit happens inside cleave via the skip predicate,
     // complementing the PURL gate in `pkg.rs`: it catches known *content* even
     // when the package locator was not in the filter. `record` emits the verdict
@@ -209,6 +235,23 @@ pub fn run_bytes(
         ..Target::new(origin, true)
     };
     session.record(&target, analyzed);
+    session.finish()
+}
+
+/// Report one artifact isotope13 judged with nothing fetched or analyzed here
+/// — a `scan purl` answered by its coordinate — as a one-artifact scan.
+///
+/// # Errors
+/// As [`run_paths`].
+pub fn report_remote(
+    config: &ScanConfig,
+    label: &str,
+    sha: &str,
+    purl: Option<&str>,
+    verdict: &Verdict,
+) -> Result<ScanSummary> {
+    let session = Session::start(config)?;
+    session.record_remote(label, sha, purl, verdict);
     session.finish()
 }
 
@@ -407,6 +450,79 @@ impl<'a> Session<'a> {
         match classified {
             Ok(result) => self.report(target, result),
             Err(error) => self.report_error(target.origin.path, &error),
+        }
+    }
+
+    /// Hand files to isotope13 under `--enriched`, and return the ones left to
+    /// analyze here. `auto` answers the files it already judges; `remote` sends
+    /// every file and leaves none; `local` keeps them all.
+    fn judge_remotely(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+        match crate::remote::mode() {
+            Analyze::Local => files,
+            Analyze::Auto => {
+                let (answered, rest) = crate::remote::answer_known(files);
+                for (path, sha, verdict) in &answered {
+                    self.record_remote(&path.display().to_string(), sha, None, verdict);
+                }
+                rest
+            }
+            Analyze::Remote => {
+                for path in &files {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match crate::remote::analyze(crate::remote::Upload::File(path)) {
+                        Ok((sha, verdict)) => {
+                            self.record_remote(&path.display().to_string(), &sha, None, &verdict);
+                        }
+                        Err(error) => {
+                            self.advance();
+                            self.report_error(path, &error);
+                        }
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Account for one artifact isotope13 judged, as [`Self::report`] does for
+    /// one analyzed here: graded at this run's level, tallied, and shown under
+    /// the same rules.
+    fn record_remote(&self, label: &str, sha: &str, purl: Option<&str>, verdict: &Verdict) {
+        self.advance();
+        let Some(class) = crate::remote::classification(verdict.fires_at, self.config.level())
+        else {
+            tracing::warn!(label, sha, "remote verdict has no level; not counted");
+            return;
+        };
+        self.tally.count(class);
+        let shown = matches!(
+            self.config.format(),
+            OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
+        ) || self.config.filter().shows(&class);
+        if !shown || self.broken_pipe.load(Ordering::Relaxed) {
+            return;
+        }
+        let write = || {
+            let mut out = io::stdout().lock();
+            crate::output::write_remote_verdict(
+                &mut out,
+                label,
+                sha,
+                purl,
+                verdict,
+                class,
+                self.config.format(),
+            )
+            .and_then(|()| out.flush())
+        };
+        let written = match &self.progress {
+            Some(progress) => progress.around_result(write),
+            None => write(),
+        };
+        if let Err(error) = written {
+            self.output_failed(&error);
         }
     }
 

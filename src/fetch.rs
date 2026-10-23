@@ -2405,6 +2405,24 @@ impl FetchSession {
             })
             .map(|r| locator(r).to_owned())
             .collect();
+        // Hopper is ours; isotope13 is told only public-registry coordinates.
+        // The rest are fetched and asked about by digest.
+        let candidates = if precheck.is_isotope13() {
+            let (public, withheld): (Vec<String>, Vec<String>) = candidates
+                .into_iter()
+                .partition(|purl| crate::remote::public_purl(purl));
+            if !withheld.is_empty() {
+                tracing::debug!(
+                    event = "remote.withheld",
+                    kind = "purl",
+                    reason = "not_public",
+                    count = withheld.len()
+                );
+            }
+            public
+        } else {
+            candidates
+        };
         if candidates.is_empty() {
             return HashMap::new();
         }
@@ -6630,6 +6648,7 @@ mod tests {
             fires_at: crate::model::Level::At(2),
             reason: None,
             findings: Vec::new(),
+            ..Default::default()
         };
         let analyzed = |corpus: Option<Verdict>| Analyzed {
             sub: None,
@@ -8423,6 +8442,7 @@ mod tests {
             fires_at: crate::model::Level::At(2),
             reason: Some("steals tokens".to_string()),
             findings: Vec::new(),
+            ..Default::default()
         }));
         let analyzed = payloads
             .analyze(&adopted)

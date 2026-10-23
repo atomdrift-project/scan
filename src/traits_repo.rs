@@ -7,7 +7,7 @@
 //! `scan update-rules` fetches traits the same way `cleave update-rules` does.
 
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Pin cleave to the installed traits tree unless the caller chose one.
 ///
@@ -21,12 +21,8 @@ pub fn prepare_runtime_env() {
     if env_set || cleave::traits_repo::override_dir().is_some() {
         return;
     }
-    // cleave's own default (`traits_repo::default_traits_dir`, private there).
-    let installed = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("atomdrift")
-        .join("cleave")
-        .join("traits");
+    // `traits-enriched` under `--enriched`, `traits-oss` otherwise.
+    let installed = cleave::traits_repo::installed_dir(cleave::enriched::enabled());
     let local = looks_like_traits(Path::new("traits"));
     if !local && !looks_like_traits(&installed) {
         return;
@@ -54,15 +50,28 @@ pub fn update(force: bool, quiet: bool) -> Result<bool> {
     prepare_runtime_env();
     let dir = cleave::traits_repo::install_target();
     let before = cleave::rule_update::installed(&dir).map(|i| i.commit);
+    // Kept as the source, not flattened into text: auto-update tells a refused
+    // enriched token (an error) from an unreachable bucket (not one) by it.
     cleave::rule_update::update(&dir, force, quiet)
-        .map_err(|e| anyhow::anyhow!("traits update failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("traits update failed"))?;
     let after = cleave::rule_update::installed(&dir).map(|i| i.commit);
     Ok(before != after)
+}
+
+/// Why `--enriched` cannot be honoured, when that is what `error` says: no
+/// token, or one the rules channel refused. Every other update failure — the
+/// network, the bucket, the disk — is one a host rides out on the rules it has.
+#[must_use]
+pub fn enriched_refusal(error: &anyhow::Error) -> Option<&str> {
+    match error.downcast_ref::<cleave::rule_update::Error>()? {
+        cleave::rule_update::Error::Enriched(why) => Some(why),
+        cleave::rule_update::Error::Other(_) => None,
+    }
 }
 
 /// Report whether newer traits are available without applying them.
 pub fn check_updates() -> Result<()> {
     prepare_runtime_env();
     let dir = cleave::traits_repo::install_target();
-    cleave::rule_update::check(&dir).map_err(|e| anyhow::anyhow!("{e}"))
+    cleave::rule_update::check(&dir).map_err(anyhow::Error::new)
 }

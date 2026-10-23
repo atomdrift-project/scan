@@ -319,7 +319,11 @@ impl FeatureSpec {
 
         let spec = Self {
             version: raw.version,
-            abi_version: if raw.abi_version == 0 { raw.version } else { raw.abi_version },
+            abi_version: if raw.abi_version == 0 {
+                raw.version
+            } else {
+                raw.abi_version
+            },
             presence_vocab: raw.presence_vocab,
             filetype_vocab: raw.filetype_vocab,
             element_vocab: raw.element_vocab,
@@ -431,16 +435,38 @@ impl FeatureSpec {
                 self.total_features
             );
         }
-        anyhow::ensure!(self.abi_version < 21 || self.metric_transforms.is_some(),
-            "v21 feature spec requires metric_transforms");
+        anyhow::ensure!(
+            self.abi_version < 21 || self.metric_transforms.is_some(),
+            "v21 feature spec requires metric_transforms"
+        );
         if let Some(transforms) = &self.metric_transforms {
-            for name in self.feature_names.iter().filter_map(|n| n.strip_prefix("metrics:")) {
-                anyhow::ensure!(matches!(transforms.get(name).map(String::as_str), Some("identity" | "log1p_abs")),
-                    "missing or invalid metric transform: {name}");
+            for name in self
+                .feature_names
+                .iter()
+                .filter_map(|n| n.strip_prefix("metrics:"))
+            {
+                anyhow::ensure!(
+                    matches!(
+                        transforms.get(name).map(String::as_str),
+                        Some("identity" | "log1p_abs")
+                    ),
+                    "missing or invalid metric transform: {name}"
+                );
             }
-            anyhow::ensure!(!self.metric_getters.iter().any(|g| g == "pe_year_distance") || (1970..=9999).contains(&self.metric_reference_year), "pe_year_distance requires its training reference year");
+            anyhow::ensure!(
+                !self.metric_getters.iter().any(|g| g == "pe_year_distance")
+                    || (1970..=9999).contains(&self.metric_reference_year),
+                "pe_year_distance requires its training reference year"
+            );
             for getter in &self.metric_getters {
-                anyhow::ensure!(known_metric_getter(getter) || self.metric_correlations.get(getter).is_some_and(|pair| pair.iter().flatten().all(|s| !s.is_empty())), "unknown metric getter: {getter}");
+                anyhow::ensure!(
+                    known_metric_getter(getter)
+                        || self
+                            .metric_correlations
+                            .get(getter)
+                            .is_some_and(|pair| pair.iter().flatten().all(|s| !s.is_empty())),
+                    "unknown metric getter: {getter}"
+                );
             }
         }
 
@@ -1385,22 +1411,41 @@ impl ExtractContext {
     }
 
     /// G5: the base [`KEY_METRICS`] then the spec's extended metric vocab.
-    fn write_metric_features(&self, metrics: &MetricMap, summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+    fn write_metric_features(
+        &self,
+        metrics: &MetricMap,
+        summaries: &[FileSummary],
+        w: &mut FeatureWriter<'_>,
+    ) {
         for m in &self.metric_slots {
             let value = if let Some([[ga, ka], [gb, kb]]) = &m.correlation {
-                let get = |g: &String, k: &String| metrics.get(g).and_then(|fields| fields.get(k)).copied().unwrap_or(0.0);
+                let get = |g: &String, k: &String| {
+                    metrics
+                        .get(g)
+                        .and_then(|fields| fields.get(k))
+                        .copied()
+                        .unwrap_or(0.0)
+                };
                 get(ga, ka) * get(gb, kb)
             } else if let Some(getter) = &m.getter {
                 derived_metric(getter, metrics, summaries, self.metric_reference_year)
             } else {
-                metrics.get(&m.group).and_then(|g| g.get(&m.field)).copied().unwrap_or(0.0)
+                metrics
+                    .get(&m.group)
+                    .and_then(|g| g.get(&m.field))
+                    .copied()
+                    .unwrap_or(0.0)
             };
             // Legacy models retain their f32-before-log contract.
             let output = if self.explicit_metrics {
                 (if m.log { value.abs().ln_1p() } else { value }) as f32
             } else {
                 let value = value as f32;
-                if m.log { (value.abs() + 1.0).ln() } else { value }
+                if m.log {
+                    (value.abs() + 1.0).ln()
+                } else {
+                    value
+                }
             };
             w.set_slot(m.slot, output);
         }
@@ -1557,15 +1602,25 @@ impl ExtractContext {
 /// Extended keys are log-scaled when the field names a count or size.
 fn metric_slots(lookup: &HashMap<String, usize>, spec: &FeatureSpec) -> Vec<MetricSlot> {
     if let Some(transforms) = &spec.metric_transforms {
-        return lookup.iter().filter_map(|(name, &slot)| {
-            let suffix = name.strip_prefix("metrics:")?;
-            let (group, field) = suffix.split_once('_')?;
-            Some(MetricSlot { slot, group: group.into(), field: field.into(),
-                log: transforms.get(suffix).is_some_and(|t| t == "log1p_abs"),
-                getter: spec.metric_getters.iter().any(|g| g == suffix).then(|| suffix.to_owned()),
-                correlation: spec.metric_correlations.get(suffix).cloned(),
+        return lookup
+            .iter()
+            .filter_map(|(name, &slot)| {
+                let suffix = name.strip_prefix("metrics:")?;
+                let (group, field) = suffix.split_once('_')?;
+                Some(MetricSlot {
+                    slot,
+                    group: group.into(),
+                    field: field.into(),
+                    log: transforms.get(suffix).is_some_and(|t| t == "log1p_abs"),
+                    getter: spec
+                        .metric_getters
+                        .iter()
+                        .any(|g| g == suffix)
+                        .then(|| suffix.to_owned()),
+                    correlation: spec.metric_correlations.get(suffix).cloned(),
+                })
             })
-        }).collect();
+            .collect();
     }
     let metric_vocab = &spec.metric_vocab;
     let base = KEY_METRICS.iter().map(|&(group, field, log)| {
@@ -1625,7 +1680,11 @@ struct RawFinding {
 fn ranked_ngram_paths(findings: &[RawFinding], limit: usize) -> Vec<String> {
     let mut scores: HashMap<&str, f64> = HashMap::new();
     for finding in findings {
-        if finding.id.is_empty() || !(finding.conf >= MIN_CONFIDENCE) || finding.crit < 3 {
+        if finding.id.is_empty()
+            || finding.conf.is_nan()
+            || finding.conf < MIN_CONFIDENCE
+            || finding.crit < 3
+        {
             continue;
         }
         let path = finding.id.split("::").next().unwrap_or("");
@@ -2037,9 +2096,13 @@ impl FileSummary {
             .collect();
 
         Self {
-            id: None, parent: None, depth: 0,
-            entry_section_nontext: metrics_value.and_then(|v| v.get("pe"))
-                .and_then(|v| v.get("entry_section")).and_then(serde_json::Value::as_str)
+            id: None,
+            parent: None,
+            depth: 0,
+            entry_section_nontext: metrics_value
+                .and_then(|v| v.get("pe"))
+                .and_then(|v| v.get("entry_section"))
+                .and_then(serde_json::Value::as_str)
                 .is_some_and(|v| !v.is_empty() && v != ".text"),
             path: path.to_owned(),
             file_type: file_type.to_owned(),
@@ -3008,13 +3071,6 @@ fn tier_prefix(crit: u32) -> &'static str {
     }
 }
 
-fn truncate_path_depth(path: &str, depth: usize) -> String {
-    if depth == 0 {
-        return path.to_string();
-    }
-    path.split('/').take(depth).collect::<Vec<_>>().join("/")
-}
-
 /// Categories whose notable-or-above paths feed the `crit:` n-grams.
 const CRIT_CATEGORIES: &[&str] = &[
     "objectives",
@@ -3096,9 +3152,13 @@ fn ranked_tiered_path_tokens(
         _ => 64,
     };
     if tokens.len() > limit {
+        // Each token is `<tier>:<path>`; rank by the path's score.
+        let score = |token: &str| {
+            let path = token.split_once(':').map_or(token, |(_, path)| path);
+            summary.path_scores.get(path).copied().unwrap_or(0.0)
+        };
         tokens.sort_unstable_by(|a, b| {
-            let score_a = summary.path_scores.get(&a[2..]).copied().unwrap_or(0.0);
-            let score_b = summary.path_scores.get(&b[2..]).copied().unwrap_or(0.0);
+            let (score_a, score_b) = (score(a), score(b));
             score_b.total_cmp(&score_a).then_with(|| a.cmp(b))
         });
         tokens.truncate(limit);
@@ -3278,7 +3338,11 @@ fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'
 
 /// Resolve each parent edge once; malformed cycles have no depth evidence.
 fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
-    let by_id: HashMap<_, _> = files.iter().enumerate().filter_map(|(i, f)| Some((f.id?, i))).collect();
+    let by_id: HashMap<_, _> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| Some((f.id?, i)))
+        .collect();
     let mut depths = vec![None; files.len()];
     for start in 0..files.len() {
         let mut chain = Vec::new();
@@ -3286,23 +3350,37 @@ fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
         let mut i = start;
         while depths[i].is_none() {
             if !seen.insert(i) {
-                for &j in &chain { depths[j] = Some(0); }
+                for &(j, _) in &chain {
+                    depths[j] = Some(0);
+                }
                 break;
             }
-            if files[i].depth > 0 { depths[i] = Some(files[i].depth); break; }
-            let parent = files[i].parent.and_then(|p| by_id.get(&p).copied()).filter(|&p| p != i);
-            let Some(parent) = parent else { depths[i] = Some(0); break; };
-            chain.push(i);
+            if files[i].depth > 0 {
+                depths[i] = Some(files[i].depth);
+                break;
+            }
+            let parent = files[i]
+                .parent
+                .and_then(|p| by_id.get(&p).copied())
+                .filter(|&p| p != i);
+            let Some(parent) = parent else {
+                depths[i] = Some(0);
+                break;
+            };
+            chain.push((i, parent));
             i = parent;
         }
-        for &j in chain.iter().rev() {
+        for &(j, parent) in chain.iter().rev() {
             if depths[j].is_none() {
-                depths[j] = Some(depths[by_id[&files[j].parent.expect("resolved parent")]].unwrap_or(0u32).saturating_add(1));
+                depths[j] = Some(depths[parent].unwrap_or(0u32).saturating_add(1));
             }
         }
     }
     let base = depths.iter().flatten().copied().min().unwrap_or(0);
-    depths.into_iter().map(|d| d.unwrap_or(0).saturating_sub(base)).collect()
+    depths
+        .into_iter()
+        .map(|d| d.unwrap_or(0).saturating_sub(base))
+        .collect()
 }
 
 /// G15: structure relative to the graded artifact (legacy bundles keep zeros).
@@ -3323,7 +3401,10 @@ fn write_structural_extensions(
     let mut hostile_files = 0;
     let mut total_loc: u64 = 0;
     let mut extension_mismatches = 0;
-    let mut has_source_files = relative && summaries.iter().any(|s| source_types.contains(&s.file_type.as_str()));
+    let mut has_source_files = relative
+        && summaries
+            .iter()
+            .any(|s| source_types.contains(&s.file_type.as_str()));
     let mut has_foreign_binaries = false;
 
     for s in summaries {
@@ -3371,12 +3452,28 @@ fn write_structural_extensions(
         "struct:packaged_capability",
         (combined.sample_paths.len() as f64 * max_entropy) as f32,
     );
-    let depths = if relative { relative_depths(summaries) } else { vec![0; summaries.len()] };
-    w.set("struct:max_nesting_depth_log", f64::from(*depths.iter().max().unwrap_or(&0)).ln_1p() as f32);
-    w.set("struct:inner_file_ratio", depths.iter().filter(|&&d| d > 0).count() as f32 / summaries.len().max(1) as f32);
+    let depths = if relative {
+        relative_depths(summaries)
+    } else {
+        vec![0; summaries.len()]
+    };
+    w.set(
+        "struct:max_nesting_depth_log",
+        f64::from(*depths.iter().max().unwrap_or(&0)).ln_1p() as f32,
+    );
+    w.set(
+        "struct:inner_file_ratio",
+        depths.iter().filter(|&&d| d > 0).count() as f32 / summaries.len().max(1) as f32,
+    );
     if relative {
-        w.set("agg:hostile_depth_weight", summaries.iter().zip(&depths)
-            .map(|(s, &d)| f64::from(s.findings.hostile_finding_count) * f64::from(d)).sum::<f64>() as f32);
+        w.set(
+            "agg:hostile_depth_weight",
+            summaries
+                .iter()
+                .zip(&depths)
+                .map(|(s, &d)| f64::from(s.findings.hostile_finding_count) * f64::from(d))
+                .sum::<f64>() as f32,
+        );
     }
     if entropies.len() > 1 {
         let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
@@ -3386,7 +3483,16 @@ fn write_structural_extensions(
         let mx = entropies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         w.set("struct:entropy_max_diff", (mx - mean) as f32);
     }
-    w.set("struct:air_gap_signal", f32::from(hostile_files > 0 && !summaries.iter().zip(&depths).any(|(s, &d)| d > 0 && s.findings.hostile_finding_count > 0)));
+    w.set(
+        "struct:air_gap_signal",
+        f32::from(
+            hostile_files > 0
+                && !summaries
+                    .iter()
+                    .zip(&depths)
+                    .any(|(s, &d)| d > 0 && s.findings.hostile_finding_count > 0),
+        ),
+    );
     if !code_entropies.is_empty() {
         let avg_ent = if entropies.is_empty() {
             0.0
@@ -3913,38 +4019,99 @@ fn write_symbol_features(
 }
 
 fn known_metric_getter(name: &str) -> bool {
-    KEY_METRICS.iter().any(|(g, f, _)| name == format!("{g}_{f}"))
-        || matches!(name, "pe_is_dotnet" | "pe_linker_major_version" | "pe_subsystem" | "pe_checksum_missing" | "pe_entry_section_nontext" | "pe_year_distance" | "pe_year_pre_2000" | "pe_year_future"
-            | "text_mixed_indent" | "binary_has_overlay" | "binary_nonstandard_section_name_count"
-            | "derived_string_per_function" | "derived_imports_per_dependency" | "derived_wide_string_ratio"
-            | "derived_imports_per_kb" | "derived_sections_per_kb" | "derived_strings_per_kb"
-            | "text_lines_over_200" | "text_lines_over_500" | "text_lines_over_1000"
-            | "text_lines_in_200_499" | "text_lines_in_500_999")
-
+    KEY_METRICS
+        .iter()
+        .any(|(g, f, _)| name == format!("{g}_{f}"))
+        || matches!(
+            name,
+            "pe_is_dotnet"
+                | "pe_linker_major_version"
+                | "pe_subsystem"
+                | "pe_checksum_missing"
+                | "pe_entry_section_nontext"
+                | "pe_year_distance"
+                | "pe_year_pre_2000"
+                | "pe_year_future"
+                | "text_mixed_indent"
+                | "binary_has_overlay"
+                | "binary_nonstandard_section_name_count"
+                | "derived_string_per_function"
+                | "derived_imports_per_dependency"
+                | "derived_wide_string_ratio"
+                | "derived_imports_per_kb"
+                | "derived_sections_per_kb"
+                | "derived_strings_per_kb"
+                | "text_lines_over_200"
+                | "text_lines_over_500"
+                | "text_lines_over_1000"
+                | "text_lines_in_200_499"
+                | "text_lines_in_500_999"
+        )
 }
 
 fn derived_metric(name: &str, metrics: &MetricMap, files: &[FileSummary], year: u32) -> f64 {
-    let get = |group: &str, field: &str| metrics.get(group).and_then(|g| g.get(field)).copied().unwrap_or(0.0);
+    let get = |group: &str, field: &str| {
+        metrics
+            .get(group)
+            .and_then(|g| g.get(field))
+            .copied()
+            .unwrap_or(0.0)
+    };
     let ratio = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
     match name {
-        "pe_year_distance" => if get("pe", "timestamp_year") > 0.0 { (f64::from(year) - get("pe", "timestamp_year")).abs() } else { 0.0 },
+        "pe_year_distance" => {
+            if get("pe", "timestamp_year") > 0.0 {
+                (f64::from(year) - get("pe", "timestamp_year")).abs()
+            } else {
+                0.0
+            }
+        }
         "pe_entry_section_nontext" => f64::from(files.iter().any(|f| f.entry_section_nontext)),
-        "pe_year_pre_2000" => f64::from(get("pe", "timestamp_year") > 0.0 && get("pe", "timestamp_year") < 2000.0),
+        "pe_year_pre_2000" => {
+            f64::from(get("pe", "timestamp_year") > 0.0 && get("pe", "timestamp_year") < 2000.0)
+        }
         "pe_year_future" => f64::from(get("pe", "timestamp_year") > 2030.0),
-        "derived_string_per_function" => ratio(get("binary", "string_count"), get("binary", "function_count")),
-        "derived_imports_per_dependency" => ratio(get("binary", "import_count"), get("binary", "dependency_count")),
-        "derived_wide_string_ratio" => ratio(get("binary", "wide_string_count"), get("binary", "string_count")),
-        "derived_imports_per_kb" => ratio(get("binary", "import_count"), get("binary", "file_size") / 1024.0),
-        "derived_sections_per_kb" => ratio(get("binary", "section_count"), get("binary", "file_size") / 1024.0),
-        "derived_strings_per_kb" => ratio(get("binary", "string_count"), get("binary", "file_size") / 1024.0),
-        "text_lines_in_200_499" => (get("text", "lines_over_200") - get("text", "lines_over_500")).max(0.0),
-        "text_lines_in_500_999" => (get("text", "lines_over_500") - get("text", "lines_over_1000")).max(0.0),
+        "derived_string_per_function" => ratio(
+            get("binary", "string_count"),
+            get("binary", "function_count"),
+        ),
+        "derived_imports_per_dependency" => ratio(
+            get("binary", "import_count"),
+            get("binary", "dependency_count"),
+        ),
+        "derived_wide_string_ratio" => ratio(
+            get("binary", "wide_string_count"),
+            get("binary", "string_count"),
+        ),
+        "derived_imports_per_kb" => ratio(
+            get("binary", "import_count"),
+            get("binary", "file_size") / 1024.0,
+        ),
+        "derived_sections_per_kb" => ratio(
+            get("binary", "section_count"),
+            get("binary", "file_size") / 1024.0,
+        ),
+        "derived_strings_per_kb" => ratio(
+            get("binary", "string_count"),
+            get("binary", "file_size") / 1024.0,
+        ),
+        "text_lines_in_200_499" => {
+            (get("text", "lines_over_200") - get("text", "lines_over_500")).max(0.0)
+        }
+        "text_lines_in_500_999" => {
+            (get("text", "lines_over_500") - get("text", "lines_over_1000")).max(0.0)
+        }
         _ => {
             let (g, f) = name.split_once('_').unwrap_or(("", ""));
             let value = get(g, f);
-            if matches!(name, "pe_is_dotnet" | "pe_checksum_missing" | "text_mixed_indent" | "binary_has_overlay") {
+            if matches!(
+                name,
+                "pe_is_dotnet" | "pe_checksum_missing" | "text_mixed_indent" | "binary_has_overlay"
+            ) {
                 f64::from(value != 0.0)
-            } else { value }
+            } else {
+                value
+            }
         }
     }
 }
@@ -4416,18 +4583,52 @@ mod tests {
 
     #[test]
     fn archive_depths_are_relative_order_independent_and_cycle_safe() {
-        let root = FileSummary { id: Some(10), depth: 2, ..Default::default() };
-        let child = FileSummary { id: Some(20), parent: Some(10), depth: 3, ..Default::default() };
-        let nested = FileSummary { id: Some(30), parent: Some(20), ..Default::default() };
-        assert_eq!(relative_depths(&[root.clone(), child.clone(), nested.clone()]), vec![0, 1, 2]);
-        assert_eq!(relative_depths(&[nested, child.clone(), root]), vec![2, 1, 0]);
+        let root = FileSummary {
+            id: Some(10),
+            depth: 2,
+            ..Default::default()
+        };
+        let child = FileSummary {
+            id: Some(20),
+            parent: Some(10),
+            depth: 3,
+            ..Default::default()
+        };
+        let nested = FileSummary {
+            id: Some(30),
+            parent: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            relative_depths(&[root.clone(), child.clone(), nested.clone()]),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            relative_depths(&[nested, child.clone(), root]),
+            vec![2, 1, 0]
+        );
         assert_eq!(relative_depths(&[child]), vec![0]);
-        let cycle = [FileSummary { id: Some(1), parent: Some(2), ..Default::default() },
-                     FileSummary { id: Some(2), parent: Some(1), ..Default::default() }];
+        let cycle = [
+            FileSummary {
+                id: Some(1),
+                parent: Some(2),
+                ..Default::default()
+            },
+            FileSummary {
+                id: Some(2),
+                parent: Some(1),
+                ..Default::default()
+            },
+        ];
         assert_eq!(relative_depths(&cycle), vec![0, 0]);
-        let chain: Vec<_> = (0..5000u32).rev().map(|id| FileSummary {
-            id: Some(id), parent: id.checked_sub(1), ..Default::default()
-        }).collect();
+        let chain: Vec<_> = (0..5000u32)
+            .rev()
+            .map(|id| FileSummary {
+                id: Some(id),
+                parent: id.checked_sub(1),
+                ..Default::default()
+            })
+            .collect();
         assert_eq!(relative_depths(&chain)[0], 4999);
     }
 
@@ -4453,16 +4654,25 @@ mod tests {
 
     #[test]
     fn new_metric_contract_is_required_and_legacy_abi_defaults_to_version() -> Result<()> {
-        for (version, transforms, succeeds) in [(20, None, true), (21, None, false),
-            (21, Some("identity"), true), (21, Some("log10"), false)] {
+        for (version, transforms, succeeds) in [
+            (20, None, true),
+            (21, None, false),
+            (21, Some("identity"), true),
+            (21, Some("log10"), false),
+        ] {
             let mut file = tempfile::NamedTempFile::new()?;
             let mut value = serde_json::json!({"version":version,"presence_vocab":["metadata"],
                 "feature_names":["metrics:text_max_inline_whitespace_run"],"total_features":1,"standardized":false});
-            if let Some(t) = transforms { value["metric_transforms"] = serde_json::json!({"text_max_inline_whitespace_run":t}); }
+            if let Some(t) = transforms {
+                value["metric_transforms"] =
+                    serde_json::json!({"text_max_inline_whitespace_run":t});
+            }
             serde_json::to_writer(&mut file, &value)?;
             let result = FeatureSpec::load(file.path());
             assert_eq!(result.is_ok(), succeeds, "{value}");
-            if let Ok(spec) = result { assert_eq!(spec.abi_version, version); }
+            if let Ok(spec) = result {
+                assert_eq!(spec.abi_version, version);
+            }
         }
         Ok(())
     }

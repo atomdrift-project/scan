@@ -53,6 +53,10 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Warm cleave's YARA engine + capability mapper off the rayon pool before
     // any scan fires rayon work. See `run_scan_paths` for why this matters.
     crate::engine::prefetch_cleave_resources();
+    // Load the model before hashing every running executable, so a broken
+    // bundle is reported at once rather than after the slowest step.
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let shap = ShapImportance::load(config.model_dir())?;
 
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
@@ -174,9 +178,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         output::print_banner(crate::engine::detection_counts(config));
     }
 
-    // Load model and scan each unique binary.
-    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-    let shap = ShapImportance::load(config.model_dir())?;
+    // Scan each unique binary.
     let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
     cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {

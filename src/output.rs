@@ -1281,6 +1281,85 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
     );
 }
 
+/// Write one artifact isotope13 judged (`--enriched`), in place of a local
+/// result.
+///
+/// JSON gets a record shaped like the bloom one — `"source": "remote"` says
+/// whose verdict it is — carrying what the service said: the level, the digest
+/// it describes, when and by what it was analyzed, and its findings (at most
+/// three). Every other format gets one line.
+///
+/// # Errors
+/// Writing to `out` failed.
+pub(crate) fn write_remote_verdict(
+    out: &mut impl std::io::Write,
+    label: &str,
+    sha256: &str,
+    purl: Option<&str>,
+    verdict: &crate::corpus_precheck::Verdict,
+    class: Classification,
+    format: OutputFormat,
+) -> std::io::Result<()> {
+    let name = match class {
+        Classification::Hostile => "hostile",
+        Classification::Suspicious => "suspicious",
+        Classification::Benign => "benign",
+    };
+    if matches!(format, OutputFormat::Json) {
+        let findings: Vec<_> = verdict
+            .findings
+            .iter()
+            .map(|f| serde_json::json!({ "id": f.id, "crit": f.crit, "desc": f.desc }))
+            .collect();
+        let fires_at = match verdict.fires_at {
+            Level::Clean => Some(-1),
+            Level::At(n) => Some(i32::from(n)),
+            Level::Manual => None,
+        };
+        let mut record = serde_json::json!({
+            "path": label,
+            "source": "remote",
+            "verdict": name,
+            "sha256": sha256,
+            "fires_at": fires_at,
+            "analyzed_at": verdict.analyzed_at,
+            "engine_version": verdict.engine_version,
+            "findings": findings,
+        });
+        if let Some(purl) = purl {
+            record["purl"] = serde_json::Value::from(purl);
+        }
+        serde_json::to_writer(&mut *out, &record)?;
+        return out.write_all(b"\n");
+    }
+
+    let p = palette();
+    let (icon, color) = match class {
+        Classification::Hostile => ("\u{2717}", p.hostile),
+        Classification::Suspicious => ("!", p.warning),
+        Classification::Benign => ("\u{2713}", p.benign),
+    };
+    let when = verdict
+        .analyzed_at
+        .as_deref()
+        .and_then(|at| at.get(..10))
+        .map(|day| format!(" \u{b7} analyzed {day}"))
+        .unwrap_or_default();
+    let why = verdict
+        .findings
+        .first()
+        .map(|f| format!(" \u{b7} {}", tty_text(&f.id)))
+        .unwrap_or_default();
+    writeln!(
+        out,
+        " {}  {} {}  {}",
+        fg(color, icon),
+        fg(color, name),
+        fg(p.very_dim, &format!("isotope13{when}{why}")),
+        fg(p.header_path, &tty_text(label)),
+    )
+}
+
 /// Print scan summary. A flagged scan closes its card sequence with a heavy
 /// rule in the worst verdict's color, the counts embedded in the rule (bloom
 /// hits folded in). A clean scan keeps the quiet thin rule and ✓ line — the

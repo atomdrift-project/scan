@@ -897,6 +897,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
         );
     }
 
+    // `--enriched` picks the rules tree, so it is set before anything resolves
+    // one.
+    if global.enriched {
+        cleave::enriched::set_enabled(true);
+    }
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another litmus run.
@@ -934,7 +939,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             global.no_update,
             global.mode,
             global.format == scan::OutputFormat::Terminal,
-        );
+        )?;
+        // Where artifacts are judged, settled once the rules are: an enriched
+        // scan that needed a token has been asked for it by now.
+        scan::remote::resolve(global.analyze, global.enriched)?;
     }
 
     let fetch = fetch_policy(&global, &command);
@@ -1443,10 +1451,19 @@ fn print_version(format: scan::OutputFormat) {
                 "filters": filters,
             })
         });
+        // Dates beside the commits, so a benchmark comparing two rules channels
+        // can say how fresh each one was, not only which it was.
+        let traits_date =
+            cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.date);
+        let models_date =
+            scan::model_update::installed(&scan::models_repo::install_target()).map(|i| i.date);
         let version = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "models": scan::models_repo::version(),
+            "models_date": models_date,
             "traits": cleave::traits_repo::version(),
+            "traits_date": traits_date,
+            "traits_channel": if cleave::enriched::enabled() { "enriched" } else { "oss" },
             "bloom": bloom_json,
         });
         println!("{version}");

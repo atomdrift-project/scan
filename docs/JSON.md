@@ -200,6 +200,26 @@ Errors share a single shape regardless of status code:
 The status code carries the category; see
 [SERVER_API.md#status-codes](SERVER_API.md#status-codes).
 
+## Records that are not analyses
+
+A file scan writes one line per artifact, and not every line is an analysis.
+Two kinds answer without one, and say so with `source`:
+
+- `"source": "bloom"` — the known-good/known-bad filters decided it
+  (`verdict`, `scanned`).
+- `"source": "remote"` — under `--enriched`, isotope13 already held a verdict
+  for these bytes (or this package), and it stands in place of local analysis:
+
+```json
+{"path": "pkg:npm/left-pad@1.3.0", "source": "remote", "verdict": "benign",
+ "sha256": "870c0fe1…", "fires_at": -1, "analyzed_at": "2026-10-10T23:13:19Z",
+ "engine_version": null, "findings": [], "purl": "pkg:npm/left-pad@1.3.0"}
+```
+
+`verdict` is `hostile`, `suspicious`, or `benign`, graded from `fires_at` at
+this run's level exactly as a local verdict is; `findings` holds at most three
+(`id`, `crit`, `desc`). `--analyze=local` never produces one.
+
 ## A complete example
 
 A hostile verdict produced at level 3:

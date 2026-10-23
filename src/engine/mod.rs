@@ -30,7 +30,7 @@ pub use self::envelope::{
     ScanResultEnvelopeRef, TopFinding,
 };
 pub use self::pipeline::{PendingLlm, count_findings, extract_top_findings};
-pub use self::run::{run, run_bytes, run_paths, scan_bytes, scan_file};
+pub use self::run::{report_remote, run, run_bytes, run_paths, scan_bytes, scan_file};
 pub use self::verdict::{
     FloorArm, FloorDecision, level_confidence, synthesized_level, trait_floor,
 };

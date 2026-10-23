@@ -342,7 +342,9 @@ the local index alone.
     }
 
 One package answers with one object; a repeated `purl` answers with a
-list, in the order asked. Every field is always present — `null` when
+list, in the order asked. A repeated `sha256` does the same for several exact
+artifacts; one `sha256` may pair with a `purl` naming the same bytes, but
+several cannot be combined with `purl` or `url` (`multiple_locators`). Every field is always present — `null` when
 unknown, `[]` when empty.
 
 `decision` is one of:
