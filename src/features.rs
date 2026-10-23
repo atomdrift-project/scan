@@ -22,7 +22,13 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+
+// An ensemble can load many specs of the same version, including specialists
+// initialized concurrently during validation. Report the compatibility note
+// once per version for the process, not once per route.
+static WARNED_OLD_SPEC_VERSIONS: LazyLock<Mutex<HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Name-based feature assignment: one route's feature vector plus the spec's
 /// name → slot lookup.
@@ -309,11 +315,16 @@ impl FeatureSpec {
                 raw.version,
             );
         }
-        if raw.version < EXPECTED_SPEC_VERSION {
+        if raw.version < EXPECTED_SPEC_VERSION
+            && WARNED_OLD_SPEC_VERSIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(raw.version)
+        {
             tracing::warn!(
                 version = raw.version,
                 expected = EXPECTED_SPEC_VERSION,
-                "loading older spec version; extractor produces newer-version features as zeros for forward compatibility, but consider retraining at v{EXPECTED_SPEC_VERSION}"
+                "loading older feature spec; features added since this version are absent from the model; retrain at v{EXPECTED_SPEC_VERSION} to use them"
             );
         }
 

@@ -58,9 +58,6 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     if !skip_traits && let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
         let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
         if !problems.is_empty() {
-            for problem in &problems {
-                eprintln!("WARNING {problem}");
-            }
             // A warning, not a failure. A stale prefix costs the coverage of
             // that one prefix; refusing to start costs the whole node, and
             // this check compares against whichever traits revision happens to
@@ -72,11 +69,12 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
             // the test suite deliberately asserts nothing about it, since trait
             // definitions are validated in the traits repo, not here.
             eprintln!(
-                "WARNING {} LLM gate prefix(es) match nothing in {}; \
-                 the gate still admits on criticality, probability and level, \
-                 so this narrows coverage rather than disabling it",
+                "WARNING {} LLM gate prefix(es) match nothing in {}: {}; \
+                 coverage for these prefixes is lost until the taxonomy and gate agree; \
+                 criticality, probability and level admissions still work",
                 problems.len(),
                 traits_dir.display(),
+                problems.join("; "),
             );
         }
     }

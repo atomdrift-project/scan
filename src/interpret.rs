@@ -242,10 +242,11 @@ pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 /// Every id here is declared in the cleave traits tree, which is what lets
 /// [`validate_gate_prefixes`] prove the taxonomy has not moved underneath them.
 pub const LLM_GATE_PREFIXES: &[&str] = &[
-    // Encrypted archive members: 154 malicious against 1 benign, the single
-    // strongest prefix in the set and the reason password-protected payload
-    // droppers reach a reader at all.
-    "micro-behaviors/data/archive/member",
+    // Encrypted archive members: 154 malicious against 1 benign in the original
+    // gate corpus. Cleave moved this trait from micro-behaviors/data/archive/member
+    // into metadata/file/archive; name the leaf so unrelated archive metadata
+    // does not enter the gate.
+    "metadata/file/archive::archive-encrypted-member",
     // Agent/editor config paths — where prompt-injection payloads in agent
     // skills and editor extensions live.
     "micro-behaviors/fs/path/config/app",
@@ -327,11 +328,16 @@ pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
 /// called hostile off a base64-decode-to-file step, and a 571-finding agent
 /// skill that points the agent at an off-vendor API base URL.
 ///
-/// Families and `family::*glob*` forms only: leaf ids get renamed in passing
-/// and an exact one stops matching silently.
+/// Prefer families and narrow globs where their whole match set is useful.
+/// The encrypted-member trait moved into a broad family, so its exact id keeps
+/// unrelated archive findings out of this override. Off-vendor URL assignments
+/// are atomic traits under a shared family; the narrow glob covers their
+/// provider-specific ids without admitting other URL configuration findings.
+/// [`validate_gate_prefixes`] checks these entries against installed traits.
 pub const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
-    // Password-protected payload droppers: 154 malicious, 0 benign.
-    "micro-behaviors/data/archive/member",
+    // Password-protected payload droppers: 154 malicious, 0 benign in the
+    // original size-veto corpus.
+    "metadata/file/archive::archive-encrypted-member",
     // Publisher is not the owner of the repository it points at: 25 vs 1.
     "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
     // Agent instruction files (CLAUDE.md, AGENTS.md, rules): 5 vs 0.
@@ -339,9 +345,10 @@ pub const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
     // Editor/agent *project* settings and tasks — the per-repository files an
     // extension or skill drops to run on open: 23 vs 0.
     "micro-behaviors/fs/path/config/app::*project-*",
-    // An agent pointed at a third-party or off-vendor LLM API base URL, the
-    // shape of key interception: 2 vs 0.
-    "micro-behaviors/process/create/agent::*base-url*",
+    // An off-vendor LLM API base URL assignment can redirect agent traffic.
+    // The original agent-specific prefix carried 2 malicious vs 0 benign
+    // samples; this emitted atomic shape also covers other provider settings.
+    "micro-behaviors/os/env/provider::*base-url-off-vendor",
     // Decoding a payload to a file from a shell command: 4 vs 0.
     "micro-behaviors/data/decode/command::*to-file*",
 ];
@@ -445,7 +452,11 @@ fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id: &str) -> b
 #[must_use]
 pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
+    let mut checked = std::collections::HashSet::new();
     for prefix in LLM_GATE_PREFIXES.iter().chain(LLM_GATE_STRONG_PREFIXES) {
+        if !checked.insert(prefix) {
+            continue;
+        }
         let (family, leaf) = match prefix.split_once("::") {
             Some((family, leaf)) => (family, Some(leaf)),
             None => (*prefix, None),
@@ -460,12 +471,7 @@ pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
         } else {
             continue;
         };
-        problems.push(format!(
-            "LLM gate prefix `{prefix}` {fault}; either the taxonomy moved \
-             underneath it, or it was written against a different traits \
-             revision than the one installed here. Coverage for that prefix is \
-             lost until the two agree",
-        ));
+        problems.push(format!("`{prefix}` {fault}"));
     }
     problems
 }
@@ -3156,7 +3162,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_prefixes_are_families_or_globs_that_match_renamed_leaves() {
+    fn strong_prefixes_match_current_trait_ids() {
         assert!(id_strong(
             "micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"
         ));
@@ -3167,11 +3173,19 @@ mod tests {
             "micro-behaviors/fs/path/config/app::claude-config-directory"
         ));
         assert!(id_strong(
-            "micro-behaviors/process/create/agent::llm-api-base-url-third-party-host"
+            "micro-behaviors/os/env/provider::anthropic-base-url-off-vendor"
+        ));
+        assert!(id_strong(
+            "micro-behaviors/os/env/provider::openai-base-url-off-vendor"
+        ));
+        assert!(id_strong(
+            "micro-behaviors/os/env/provider::deepseek-base-url-off-vendor"
         ));
         assert!(!id_strong(
-            "micro-behaviors/process/create/agent::agent-function-tool-schema"
+            "micro-behaviors/os/env/provider::anthropic-base-url-setdefault-call"
         ));
+        assert!(id_strong("metadata/file/archive::archive-encrypted-member"));
+        assert!(!id_strong("metadata/file/archive::archive-sole-member"));
         assert!(id_strong(
             "micro-behaviors/data/decode/command::base64-decode-to-file"
         ));
@@ -3181,9 +3195,6 @@ mod tests {
     #[test]
     fn gate_prefixes_match_ids_at_or_below_a_family() {
         // A family prefix admits itself and anything under it.
-        assert!(id_admits(
-            "micro-behaviors/data/archive/member::archive-encrypted-member"
-        ));
         assert!(id_admits(
             "micro-behaviors/fs/path/config/app::claude-skills-directory"
         ));
@@ -3197,10 +3208,11 @@ mod tests {
         assert!(!id_admits(
             "micro-behaviors/communications/http/url/scheme::https-url"
         ));
-        // A family prefix must match on a path boundary. Without that,
-        // `.../archive/member` would swallow an unrelated sibling family.
+        assert!(id_admits("metadata/file/archive::archive-encrypted-member"));
+        assert!(!id_admits("metadata/file/archive::archive-sole-member"));
+        // A family prefix must match on a path boundary.
         assert!(!id_admits(
-            "micro-behaviors/data/archive/members-of-interest::whatever"
+            "micro-behaviors/fs/path/config/application::whatever"
         ));
         // Neighbouring families that were measured and deliberately excluded.
         assert!(!id_admits("metadata/encoded-payload/base64"));
@@ -3212,7 +3224,7 @@ mod tests {
     /// The skeleton the whole gate exists to separate: one ordinary package
     /// against the four shapes that must reach a reader.
     #[test]
-    fn gate_admits_the_shapes_it_was_measured_on() {
+    fn gate_admits_intended_shapes() {
         // An ordinary package. Notable findings on families nobody gated, and a
         // raw score in the benign mass. This is the sample we are trying not to
         // send, and it is ~78% of the benign corpus.
@@ -3247,7 +3259,7 @@ mod tests {
         // Nothing above notable anywhere, raw score at zero, and it must still
         // be sent — this prefix alone carries 154 of the malicious corpus.
         let encrypted = [finding(
-            "micro-behaviors/data/archive/member::archive-encrypted-member",
+            "metadata/file/archive::archive-encrypted-member",
             cleave::Criticality::Notable,
         )];
         assert_eq!(admits(&encrypted, 0.0), Some(LlmAdmission::Required));
@@ -3256,7 +3268,7 @@ mod tests {
         // fire on ordinary packages, so notable is the floor and this must not
         // open the gate.
         let component = [finding(
-            "micro-behaviors/data/archive/member::archive-encrypted-member",
+            "metadata/file/archive::archive-encrypted-member",
             cleave::Criticality::Component,
         )];
         assert_eq!(admits(&component, 0.0), None);
@@ -3301,7 +3313,11 @@ mod tests {
         // synthesized list is correctly not reported at all.
         assert_eq!(
             validate_gate_prefixes(dir.path()).len(),
-            LLM_GATE_PREFIXES.len() + LLM_GATE_STRONG_PREFIXES.len()
+            LLM_GATE_PREFIXES
+                .iter()
+                .chain(LLM_GATE_STRONG_PREFIXES)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
 
         // A family that exists but no longer declares the leaf the gate names

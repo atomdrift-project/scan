@@ -182,7 +182,9 @@ backtrace = "0.3"
 # outright. OpenBSD's jemalloc version string format is incompatible with that
 # same configure script. illumos and Solaris ship libumem (a comparable arena
 # allocator) and tikv-jemalloc-sys bundles a pre-illumos config.sub that fails
-# to recognize the host triple.
+# to recognize the host triple. 32-bit ARM: jemalloc calls libgcc helpers
+# (`__ffsdi2`, `__sync_*`) that Rust's static musl link omits, and linking
+# libgcc collides with compiler_builtins on armv7.
 #
 # Windows: CRT heap showed 12% exclusive plus lock convoy under 16-way
 # archive-member analysis (S2pair WPR). mimalloc is the Windows counterpart
@@ -199,7 +201,7 @@ tree-sitter = "0.28"
 # Keep this list in lockstep with the three cfg blocks in src/main.rs: the
 # `#[global_allocator]` static, `mod jemalloc_conf`, and the startup call to
 # `route_tree_sitter_through_jemalloc` in `main`.
-[target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
+[target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris", target_arch = "arm"))))'.dependencies]
 tikv-jemallocator = "0.7"
 # Already in the graph beneath tikv-jemallocator; named directly only for its
 # malloc/calloc/realloc/free declarations, which carry the correct C signatures
