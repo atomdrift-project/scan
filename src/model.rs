@@ -813,7 +813,7 @@ struct FastTreeBackend {
     n_classes: usize,
     trees: Vec<usize>,
     nodes: Vec<FastTreeNode>,
-    leaves: Vec<(usize, f32)>,
+    leaves: Vec<(u32, f32)>,
     base_values: Vec<f32>,
     post_transform: FastPostTransform,
     binary_result_layout: bool,
@@ -843,19 +843,22 @@ enum FastCmp {
     GreaterEqual,
 }
 
+// Compact indices keep more of the model in cache during per-member
+// inference. All narrowing is checked while loading; scoring keeps the same
+// tree order, branch comparisons and floating-point accumulation order.
 #[derive(Debug, Clone, Copy)]
 enum FastTreeNode {
     Branch {
-        feature_id: usize,
+        feature_id: u32,
         threshold: f32,
-        true_id: usize,
-        false_id: usize,
+        true_id: u32,
+        false_id: u32,
         cmp: FastCmp,
         nan_is_true: bool,
     },
     Leaf {
-        start: usize,
-        end: usize,
+        start: u32,
+        end: u32,
     },
 }
 
@@ -944,10 +947,21 @@ impl FastTreeBackend {
                     .last()
                     .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing tree root"))?;
                 nodes.push(FastTreeNode::Branch {
-                    feature_id: nodes_featureids[node_idx],
+                    feature_id: u32::try_from(nodes_featureids[node_idx])
+                        .context("ONNX feature index exceeds compact node capacity")?,
                     threshold: node_values[node_idx],
-                    true_id: true_ids[node_idx] + tree_offset,
-                    false_id: false_ids[node_idx] + tree_offset,
+                    true_id: u32::try_from(
+                        true_ids[node_idx]
+                            .checked_add(tree_offset)
+                            .context("ONNX true branch index overflow")?,
+                    )
+                    .context("ONNX true branch exceeds compact node capacity")?,
+                    false_id: u32::try_from(
+                        false_ids[node_idx]
+                            .checked_add(tree_offset)
+                            .context("ONNX false branch index overflow")?,
+                    )
+                    .context("ONNX false branch exceeds compact node capacity")?,
                     cmp,
                     nan_is_true: nan_is_true[node_idx],
                 });
@@ -960,12 +974,18 @@ impl FastTreeBackend {
                     {
                         break;
                     }
-                    leaves.push((leaf_class_ids[leaf_idx], leaf_weights[leaf_idx]));
+                    leaves.push((
+                        u32::try_from(leaf_class_ids[leaf_idx])
+                            .context("ONNX class index exceeds compact node capacity")?,
+                        leaf_weights[leaf_idx],
+                    ));
                     in_leaf_idx += 1;
                 }
                 nodes.push(FastTreeNode::Leaf {
-                    start,
-                    end: leaves.len(),
+                    start: u32::try_from(start)
+                        .context("ONNX leaf index exceeds compact node capacity")?,
+                    end: u32::try_from(leaves.len())
+                        .context("ONNX leaf index exceeds compact node capacity")?,
                 });
             }
         }
@@ -1055,16 +1075,16 @@ impl FastTreeBackend {
                         cmp,
                         nan_is_true,
                     }) => {
-                        let feature = features[*feature_id];
+                        let feature = features[*feature_id as usize];
                         node_idx = if fast_compare(*cmp, feature, *threshold, *nan_is_true) {
-                            *true_id
+                            *true_id as usize
                         } else {
-                            *false_id
+                            *false_id as usize
                         };
                     }
                     Some(FastTreeNode::Leaf { start, end }) => {
-                        for &(class_id, weight) in &self.leaves[*start..*end] {
-                            scores[class_id] += weight;
+                        for &(class_id, weight) in &self.leaves[*start as usize..*end as usize] {
+                            scores[class_id as usize] += weight;
                         }
                         break;
                     }
@@ -1309,6 +1329,73 @@ fn fast_compare(cmp: FastCmp, feature: f32, threshold: f32, nan_is_true: bool) -
 struct Backend {
     first: OnnxModel,
     rest: Vec<OnnxModel>,
+    memo: Option<PredictionMemo>,
+}
+
+/// Per-loaded-model memo: only inputs read by its trees affect a score. Keys
+/// retain every input bit, including signed zero and NaN payloads; hashing is
+/// only an index and never substitutes for equality. Each shard has a bounded
+/// LRU, and inference happens outside its lock. Nothing survives this process.
+#[derive(Debug)]
+struct PredictionMemo {
+    features: Vec<usize>,
+    shards: Vec<std::sync::Mutex<lru::LruCache<Vec<u32>, f32>>>,
+    hasher: std::collections::hash_map::RandomState,
+    hits: std::sync::atomic::AtomicUsize,
+    misses: std::sync::atomic::AtomicUsize,
+}
+
+impl PredictionMemo {
+    fn new(features: Vec<usize>, bytes: usize) -> Option<Self> {
+        // Allow for LRU bookkeeping in addition to the owned key.
+        let entry_bytes = features.len().checked_mul(4)?.checked_add(128)?;
+        let capacity = std::num::NonZeroUsize::new(bytes / entry_bytes / 16)?;
+        Some(Self {
+            features,
+            shards: (0..16)
+                .map(|_| std::sync::Mutex::new(lru::LruCache::new(capacity)))
+                .collect(),
+            hasher: std::collections::hash_map::RandomState::new(),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            misses: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn predict(&self, features: &[f32], calculate: impl FnOnce() -> Result<f32>) -> Result<f32> {
+        use std::hash::BuildHasher;
+        use std::sync::atomic::Ordering;
+        let key: Vec<u32> = self
+            .features
+            .iter()
+            .map(|&i| features[i].to_bits())
+            .collect();
+        let shard = &self.shards[(self.hasher.hash_one(&key) & 15) as usize];
+        if let Some(score) = shard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+        {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(score);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let score = calculate()?;
+        shard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, score);
+        Ok(score)
+    }
+}
+
+impl Drop for PredictionMemo {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        tracing::info!(target: "scan::model_memo", features = self.features.len(),
+            hits = self.hits.load(Ordering::Relaxed), misses = self.misses.load(Ordering::Relaxed),
+            "model prediction memo");
+    }
 }
 
 impl Backend {
@@ -1317,6 +1404,20 @@ impl Backend {
     }
 
     fn predict(&self, features: &[f32]) -> Result<f32> {
+        if features.len() != self.num_features() {
+            anyhow::bail!(
+                "feature vector length {} != ONNX expected {}",
+                features.len(),
+                self.num_features()
+            );
+        }
+        if let Some(memo) = &self.memo {
+            return memo.predict(features, || self.predict_uncached(features));
+        }
+        self.predict_uncached(features)
+    }
+
+    fn predict_uncached(&self, features: &[f32]) -> Result<f32> {
         // Average member predictions in f64 to keep the rounding noise-floor
         // below f32 precision even for K up to a few dozen seeds. The K=1
         // path is mathematically identical to a direct `models[0].predict`.
@@ -2284,7 +2385,29 @@ fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         rest.push(member);
     }
 
-    Ok(Backend { first, rest })
+    let memo = std::env::var("SCAN_MODEL_MEMO_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .filter(|&bytes| bytes > 0)
+        .and_then(|bytes| {
+            let mut features = Vec::new();
+            for model in std::iter::once(&first).chain(&rest) {
+                let OnnxModel::Fast(fast) = model else {
+                    return None;
+                };
+                for node in &fast.nodes {
+                    if let FastTreeNode::Branch { feature_id, .. } = node {
+                        let i = *feature_id as usize;
+                        features.push(i);
+                    }
+                }
+            }
+            features.sort_unstable();
+            features.dedup();
+            PredictionMemo::new(features, bytes)
+        });
+    Ok(Backend { first, rest, memo })
 }
 
 /// Pick up every `seed_*.onnx` under a `models/` directory. Native
@@ -2978,13 +3101,20 @@ impl Model {
         thresholds: Option<Thresholds>,
         active_level: Option<u16>,
     ) -> Result<Self> {
+        let started = std::time::Instant::now();
         // Detect ensemble layout by the presence of `general/` immediately
         // under model_dir. Otherwise treat model_dir itself as a single bundle.
-        if model_dir.join("general").is_dir() {
+        let model = if model_dir.join("general").is_dir() {
             Self::load_ensemble(model_dir, thresholds, active_level)
         } else {
             Self::load_single_bundle(model_dir, thresholds, active_level)
-        }
+        }?;
+        tracing::info!(
+            path = %model_dir.display(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "model load complete",
+        );
+        Ok(model)
     }
 
     /// Load a single-bundle layout (legacy / dev). The model artifacts
@@ -3045,15 +3175,17 @@ impl Model {
         for route in cfg.route_thresholds.keys() {
             names.intern(route);
         }
-        let mut policies = load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL, &mut names)?;
-
         let general_dir = model_dir.join("general");
         let general_thresholds =
             thresholds.or_else(|| cfg.route_thresholds.get("general").copied());
 
-        // Walk filegroups/<name>/ and filetypes/<name>/ while general loads.
+        // The policy search JSON includes large diagnostic tables. Parse it
+        // while decoding the general model: neither operation depends on the
+        // other. Specialist registration needs the policy route names, so it
+        // follows both loads; it only reads small calibrator files.
         let specialist_start = std::time::Instant::now();
-        let (general, (filegroups, filetypes)) = rayon::join(
+        let (policies, general) = rayon::join(
+            || load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL, &mut names),
             || {
                 load_bundle(
                     &general_dir,
@@ -3062,30 +3194,29 @@ impl Model {
                 )
                 .with_context(|| format!("loading general route from {}", general_dir.display()))
             },
+        );
+        let mut policies = policies?;
+        let general = general?;
+        let (filegroups, filetypes) = rayon::join(
             || {
-                rayon::join(
-                    || {
-                        load_specialists(
-                            &model_dir.join("filegroups"),
-                            &cfg.route_thresholds,
-                            &policies,
-                            &names,
-                            "filegroups",
-                        )
-                    },
-                    || {
-                        load_specialists(
-                            &model_dir.join("filetypes"),
-                            &cfg.route_thresholds,
-                            &policies,
-                            &names,
-                            "filetypes",
-                        )
-                    },
+                load_specialists(
+                    &model_dir.join("filegroups"),
+                    &cfg.route_thresholds,
+                    &policies,
+                    &names,
+                    "filegroups",
+                )
+            },
+            || {
+                load_specialists(
+                    &model_dir.join("filetypes"),
+                    &cfg.route_thresholds,
+                    &policies,
+                    &names,
+                    "filetypes",
                 )
             },
         );
-        let general = general?;
         tracing::info!(
             filegroups = filegroups.len(),
             filetypes = filetypes.len(),
@@ -3335,12 +3466,13 @@ impl Model {
                 class: classify(*id, probability, &route.thresholds),
             }))
         };
-        let (general, (group_score, filetype_score)) = rayon::join(score_general, || {
-            rayon::join(
-                || score_specialist(group.as_ref()),
-                || score_specialist(filetype.as_ref()),
-            )
-        });
+        // Files (including embedded members) already score in parallel. These
+        // three short route calls do not need another nested join: a worker
+        // waiting there can steal a long, unrelated archive task and delay the
+        // otherwise completed file. Keep the same result and error ordering.
+        let general = score_general();
+        let group_score = score_specialist(group.as_ref());
+        let filetype_score = score_specialist(filetype.as_ref());
 
         let mut route_probs = Vec::with_capacity(3);
         let mut scores = Vec::with_capacity(3);
@@ -3551,7 +3683,51 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+
+    #[test]
+    fn prediction_memo_checks_exact_used_inputs_and_does_not_cache_errors() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let memo = PredictionMemo::new(vec![0, 2], 4096).unwrap();
+        let calls = AtomicUsize::new(0);
+        let calculate = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(0.75)
+        };
+        assert_eq!(memo.predict(&[1.0, 10.0, 0.0], calculate)?, 0.75);
+        assert_eq!(memo.predict(&[1.0, 20.0, 0.0], calculate)?, 0.75);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "unused inputs do not affect a tree"
+        );
+        memo.predict(&[1.0, 20.0, -0.0], calculate)?;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "signed zero retains its bits"
+        );
+        let nan = f32::from_bits(0x7fc00001);
+        memo.predict(&[nan, 20.0, 0.0], calculate)?;
+        memo.predict(&[nan, 30.0, 0.0], calculate)?;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "identical NaN bits can be reused"
+        );
+        assert!(
+            memo.predict(&[2.0, 0.0, 0.0], || anyhow::bail!("inference failed"))
+                .is_err()
+        );
+        assert_eq!(memo.predict(&[2.0, 0.0, 0.0], || Ok(0.25))?, 0.25);
+        for i in 0..1000 {
+            memo.predict(&[i as f32, 0.0, 0.0], || Ok(0.5))?;
+        }
+        assert!(memo.shards.iter().all(|s| {
+            let s = s.lock().unwrap();
+            s.len() <= s.cap().get()
+        }));
+        Ok(())
+    }
 
     #[test]
     fn normalize_archive_filetype_strips_pure_compression() {

@@ -624,15 +624,26 @@ impl Classifier<'_> {
 /// # Errors
 /// The write failed; `BrokenPipe` means nobody is reading any more.
 fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
-    let mut out = io::stdout().lock();
     match config.format() {
         OutputFormat::Json => {
-            serde_json::to_writer(&mut out, &r.envelope_ref())?;
-            out.write_all(b"\n")
+            // Archive reports can contain thousands of members. Serialize on
+            // the caller's worker before taking stdout, otherwise one large
+            // report parks every other completed scan behind its encoding.
+            // Keep the complete line under one lock so records cannot mix.
+            let started = Instant::now();
+            let mut bytes = serde_json::to_vec(&r.envelope_ref())?;
+            bytes.push(b'\n');
+            let encoded = started.elapsed();
+            io::stdout().lock().write_all(&bytes)?;
+            tracing::debug!(target: "scan::json_timing", bytes = bytes.len(),
+                encode_ms = encoded.as_millis(), write_ms = started.elapsed().saturating_sub(encoded).as_millis(),
+                "JSON result written");
+            Ok(())
         }
         // The terminal result card was built in `classify_report`; write it
         // verbatim, then flush before the stderr footer.
         OutputFormat::Terminal => {
+            let mut out = io::stdout().lock();
             out.write_all(r.rendered_context.as_bytes())?;
             if !r.rendered_context.ends_with('\n') {
                 out.write_all(b"\n")?;
@@ -648,9 +659,9 @@ fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
             out.flush()
         }
         // `--format tiny` prefixes the machine verdict line, never colored.
-        OutputFormat::Tiny => write_tiny(&mut out, r),
+        OutputFormat::Tiny => write_tiny(&mut io::stdout().lock(), r),
         // `--format interpret` is the LLM payload verbatim — no verdict line.
-        OutputFormat::Interpret => out.write_all(r.rendered_context.as_bytes()),
+        OutputFormat::Interpret => io::stdout().lock().write_all(r.rendered_context.as_bytes()),
     }
 }
 

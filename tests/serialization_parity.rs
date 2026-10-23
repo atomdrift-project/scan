@@ -30,7 +30,7 @@ use scan::model::{Classification, Level, RouteScore, SkippedRoute};
 /// serde_json's compact formatter (as does axum's `Json` responder), so equal
 /// bytes here means the CLI, server, and worker emit the same envelope.
 fn assert_envelopes_identical(result: ScanResult, case: &str) {
-    // CLI path: exactly what `emit_result` writes (`serde_json::to_writer` over
+    // CLI path: exactly what `emit_result` writes (`serde_json::to_vec` over
     // the borrowed view). Borrow first so the owned conversions can consume.
     let cli = serde_json::to_vec(&result.envelope_ref()).unwrap();
     // Clone-based owned builder (used where the caller keeps the result).

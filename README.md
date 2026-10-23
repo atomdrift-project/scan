@@ -172,6 +172,57 @@ current matrix.
 
 ## Documentation
 
+Measure model loading with `make bench-model-load MODEL_LOAD_DIR=../azoth`.
+It reports the first load and repeated timings, and fails if any load exceeds
+`MODEL_LOAD_MAX_MS` (300 ms by default). Add `EAGER=1` to include every specialist;
+normal startup loads specialists on demand. These timings exclude trait loading,
+file analysis, and process/thread-pool startup, and repeated runs use the OS file
+cache. On Linux, `make profile-model-load` records a CPU profile with `perf`.
+
+For the complete VSIX throughput check on Linux, use an existing scanner and
+Rizin build:
+
+```sh
+sh scripts/bench-vsix.sh /var/tmp/vsix out/vsix-perf/rust-native-pgo/atomscan \
+  out/rizin-perf-static-pgo/bin/rizin out/vsix-perf/goal
+```
+
+This requires all five fresh-process scans to finish within 47 seconds, with
+one output per input and no errors or skips. It disables persistent analysis
+caches, retains compiled-rule caches and bounded in-process memoization, and
+writes every result and timing plus a series summary. `VSIX_RUNS`, `VSIX_LIMIT`,
+and `VSIX_NATIVE_CPUS` override the defaults of 5, 47, and `0,1`. Large native
+helpers use those CPUs; the scanner excludes their SMT siblings. The scheduling
+settings in the script can each be overridden through the environment.
+
+The preset uses 96 scan workers, 32 workers per large-file pool, a 4 GiB
+analysis memo, and delayed jemalloc page purging. On the measured 64-core
+Threadripper host, give the private large-file pools the faster CPU groups:
+
+```sh
+CLEAVE_LEAF_CPUS=2-7,24-39,56-63,66-71,88-103,120-127 \
+  sh scripts/bench-vsix.sh /var/tmp/vsix out/vsix-perf/rust-native-pgo/atomscan \
+  out/rizin-perf-static-pgo/bin/rizin out/vsix-perf/goal
+```
+
+That CPU mask is host-specific: omit or replace it on other machines.
+`CLEAVE_LEAF_CPUS` is opt-in on Linux and intersects each private worker's
+inherited affinity. It leaves the general scan pool's placement unchanged.
+
+`scripts/build-balanced-pgo.sh CORPUS OUTPUT_DIR [CARGO_CONFIG]` builds a scanner
+for the current CPU, trains it on cache-disabled analysis, and rebuilds
+with the resulting Rust profile. `PGO_TRAIN_SECONDS` optionally bounds training;
+an interrupted training run never counts as a passing benchmark. Set
+`PGO_USE_EXISTING=1` to rebuild from the retained profile, and `LLVM_PROFDATA` to the tool matching
+`rustc -vV`; use a Cargo config override when testing edited sibling dependencies.
+For Rizin, `RIZIN_NATIVE=1 RIZIN_PGO_TRAIN_DIR=DIR sh scripts/build-rizin-perf.sh`
+also enables native compilation and PGO. That training directory should contain
+extracted native binaries, such as the corpus's ELF and PE Go helpers.
+Set `RIZIN_STATIC=1` to link Rizin's own libraries
+statically, allowing LTO across their boundaries; system runtime libraries
+remain dynamic. These build scripts retain their output locally and do not
+replace installed tools.
+
 - [Integration guide](docs/INTEGRATION.md) — CLI, server, worker, exit codes,
   and deployment choices
 - [JSON report schema](docs/JSON.md) — machine-readable output fields

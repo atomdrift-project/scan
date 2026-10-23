@@ -794,7 +794,7 @@ ARCHIVE_RUNS    ?= 3
 # benchmark that fetches measures the network (and drifts run to run — the
 # fetched-node set differed by ~400 entries between two otherwise identical
 # runs, which broke detection comparison). Matches sampled-benchmark/profile-slow.
-ARCHIVE_ENV = CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 SCAN_FETCH=none CLEAVE_SCAN_THREADS="$(SCAN_THREADS)"
+ARCHIVE_ENV = SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 SCAN_FOLLOW=none SCAN_FETCH=none CLEAVE_RAYON_THREADS="$(SCAN_THREADS)"
 
 bench-archive: release ## Time+RSS+output an archive-mode scan, best of ARCHIVE_RUNS (ARCHIVE_DATASET=typed-4k|typed-16k|typed)
 	@[ -e "$(ARCHIVE_PATH)" ] || { echo "error: archive dataset not found: $(ARCHIVE_PATH)"; exit 1; }
@@ -890,11 +890,42 @@ bench-build: $(OUT_DIR) ## Build benchmark binary (profiling profile, release + 
 	@if [ "$$(uname)" = "Darwin" ]; then codesign -s - -f $(OUT_DIR)/$(BINARY).bench; fi
 	@echo "✓ Benchmark binary: $(OUT_DIR)/$(BINARY).bench"
 
+# Model loading only, independent of traits, bloom filters, and sample scans.
+# EAGER=1 includes every specialist; default measures normal lazy startup.
+MODEL_LOAD_DIR ?= ../azoth
+MODEL_LOAD_RUNS ?= 20
+MODEL_LOAD_MAX_MS ?= 300
+.PHONY: bench-model-load profile-model-load
+bench-model-load: ## Time model startup (MODEL_LOAD_DIR=../azoth EAGER=1 for all specialists)
+	$(CARGO) build --release --example model-load
+	$(CARGO_TARGET)/release/examples/model-load "$(MODEL_LOAD_DIR)" "$(MODEL_LOAD_RUNS)" --max-ms "$(MODEL_LOAD_MAX_MS)" $(if $(filter 1,$(EAGER)),--eager,)
+
+profile-model-load: $(OUT_DIR) ## CPU-profile model loading independently of file analysis
+	$(CARGO) build --profile profiling --example model-load
+	perf record -F 999 -o $(OUT_DIR)/model-load.perf.data -- \
+		$(CARGO_TARGET)/profiling/examples/model-load "$(MODEL_LOAD_DIR)" "$(MODEL_LOAD_RUNS)" $(if $(filter 1,$(EAGER)),--eager,)
+	perf report -i $(OUT_DIR)/model-load.perf.data --stdio --no-children -F overhead,sym
+
+# Full local analysis, including all archive members. Keep compiled rules,
+# but disable analysis-result caches at every layer (not just cleave).
+# Reference downloads are outside this benchmark's measured corpus.
+BENCHMARK_RUNS ?= 1
+BENCHMARK_BINARY ?= $(OUT_DIR)/$(BINARY).bench
+BENCHMARK_RIZIN ?=
+BENCHMARK_NATIVE_CPUS ?=
+.PHONY: balanced-benchmark balanced-benchmark-existing
+balanced-benchmark: bench-build
+balanced-benchmark balanced-benchmark-existing: ## Cache-disabled balanced analysis; -existing uses BENCHMARK_BINARY without rebuilding
+	CLEAVE_RAYON_THREADS="$(SCAN_THREADS)" python3 scripts/bench-balanced.py --binary "$(BENCHMARK_BINARY)" \
+		--output $(OUT_DIR)/balanced-benchmark --runs $(BENCHMARK_RUNS) $(if $(BENCHMARK_LIMIT),--limit $(BENCHMARK_LIMIT),) \
+		$(if $(BENCHMARK_RIZIN),--rizin "$(BENCHMARK_RIZIN)",) $(if $(BENCHMARK_NATIVE_CPUS),--native-cpus "$(BENCHMARK_NATIVE_CPUS)",) \
+		"$(BENCHMARK_PATH)"
+
 sampled-benchmark: bench-build ## Benchmark with samply CPU profiling
 	@command -v samply >/dev/null 2>&1 || { echo "Error: samply not installed. Run: cargo install samply"; exit 1; }
 	@[ -e "$(TUNA_BENCH_PATH)" ] || { echo "error: benchmark path not found: $(TUNA_BENCH_PATH)"; exit 1; }
-	CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 samply record --save-only -o $(OUT_DIR)/bench.profile.json.gz -- \
-		$(OUT_DIR)/$(BINARY).bench -f json $(TUNA_BENCH_PATH) \
+	$(ARCHIVE_ENV) SCAN_NO_UPDATE_CHECK=1 samply record --save-only -o $(OUT_DIR)/bench.profile.json.gz -- \
+		$(OUT_DIR)/$(BINARY).bench --mode balanced -f json $(TUNA_BENCH_PATH) \
 		>$(OUT_DIR)/bench.out 2>$(OUT_DIR)/bench.err
 	@echo "✓ Profile: $(OUT_DIR)/bench.profile.json.gz  Logs: $(OUT_DIR)/bench.err"
 
