@@ -1,6 +1,6 @@
 //! Download bytes identify their registry ecosystem even when cached by digest.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use cleave::types::compact_from_files;
+use cleave::types::{Facts, compact_from_files};
 use fletch::fetch::{BlobCache, Fixtures, Outcome, fetch_ref};
 use fletch::{RefKind, RefLocator, Reference};
 
@@ -65,7 +65,7 @@ fn package_download_types_reach_model_json() {
             .analyze_file(&path, &cleave::AnalysisOptions::default())
             .unwrap();
         report.finalize();
-        let json = serde_json::to_value(compact_from_files(&report.files)).unwrap();
+        let json = serde_json::to_value(compact_from_files(&report.files, Facts::Full)).unwrap();
         assert_eq!(json["files"][0]["type"], *label);
         assert!(
             json["files"].as_array().unwrap().len() > 1,

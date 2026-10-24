@@ -1,6 +1,6 @@
 //! Go PURL bytes retain the package type through scan's model report path.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use cleave::types::compact_from_files;
+use cleave::types::{Facts, compact_from_files};
 use fletch::fetch::{BlobCache, Fixtures, Outcome, fetch_ref};
 use fletch::{RefKind, RefLocator, Reference};
 
@@ -39,7 +39,7 @@ fn go_module_purl_download_reaches_model_json_with_its_type() {
         .analyze_file(&path, &cleave::AnalysisOptions::default())
         .unwrap();
     report.finalize();
-    let compact = compact_from_files(&report.files);
+    let compact = compact_from_files(&report.files, Facts::Full);
     let json = serde_json::to_value(compact).unwrap();
     assert_eq!(json["files"][0]["type"], "go_module");
     assert!(
