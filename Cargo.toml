@@ -94,7 +94,9 @@ proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
 # native-arch-only, a tighter timeout, and a size gate on giant binaries.
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 clap = { version = "4", features = ["derive", "env"] }
-serde = { version = "1", features = ["derive"] }
+# `rc`: a stored cleave report is an `Arc<RawValue>`, shared by every clone of
+# a result and serialized verbatim into its envelope.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Compresses result POST bodies to hopper. Cleave reports are large, highly
 # repetitive JSON; zstd cuts them 3-5x on the wire. Already present transitively

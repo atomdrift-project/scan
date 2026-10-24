@@ -2082,6 +2082,22 @@ fn request(
     Ok((grade, reason, model))
 }
 
+/// Grade an interpret render (`--format interpret`) as a live second opinion
+/// asks — same prompt, same endpoint chain — but with no ML admission gate or
+/// blend, queued as background work, for checking a saved report against the
+/// grade a live scan gave it. Returns `{grade, model, reason}`.
+///
+/// # Errors
+/// Every endpoint refused, or none replied with a parseable grade.
+pub fn grade_render(cfg: &InterpretConfig, context: &str) -> Result<serde_json::Value> {
+    // A render is normally recategorized already, and recategorizing is
+    // idempotent; doing it here keeps this the live path for any render.
+    let user = crate::engine::recategorize_annotations(context);
+    let priority = LlmCaller::Background.priority(user.len());
+    let (grade, reason, model) = request(cfg, &user, priority).map_err(CallError::into_inner)?;
+    Ok(serde_json::json!({"grade": grade.as_str(), "model": model, "reason": reason}))
+}
+
 /// Send a `system` + `user` prompt to the configured endpoint and return the
 /// model's reply text. This is the shared transport used by scan's grader and
 /// by external callers (e.g. isomer's diff interpreter) that reuse scan's

@@ -316,7 +316,7 @@ mod tests {
             fa.findings.push(f);
             files.push(fa);
         }
-        let mut report = cleave::types::compact_from_files(&files);
+        let mut report = cleave::types::compact_from_files(&files, cleave::types::Facts::Full);
         apply_report_retention(&mut report);
 
         let kept: Vec<u32> = report.files.iter().map(|f| f.id).collect();

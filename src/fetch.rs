@@ -5899,7 +5899,8 @@ fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> FetchRecord 
 /// limit). Returns `None` when there is nothing to upload.
 fn capture_dependency(rec: &FetchRecord, analyzed: &Analyzed) -> Option<FetchedDependency> {
     let sub = analyzed.sub.as_ref()?;
-    let compact = cleave::types::compact::compact_from_files(&sub.files);
+    let compact =
+        cleave::types::compact::compact_from_files(&sub.files, cleave::types::Facts::Full);
     let raw = serde_json::to_string(&compact)
         .map_err(|e| tracing::warn!(locator = %rec.locator, error = %e, "dependency report could not be serialized for upload"))
         .ok()?;

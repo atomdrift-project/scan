@@ -1046,8 +1046,6 @@ struct MetricSlot {
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
-    /// Whether this layout is supported by the bundled retained-facts contract.
-    model_facts_supported: bool,
     ranked_ngrams: bool,
     relative_structure: bool,
     explicit_metrics: bool,
@@ -1185,11 +1183,6 @@ impl ExtractContext {
             metric_reference_year: spec.metric_reference_year,
             tiered_min_crit: spec.tiered_min_crit,
             tiered_branch_min_crit: spec.tiered_branch_min_crit.clone(),
-            model_facts_supported: cleave::model_facts::supports(
-                cleave::model_facts::profile_id(),
-                &spec.feature_names,
-            )
-            .is_ok(),
             metric_slots: metric_slots(&absolute_lookup, spec),
             ghost_slots: spec
                 .ghost_vocab
@@ -1251,28 +1244,6 @@ impl ExtractContext {
     pub fn extract(&self, report: &cleave::types::CompactReport) -> Vec<f32> {
         let parsed = ParsedReport::from_compact_report(report, self.raw_needs(), None);
         self.extract_from_parsed(&parsed)
-    }
-
-    /// Extract directly from selective typed wire inputs, without rebuilding a
-    /// rendering AnalysisReport or serializing a CompactReport compatibility copy.
-    pub fn extract_wire(
-        &self,
-        report: &cleave::file_wire::features::FeatureReport,
-    ) -> Result<Vec<f32>> {
-        self.ensure_fact_profile(report.fp.as_deref())?;
-        let parsed = ParsedReport::from_wire(report, self.raw_needs())?;
-        Ok(self.extract_from_parsed(&parsed))
-    }
-
-    pub(crate) fn ensure_fact_profile(&self, profile: Option<&str>) -> Result<()> {
-        if let Some(profile) = profile {
-            cleave::model_facts::supports(profile, &[])?;
-        }
-        anyhow::ensure!(
-            profile.is_none() || self.model_facts_supported,
-            "model feature layout requires facts omitted by this profile"
-        );
-        Ok(())
     }
 
     /// This route's active raw-subtree needs (which optional families it emits).
@@ -1899,66 +1870,6 @@ impl ParsedReport {
         Self::from_summaries(file_summaries, primary)
     }
 
-    pub(crate) fn from_wire(
-        report: &cleave::file_wire::features::FeatureReport,
-        needs: RawNeeds,
-    ) -> Result<Self> {
-        // A shared analysis is summarized once; occurrence multiplicity remains
-        // unchanged. Move unique summaries rather than cloning them.
-        let mut summaries = report
-            .analyses
-            .iter()
-            .map(|a| {
-                let findings = a
-                    .findings()?
-                    .into_iter()
-                    .map(|f| RawFinding {
-                        id: f.id.into(),
-                        conf: f64::from(f.conf),
-                        crit: u32::from(f.crit),
-                        atk: f.atk.map(str::to_owned),
-                        mbc: f.mbc.map(str::to_owned),
-                    })
-                    .collect();
-                Ok(Some(FileSummary::from_model(
-                    "",
-                    &a.file_type,
-                    a.size,
-                    &a.facts,
-                    findings,
-                    needs,
-                )))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut uses = vec![0usize; summaries.len()];
-        for f in &report.files {
-            *uses
-                .get_mut(f.a)
-                .ok_or_else(|| anyhow::anyhow!("invalid model analysis index"))? += 1;
-        }
-        let mut files = Vec::with_capacity(report.files.len());
-        for f in &report.files {
-            uses[f.a] -= 1;
-            let summary = &mut summaries[f.a];
-            let mut placed = if uses[f.a] == 0 {
-                summary.take()
-            } else {
-                summary.clone()
-            }
-            .ok_or_else(|| anyhow::anyhow!("missing model analysis"))?;
-            placed.path = f.path.clone();
-            placed.depth = f.depth;
-            files.push(placed);
-        }
-        let primary = report
-            .files
-            .iter()
-            .find(|f| f.depth == 0)
-            .map(|f| &report.analyses[f.a])
-            .map(|a| (a.mol.as_deref().unwrap_or(""), a.risk));
-        Ok(Self::from_summaries(files, primary))
-    }
-
     fn from_summaries(file_summaries: Vec<FileSummary>, primary: Option<(&str, i64)>) -> Self {
         let summaries = if file_summaries.is_empty() {
             vec![FileSummary::default()]
@@ -2019,7 +1930,7 @@ impl ParsedReport {
 impl FileSummary {
     /// Summarize one compact file entry.
     fn from_compact(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
-        let raw_findings = file
+        let raw_findings: Vec<RawFinding> = file
             .findings
             .iter()
             .map(|f| RawFinding {
@@ -2030,28 +1941,7 @@ impl FileSummary {
                 mbc: f.mbc.clone(),
             })
             .collect();
-        let mut summary = Self::from_model(
-            &file.path,
-            &file.file_type,
-            file.size,
-            &file.facts,
-            raw_findings,
-            needs,
-        );
-        summary.id = Some(file.id);
-        summary.parent = file.parent;
-        summary.depth = file.depth;
-        summary
-    }
-
-    fn from_model(
-        path: &str,
-        file_type: &str,
-        size: u64,
-        facts: &cleave::types::CompactFacts,
-        raw_findings: Vec<RawFinding>,
-        needs: RawNeeds,
-    ) -> Self {
+        let facts = &file.facts;
         let finding_views: Vec<FindingView<'_>> = raw_findings
             .iter()
             .map(|f| FindingView {
@@ -2062,7 +1952,7 @@ impl FileSummary {
             .collect();
         let findings = summarize_findings(&finding_views);
 
-        let size_bytes = size as f64;
+        let size_bytes = file.size as f64;
         let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
         let denom = findings.filtered_finding_count.max(1) as f32;
         let max_crit = findings.sample_paths.values().copied().max().unwrap_or(0);
@@ -2107,16 +1997,16 @@ impl FileSummary {
             .collect();
 
         Self {
-            id: None,
-            parent: None,
-            depth: 0,
+            id: Some(file.id),
+            parent: file.parent,
+            depth: file.depth,
             entry_section_nontext: metrics_value
                 .and_then(|v| v.get("pe"))
                 .and_then(|v| v.get("entry_section"))
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|v| !v.is_empty() && v != ".text"),
-            path: path.to_owned(),
-            file_type: file_type.to_owned(),
+            path: file.path.clone(),
+            file_type: file.file_type.clone(),
             size_bytes,
             overall_entropy,
             metrics,
@@ -2162,8 +2052,9 @@ struct FindingSummary {
     has_yara: bool,
 }
 
-// Compatibility aliases for the August 2026 metric rename. Keep in sync with
-// collimator.features._METRIC_RENAMES: existing names (even null/zero) win.
+// Compatibility aliases for metrics cleave has renamed since August 2026. Keep
+// in sync with collimator.features._METRIC_RENAMES: existing names (even
+// null/zero) win. Keep every entry: hopper keeps reports from every generation.
 const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("archive", "total_compressed", "archive", "compressed_size"),
     (
@@ -2172,7 +2063,7 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
         "archive",
         "uncompressed_size",
     ),
-    ("ast", "array_literal_max_length", "ast", "max_array_len"),
+    ("ast", "array_literal_max_length", "ast", "max_array_length"),
     (
         "ast",
         "numeric_array_max_length",
@@ -2183,7 +2074,7 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
         "ast",
         "numeric_sequence_max_length",
         "ast",
-        "max_numeric_seq",
+        "max_numeric_sequence",
     ),
     (
         "ast",
@@ -2205,7 +2096,12 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ),
     ("binary", "embedded_file_count", "binary", "embedded_files"),
     ("binary", "overall_entropy", "file", "entropy"),
-    ("binary", "total_basic_blocks", "binary", "basic_blocks"),
+    (
+        "binary",
+        "total_basic_blocks",
+        "binary",
+        "basic_block_count",
+    ),
     ("comments", "base64_in_comments", "comments", "base64"),
     ("comments", "code_in_comments", "comments", "code"),
     ("comments", "empty_comments", "comments", "empty"),
@@ -2254,11 +2150,58 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("strings", "url_encoded_strings", "strings", "url_encoded"),
     ("strings", "very_long_strings", "strings", "very_long"),
     ("text", "high_byte_ratio", "text", "non_ascii_ratio"),
-    ("text", "max_inline_whitespace_run", "text", "max_ws_run"),
+    (
+        "text",
+        "max_inline_whitespace_run",
+        "text",
+        "max_whitespace_run",
+    ),
     ("text", "most_common_char_codepoint", "text", "top_char"),
     ("text", "most_common_char_is_null", "text", "top_char_null"),
     ("text", "most_common_ratio", "text", "top_char_ratio"),
     ("text", "total_lines", "text", "lines"),
+    // Later renames: filefacts' 2026-10-01 schema cleanup, and metrics cleave
+    // computed before filefacts took over parsing.
+    ("ast", "member_depth_max", "ast", "max_member_depth"),
+    (
+        "binary",
+        "high_entropy_strings",
+        "binary",
+        "high_entropy_string_count",
+    ),
+    (
+        "binary",
+        "normalized_string_count",
+        "text",
+        "normalized_string_count",
+    ),
+    ("comments", "url_in_comments", "comments", "url_count"),
+    ("elf", "build_id_present", "elf", "has_build_id"),
+    ("elf", "class_bits", "elf", "bits"),
+    ("elf", "debuglink_present", "elf", "has_debuglink"),
+    ("elf", "entry_point", "elf", "entry"),
+    ("elf", "gnu_hash_present", "elf", "has_gnu_hash"),
+    ("elf", "hidden_symbols", "elf", "hidden_symbol_count"),
+    (
+        "elf",
+        "load_segment_max_p_filesz",
+        "elf",
+        "load_segment_max_file_size",
+    ),
+    (
+        "elf",
+        "load_segment_max_p_memsz",
+        "elf",
+        "load_segment_max_memory_size",
+    ),
+    ("pe", "certificate_table_size", "pe", "cert_table_size"),
+    ("pe", "delay_load_imports", "pe", "delay_import_count"),
+    ("pe", "manifest_present", "pe", "has_manifest"),
+    ("pe", "size_of_headers", "pe", "headers_size"),
+    ("pe", "size_of_image", "pe", "image_size"),
+    ("pe", "tls_callbacks", "pe", "tls_callback_count"),
+    ("pe", "version_info_present", "pe", "has_version_info"),
+    ("text", "max_ws_run", "text", "max_whitespace_run"),
 ];
 
 /// Borrow metric values under their original names and missing legacy aliases.
@@ -4238,7 +4181,7 @@ mod reader_equivalence_tests {
             }
             files.push(fa);
         }
-        compact_from_files(&files)
+        compact_from_files(&files, cleave::types::Facts::Full)
     }
 
     /// The typed reader's per-file output, pinned. These values feed the model
@@ -4290,7 +4233,7 @@ mod reader_equivalence_tests {
             library: Some("kernel32.dll".to_string()),
             ..Default::default()
         }];
-        let report = compact_from_files(&[fa]);
+        let report = compact_from_files(&[fa], cleave::types::Facts::Full);
         let summary = FileSummary::from_compact(&report.files[0], RawNeeds::all());
         // Both forms: LOGIC_GAPS matches the bare name, the vocab the qualified.
         assert!(summary.imports.contains("CreateProcessW"));

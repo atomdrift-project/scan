@@ -21,7 +21,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use scan::engine::{EmbeddedFile, FindingCounts, ScanResult};
+use scan::engine::{EmbeddedFile, FindingCounts, ScanResult, StoredReport};
 use scan::interpret::{Graded, Interpretation, LlmGrade};
 use scan::model::{Classification, Level, RouteScore, SkippedRoute};
 
@@ -76,15 +76,16 @@ fn full_result_serializes_identically() {
         version: "model-abc123".to_string(),
         analyzed_at: "2026-06-17T15:01:22Z".to_string(),
         cleave: Some(
-            serde_json::from_value(serde_json::json!({
-                "v": "8",
+            StoredReport::new(&serde_json::from_value(serde_json::json!({
+                "v": "9",
                 "files": [
                     { "id": 0, "depth": 0, "type": "whl", "sha": "r", "size": 13189, "path": "pkg.whl", "risk": 3 },
                     { "id": 1, "depth": 1, "type": "python", "sha": "a", "size": 10, "path": "pkg.whl!!a/__init__.py", "risk": 1 },
                     { "id": 2, "depth": 1, "type": "python", "sha": "b", "size": 20, "path": "pkg.whl!!a/_utilities.py", "risk": 3 }
                 ]
             }))
-            .expect("fixture is a valid compact report"),
+            .expect("fixture is a valid compact report"))
+            .expect("fixture serializes"),
         ),
         pids: Some(vec![123, 456]),
         deleted: Some(true),

@@ -444,7 +444,8 @@ fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<S
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Experimental: render saved JSON locally, without models, updates, fetching, or LLM calls.
+    /// Experimental: render saved JSON locally, without models, updates, or fetching. With
+    /// `--llm`, print the LLM's grade of the interpret render as `{grade, model, reason}` JSON.
     Render {
         /// Saved report input.
         #[command(flatten)]
@@ -870,11 +871,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
 
     if let Commands::Render { args } = &command {
+        // `--llm` grades what a live query sends, which is the interpret render.
+        let llm = global.interpret_config()?;
+        let format = if llm.is_some() {
+            scan::OutputFormat::Interpret
+        } else {
+            global.format
+        };
         let rendered = cleave::report_input::run(args, |loaded| {
-            scan::engine::render_saved_report(loaded, global.format)
+            scan::engine::render_saved_report(loaded, format)
         })?;
+        let out = match &llm {
+            Some(cfg) => format!("{}\n", scan::interpret::grade_render(cfg, &rendered)?),
+            None => rendered,
+        };
         use std::io::Write as _;
-        std::io::stdout().lock().write_all(rendered.as_bytes())?;
+        std::io::stdout().lock().write_all(out.as_bytes())?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -899,11 +911,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         );
     }
 
-    // `--enriched` picks the rules tree, so it is set before anything resolves
-    // one.
-    if global.enriched {
-        cleave::enriched::set_enabled(true);
-    }
+    // A held token picks the Enriched rules tree and `--enriched` insists on
+    // it: decided before anything resolves one.
+    cleave::enriched::resolve(global.enriched).map_err(anyhow::Error::msg)?;
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another litmus run.
@@ -936,6 +946,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
     // daemons refresh on restart, and `version`/`update-rules` manage updates
     // themselves.
     if command.is_scan() {
+        // `--enriched` needs a token before the refresh below would ask for
+        // one mid-download; asked here, once.
+        if cleave::enriched::required() {
+            cleave::rule_update::sign_in()?;
+        }
         scan::auto_update::refresh_if_stale(
             global.update,
             global.no_update,
@@ -943,8 +958,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             global.format == scan::OutputFormat::Terminal,
         )?;
         // Where artifacts are judged, settled once the rules are: an enriched
-        // scan that needed a token has been asked for it by now.
-        scan::remote::resolve(global.analyze, global.enriched)?;
+        // scan that needed a token has been asked for it by now, and one whose
+        // token was refused has fallen back to open source, and asks nothing.
+        scan::remote::resolve(global.analyze, cleave::enriched::enabled())?;
     }
 
     let fetch = fetch_policy(&global, &command);
@@ -1465,7 +1481,7 @@ fn print_version(format: scan::OutputFormat) {
             "models_date": models_date,
             "traits": cleave::traits_repo::version(),
             "traits_date": traits_date,
-            "traits_channel": if cleave::enriched::enabled() { "enriched" } else { "oss" },
+            "traits_channel": cleave::traits_repo::Edition::current().as_str(),
             "bloom": bloom_json,
         });
         println!("{version}");
@@ -1563,7 +1579,13 @@ fn print_version(format: scan::OutputFormat) {
         });
     }
 
-    scan::output::print_version(env!("CARGO_PKG_VERSION"), bloom_count, rules, &rows);
+    scan::output::print_version(
+        env!("CARGO_PKG_VERSION"),
+        &info.traits_edition.styled(),
+        bloom_count,
+        rules,
+        &rows,
+    );
 }
 
 /// The abbreviated commit hash and committer date (Unix seconds) of `HEAD` in

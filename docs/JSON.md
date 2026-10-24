@@ -9,8 +9,9 @@ same envelope:
       "raw": { ... full cleave report ... }
     }
 
-`ml` is Atomdrift Scan. `raw` is the cleave [AnalysisReport](../../cleave/docs/JSON.md);
-the cleave repo owns its schema.
+`ml` is Atomdrift Scan. `raw` is the cleave [compact report](../../cleave/docs/JSON.md);
+the cleave repo owns its schema. Scan stores it with `facts` reduced to what
+the models read (named by `fp`), after the models have read the full set.
 
 ## Why the field names are short
 
@@ -277,9 +278,15 @@ decision; the general `az` route alone would have been suspicious.
 `atomscan render report.json --format interpret` reads a saved cleave report
 (or a scan envelope's `raw` report) and uses the live primary-context budget and
 annotation rewrite. It does not load models, analyze the original files, fetch
-references, update rules, or call an LLM. `--format tiny` and `terminal` render
-cleave's corresponding context views; they do not synthesize an ML verdict.
-Use `-` as the input path to read one JSON document from stdin.
+references, or update rules. `--format tiny` and `terminal` render cleave's
+corresponding context views; they do not synthesize an ML verdict. Use `-` as
+the input path to read one JSON document from stdin.
+
+With `--llm` (and the usual `--llm-model`/`--llm-key`/`SCAN_LLM*` settings),
+`render` sends the interpret render to the LLM with the live grading prompt and
+prints `{"grade","model","reason"}` instead: the grade alone, with no ML
+admission gate or blend, for checking that a saved report grades as its live
+scan did. It queues at background priority.
 
 For a byte-for-byte comparison, use:
 
@@ -292,25 +299,11 @@ diff -u before.txt after.txt
 Rendered output goes to stdout, and warnings go to stderr. Run both inputs with the
 same renderer build and `SCAN_INTERPRET_BUDGET_BYTES` setting.
 
-Capture exact baselines with `cleave --format snapshot SAMPLE -o before.json`.
-That diagnostic format retains the capture annotations the live renderer uses.
-Historical compact v8 reports can be reconstructed from their spans, but omitted
-annotations/provenance prevent certifying parity with their original live
-render; they warn on stderr. Unknown schemas fail.
-
-The reader also accepts cleave's opt-in `file-1` typed candidate and the earlier
-`context-1` replay prototype, including trimmed context and local annotations. Generate it with
-`cleave render before.json --format json --trim-context -o after.json`, then
-compare with the commands above. Normal scan JSON output is unchanged. See
-[cleave context retention](../../cleave/docs/JSON.md#experimental-context-retention)
-for the scope and storage measurements.
-
-The reader additionally accepts the opt-in `joined-1` form produced by
-`cleave render before.json --format json --trim-context --model-facts --share-analyses`.
-Its local analysis pool preserves every occurrence. The selective model reader
-and `Model::predict_wire` bypass rendering/compact compatibility copies, checking
-the explicit retained-facts contract for every consulted route. New diagnostic
-wire formats are not enabled for normal scan uploads or production caches.
+The reader accepts compact v9 or v8 reports and cleave's raw v3 snapshots
+(`cleave --format snapshot SAMPLE -o before.json`); unknown schemas fail.
+Reports store no context annotations: the renderer derives them from each
+file's findings exactly as a live analysis does, so a saved report renders as
+its analysis did.
 
 The initial interpretation replay supports artifacts and their archive members.
 Fetched subjects and registry sidecars additionally require saved dependency

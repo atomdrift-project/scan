@@ -1509,7 +1509,7 @@ mod tests {
                 level: Level::Manual,
             }),
             members: MemberEvals::new(),
-            raw: "{}".to_string(),
+            report: None,
         }];
         (vec![edge], deps, report)
     }
@@ -1640,7 +1640,7 @@ mod tests {
                 level: Level::Manual,
             }),
             members: MemberEvals::new(),
-            raw: "{}".to_string(),
+            report: None,
         }];
         let registries = vec![crate::fetch::DependencyRegistry {
             locator: "pkg:test/dep@1".to_string(),
@@ -2293,11 +2293,17 @@ mod saved_render_tests {
             ..FileAnalysis::default()
         });
         report.files[0].findings[0].crit = Criticality::Notable;
+        // The match the renderer annotates: `eval`, the first four bytes.
+        report.files[0].findings[0].evidence = vec![cleave::Evidence {
+            method: "ast".into(),
+            value: "eval".into(),
+            offsets: vec![0],
+            ..Default::default()
+        }];
+        // A window as schema 8 wrote it (Z85 `b`), which readers still accept.
         report.files[0].context = serde_json::from_value(serde_json::json!([{
             "ln":0,"line":1,"col":1,
             "b":"wP?G#c$D+dvjsnB",
-            "n":[{"c":3,"i":"micro-behaviors/process/interpreter::eval",
-                "d":"Executes a variable","o":0,"z":4,"cf":0.95}]
         }]))
         .unwrap();
         let loaded = cleave::report_input::decode(&serde_json::to_vec(&report).unwrap()).unwrap();

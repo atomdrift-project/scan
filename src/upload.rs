@@ -394,11 +394,11 @@ pub fn encode_result_body(
             limit_bytes = HOPPER_MAX_RESULT_BODY_BYTES,
             "upload: result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
         );
-        // Empty the cleave report but keep the ml/llm verdict. `{}` (not null)
-        // mirrors the envelope litmus emits when there is no cleave report, so
-        // the dropped-raw form stays a structurally valid envelope.
+        // Empty the cleave report but keep the ml/llm verdict. An empty report
+        // (not null) mirrors the envelope litmus emits when there is no cleave
+        // report, so the dropped-raw form stays a structurally valid envelope.
         if let Some(envelope) = payload.envelope.as_mut() {
-            envelope.raw = cleave::types::CompactReport::default();
+            envelope.raw = std::sync::Arc::clone(crate::engine::empty_report());
         }
         // Moving/dropping the old buffer matters: shadowing it alone keeps
         // the oversized JSON allocation alive through the compression step.
@@ -407,8 +407,8 @@ pub fn encode_result_body(
     } else {
         json
     };
-    // The JSON now owns everything needed for upload. Release the complete
-    // typed report before allocating the compressor and its output buffer.
+    // The JSON now owns everything needed for upload. Release the payload
+    // before allocating the compressor and its output buffer.
     drop(payload);
     match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
         Ok(compressed) => Some((compressed, Some("zstd"))),
@@ -1088,25 +1088,13 @@ impl Hopper {
         // The store settles it now, in one indexed read, because the store is the
         // only place ordered against the other producers.
         for dep in fresh {
-            let envelope = match crate::engine::dep_envelope(&dep, version, analyzed_at) {
-                Ok(Some(envelope)) => envelope,
-                Ok(None) => {
-                    tracing::info!(
-                        sha256 = %dep.sha256,
-                        locator = %dep.locator,
-                        "upload: dependency not evaluated; stored for analysis without a verdict"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        sha256 = %dep.sha256,
-                        locator = %dep.locator,
-                        error = format!("{error:#}"),
-                        "upload: dependency report does not parse; verdict not posted"
-                    );
-                    continue;
-                }
+            let Some(envelope) = crate::engine::dep_envelope(&dep, version, analyzed_at) else {
+                tracing::info!(
+                    sha256 = %dep.sha256,
+                    locator = %dep.locator,
+                    "upload: dependency not evaluated; stored for analysis without a verdict"
+                );
+                continue;
             };
             // A dependency's locator is a PURL or a URL; only the former belongs
             // under a `purl` field, so a URL-sourced dependency logs by digest.
@@ -1888,6 +1876,10 @@ mod tests {
         }))
         .expect("typed raw report");
         assert_eq!(raw.files.len(), 2);
+        let raw = crate::engine::StoredReport::new(&raw)
+            .expect("serializes")
+            .json;
+        let raw_json = raw.get().to_owned();
         let payload = ResultPayload {
             sha256: "a".repeat(64),
             worker: "fixture".into(),
@@ -1913,6 +1905,11 @@ mod tests {
             }),
         };
         let expected = serde_json::to_vec(&payload).expect("expected JSON");
+        // The stored report rides through the flattened envelope verbatim.
+        assert!(
+            String::from_utf8_lossy(&expected).ends_with(&format!(r#""raw":{raw_json}}}"#)),
+            "raw is embedded as stored"
+        );
         let (body, encoding) = encode_result_body(payload, "test").expect("encode full report");
         assert_eq!(encoding, Some("zstd"));
         assert_eq!(
@@ -2063,7 +2060,7 @@ mod tests {
             provenance: None,
             verdict: None,
             members: crate::engine::MemberEvals::new(),
-            raw: "{}".to_string(),
+            report: None,
         };
         uploader.submit_dependencies(vec![dep], "v".into(), "t".into());
         uploader.submit_artifacts(vec![artifact(
@@ -2136,7 +2133,7 @@ mod tests {
             )),
             verdict: None,
             members: crate::engine::MemberEvals::new(),
-            raw: "{}".to_string(),
+            report: None,
         };
         let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z").expect("sidecar builds");
         assert_eq!(art.sha256, "c".repeat(64));

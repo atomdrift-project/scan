@@ -175,6 +175,9 @@ fn incomplete(report: &AnalysisReport) -> bool {
 /// time. A Git commit alone misses uncommitted edits; directories without
 /// Git metadata would all share a single namespace.
 ///
+/// cleave's compact schema version belongs here too: a cached entry holds a
+/// report in that format, and a format change must not replay the old one.
+///
 /// The model belongs here for the same reason the rules do: a cached entry
 /// holds the *verdict*, and the verdict is the model's output. Until
 /// 2026-08-07 it was absent, so a model auto-update reused the previous
@@ -187,8 +190,9 @@ pub(crate) fn ruleset_version() -> String {
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
     format!(
-        "{}-r{traits:016x}-{bloom}-m{}",
+        "{}-c{}-r{traits:016x}-{bloom}-m{}",
         env!("CARGO_PKG_VERSION"),
+        cleave::types::CompactReport::default().version,
         model_version(),
     )
 }

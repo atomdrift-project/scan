@@ -162,11 +162,17 @@ impl Fixture {
             ..Default::default()
         });
         report.files[0].findings[0].crit = cleave::Criticality::Notable;
+        // The match the renderer annotates: `eval`, the first four bytes.
+        report.files[0].findings[0].evidence = vec![cleave::Evidence {
+            method: "ast".into(),
+            value: "eval".into(),
+            offsets: vec![0],
+            ..Default::default()
+        }];
+        // A window as schema 8 wrote it (Z85 `b`), which readers still accept.
         report.files[0].context = serde_json::from_value(serde_json::json!([{
             "ln": 0, "line": 1, "col": 1,
             "b": "wP?G#c$D+dvjsnB",
-            "n": [{"c":3,"i":"micro-behaviors/process/interpreter::eval",
-                "d":"Executes a variable","o":0,"z":4,"cf":0.95}]
         }]))
         .unwrap();
         let path = self.root.path().join("report.json");

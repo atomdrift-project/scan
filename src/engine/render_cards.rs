@@ -262,8 +262,9 @@ fn terminal_finding_path(path: &str) -> String {
 }
 
 fn terminal_note_anchor(file: &FileAnalysis, finding_id: &str) -> Option<String> {
-    for line in &file.context {
-        let Some(note) = line.notes.iter().find(|n| n.id.as_str() == finding_id) else {
+    let notes = cleave::context::notes(&file.findings, &file.context);
+    for (line, notes) in file.context.iter().zip(notes) {
+        let Some(note) = notes.iter().find(|n| n.id.as_str() == finding_id) else {
             continue;
         };
         if let Some(base_line) = line.line {

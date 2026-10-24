@@ -197,21 +197,25 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_update: bool,
 
-    /// Use isotope13 Enriched: the private ruleset, fresh the hour it clears
-    /// QA, and remote verdicts (see `--analyze`). Requires a subscription token
-    /// from `ISOTOPE13_TOKEN` or the saved one, and asks for one on a terminal.
-    /// Also settable via `ATOMDRIFT_ENRICHED=1`.
+    /// Insist on isotope13 Enriched: the latest rules, the moment they clear
+    /// QA, and remote verdicts (see `--analyze`). A computer that holds a
+    /// token (`ISOTOPE13_TOKEN`, or the one saved when it was connected) uses
+    /// them without this flag. With it, a computer that holds none is
+    /// connected — a terminal shows a code to approve at dash.isotope13.io —
+    /// and a refused token stops the scan instead of falling back to the
+    /// open-source rules. Also settable via `ATOMDRIFT_ENRICHED=1`; `=0`
+    /// keeps the open-source rules.
     #[arg(long, global = true, env = "ATOMDRIFT_ENRICHED", value_parser = clap::builder::FalseyValueParser::new())]
     pub enriched: bool,
 
     /// Where artifacts are judged. `auto` (the default) asks isotope13 for a
     /// verdict it already holds — sending only the SHA-256 of local files of
     /// 1 MiB or more, and the PURLs of packages on mainstream public registries — and analyzes
-    /// locally whatever it does not know; it needs `--enriched`, and without
-    /// it is the same as `local`. `local` never asks, and is the reproducible
-    /// mode. `remote` sends everything to isotope13 for analysis, uploading
-    /// local files' contents, and needs `--enriched`. Also settable via
-    /// `SCAN_ANALYZE`.
+    /// locally whatever it does not know; it needs isotope13 Enriched (a
+    /// token, or `--enriched`), and without it is the same as `local`.
+    /// `local` never asks, and is the reproducible mode. `remote` sends
+    /// everything to isotope13 for analysis, uploading local files' contents,
+    /// and needs isotope13 Enriched. Also settable via `SCAN_ANALYZE`.
     #[arg(
         long,
         global = true,

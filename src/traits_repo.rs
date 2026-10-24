@@ -21,7 +21,7 @@ pub fn prepare_runtime_env() {
     if env_set || cleave::traits_repo::override_dir().is_some() {
         return;
     }
-    // `traits-enriched` under `--enriched`, `traits-oss` otherwise.
+    // `traits-enriched` when this run is Enriched, `traits-oss` otherwise.
     let installed = cleave::traits_repo::installed_dir(cleave::enriched::enabled());
     let local = looks_like_traits(Path::new("traits"));
     if !local && !looks_like_traits(&installed) {
@@ -46,21 +46,27 @@ fn looks_like_traits(path: &Path) -> bool {
 
 /// Install or refresh cleave traits from the R2 bundle, the same path
 /// `cleave update-rules` uses. Returns `true` when the installed commit changed.
+///
+/// The target is read again afterwards: a refused token without `--enriched`
+/// falls the run back to the open-source tree, and it is that tree's commit
+/// that then answers.
 pub fn update(force: bool, quiet: bool) -> Result<bool> {
     prepare_runtime_env();
-    let dir = cleave::traits_repo::install_target();
-    let before = cleave::rule_update::installed(&dir).map(|i| i.commit);
+    let commit =
+        || cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.commit);
+    let before = commit();
     // Kept as the source, not flattened into text: auto-update tells a refused
     // enriched token (an error) from an unreachable bucket (not one) by it.
-    cleave::rule_update::update(&dir, force, quiet)
+    cleave::rule_update::refresh(force, quiet)
         .map_err(|e| anyhow::Error::new(e).context("traits update failed"))?;
-    let after = cleave::rule_update::installed(&dir).map(|i| i.commit);
-    Ok(before != after)
+    Ok(before != commit())
 }
 
 /// Why `--enriched` cannot be honoured, when that is what `error` says: no
-/// token, or one the rules channel refused. Every other update failure — the
-/// network, the bucket, the disk — is one a host rides out on the rules it has.
+/// token, or one the rules channel refused. Without `--enriched` a refusal
+/// never gets this far — the run has fallen back to the open-source rules.
+/// Every other update failure — the network, the bucket, the disk — is one a
+/// host rides out on the rules it has.
 #[must_use]
 pub fn enriched_refusal(error: &anyhow::Error) -> Option<&str> {
     match error.downcast_ref::<cleave::rule_update::Error>()? {

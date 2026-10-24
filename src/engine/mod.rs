@@ -13,7 +13,7 @@ use crate::bloom_repo::Lookup;
 use crate::model::{Classification, Thresholds};
 
 pub use crate::explain::Reason;
-pub use crate::lookup::{Hit, collect_hits};
+pub use crate::lookup::Hit;
 
 mod envelope;
 mod hopper;
@@ -25,9 +25,10 @@ mod retention;
 mod run;
 mod verdict;
 
+pub(crate) use self::envelope::empty_report;
 pub use self::envelope::{
     DepResult, EmbeddedFile, HopperRoute, MemberEvals, MlSection, ScanResult, ScanResultEnvelope,
-    ScanResultEnvelopeRef, TopFinding,
+    ScanResultEnvelopeRef, StoredFile, StoredReport, TopFinding,
 };
 pub use self::pipeline::{PendingLlm, count_findings, extract_top_findings};
 pub use self::run::{report_remote, run, run_bytes, run_paths, scan_bytes, scan_file};
@@ -570,7 +571,6 @@ impl Tuning {
 }
 
 /// Render a saved report through the live presentation functions without models.
-/// Compact historical reports reconstruct capture notes and warn on stderr.
 pub fn render_saved_report(
     loaded: &cleave::report_input::LoadedReport,
     format: crate::OutputFormat,

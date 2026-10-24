@@ -63,18 +63,22 @@ pub enum Analyze {
 /// The mode this run resolved to, and the token `remote` uploads with.
 static RESOLVED: OnceLock<(Analyze, Option<cleave::enriched::Token>)> = OnceLock::new();
 
-/// Resolve `--analyze` against `--enriched`, once, before any scan starts.
+/// Resolve `--analyze` against whether this run is Enriched (a held token,
+/// or `--enriched`), once, before any scan starts.
 ///
-/// `auto` without `--enriched` is `local`: no new traffic for anyone who did
-/// not ask for the service. With it, `auto` arms the isotope13 lookups and
-/// `remote` holds the token for uploads. A missing token is asked for here, on
-/// a terminal, and checked against the rules channel before it is used.
+/// `auto` on an open-source run is `local`: no new traffic for anyone who did
+/// not ask for the service. On an Enriched run, `auto` arms the isotope13
+/// lookups and `remote` holds the token for uploads. A missing token is asked
+/// for here, on a terminal, and checked against the rules channel before it
+/// is used.
 ///
 /// # Errors
-/// `remote` without `--enriched`, or `--enriched` with no usable token.
+/// `remote` on an open-source run, or an Enriched run with no usable token.
 pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
     let resolved = match (analyze, enriched) {
-        (Analyze::Remote, false) => anyhow::bail!("--analyze=remote requires --enriched"),
+        (Analyze::Remote, false) => {
+            anyhow::bail!("--analyze=remote requires isotope13 Enriched: a token, or --enriched")
+        }
         (Analyze::Local, _) | (Analyze::Auto, false) => (Analyze::Local, None),
         (mode, true) => {
             let token = token()?;
@@ -102,7 +106,7 @@ fn token() -> Result<cleave::enriched::Token> {
     if let Some((token, _)) = cleave::enriched::token().map_err(anyhow::Error::msg)? {
         return Ok(token);
     }
-    cleave::rule_update::login()?;
+    cleave::rule_update::enrich()?;
     cleave::enriched::token()
         .map_err(anyhow::Error::msg)?
         .map(|(token, _)| token)

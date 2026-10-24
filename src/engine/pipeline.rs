@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
-use cleave::types::{CompactFile, CompactReport, CompactTrait};
+use anyhow::{Context as _, Result, bail};
+use cleave::types::{CompactFile, CompactReport, CompactTrait, Facts};
 use cleave::{AnalysisReport, Criticality, FileAnalysis};
 use fletch::fetch::FetchRecord;
 
@@ -28,8 +28,8 @@ use super::verdict::{
 };
 use super::{
     DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute, MemberEvals, Reason,
-    SCHEMA_VERSION, ScanResult, TopFinding, Tuning, archive_leaf, compact_crit, is_inside,
-    model_version_string, now_rfc3339,
+    SCHEMA_VERSION, ScanResult, StoredReport, TopFinding, Tuning, archive_leaf, compact_crit,
+    is_inside, model_version_string, now_rfc3339,
 };
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, ParsedReport, RawNeeds};
@@ -257,6 +257,11 @@ pub fn classify_report(
     if !prepared.listed_members.is_empty() {
         append_unanalyzed_members(&mut compact, &prepared.listed_members);
     }
+    // The model has read every fact it featurizes from; what is stored keeps
+    // only those, named by the report's `fp`.
+    compact.retain_model_facts();
+    let cleave = StoredReport::new(&compact).context("serializing the cleave report")?;
+    drop(compact);
 
     let phase = PhaseTimings {
         fetch: prepared.fetch_time,
@@ -274,7 +279,7 @@ pub fn classify_report(
             level: decision.level,
             version: String::new(),
             analyzed_at: String::new(),
-            cleave: Some(compact),
+            cleave: Some(cleave),
             pids: None,
             deleted: None,
             path: req.label.to_string(),
@@ -412,12 +417,15 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
     // renders it: the consuming variant drops each `FileAnalysis` as its compact
     // projection is built, so the typed graph and the compact copy never
     // co-reside (on a member-heavy sample the typed graph is the single largest
-    // live allocation in the process).
+    // live allocation in the process). Every fact is kept: the model was
+    // trained on the full set, and what is stored is reduced only after it ran.
     let mut compact = if keep_typed {
-        cleave::types::compact::compact_from_files(&report.files)
+        cleave::types::compact::compact_from_files(&report.files, Facts::Full)
     } else {
-        let compact =
-            cleave::types::compact::compact_from_files_consuming(std::mem::take(&mut report.files));
+        let compact = cleave::types::compact::compact_from_files_consuming(
+            std::mem::take(&mut report.files),
+            Facts::Full,
+        );
         report = AnalysisReport::new(report.target.clone());
         compact
     };
@@ -730,26 +738,28 @@ fn grade_dependencies(
     dependencies
         .into_iter()
         .map(|dep| {
-            let (verdict, members, raw) = match serde_json::from_str::<CompactReport>(&dep.raw) {
+            let (verdict, members, report) = match serde_json::from_str::<CompactReport>(&dep.raw) {
                 Ok(mut report) => {
                     let graded = classify_dependency(&report, &dep.locator, req)?;
                     // Same retention rubric as the root report: grading consumed
                     // the complete report; the stored body keeps only the nodes
-                    // someone will read again.
+                    // and facts someone will read again.
                     if !req.tuning.keep_all_members {
                         apply_report_retention(&mut report);
                     }
-                    let raw = serde_json::to_string(&report).unwrap_or(dep.raw);
+                    report.retain_model_facts();
+                    let report = StoredReport::new(&report)
+                        .with_context(|| format!("serializing report of {}", dep.locator))?;
                     match graded {
-                        Some((verdict, members)) => (Some(verdict), members, raw),
-                        None => (None, MemberEvals::new(), raw),
+                        Some((verdict, members)) => (Some(verdict), members, Some(report)),
+                        None => (None, MemberEvals::new(), Some(report)),
                     }
                 }
                 Err(error) => {
                     // No verdict rather than an invented one; its bytes and
                     // provenance still go to hopper, which can analyze them.
                     tracing::warn!(locator = %dep.locator, %error, "dependency report does not parse; not graded");
-                    (None, MemberEvals::new(), dep.raw)
+                    (None, MemberEvals::new(), None)
                 }
             };
             Ok(DepResult {
@@ -762,7 +772,7 @@ fn grade_dependencies(
                 locator: dep.locator,
                 url: dep.url,
                 size: dep.size,
-                raw,
+                report,
             })
         })
         .collect()
@@ -1572,6 +1582,11 @@ mod tests {
         classify_dependency(&report, label, &req).expect("not cancelled")
     }
 
+    /// Store `raw` the way `classify_report` stores a report.
+    fn stored(raw: &str) -> StoredReport {
+        StoredReport::new(&serde_json::from_str(raw).expect("report parses")).expect("serializes")
+    }
+
     /// The former production cutoff. Tests deliberately put evidence beyond it
     /// so reintroducing a prefix-only grading policy cannot pass unnoticed.
     const FORMER_EMBEDDED_FILE_LIMIT: usize = 100;
@@ -1724,9 +1739,9 @@ mod tests {
             graded[0].verdict.is_none(),
             "an unparseable report must yield no verdict",
         );
-        assert_eq!(
-            graded[0].raw, "{not json",
-            "its bytes still go to hopper as they came"
+        assert!(
+            graded[0].report.is_none(),
+            "an unparseable report has no stored form"
         );
     }
 
@@ -1850,10 +1865,9 @@ mod tests {
             provenance: None,
             verdict: Some(verdict),
             members,
-            raw: raw.clone(),
+            report: Some(stored(&raw)),
         };
         let dep_env = dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z")
-            .expect("the report parses")
             .expect("a graded dependency yields an envelope");
 
         // The same bytes as a first-hand scan would produce them.
@@ -1865,7 +1879,7 @@ mod tests {
             level: verdict.level,
             version: "model-9".to_string(),
             analyzed_at: "2026-06-28T00:00:00Z".to_string(),
-            cleave: Some(serde_json::from_str(&raw).expect("report parses")),
+            cleave: Some(stored(&raw)),
             embedded_files: dep.members,
             ..super::super::envelope::tests::base_result()
         };
@@ -2051,7 +2065,7 @@ mod tests {
             f.crit = crit;
             fa.findings.push(f);
         }
-        let report = cleave::types::compact_from_files(&[fa]);
+        let report = cleave::types::compact_from_files(&[fa], cleave::types::Facts::Full);
         assert_eq!(
             count_findings(&report),
             FindingCounts {
@@ -2190,11 +2204,14 @@ mod tests {
         // rejects. The ordinary parent/member pair around it stays clean.
         let mut orphan = file(2, "reg", "registry", "s2", None);
         orphan.role = Role::Sidecar;
-        let report = cleave::types::compact::compact_from_files(&[
-            file(0, "a.tar", "tar", "s0", None),
-            file(1, "a.tar!!x.py", "python", "s1", Some(0)),
-            orphan,
-        ]);
+        let report = cleave::types::compact::compact_from_files(
+            &[
+                file(0, "a.tar", "tar", "s0", None),
+                file(1, "a.tar!!x.py", "python", "s1", Some(0)),
+                orphan,
+            ],
+            Facts::Full,
+        );
         let integ = validate_report_references("test", &report);
         assert_eq!(integ.orphan_sidecars, 1, "orphan sidecar");
         assert_eq!(integ.dangling_refs, 0, "no dangling refs");
@@ -2205,10 +2222,10 @@ mod tests {
         // A sidecar that correctly names its parent is fine.
         let mut sidecar = file(1, "reg", "registry", "s1", Some(0));
         sidecar.role = Role::Sidecar;
-        let report = cleave::types::compact::compact_from_files(&[
-            file(0, "a.tar", "tar", "s0", None),
-            sidecar,
-        ]);
+        let report = cleave::types::compact::compact_from_files(
+            &[file(0, "a.tar", "tar", "s0", None), sidecar],
+            Facts::Full,
+        );
         let integ = validate_report_references("test", &report);
         assert_eq!(integ, super::ReportIntegrity::default());
     }

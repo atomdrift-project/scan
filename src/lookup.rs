@@ -116,7 +116,7 @@ impl Verdict {
             hits: result
                 .cleave
                 .as_ref()
-                .map(|report| collect_hits(report, purl))
+                .map(|report| report.hits(purl))
                 .unwrap_or_default(),
         }
     }
@@ -127,10 +127,10 @@ impl Verdict {
 /// One selection rule, shared by everything that reports findings, so two
 /// consumers never disagree about which ones matter. Notable and above
 /// ([`MIN_HIT_CRIT`]), native matches only, deduplicated, capped at
-/// [`MAX_STORED_HITS`]. `purl` names the package a finding belongs to when
-/// the artifact was fetched by coordinate.
+/// [`MAX_STORED_HITS`]. A finding from a dependency names it in `pkg`; any
+/// other leaves `pkg` empty for the caller to attribute.
 #[must_use]
-pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -> Vec<Hit> {
+pub(crate) fn collect_hits(report: &cleave::types::CompactReport) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &report.files {
@@ -150,7 +150,6 @@ pub fn collect_hits(report: &cleave::types::CompactReport, purl: Option<&str>) -
                 .dep
                 .as_ref()
                 .map(|d| d.locator.clone())
-                .or_else(|| purl.map(str::to_owned))
                 .unwrap_or_default();
             // One row per (trait, file, component): the same trait firing on a
             // dozen members of one archive is one fact, not a dozen.
@@ -365,31 +364,27 @@ impl Verdict {
 
 /// Where a finding fired: `(byte offset, 1-based line)`.
 ///
-/// The context windows carry a note per match, holding the exact offset. The
-/// window's own `line` labels its first byte, so the match's line is that plus
-/// the newlines between the window start and the match — the derivation the
-/// format documents. Binary windows have no line structure and report only the
-/// offset. A file whose context was trimmed falls back to the finding's first
-/// evidence span, which locates it without naming a line.
+/// The offset is the finding's first evidence span. A text context window
+/// holding that byte names its line: the window's own `line` labels its first
+/// byte, so the match's line is that plus the newlines before it — the
+/// derivation the format documents. A byte in a binary window, or in none,
+/// has no line.
 fn locate(
     file: &cleave::types::CompactFile,
     finding: &cleave::types::CompactTrait,
 ) -> (Option<u64>, Option<u64>) {
-    for window in &file.context {
-        let Some(note) = window.notes.iter().find(|n| *n.id == *finding.id) else {
-            continue;
-        };
-        let line = window.line.map(|start| {
-            // A 32-bit target cannot hold a window longer than usize::MAX
-            // anyway, so an offset that does not fit is past its end.
-            let offset_in_window =
-                usize::try_from(note.off.saturating_sub(window.loc)).unwrap_or(usize::MAX);
-            let scanned = &window.data[..offset_in_window.min(window.data.len())];
-            start + scanned.iter().filter(|&&b| b == b'\n').count() as u64
-        });
-        return (Some(note.off), line);
-    }
-    (finding.ev.first().map(|[off, _len]| *off), None)
+    let Some(&[off, _len]) = finding.ev.first() else {
+        return (None, None);
+    };
+    let line = file.context.iter().find_map(|window| {
+        let start = window.line?;
+        let at = usize::try_from(off.checked_sub(window.loc)?)
+            .ok()
+            .filter(|&at| at < window.data.len())?;
+        let newlines = window.data[..at].iter().filter(|&&b| b == b'\n').count();
+        Some(start + newlines as u64)
+    });
+    (Some(off), line)
 }
 
 /// Handle to the index directory for the current ruleset version.
@@ -753,33 +748,23 @@ mod tests {
         );
     }
 
-    /// A match reports the exact byte its note recorded, and the line that
-    /// byte falls on — the window's own line advanced by the newlines before
-    /// it. A window without line structure (a binary) reports only the offset.
+    /// A match reports the byte its first evidence span starts at, and the
+    /// line that byte falls on — the window's own line advanced by the
+    /// newlines before it. A window without line structure (a binary), or no
+    /// window at all, leaves only the offset.
     #[test]
     fn a_finding_reports_the_byte_and_line_it_fired_on() {
-        use cleave::types::{ContextLine, Criticality, Istr, Note};
-
-        let id = "objectives/execution/shell/bash";
-        let finding = cleave::types::CompactTrait {
-            id: id.to_string(),
+        let mut finding = cleave::types::CompactTrait {
+            id: "objectives/execution/shell/bash".to_string(),
             criticality: 5,
             description: String::new(),
             confidence: 1.0,
             mbc: None,
             attack: None,
             from: Vec::new(),
-            ev: vec![[2048, 16]],
+            ev: vec![[109, 4], [2048, 16]],
             uses: Vec::new(),
             dep: None,
-        };
-        let note = |off: u64| Note {
-            crit: Criticality::Hostile,
-            id: Istr::from(id),
-            desc: Istr::from(""),
-            off,
-            len: 4,
-            conf: 1.0,
         };
         let mut file = cleave::types::CompactFile {
             path: "lib/install.js".to_string(),
@@ -788,23 +773,30 @@ mod tests {
         };
 
         // Two lines of context before the match, so it sits on line 12.
-        file.context = vec![ContextLine {
+        file.context = vec![cleave::types::ContextLine {
             loc: 100,
             line: Some(10),
             col: Some(1),
             data: b"one\ntwo\nspawn('bash')".to_vec(),
-            notes: vec![note(109)],
         }];
         assert_eq!(locate(&file, &finding), (Some(109), Some(12)));
+
+        // A byte past the window's end is not in it.
+        finding.ev = vec![[122, 4]];
+        assert_eq!(locate(&file, &finding), (Some(122), None));
+        finding.ev = vec![[109, 4]];
 
         // A binary window carries no line structure: the offset stands alone.
         file.context[0].line = None;
         assert_eq!(locate(&file, &finding), (Some(109), None));
 
-        // Context trimmed away: fall back to the finding's own evidence span,
-        // which locates it without claiming a line.
+        // Context trimmed away: the offset still locates it.
         file.context.clear();
-        assert_eq!(locate(&file, &finding), (Some(2048), None));
+        assert_eq!(locate(&file, &finding), (Some(109), None));
+
+        // No evidence span: nowhere to point.
+        finding.ev.clear();
+        assert_eq!(locate(&file, &finding), (None, None));
     }
 
     /// A panic while the memo was held must not switch the memo off for the

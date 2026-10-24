@@ -1571,16 +1571,27 @@ pub struct SourceRow {
     pub epoch: Option<i64>,
 }
 
-/// Render `scan version`: the split signature/rule inventory, then one aligned
-/// row per detection source with its count, version, and upstream age.
-pub fn print_version(scan_version: &str, hashes_and_purls: u64, rules: u64, rows: &[SourceRow]) {
+/// Render `scan version`: which rules edition is in use and the split
+/// signature/rule inventory, then one aligned row per detection source with
+/// its count, version, and upstream age.
+///
+/// `edition` is already styled for the terminal (see
+/// `cleave::traits_repo::Edition::styled`).
+pub fn print_version(
+    scan_version: &str,
+    edition: &str,
+    hashes_and_purls: u64,
+    rules: u64,
+    rows: &[SourceRow],
+) {
     let p = palette();
     let now = now_unix();
 
     println!();
     println!(
-        " \u{269b}\u{fe0f} {} {}",
+        " \u{269b}\u{fe0f} {} {} {edition} {}",
         fg_bold(p.path_name, &format!("Atomdrift Scan v{scan_version}")),
+        fg(p.very_dim, "\u{00b7}"),
         fg(
             p.very_dim,
             &detection_inventory_text(hashes_and_purls, rules)
