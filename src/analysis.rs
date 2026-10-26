@@ -85,7 +85,7 @@ pub fn classify_file(path: &Path, analysis: Analysis<'_>) -> Result<ScanResult> 
     analysis.mark("cleave:analyze");
     let report = cleave::analyze_file(path, &opts)
         .with_context(|| format!("cleave analysis of {}", analysis.label))?;
-    finish(report, analysis)
+    finish(report, analysis, Some(path), None)
 }
 
 /// Analyze `data` in memory. cleave adopts the refcounted buffer, so a
@@ -104,17 +104,23 @@ pub fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<Scan
     opts.dedicated_pool = lane.is_some();
     analysis.mark("cleave:analyze");
     let label = analysis.label;
+    let retained = data.clone();
     let analyze = move || cleave::analyze_bytes_shared(data, label, &opts);
     let report = match lane {
         Some(lane) => lane.install(analyze),
         None => analyze(),
     }
     .with_context(|| format!("cleave analysis of {label}"))?;
-    finish(report, analysis)
+    finish(report, analysis, None, Some(retained))
 }
 
 /// Shared tail: honor a late cancellation, then classify and build the result.
-fn finish(report: cleave::AnalysisReport, analysis: Analysis<'_>) -> Result<ScanResult> {
+fn finish(
+    report: cleave::AnalysisReport,
+    analysis: Analysis<'_>,
+    path: Option<&Path>,
+    bytes: Option<bytes::Bytes>,
+) -> Result<ScanResult> {
     // A timeout that fired while cleave ran: skip featurization and inference
     // for a result nobody is waiting for.
     if analysis
@@ -141,9 +147,12 @@ fn finish(report: cleave::AnalysisReport, analysis: Analysis<'_>) -> Result<Scan
             root_registry: analysis.root_registry,
             phase: analysis.phase.map(RequestPhase::tracker),
             cpu_lease: analysis.cpu_lease,
-            // There is no file to re-read for the root imperative hunt; the
-            // label is a best-effort path. Declared references still follow.
-            ..ClassifyRequest::new(analysis.label, Path::new(analysis.label), &r.model)
+            root_bytes: bytes,
+            ..ClassifyRequest::new(
+                analysis.label,
+                path.unwrap_or_else(|| Path::new("")),
+                &r.model,
+            )
         },
     )?;
     Ok(cr.into_scan_result(analysis.label.to_string(), &r.model, true))

@@ -42,9 +42,10 @@ use crate::model::{Classification, Decision, Level, Model, RouteScore, SkippedRo
 pub struct ClassifyRequest<'a> {
     /// Display label; becomes the result's path.
     pub label: &'a str,
-    /// The artifact on disk, for the root imperative-reference hunt. Callers
-    /// analyzing bytes pass the label; the hunt then finds nothing to re-read.
+    /// The artifact on disk, for reference discovery when root_bytes is absent.
     pub root_path: &'a std::path::Path,
+    /// Original in-memory artifact, retained through reference discovery.
+    pub root_bytes: Option<bytes::Bytes>,
     pub model: &'a Model,
     pub shap: Option<&'a ShapImportance>,
     pub cancellation: Option<&'a AtomicBool>,
@@ -77,6 +78,7 @@ impl<'a> ClassifyRequest<'a> {
         Self {
             label,
             root_path,
+            root_bytes: None,
             model,
             shap: None,
             cancellation: None,
@@ -167,6 +169,9 @@ pub fn classify_report(
     let needs = req.needs;
 
     let mut prepared = prepare(report, &req);
+    // Fetch discovery is finished; release the retained input before inference
+    // and the potentially slow LLM round trip.
+    drop(req.root_bytes.take());
     let index = ReportIndex::new(&prepared.typed);
     let scored = score(&prepared, &req)?;
     // After featurization, never before: a backref is a conclusion about
@@ -378,9 +383,10 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
         p.set("fetch+graft");
     }
     let fetch_started = Instant::now();
-    let fetch = crate::fetch::orchestrate(
+    let fetch = crate::fetch::orchestrate_with_input(
         &mut report,
         req.root_path,
+        req.root_bytes.as_deref(),
         req.fetch,
         needs.fetch_progress,
         capture_deps,
