@@ -61,6 +61,7 @@ pub fn global() -> Option<Arc<Lookup>> {
 #[derive(Debug)]
 pub struct Lookup {
     inner: burton::Lookup,
+    nsrl: Option<burton::Lookup>,
     sha256_memo: DecisionCache<[u8; 32]>,
     purl_memo: DecisionCache<String>,
 }
@@ -75,6 +76,7 @@ impl Lookup {
     fn wrap(inner: burton::Lookup) -> Self {
         Self {
             inner,
+            nsrl: None,
             sha256_memo: DecisionCache::new(decision_cache::CAP),
             purl_memo: DecisionCache::new(decision_cache::CAP),
         }
@@ -88,7 +90,27 @@ impl Lookup {
     /// is about to be analyzed that need not have been.
     #[must_use]
     pub fn load() -> Self {
-        Self::load_from(&install_dir())
+        let primary = install_dir();
+        let mut lookup = Self::load_from(&primary);
+        if crate::nsrl_repo::enabled() {
+            lookup.attach_nsrl(&primary, &crate::nsrl_repo::install_dir());
+        }
+        lookup
+    }
+
+    fn attach_nsrl(&mut self, primary: &Path, nsrl: &Path) {
+        // NSRL may bless only while our own SHA-256 revocation slot is loaded.
+        // Losing the daily bundle must never leave a standalone stale allowlist.
+        let revocations = self.inner.is_active()
+            && burton::build::read_manifest(primary)
+                .is_some_and(|m| m.filter.contains_key("sha256-bad"));
+        if !revocations || !nsrl.join("bloom.toml").is_file() {
+            return;
+        }
+        match crate::nsrl_repo::open(nsrl) {
+            Ok(lookup) => self.nsrl = Some(lookup),
+            Err(error) => tracing::warn!(%error, "NSRL bundle unusable; scanning without NSRL"),
+        }
     }
 
     /// Open a bundle from a specific directory.
@@ -132,13 +154,25 @@ impl Lookup {
     /// The verdict for one artifact. Supply every key you have: a blessing
     /// needs all of them to agree.
     pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
-        self.inner.decide(artifact)
+        let primary = self.inner.decide(artifact);
+        // Every adverse decision, including an outside claim or a conflict,
+        // wins outright over NSRL. Existing primary blessings also stand.
+        if primary == Decision::Unknown
+            && self
+                .nsrl
+                .as_ref()
+                .is_some_and(|nsrl| nsrl.may_skip(artifact))
+        {
+            Decision::Skip
+        } else {
+            primary
+        }
     }
 
     /// Whether this artifact may be skipped.
     #[must_use]
     pub fn may_skip(&self, artifact: &Artifact<'_>) -> bool {
-        self.inner.may_skip(artifact)
+        self.decide(artifact).may_skip()
     }
 
     /// The verdict for a raw PURL, canonicalized on the way in.
@@ -152,7 +186,7 @@ impl Lookup {
 
     /// The verdict for an artifact digest.
     pub fn decide_sha256(&self, digest: &[u8; 32]) -> Decision {
-        self.inner.decide(&Artifact::sha256(digest))
+        self.decide(&Artifact::sha256(digest))
     }
 
     /// The verdict for an artifact named by a digest, a PURL, or both.
@@ -170,7 +204,20 @@ impl Lookup {
         if let Some(digest) = digest {
             artifact = artifact.and_sha256(digest);
         }
-        self.inner.decide(&artifact)
+        let primary = self.inner.decide(&artifact);
+        if primary != Decision::Unknown {
+            return primary;
+        }
+        // NSRL contributes to the digest key only. If a caller also supplies a
+        // PURL, that key must independently be vouched by the primary bundle.
+        let purl_good = key
+            .as_deref()
+            .is_none_or(|key| self.inner.may_skip(&Artifact::purl(key)));
+        if purl_good && digest.is_some_and(|digest| self.decide_sha256(digest).may_skip()) {
+            Decision::Skip
+        } else {
+            Decision::Unknown
+        }
     }
 
     /// The verdict for an artifact known by both keys.
@@ -201,7 +248,7 @@ impl Lookup {
     /// rule tally.
     #[must_use]
     pub fn rule_count(&self) -> u64 {
-        self.inner.keys()
+        self.inner.keys() + self.nsrl.as_ref().map_or(0, burton::Lookup::keys)
     }
 }
 
@@ -328,6 +375,84 @@ mod tests {
             purl: purl.and_then(purl_key),
             sha256: sha,
         }
+    }
+
+    fn publish_nsrl(dir: &Path, digests: &[[u8; 32]]) {
+        let mut sets = KeySets::new();
+        for digest in digests {
+            sets.insert(Tier::Good, rec(None, Some(*digest)));
+        }
+        let filters: Vec<_> = sets
+            .into_filters_for(1, 1e-9)
+            .into_iter()
+            .filter(|f| f.kind() == burton::Kind::Sha256)
+            .collect();
+        let mut manifest =
+            burton::build::write_bundle(dir, &filters, "2026-09-01", crate::nsrl_repo::KEY_SCHEME)
+                .unwrap();
+        for (stem, entry) in &mut manifest.filter {
+            let name = format!("{stem}-{}.adbl", entry.sha256);
+            std::fs::rename(dir.join(&entry.file), dir.join(&name)).unwrap();
+            entry.file = name;
+        }
+        std::fs::write(dir.join("bloom.toml"), toml::to_string(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn nsrl_blesses_digests_but_every_adverse_tier_wins() {
+        let primary = tempfile::tempdir().unwrap();
+        let nsrl = tempfile::tempdir().unwrap();
+        publish(
+            primary.path(),
+            &[
+                (Tier::Bad, rec(None, Some(digest(2)))),
+                (Tier::SightedHostile, rec(None, Some(digest(3)))),
+                (Tier::SightedSuspicious, rec(None, Some(digest(4)))),
+                (Tier::Good, rec(Some("pkg:npm/ok@1"), None)),
+                (Tier::Bad, rec(Some("pkg:npm/bad@1"), None)),
+            ],
+        );
+        publish_nsrl(nsrl.path(), &[digest(1), digest(2), digest(3), digest(4)]);
+        let mut lookup = Lookup::load_from(primary.path());
+        lookup.attach_nsrl(primary.path(), nsrl.path());
+        assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Skip);
+        assert_eq!(lookup.memo_sha256(&digest(1)), Decision::Skip);
+        assert!(lookup.may_skip(&Artifact::sha256(&digest(1))));
+        assert_eq!(lookup.decide_sha256(&digest(2)), Decision::KnownBad);
+        assert_eq!(lookup.decide_sha256(&digest(3)), Decision::SightedHostile);
+        assert_eq!(
+            lookup.decide_sha256(&digest(4)),
+            Decision::SightedSuspicious
+        );
+        assert_eq!(
+            lookup.decide_both("pkg:npm/ok@1", &digest(1)),
+            Decision::Skip
+        );
+        assert_eq!(
+            lookup.decide_both("pkg:npm/unknown@1", &digest(1)),
+            Decision::Unknown
+        );
+        assert_eq!(
+            lookup.decide_both("pkg:npm/bad@1", &digest(1)),
+            Decision::KnownBad
+        );
+        assert_eq!(lookup.decide_purl("pkg:npm/unknown@1"), Decision::Unknown);
+        assert_eq!(lookup.rule_count(), 9);
+    }
+
+    #[test]
+    fn nsrl_cannot_bless_without_the_primary_revocation_slot() {
+        let primary = tempfile::tempdir().unwrap();
+        let nsrl = tempfile::tempdir().unwrap();
+        publish_nsrl(nsrl.path(), &[digest(1)]);
+        let mut lookup = Lookup::load_from(primary.path());
+        lookup.attach_nsrl(primary.path(), nsrl.path());
+        assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Unknown);
+        publish(primary.path(), &[]);
+        std::fs::remove_file(primary.path().join("sha256-bad.adbl")).unwrap();
+        let mut lookup = Lookup::load_from(primary.path());
+        lookup.attach_nsrl(primary.path(), nsrl.path());
+        assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Unknown);
     }
 
     #[test]

@@ -168,10 +168,20 @@ fn refresh() -> Outcome {
         let traits = s.spawn(|| crate::traits_repo::update(false, true));
         let models = s.spawn(|| crate::model_update::update(&models_dir, false, true));
         let bloom = s.spawn(|| crate::bloom_update::update(&bloom_dir, false, true));
+        // NSRL follows its own manifest on the normal daily rules check,
+        // including first install. SCAN_NSRL=0 disables this source.
+        let nsrl = s.spawn(|| {
+            if crate::nsrl_repo::enabled() {
+                crate::nsrl_repo::update(&crate::nsrl_repo::install_dir(), true)
+            } else {
+                Ok(false)
+            }
+        });
         [
             ("traits", traits.join()),
             ("model", models.join()),
             ("bloom", bloom.join()),
+            ("nsrl", nsrl.join()),
         ]
     });
 

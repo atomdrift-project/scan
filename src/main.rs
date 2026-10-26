@@ -1422,6 +1422,12 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
         if let Err(e) = scan::bloom_update::check(&bloom_dir) {
             eprintln!("Warning: bloom filter check failed: {e}");
         }
+        if scan::nsrl_repo::enabled() {
+            if let Err(e) = scan::nsrl_repo::check(&scan::nsrl_repo::install_dir()) {
+                eprintln!("Error checking NSRL updates: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         if let Err(e) = scan::model_update::update(&dir, false, false) {
             eprintln!("Error updating models: {e}");
@@ -1439,6 +1445,12 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
         if let Err(e) = scan::bloom_update::update(&bloom_dir, false, false) {
             eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
         }
+        if scan::nsrl_repo::enabled() {
+            if let Err(e) = scan::nsrl_repo::update(&scan::nsrl_repo::install_dir(), false) {
+                eprintln!("Error updating NSRL: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     ExitCode::SUCCESS
 }
@@ -1447,6 +1459,7 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
 /// source it would scan with.
 fn print_version(format: scan::OutputFormat) {
     let bloom = scan::bloom_repo::installed_manifest();
+    let nsrl = scan::nsrl_repo::installed_manifest();
     if format == scan::OutputFormat::Json {
         let bloom_json = bloom.as_ref().map(|m| {
             let filters: serde_json::Map<String, serde_json::Value> = m
@@ -1483,6 +1496,8 @@ fn print_version(format: scan::OutputFormat) {
             "traits_date": traits_date,
             "traits_channel": cleave::traits_repo::Edition::current().as_str(),
             "bloom": bloom_json,
+            "nsrl": nsrl,
+            "nsrl_release": scan::nsrl_repo::installed_release(),
         });
         println!("{version}");
         return;
@@ -1529,6 +1544,15 @@ fn print_version(format: scan::OutputFormat) {
     let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
 
     let mut rows = Vec::new();
+    if let Some(nsrl) = nsrl {
+        rows.push(SourceRow {
+            label: "nsrl",
+            count: nsrl.filter.values().map(|e| e.n).sum(),
+            metric: None,
+            version: scan::nsrl_repo::installed_release().unwrap_or_else(|| "v1".to_owned()),
+            epoch: scan::output::parse_ymd(&nsrl.built),
+        });
+    }
     if bloom.is_some() {
         rows.push(SourceRow {
             label: "blooms",
@@ -1624,6 +1648,27 @@ mod tests {
     use std::net::SocketAddr;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
+
+    #[test]
+    fn nsrl_uses_the_normal_rules_update_without_an_extra_flag() {
+        let cli = Cli::try_parse_from(["atomscan", "update-rules"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::UpdateRules {
+                models_only: false,
+                check: false
+            })
+        ));
+        let cli = Cli::try_parse_from(["atomscan", "update-rules", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::UpdateRules {
+                models_only: false,
+                check: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["atomscan", "update-rules", "--nsrl"]).is_err());
+    }
 
     #[test]
     fn a_closed_pipe_anywhere_in_the_chain_exits_quietly() {

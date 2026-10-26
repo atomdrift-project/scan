@@ -77,6 +77,7 @@ pub mod memory;
 pub mod model;
 pub mod model_update;
 pub mod models_repo;
+pub mod nsrl_repo;
 pub mod output;
 pub mod pkg;
 pub mod provenance;

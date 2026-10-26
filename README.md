@@ -245,3 +245,24 @@ replace installed tools.
 Atomdrift Scan is available under the [Apache License 2.0](LICENSE).
 
 All contributions welcome!
+
+## NSRL Modern allowlist
+
+NSRL's separate, independently versioned Bloom bundle installs with
+`atomscan update-rules` (`--check` checks availability without fetching the
+large filter). The initial download is approximately 512 MiB at the current
+corpus size. The daily rules check also installs and refreshes it, downloading
+filter bytes only when its own NSRL manifest changes.
+Pulsar publishes it under `litmus/nsrl/modern/v1/`, independently of the daily
+known-good/known-bad filters.
+
+An NSRL SHA-256 hit is an additional good signal. A bad, sighted-hostile,
+sighted-suspicious, or conflicted match in Scan's primary bundle always takes
+precedence. The primary SHA-256 revocation filter must be loaded before NSRL
+can permit skipping. When both PURL and digest are supplied, each key still
+needs a good match. Slow mode continues to analyze all inputs.
+
+`SCAN_NSRL=0` disables this source. `SCAN_NSRL_DIR` selects an operator-maintained
+bundle, which the updater leaves alone. `SCAN_NSRL_URL` overrides the update
+base URL (the updater appends `nsrl/modern/v1/`). `atomscan version` reports
+NSRL separately, and NSRL content changes invalidate cached analysis verdicts.

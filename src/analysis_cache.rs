@@ -189,8 +189,15 @@ pub(crate) fn ruleset_version() -> String {
     let traits = cleave::cache::traits_revision_fingerprint();
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
+    let nsrl = crate::nsrl_repo::enabled()
+        .then(crate::nsrl_repo::installed_manifest)
+        .flatten()
+        .map_or_else(
+            || "nonsrl".to_string(),
+            |m| format!("nsrl-{}", bloom_token(&m)),
+        );
     format!(
-        "{}-c{}-r{traits:016x}-{bloom}-m{}",
+        "{}-c{}-r{traits:016x}-{bloom}-{nsrl}-m{}",
         env!("CARGO_PKG_VERSION"),
         cleave::types::CompactReport::default().version,
         model_version(),
