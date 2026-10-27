@@ -1,0 +1,36 @@
+--- a/librz/core/cmd/cmd_analysis.c
++++ b/librz/core/cmd/cmd_analysis.c
+@@ -3489,6 +3489,33 @@
+ }
+ 
+ static void function_print_to_json(RzCore *core, RzAnalysisFunction *fcn, RzCmdStateOutput *state) {
++	/* Experimental filefacts projection: preserve every field consumed by
++	 * its RawFunction/RawCallref types, avoid deriving unused metadata. */
++	if (getenv("RZ_FACTS_JSON")) {
++		PJ *pj = state->d.pj;
++		pj_o(pj);
++		pj_kn(pj, "offset", fcn->addr);
++		if (fcn->name) pj_ks(pj, "name", fcn->name);
++		pj_kn(pj, "size", rz_analysis_function_linear_size(fcn));
++		pj_ki(pj, "cc", rz_analysis_function_complexity(fcn));
++		pj_ki(pj, "nbbs", rz_pvector_len(fcn->bbs));
++		RzList *xrefs = rz_analysis_function_get_xrefs_from(fcn);
++		if (!rz_list_empty(xrefs)) {
++			RzListIter *iter;
++			RzAnalysisXRef *xref;
++			pj_k(pj, "callrefs");
++			pj_a(pj);
++			rz_list_foreach(xrefs, iter, xref) {
++				if (xref->type == RZ_ANALYSIS_XREF_TYPE_CODE || xref->type == RZ_ANALYSIS_XREF_TYPE_CALL) {
++					xref_print_to_json(core, xref, pj);
++				}
++			}
++			pj_end(pj);
++		}
++		rz_list_free(xrefs);
++		pj_end(pj);
++		return;
++	}
+ 	int ebbs = 0;
+ 	pj_o(state->d.pj);
+ 	pj_kn(state->d.pj, "offset", fcn->addr);

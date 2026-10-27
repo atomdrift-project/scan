@@ -23,6 +23,9 @@ pub struct ScanResult {
     pub v: &'static str,
     /// Model classification outcome.
     pub classification: Classification,
+    /// Dependency attention counts retained even when the report is dropped.
+    /// Detailed records remain in the JSON envelope's raw report.
+    pub dependency_attention: super::DependencyAttention,
     /// Probability the verdict was decided on.
     pub probability: f32,
     /// Cutoff defining the verdict band — the same value `probability` was
@@ -531,6 +534,13 @@ pub struct MlSection {
 }
 
 impl ScanResult {
+    /// Static findings remain attention-worthy when the model grades benign.
+    pub(crate) fn has_severe_findings(&self) -> bool {
+        self.finding_counts.hostile > 0 || self.finding_counts.suspicious > 0
+            || self.top_findings.iter().any(|finding| finding.crit >= 4)
+            || self.embedded_files.values().any(|member| member.top_findings.iter().any(|finding| finding.crit >= 4))
+    }
+
     /// The `ml` section. Clones only the small fields; `files` is built here.
     fn ml_section(&self) -> MlSection {
         MlSection {
@@ -776,6 +786,7 @@ pub(super) mod tests {
 
     pub fn base_result() -> ScanResult {
         ScanResult {
+            dependency_attention: super::super::DependencyAttention::default(),
             v: SCHEMA_VERSION,
             model: Decision {
                 class: Classification::Benign,

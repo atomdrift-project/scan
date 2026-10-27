@@ -886,8 +886,8 @@ fn package_display_path(path: &str) -> String {
 }
 
 /// Human-facing counterpart to the LLM render: the same fetched subjects, with
-/// provenance before traits, but only hostile ones, and only the processed
-/// acquisition and registry fields.
+/// provenance before traits, for suspicious or hostile subjects. Only processed
+/// acquisition and registry fields are included.
 pub(super) fn render_terminal_fetch_context(
     fetched: Fetched<'_>,
     report: &cleave::AnalysisReport,
@@ -903,15 +903,13 @@ pub(super) fn render_terminal_fetch_context(
     let mut branches = Vec::new();
 
     for subject in fetched_subjects(fetched, index) {
-        // Only hostile dependencies earn a provenance block: a benign-but-old or
-        // merely-notable dependency is exactly the noise that buried the real
-        // ones. Hostility is a hostile verdict on the fetched bytes, or a hostile
-        // finding on one of its members.
-        let hostile_finding = subject.has_finding(index, Criticality::Hostile);
-        let hostile_verdict = subject
+        // A severe static finding remains an issue even when the model grades
+        // these bytes benign. Merely notable dependencies stay out of this view.
+        let severe_finding = subject.has_finding(index, Criticality::Suspicious);
+        let adverse_verdict = subject
             .verdict()
-            .is_some_and(|verdict| verdict.class == Classification::Hostile);
-        if !hostile_finding && !hostile_verdict {
+            .is_some_and(|verdict| verdict.class >= Classification::Suspicious);
+        if !severe_finding && !adverse_verdict {
             continue;
         }
         let rec = subject.edge;

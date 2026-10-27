@@ -75,8 +75,9 @@ impl AnalysisCache {
         let base = cache_base()?;
         // Reference discovery/context changed independently of the trait set.
         // Historical next-hop lists can contain prose-derived package names.
-        // v3: entries are keyed by [`entry_key`], not the bare content sha.
-        let version = format!("dependency-v3-{}", ruleset_version());
+        // v4: Python import candidates require namespace verification. Old
+        // next-hop lists used unqualified ast-call edges for dynamic imports.
+        let version = format!("dependency-v4-{}", ruleset_version());
         prune_stale_versions(&base, &version);
         let dir = base.join(version);
         std::fs::create_dir_all(&dir).ok()?;

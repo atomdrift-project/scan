@@ -82,15 +82,15 @@ pub(crate) use self::run::{
 use self::render_context::INTERPRET_PRIMARY_BUDGET_BYTES;
 use self::retention::UNANALYZED_MEMBER_RISK;
 
-/// Terminal display policy for scan results.
+/// Terminal display policy for scan verdicts and severe static findings.
 ///
 /// This affects human-readable output only. JSON output still emits every
 /// scanned file so downstream consumers receive a complete event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayFilter {
-    /// Show hostile files.
+    /// Show hostile verdicts or static findings.
     pub hostile: bool,
-    /// Show suspicious files.
+    /// Show suspicious verdicts or static findings.
     pub suspicious: bool,
     /// Show benign files.
     pub benign: bool,
@@ -356,7 +356,7 @@ impl ScanConfig {
         self.thresholds
     }
 
-    /// Filter controlling which classifications are printed in terminal mode.
+    /// Filter controlling terminal verdicts and severe static findings.
     #[must_use]
     pub const fn filter(&self) -> DisplayFilter {
         self.filter
@@ -411,6 +411,22 @@ impl ScanConfig {
     }
 }
 
+/// Dependency coverage warnings, independent of the model's file grades.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct DependencyAttention {
+    /// Dependency edges whose analysis or installed provider remains unresolved.
+    pub gaps: u32,
+    /// Unverified provider candidates with suspicious or hostile static findings.
+    pub flagged_candidates: u32,
+}
+
+impl DependencyAttention {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.gaps = self.gaps.saturating_add(other.gaps);
+        self.flagged_candidates = self.flagged_candidates.saturating_add(other.flagged_candidates);
+    }
+}
+
 /// Aggregate counters for a completed scan.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanSummary {
@@ -424,6 +440,10 @@ pub struct ScanSummary {
     pub benign: u32,
     /// Number of files that could not be analyzed.
     pub errors: u32,
+    /// Analyzed inputs with suspicious/hostile static findings, irrespective of grade.
+    pub static_flags: u32,
+    /// Dependency coverage and candidate findings, separate from file verdicts.
+    pub dependency_attention: DependencyAttention,
     /// Wall-clock duration of the scan in milliseconds.
     pub duration_ms: u64,
 }

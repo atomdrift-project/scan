@@ -81,6 +81,8 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             suspicious: 0,
             benign: 0,
             errors: 0,
+            dependency_attention: Default::default(),
+            static_flags: 0,
             duration_ms: crate::duration_ms(scan_start.elapsed()),
         };
         if is_terminal {
@@ -204,6 +206,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let suspicious = AtomicU32::new(0);
     let benign = AtomicU32::new(0);
     let errors = AtomicU32::new(hash_errors);
+    let dependency_gaps = AtomicU32::new(0);
+    let static_flags = AtomicU32::new(0);
+    let flagged_candidates = AtomicU32::new(0);
 
     // Map each scan path back to its process group for PID annotation. Deleted
     // binaries that aren't scannable are counted as errors here and omitted.
@@ -315,6 +320,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                         print();
                     }
                 }
+                dependency_gaps.fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
+                static_flags.fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
+                flagged_candidates.fetch_add(result.dependency_attention.flagged_candidates, Ordering::Relaxed);
             }
             Err(e) => {
                 tracing::warn!("error processing {}: {e}", group.path.display());
@@ -340,6 +348,11 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         suspicious,
         benign,
         errors,
+        dependency_attention: crate::engine::DependencyAttention {
+            gaps: dependency_gaps.load(Ordering::Relaxed),
+            flagged_candidates: flagged_candidates.load(Ordering::Relaxed),
+        },
+        static_flags: static_flags.load(Ordering::Relaxed),
         duration_ms: crate::duration_ms(scan_start.elapsed()),
     };
 

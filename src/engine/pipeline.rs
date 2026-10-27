@@ -279,6 +279,7 @@ pub fn classify_report(
         result: ScanResult {
             v: SCHEMA_VERSION,
             classification: decision.class,
+            dependency_attention: crate::fetch::dependency_attention(&prepared.fetch.records),
             probability: decision.probability,
             threshold: decision.threshold,
             level: decision.level,

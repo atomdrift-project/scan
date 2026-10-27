@@ -1,0 +1,41 @@
+diff --git a/librz/flag/flag.c b/librz/flag/flag.c
+index f098cd4..a548b50 100644
+--- a/librz/flag/flag.c
++++ b/librz/flag/flag.c
+@@ -723,28 +723,20 @@ RZ_API bool rz_flag_unset_off(RzFlag *f, ut64 off) {
+ 	return false;
+ }
+ 
+-struct unset_off_foreach_t {
+-	RzFlag *f;
+-	ut64 offset;
+-};
+-
+-static bool unset_off_foreach(void *user, const char *k, const void *v) {
+-	struct unset_off_foreach_t *u = (struct unset_off_foreach_t *)user;
+-	RzFlagItem *fi = (RzFlagItem *)v;
+-	if (u->offset == fi->offset) {
+-		rz_flag_unset(u->f, fi);
+-	}
+-	return true;
+-}
+-
+ /* \brief unset the all flag items found at offset \p off.
+  *
+  * return true if at least one flag is found and unset, false otherwise.
+  */
+ RZ_API bool rz_flag_unset_all_off(RzFlag *f, ut64 off) {
+ 	rz_return_val_if_fail(f, false);
+-	struct unset_off_foreach_t u = { f, off };
+-	ht_sp_foreach(f->ht_name, unset_off_foreach, &u);
++	// The offset index already identifies every flag to remove. Walking
++	// ht_name here is quadratic when Go recovery renames thousands of flags.
++	// Re-fetch after unset: removing the last item also frees its list.
++	const RzList *list;
++	while ((list = rz_flag_get_list(f, off)) && !rz_list_empty(list)) {
++		RzFlagItem *item = rz_list_first(list);
++		rz_flag_unset(f, item);
++	}
+ 	return true;
+ }
+ 

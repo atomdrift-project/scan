@@ -15,7 +15,7 @@ use super::pipeline::{ClassifyRequest, OutputNeeds, classify_report};
 use super::progress::{Progress, Spinner};
 use super::render_cards::{write_extra_diagnostics, write_tiny};
 use super::{
-    ENGINE_VERSION, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
+    DisplayFilter, ENGINE_VERSION, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources,
 };
 use crate::bloom_repo::Decision as BloomDecision;
@@ -221,7 +221,8 @@ pub fn run_bytes(
     // complementing the PURL gate in `pkg.rs`: it catches known *content* even
     // when the package locator was not in the filter. `record` emits the verdict
     // from the minimal report cleave returns on a skip.
-    let analyzed = cleave::analyze_bytes_owned(bytes, name, &session.opts)
+    let bytes = bytes::Bytes::from(bytes);
+    let analyzed = cleave::analyze_bytes_shared(bytes.clone(), name, &session.opts)
         .with_context(|| format!("cleave analysis of {label}"));
     let origin = Origin {
         path: Path::new(label),
@@ -234,7 +235,7 @@ pub fn run_bytes(
         fallback_purl: registry_fallback_purl,
         ..Target::new(origin, true)
     };
-    session.record(&target, analyzed);
+    session.record_input(&target, analyzed, Some(bytes));
     session.finish()
 }
 
@@ -280,7 +281,8 @@ pub fn scan_bytes(
     config: &ScanConfig,
 ) -> Result<ScanResult> {
     prefetch_cleave_resources();
-    let report = cleave::analyze_bytes_owned(data, filename, &analysis_options(config))
+    let data = bytes::Bytes::from(data);
+    let report = cleave::analyze_bytes_shared(data.clone(), filename, &analysis_options(config))
         .with_context(|| format!("cleave analysis of {filename}"))?;
     let classifier = Classifier {
         config,
@@ -288,7 +290,7 @@ pub fn scan_bytes(
         shap,
         cancel: None,
     };
-    classifier.classify(report, Origin::local(Path::new(filename)), None)
+    classifier.classify(report, Origin::local(Path::new(filename)), None, Path::new(filename), Some(data))
 }
 
 /// Scan a payload that already lives on disk, returning the same [`ScanResult`]
@@ -320,7 +322,7 @@ pub fn scan_file(
         shap,
         cancel: None,
     };
-    classifier.classify(report, Origin::local(Path::new(filename)), None)
+    classifier.classify(report, Origin::local(Path::new(filename)), None, read_path, None)
 }
 
 /// The cleave options a config implies, before any per-scan additions.
@@ -406,6 +408,12 @@ impl<'a> Session<'a> {
     /// Classify one analyzed file and account for it: tally, print, renew.
     /// Called from rayon workers, so every shared input is behind `&`/atomics.
     fn record(&self, target: &Target<'_>, analyzed: Result<AnalysisReport>) {
+        self.record_input(target, analyzed, None);
+    }
+
+    /// Keep an in-memory root available through dependency discovery. The
+    /// classifier consumes this shared handle and releases it after that phase.
+    fn record_input(&self, target: &Target<'_>, analyzed: Result<AnalysisReport>, root_bytes: Option<bytes::Bytes>) {
         // The bloom verdict, re-derived from the sha cleave computed. A file
         // cleave skipped at our request (a stale known-good, or a fast-mode
         // unknown) arrives as a minimal report and is counted here without an
@@ -444,7 +452,7 @@ impl<'a> Session<'a> {
 
         let classified = analyzed.and_then(|report| {
             self.classifier()
-                .classify(report, target.origin, bloom_mark)
+                .classify(report, target.origin, bloom_mark, target.origin.path, root_bytes)
         });
         self.advance();
         match classified {
@@ -534,18 +542,27 @@ impl<'a> Session<'a> {
 
     fn report(&self, target: &Target<'_>, result: ScanResult) {
         self.tally.count(result.classification);
+        self.tally.static_flags.fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
+        self.tally.dependency_gaps.fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
+        self.tally.flagged_candidates.fetch_add(result.dependency_attention.flagged_candidates, Ordering::Relaxed);
         // An adversely bloom-marked file is always surfaced — its flag replaces
         // the old unconditional banner, so the benign filter must not swallow a
         // known-bad file the model happens to rate benign. JSON, tiny, and
         // interpret are machine/LLM payload formats: they emit every scanned
-        // file — `--show` gates only the terminal view.
+        // file. Severe static findings also admit a terminal result, even when
+        // the model's verdict is benign; `--show` selects their severity.
         let shown = matches!(
             self.config.format(),
             OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
         ) || result
             .bloom_mark
             .is_some_and(BloomMark::forces_terminal_display)
-            || self.config.filter().shows(&result.classification);
+            || self.config.filter().shows(&result.classification)
+            || findings_match_filter(
+                self.config.filter(),
+                &result.top_findings,
+                &result.embedded_files,
+            );
         if shown && !self.broken_pipe.load(Ordering::Relaxed) {
             let written = match &self.progress {
                 Some(progress) => progress.around_result(|| emit_result(&result, self.config)),
@@ -634,6 +651,21 @@ impl<'a> Session<'a> {
     }
 }
 
+/// Static issues remain reviewable when the model grades the artifact benign.
+/// Member findings include fetched dependencies, which need not be inherited
+/// onto the root file's own findings. This affects display, never the verdict.
+fn findings_match_filter(
+    filter: DisplayFilter,
+    root: &[super::TopFinding],
+    members: &super::MemberEvals,
+) -> bool {
+    root.iter()
+        .chain(members.values().flat_map(|member| &member.top_findings))
+        .any(|finding| {
+            (filter.hostile && finding.crit >= 5) || (filter.suspicious && finding.crit == 4)
+        })
+}
+
 /// One file of a CLI scan, and what the scan knows about it besides its report.
 #[derive(Clone, Copy)]
 struct Target<'a> {
@@ -676,6 +708,8 @@ impl Classifier<'_> {
         report: AnalysisReport,
         origin: Origin<'_>,
         bloom_mark: Option<BloomMark>,
+        root_path: &Path,
+        root_bytes: Option<bytes::Bytes>,
     ) -> Result<ScanResult> {
         let config = self.config;
         let label = origin.path.display().to_string();
@@ -683,6 +717,7 @@ impl Classifier<'_> {
         let classified = classify_report(
             report,
             ClassifyRequest {
+                root_bytes,
                 shap: self.shap,
                 cancellation: self.cancel,
                 tiny_opts: tiny_opts_for(config),
@@ -704,7 +739,7 @@ impl Classifier<'_> {
                 root_registry: origin.registry,
                 root_fetch: origin.fetch,
                 bloom_mark,
-                ..ClassifyRequest::new(&label, origin.path, self.model)
+                ..ClassifyRequest::new(&label, root_path, self.model)
             },
         )?;
 
@@ -958,6 +993,8 @@ const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSum
         suspicious,
         benign,
         errors: 0,
+        dependency_attention: super::DependencyAttention { gaps: 0, flagged_candidates: 0 },
+        static_flags: 0,
         duration_ms: 0,
     }
 }
@@ -1039,6 +1076,9 @@ struct Tally {
     suspicious: AtomicU32,
     benign: AtomicU32,
     errors: AtomicU32,
+    dependency_gaps: AtomicU32,
+    static_flags: AtomicU32,
+    flagged_candidates: AtomicU32,
 }
 
 impl Tally {
@@ -1068,6 +1108,11 @@ impl Tally {
             suspicious,
             benign,
             errors,
+            dependency_attention: super::DependencyAttention {
+                gaps: self.dependency_gaps.load(Ordering::Relaxed),
+                flagged_candidates: self.flagged_candidates.load(Ordering::Relaxed),
+            },
+            static_flags: self.static_flags.load(Ordering::Relaxed),
             duration_ms: crate::duration_ms(scan_start.elapsed()),
         }
     }
@@ -1144,6 +1189,60 @@ struct EmptyRaw {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_dependency_findings_survive_benign_verdict_display_filter() {
+        let finding = super::super::TopFinding {
+            id: "objectives/impact/test::issue".into(),
+            crit: 4,
+            conf: 0.99,
+            desc: "Dependency issue".into(),
+        };
+        let mut members = super::super::MemberEvals::new();
+        members.insert(
+            1,
+            super::super::EmbeddedFile {
+                id: 1,
+                sha256: "dep".into(),
+                path: "dependency.js".into(),
+                file_type: "javascript".into(),
+                classification: Classification::Benign,
+                probability: 0.01,
+                threshold: 0.9,
+                level: crate::model::Level::Clean,
+                model_scores: vec![],
+                skipped_models: vec![],
+                formula: String::new(),
+                top_findings: vec![finding.clone()],
+                floor: None,
+            },
+        );
+        let hostile_only = DisplayFilter {
+            hostile: true,
+            suspicious: false,
+            benign: false,
+        };
+        assert!(findings_match_filter(
+            DisplayFilter::alerts_only(),
+            &[],
+            &members
+        ));
+        assert!(!findings_match_filter(hostile_only, &[], &members));
+        assert!(findings_match_filter(
+            DisplayFilter::alerts_only(),
+            &[finding],
+            &Default::default()
+        ));
+        let finding = &mut members.get_mut(&1).unwrap().top_findings[0];
+        finding.crit = 3;
+        assert!(!findings_match_filter(
+            DisplayFilter::alerts_only(),
+            &[],
+            &members
+        ));
+        members.get_mut(&1).unwrap().top_findings[0].crit = 5;
+        assert!(findings_match_filter(hostile_only, &[], &members));
+    }
 
     #[test]
     fn file_touched_within_flags_fresh_and_ignores_old_and_missing() {

@@ -1732,6 +1732,37 @@ mod tests {
         assert!(!terminal.contains("transfer"));
         assert!(!terminal.contains("cache:"));
         assert!(terminal.contains("metadata  https://registry.example/dep"));
+
+        // A single suspicious finding is visible even when the model grades
+        // the dependency benign; notable-only packages remain omitted.
+        let mut deps = deps;
+        let verdict = deps[0].verdict.as_mut().unwrap();
+        verdict.class = Classification::Benign;
+        verdict.probability = 0.01;
+        let mut report = report;
+        report.files[1].findings[0].crit = cleave::Criticality::Suspicious;
+        let fetched = Fetched {
+            edges: &edges,
+            deps: &deps,
+            registries: &registries,
+        };
+        let terminal = crate::engine::render_cards::render_terminal_fetch_context(
+            fetched,
+            &report,
+            &ReportIndex::new(&report),
+        )
+        .expect("suspicious static dependency finding must be shown");
+        assert!(terminal.contains("dependency package finding"));
+        assert!(terminal.contains("pkg:test/dep@1"));
+        report.files[1].findings[0].crit = cleave::Criticality::Notable;
+        assert!(
+            crate::engine::render_cards::render_terminal_fetch_context(
+                fetched,
+                &report,
+                &ReportIndex::new(&report),
+            )
+            .is_none()
+        );
     }
 
     /// The grader sees the package's whole registry identity — every signal a

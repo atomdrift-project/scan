@@ -111,12 +111,16 @@ fn curated_targets() -> Vec<PathBuf> {
 
 /// Sum the count fields of two phase summaries; duration is the triage wall time.
 fn merge(a: &ScanSummary, b: &ScanSummary, start: Instant) -> ScanSummary {
+    let mut dependency_attention = a.dependency_attention;
+    dependency_attention.add(b.dependency_attention);
     ScanSummary {
         total_files: a.total_files.saturating_add(b.total_files),
         hostile: a.hostile.saturating_add(b.hostile),
         suspicious: a.suspicious.saturating_add(b.suspicious),
         benign: a.benign.saturating_add(b.benign),
         errors: a.errors.saturating_add(b.errors),
+        dependency_attention,
+        static_flags: a.static_flags.saturating_add(b.static_flags),
         duration_ms: crate::duration_ms(start.elapsed()),
     }
 }
@@ -129,6 +133,8 @@ fn zero_summary() -> ScanSummary {
         suspicious: 0,
         benign: 0,
         errors: 0,
+        dependency_attention: Default::default(),
+        static_flags: 0,
         duration_ms: 0,
     }
 }

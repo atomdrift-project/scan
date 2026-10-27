@@ -1367,7 +1367,7 @@ pub(crate) fn write_remote_verdict(
 /// color.
 pub fn print_summary(summary: &ScanSummary) {
     let p = palette();
-    let flagged = summary.hostile > 0 || summary.suspicious > 0;
+    let flagged = summary.hostile > 0 || summary.suspicious > 0 || summary.static_flags > 0;
     let color = color_enabled();
     let bloom = crate::bloom_repo::counts();
 
@@ -1400,8 +1400,22 @@ pub fn print_summary(summary: &ScanSummary) {
             let s = format!("{} errors", summary.errors);
             parts.push((fg(p.header_path, &s), s));
         }
+        if summary.dependency_attention.gaps > 0 {
+            let n = summary.dependency_attention.gaps;
+            let s = format!("{n} dependency gap{}", if n == 1 { "" } else { "s" });
+            parts.push((fg(p.warning, &s), s));
+        }
+        if summary.static_flags > 0 {
+            let s = format!("{} with severe static findings", summary.static_flags);
+            parts.push((fg(p.warning, &s), s));
+        }
+        if summary.dependency_attention.flagged_candidates > 0 {
+            let n = summary.dependency_attention.flagged_candidates;
+            let s = format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" });
+            parts.push((fg(p.warning, &s), s));
+        }
         {
-            let s = format!("{} clean", summary.benign);
+            let s = format!("{} graded benign", summary.benign);
             parts.push((fg(p.very_dim, &s), s));
         }
         if bloom.flagged > 0 {
@@ -1469,9 +1483,12 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
         );
     }
 
-    if summary.hostile == 0 && summary.suspicious == 0 && summary.errors == 0 {
+    if summary.hostile == 0 && summary.suspicious == 0 && summary.errors == 0
+        && summary.dependency_attention.gaps == 0 && summary.dependency_attention.flagged_candidates == 0
+        && summary.static_flags == 0
+    {
         return format!(
-            "{}  {} files scanned, all clean  {}",
+            "{}  {} files scanned, all graded benign  {}",
             fg(p.benign, "\u{2713}"),
             summary.total_files,
             fg(p.very_dim, &format_elapsed(summary.duration_ms)),
@@ -1495,7 +1512,18 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
     if summary.errors > 0 {
         parts.push(fg(p.header_path, &format!("{} errors", summary.errors)));
     }
-    parts.push(fg(p.very_dim, &format!("{} clean", summary.benign)));
+    if summary.dependency_attention.gaps > 0 {
+        let n = summary.dependency_attention.gaps;
+        parts.push(fg(p.warning, &format!("{n} dependency gap{}", if n == 1 { "" } else { "s" })));
+    }
+    if summary.static_flags > 0 {
+        parts.push(fg(p.warning, &format!("{} with severe static findings", summary.static_flags)));
+    }
+    if summary.dependency_attention.flagged_candidates > 0 {
+        let n = summary.dependency_attention.flagged_candidates;
+        parts.push(fg(p.warning, &format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" })));
+    }
+    parts.push(fg(p.very_dim, &format!("{} graded benign", summary.benign)));
     parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
 
     let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
@@ -1680,6 +1708,25 @@ pub fn parse_ymd(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_dependencies_preclude_a_clean_summary() {
+        let mut summary = ScanSummary {
+            total_files: 1, hostile: 0, suspicious: 0, benign: 1, errors: 0,
+            duration_ms: 1,
+            static_flags: 0,
+            dependency_attention: crate::engine::DependencyAttention { gaps: 2, flagged_candidates: 1 },
+        };
+        let line = summary_status_line(&summary);
+        assert!(line.contains("2 dependency gaps") && line.contains("1 flagged candidate"));
+        assert!(!line.contains("all graded benign") && !line.contains('\u{2713}'));
+        summary.dependency_attention = Default::default();
+        assert!(summary_status_line(&summary).contains("all graded benign"));
+        summary.static_flags = 1;
+        let line = summary_status_line(&summary);
+        assert!(line.contains("1 with severe static findings"));
+        assert!(!line.contains("all graded benign"));
+    }
 
     #[test]
     fn bloom_mark_from_decision() {

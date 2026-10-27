@@ -286,9 +286,11 @@ pub struct GlobalArgs {
     )]
     pub level: Option<u16>,
 
-    /// Classifications to display in the terminal view: hostile, suspicious,
-    /// sus, benign, all (comma-separated). The machine formats (json, tiny,
-    /// interpret) emit every scanned file regardless.
+    /// Verdicts or severe static findings to display in the terminal view:
+    /// hostile, suspicious, sus, benign, all (comma-separated). Suspicious and
+    /// hostile findings remain visible even with a benign model verdict.
+    /// The machine formats (json, tiny, interpret) emit every scanned file
+    /// regardless.
     #[arg(long, global = true, value_delimiter = ',', default_values = ["hostile", "sus"])]
     pub show: Vec<Show>,
 
