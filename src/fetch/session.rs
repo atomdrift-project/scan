@@ -74,10 +74,11 @@ pub(super) fn unresolved_downloader_records(
             record.source_sha256 = Some(file.sha256.clone());
             record.source_offset = call.offset;
             record.kind = RefKind::UrlFetch;
-            record.coverage_note = Some(format!(
-                "{}: downloader arguments require runtime evaluation; no URL inferred",
-                note::UNAVAILABLE
-            ));
+            record.coverage.push(Coverage::Unavailable {
+                reason: Some(
+                    "downloader arguments require runtime evaluation; no URL inferred".into(),
+                ),
+            });
             records.push(record);
         }
     }
@@ -118,10 +119,9 @@ pub(super) fn unresolved_maven_records(
             );
             record.source_sha256 = Some(file.sha256.clone());
             record.kind = RefKind::Dependency;
-            record.coverage_note = Some(format!(
-                "{}: Maven POM dependency: {reason}",
-                note::UNAVAILABLE
-            ));
+            record.coverage.push(Coverage::Unavailable {
+                reason: Some(format!("Maven POM dependency: {reason}")),
+            });
             records.push(record);
         }
     }
@@ -372,7 +372,11 @@ impl FetchSession {
             for (source, reference) in
                 reconcile_python_imports(report, &mut worklist, self.policy.deps)
             {
-                self.out.records.push(skipped_record(&source, &reference, "Python import candidate covered by separately reported declared requirement; installed provider/version unknown"));
+                self.out.records.push(skipped_record(
+                    &source,
+                    &reference,
+                    Coverage::CoveredByDeclaration,
+                ));
                 covered.push(self.pending_entry(
                     &source,
                     &reference,
@@ -388,8 +392,13 @@ impl FetchSession {
                     {
                         return true;
                     }
-                    let Some(name) = npm_import_name(reference) else { return true; };
-                    let Some(declaration) = declared_imports.get(source).and_then(|names| names.get(&name)) else {
+                    let Some(name) = npm_import_name(reference) else {
+                        return true;
+                    };
+                    let Some(declaration) = declared_imports
+                        .get(source)
+                        .and_then(|names| names.get(&name))
+                    else {
                         return true;
                     };
                     if !self.policy.deps {
@@ -398,12 +407,14 @@ impl FetchSession {
                         reference.context = declaration.context.clone();
                         return true;
                     }
-                    let note = if self.policy.wants_at(RefKind::Dependency, hop) {
-                        "import covered by separately reported manifest dependency; installed version unknown"
+                    let coverage = if self.policy.wants_at(RefKind::Dependency, hop) {
+                        Coverage::CoveredByDeclaration
                     } else {
-                        "declared import not followed; enable --fetch-transitive-deps; see manifest dependency outcome"
+                        Coverage::TransitiveNotFollowed
                     };
-                    self.out.records.push(skipped_record(source, reference, note));
+                    self.out
+                        .records
+                        .push(skipped_record(source, reference, coverage));
                     covered.push(self.pending_entry(source, reference, hop, "manifest dependency"));
                     false
                 });
@@ -425,10 +436,10 @@ impl FetchSession {
                     self.out.records.push(skipped_record(
                         source,
                         reference,
-                        format!(
-                            "{}: {path}; registry archive identity not verified",
-                            note::SUPPLIED
-                        ),
+                        Coverage::Supplied {
+                            path,
+                            pin_verified: None,
+                        },
                     ));
                     covered.push(self.pending_entry(source, reference, hop, "supplied code"));
                     false
@@ -495,7 +506,10 @@ impl FetchSession {
             self.out.records.push(skipped_record(
                 &entry.source_sha,
                 &entry.reference,
-                format!("{} {reason}; hop={hop}", note::PENDING),
+                Coverage::Pending {
+                    reason: reason.to_owned(),
+                    hop,
+                },
             ));
         }
     }
@@ -603,7 +617,7 @@ impl FetchSession {
                 self.out.records.push(skipped_record(
                     source_sha,
                     &r,
-                    "transitive dependency not followed; enable --fetch-transitive-deps",
+                    Coverage::TransitiveNotFollowed,
                 ));
                 continue;
             }
@@ -615,10 +629,7 @@ impl FetchSession {
                 self.out.records.push(skipped_record(
                     source_sha,
                     &r,
-                    format!(
-                        "{} dependency excluded by --fetch-dev-deps=false",
-                        note::DEVELOPMENT
-                    ),
+                    Coverage::DevelopmentExcluded,
                 ));
                 continue;
             }
@@ -629,10 +640,9 @@ impl FetchSession {
                 self.out.records.push(skipped_record(
                     source_sha,
                     &r,
-                    format!(
-                        "{}: downloader URL excluded by policy ({reason})",
-                        note::UNAVAILABLE
-                    ),
+                    Coverage::Unavailable {
+                        reason: Some(format!("downloader URL excluded by policy ({reason})")),
+                    },
                 ));
                 continue;
             }
@@ -938,12 +948,10 @@ impl FetchSession {
                 .local_coverage
                 .get(&(source_sha.clone(), locator(&l.reference).to_owned()))
             {
-                let pin = if l.record.pin_verified == Some(true) {
-                    "archive pin verified"
-                } else {
-                    "archive pin unverified"
-                };
-                l.record.coverage_note = Some(format!("{}: {path}; {pin}", note::SUPPLIED));
+                l.record.coverage.push(Coverage::Supplied {
+                    path: path.clone(),
+                    pin_verified: Some(l.record.pin_verified == Some(true)),
+                });
             }
             self.reporter.landed(&l.reference, &l.record);
             let notice = if l.reference.kind == RefKind::UrlFetch {
@@ -1024,10 +1032,11 @@ impl FetchSession {
         };
         for record in &mut records {
             if matches!(record.outcome, Outcome::BudgetExceeded) {
-                record.coverage_note = Some(format!(
-                    "budget exceeded: {notice}; request allowance={}; byte allowance={}",
-                    grant.fetches, grant.bytes
-                ));
+                record.coverage.push(Coverage::BudgetExceeded {
+                    notice: notice.to_string(),
+                    fetches: u64::try_from(grant.fetches).unwrap_or(u64::MAX),
+                    bytes: grant.bytes,
+                });
             }
         }
         let spent = live_fetch_usage(&records);
@@ -1171,7 +1180,9 @@ impl FetchSession {
                 && delivered_bytes(&l.record)
                 && matches!(l.standing, Standing::Analyze)
             {
-                l.record.coverage_note = Some(note::UNAVAILABLE.into());
+                l.record
+                    .coverage
+                    .push(Coverage::Unavailable { reason: None });
             }
             if payload
                 .as_ref()
@@ -1181,7 +1192,7 @@ impl FetchSession {
                         || sub.files.iter().any(|f| !f.analysis_gaps.is_empty())
                 })
             {
-                l.record.coverage_note = Some(note::INCOMPLETE.into());
+                l.record.coverage.push(Coverage::Incomplete);
             }
             mark_peer_candidate(&mut l.record, &l.reference.source);
             if is_python_import_candidate(&l.reference) {
@@ -1211,9 +1222,7 @@ impl FetchSession {
             );
             if matches!(l.record.outcome, Outcome::BudgetExceeded)
                 || matches!(&l.record.outcome, Outcome::Failed(error) if error.is_retryable())
-                || l.record.coverage_note.as_deref().is_some_and(|note| {
-                    note.starts_with(note::INCOMPLETE) || note.starts_with(note::UNAVAILABLE)
-                })
+                || l.record.coverage.iter().any(is_analysis_gap)
             {
                 pending.push(entry);
             } else {
@@ -1432,7 +1441,7 @@ impl FetchSession {
                 "fetch backlog".into(),
                 Outcome::Failed(FetchError::Internal(error)),
             );
-            record.coverage_note = Some("unfinished work could not be persisted".into());
+            record.coverage.push(Coverage::BacklogUnsaved);
             self.out.records.push(record);
         }
         self.reporter.finish(&self.out.records);

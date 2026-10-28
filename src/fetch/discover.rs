@@ -39,14 +39,14 @@ pub(super) fn collect_references(
 pub(super) fn skipped_record(
     source_sha: &str,
     reference: &Reference,
-    note: impl Into<String>,
+    why: Coverage,
 ) -> FetchRecord {
     let mut record = FetchRecord::terminal(locator(reference).to_owned(), Outcome::Skipped);
     record.source_sha256 = Some(source_sha.to_owned());
     record.source_offset = reference.offset;
     record.kind = reference.kind;
     record.context.clone_from(&reference.context);
-    record.coverage_note = Some(note.into());
+    record.coverage.push(why);
     record
 }
 

@@ -183,10 +183,9 @@ fn real_compact_archive_retains_local_identity_entry_points_and_install_hooks() 
     assert!(matches!(records[0].outcome, Outcome::Skipped));
     assert!(
         records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("already analyzed")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::Supplied { .. }))
     );
 }
 fn reference() -> Reference {
@@ -273,10 +272,9 @@ fn unresolved_maven_declarations_survive_empty_worklists_and_deduplicate() {
     assert_eq!(record.kind, RefKind::Dependency);
     assert!(
         record
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .starts_with("analysis unavailable: Maven POM")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::Unavailable { reason: Some(r) } if r.starts_with("Maven POM")))
     );
     let disabled = FetchPolicy::parse_follow("none").unwrap();
     assert!(unresolved_maven_records(&report, &disabled).is_empty());
@@ -354,25 +352,19 @@ fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
     assert!(terminal_fetch_row_visible(&pass.out.records[0]));
     assert!(
         pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("hostile:objectives/test::hostile-candidate")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::CandidateFlagged { findings } if findings.iter().any(|f| f == "hostile:objectives/test::hostile-candidate")))
     );
     assert!(
         pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("hostile:objectives/test::hostile-registry")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::CandidateFlagged { findings } if findings.iter().any(|f| f == "hostile:objectives/test::hostile-registry")))
     );
-    assert!(
-        pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("2 unique severe findings")
-    );
+    assert!(pass.out.records[0].coverage.iter().any(
+        |fact| matches!(fact, Coverage::CandidateFlagged { findings } if findings.len() == 2)
+    ));
     assert_eq!(
         fetch_row(&pass.out.records[0]).detail.as_deref(),
         Some("candidate flagged")
@@ -506,10 +498,9 @@ fn supplied_unpinned_code_is_recorded_without_claiming_integrity() {
     assert!(records[0].content_sha256.is_none());
     assert!(
         records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("already analyzed")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::Supplied { .. }))
     );
 }
 #[test]
@@ -538,10 +529,9 @@ fn development_scope_does_not_outrank_runtime_unless_it_executes_hooks() {
     assert!(pass.select("source", vec![dev], 0, &mut 0).is_empty());
     assert!(
         pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("development-only")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::DevelopmentExcluded))
     );
 }
 #[test]
@@ -583,10 +573,9 @@ fn resumed_work_keeps_depth_pins_and_source_and_does_not_bypass_ci_scope() {
     assert!(!pass.out.records.is_empty());
     assert!(
         pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("hop=3")
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::Pending { hop: 3, .. }))
     );
     let saved = store.entries("source").unwrap();
     assert_eq!(saved.len(), 1);
@@ -664,11 +653,9 @@ fn timeout_defers_unvisited_references_and_keeps_integrity() {
     pass.deadline.at = Some(Instant::now());
     pass.run(&mut supplied, vec![("source".into(), vec![r.clone()])]);
     assert!(
-        pass.out.records[0]
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains("fetch timeout")
+        pass.out.records[0].coverage.iter().any(
+            |fact| matches!(fact, Coverage::Pending { reason, .. } if reason == "fetch timeout")
+        )
     );
     assert_eq!(store.entries("source").unwrap()[0].reference, r);
 }

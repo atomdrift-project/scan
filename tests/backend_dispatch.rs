@@ -8,24 +8,21 @@
 //!   * a native `.txt`/`.json` (or empty) bundle is rejected.
 //!
 //! Predictions go through `Model::predict_report`, the path a scan takes, on
-//! an empty cleave report. The ONNX tests are `#[ignore]`d by default because
-//! they depend on a real ONNX bundle on disk. To run:
-//!
-//! ```sh
-//! SCAN_ONNX_BUNDLE=/path/to/onnx-bundle \
-//!     cargo test --test backend_dispatch -- --ignored
-//! ```
+//! an empty cleave report, against the one-feature fixture bundle.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use scan::model::Model;
 
-#[expect(clippy::disallowed_methods, reason = "a test-only fixture location")]
-fn onnx_bundle() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
-    (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+mod bundle;
+
+/// A loadable single-model bundle to copy routes and seeds from.
+fn onnx_bundle() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    bundle::write(dir.path()).expect("write bundle");
+    dir
 }
 
 /// The probability a scan of an empty report gets from `model`.
@@ -44,12 +41,10 @@ fn copy_bundle(src: &Path, files: &[&str]) -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn onnx_bundle_dispatches_to_onnx_backend() {
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
-    let dir = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
+    let src = onnx_bundle();
+    let src = src.path();
+    let dir = copy_bundle(src, &["model.onnx", "feature_spec.json"]);
     let model = Model::load(dir.path(), None, None).expect("load ONNX bundle");
     assert_eq!(model.backend_kind(), "onnx");
     assert!(model.spec().total_features() > 0);
@@ -59,15 +54,13 @@ fn onnx_bundle_dispatches_to_onnx_backend() {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn multi_seed_onnx_bundle_loads_and_predicts() {
     // Two seed members loaded from the same source model.onnx — averaging two
     // identical models must produce a probability identical to either member's
     // single prediction (within f32 noise). Confirms the K-member load and
     // predict paths are wired correctly without needing two distinct models.
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
+    let src = onnx_bundle();
+    let src = src.path();
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
         src.join("feature_spec.json"),
@@ -86,7 +79,7 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 
-    let single = copy_bundle(&src, &["model.onnx", "feature_spec.json"]);
+    let single = copy_bundle(src, &["model.onnx", "feature_spec.json"]);
     let single_model = Model::load(single.path(), None, None).expect("load single bundle");
     let single_prob = predict(&single_model);
     assert!(
@@ -96,13 +89,11 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a model.onnx+feature_spec.json bundle"]
 fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
     // A bundle with BOTH top-level `model.onnx` and `models/seed_*.onnx` is
     // ambiguous — the deploy should choose one layout. We refuse to guess.
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
+    let src = onnx_bundle();
+    let src = src.path();
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
         src.join("feature_spec.json"),

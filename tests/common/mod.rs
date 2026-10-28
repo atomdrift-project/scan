@@ -34,6 +34,7 @@ pub(crate) fn loopback<B>(req: Request<B>) -> Request<B> {
 /// it never becomes ready, which is the point for every route that must answer
 /// without a model: lookups, refusals, and the ACL.
 pub(crate) fn unready_config() -> ServerConfig {
+    isolate_caches();
     ServerConfig {
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         max_body_size: 1024 * 1024,
@@ -41,6 +42,22 @@ pub(crate) fn unready_config() -> ServerConfig {
         workers: 2,
         ..ServerConfig::default()
     }
+}
+
+/// Keep this test process's caches in a private directory. Opening the
+/// verdict index prunes every version but its own, so a shared index would
+/// lose a developer's real verdicts to a test run.
+#[expect(
+    clippy::expect_used,
+    reason = "a harness that cannot isolate its caches must stop before touching a real index"
+)]
+fn isolate_caches() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("cache tempdir");
+        scan::set_cache_dir(dir.path().to_owned()).expect("caches not opened yet");
+        dir
+    });
 }
 
 /// The app for [`unready_config`].

@@ -27,9 +27,9 @@ fn unresolved_shell_fetches_retain_root_and_member_coverage_gaps() {
         assert!(record.resolved_url.is_none() && record.content_sha256.is_none());
         assert!(
             record
-                .coverage_note
-                .as_deref()
-                .is_some_and(|note| note.starts_with(note::UNAVAILABLE))
+                .coverage
+                .iter()
+                .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
         );
         assert!(terminal_fetch_row_visible(record));
         assert_eq!(fetch_row(record).label, "gap");
@@ -185,20 +185,55 @@ fn published_npm_lockfiles_identify_publisher_development_graph() {
 #[test]
 fn peer_candidate_note_preserves_analysis_gap() {
     let mut record = fetched_record();
-    record.coverage_note = Some("analysis incomplete".into());
+    record.coverage.push(Coverage::Incomplete);
     mark_peer_candidate(&mut record, "package.json:peerDependencies");
     assert_eq!(
-        record.coverage_note.as_deref(),
-        Some("analysis incomplete; peer dependency candidate; installed version is unknown")
+        record.coverage,
+        [
+            Coverage::Incomplete,
+            Coverage::Candidate {
+                source: CandidateSource::PeerDependency
+            }
+        ]
+    );
+    assert_eq!(
+        coverage_text(&record),
+        "analysis incomplete; peer dependency candidate; installed version is unknown"
     );
     assert!(summary_line(&[record]).contains("analysis incomplete"));
+}
+
+/// Every candidate for what is installed is a dependency gap, whichever
+/// ecosystem named it; a deliberate policy skip is not.
+#[test]
+fn every_candidate_counts_as_a_gap_and_policy_skips_do_not() {
+    let candidate = |source| {
+        let mut record = fetched_record();
+        record.coverage.push(Coverage::Candidate { source });
+        record
+    };
+    let skipped = |why| {
+        let mut record = fetched_record();
+        record.outcome = Outcome::Skipped;
+        record.coverage.push(why);
+        record
+    };
+    let records = [
+        candidate(CandidateSource::PeerDependency),
+        candidate(CandidateSource::ArchRepository),
+        candidate(CandidateSource::PythonImport),
+        skipped(Coverage::DevelopmentExcluded),
+        skipped(Coverage::TransitiveNotFollowed),
+        skipped(Coverage::CoveredByDeclaration),
+    ];
+    assert_eq!(dependency_attention(&records).gaps, 3);
 }
 
 fn fetched_record() -> FetchRecord {
     FetchRecord {
         source_sha256: Some("s".repeat(64)),
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
         source_offset: Some(17),
         kind: RefKind::Dependency,
         locator: "pkg:npm/held@0.0.1-security".to_string(),
@@ -360,7 +395,7 @@ fn summary_line_omits_zero_counts() {
     let record = |outcome: Outcome, served: Served, size: Option<u64>| FetchRecord {
         source_sha256: None,
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
         source_offset: None,
         kind: RefKind::Dependency,
         locator: "pkg:npm/x".to_string(),
@@ -1092,7 +1127,7 @@ fn merge_payload_renames_the_subtree_to_its_locator() {
     let rec_for = |locator: &str, url: &str| FetchRecord {
         source_sha256: None,
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
         source_offset: None,
         kind: RefKind::Dependency,
         locator: locator.to_string(),
@@ -1153,7 +1188,7 @@ fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
     let mut rec = FetchRecord {
         source_sha256: None,
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
         source_offset: None,
         kind: RefKind::Dependency,
         locator: "pkg:npm/x".to_string(),

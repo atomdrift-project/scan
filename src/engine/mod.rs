@@ -401,7 +401,10 @@ impl ScanConfig {
 /// Dependency coverage warnings, independent of the model's file grades.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct DependencyAttention {
-    /// Dependency edges whose analysis or installed provider remains unresolved.
+    /// Dependency edges whose analysis or installed provider remains
+    /// unresolved: a coverage fact that is a gap (see
+    /// [`fletch::fetch::Coverage::is_gap`]), or a fetch that failed, ran out
+    /// of budget, or could not be verified or resolved.
     pub gaps: u32,
     /// Unverified provider candidates with suspicious or hostile static findings.
     pub flagged_candidates: u32,

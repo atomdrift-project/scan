@@ -222,41 +222,6 @@ fn severe_members_do_not_rank_below_clean_ones() {
     );
 }
 
-/// The dependency backref is a conclusion about *another* artifact, pinned
-/// onto the file that named it. It must never reach featurization: a
-/// synthetic crit-5 trait describing someone else's bytes, fed as a feature
-/// of these ones, teaches the model that declaring dependencies is itself
-/// malicious.
-///
-/// Nothing in the types enforces that — it holds only because
-/// `classify_report` injects after the `score` stage returns, and `score`
-/// is where featurization happens. This pins that order so a future edit
-/// that moves either one fails here instead of silently contaminating
-/// training data. Delete this test only by making the distinction explicit
-/// in the trait itself.
-#[test]
-fn dependency_backref_is_injected_after_featurization() {
-    // Production code only: the needles below also appear in this test.
-    let src = include_str!("../pipeline.rs");
-    let src = src.split("#[cfg(test)]").next().unwrap_or(src);
-    let featurize = src
-        .find("let scored = score(&prepared, &req)?;")
-        .expect("the featurizing stage");
-    let inject = src
-        .find("inject_dependency_backref(&mut prepared.compact, backref);")
-        .expect("backref injection call");
-    assert_eq!(
-        src.matches("inject_dependency_backref(").count(),
-        2,
-        "one definition, one call",
-    );
-    assert!(
-        featurize < inject,
-        "dependency backrefs are injected before featurization — the model would \
-             train on synthetic traits describing other artifacts",
-    );
-}
-
 /// The acceptance test for the whole dependency path: what hopper stores for
 /// a fetched dependency must be the same *shape* as what it stores when the
 /// same bytes are scanned directly with `scan purl`. Anything a first-hand

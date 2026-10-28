@@ -438,15 +438,12 @@ pub(super) fn registry_doc_name(reg: &Registry) -> String {
 /// prints it beneath the settled dependency rows.
 /// A manifest peer range is a candidate, not evidence of an installed version.
 pub(super) fn mark_peer_candidate(record: &mut FetchRecord, source: &str) {
-    let note = if source == "package.json:peerDependencies" {
-        "peer dependency candidate; installed version is unknown"
+    let source = if source == "package.json:peerDependencies" {
+        CandidateSource::PeerDependency
     } else if source.starts_with("arch-pkginfo:") {
-        "Arch repository candidate; installed version and architecture are unknown"
+        CandidateSource::ArchRepository
     } else {
         return;
     };
-    record.coverage_note = Some(match record.coverage_note.take() {
-        Some(existing) => format!("{existing}; {note}"),
-        None => note.to_owned(),
-    });
+    record.coverage.push(Coverage::Candidate { source });
 }

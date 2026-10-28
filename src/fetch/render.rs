@@ -448,10 +448,8 @@ pub(super) fn report_fetch(rec: &FetchRecord) {
         fg(DETAIL, &format!("{column:>10}")),
         crate::output::tty_text(fetch_target(rec))
     );
-    if analysis_unavailable(rec)
-        && let Some(note) = &rec.coverage_note
-    {
-        eprintln!("      {}", crate::output::tty_text(note));
+    if analysis_unavailable(rec) {
+        eprintln!("      {}", crate::output::tty_text(&coverage_text(rec)));
     }
 }
 
@@ -476,9 +474,9 @@ pub(super) fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
 }
 
 pub(super) fn analysis_unavailable(rec: &FetchRecord) -> bool {
-    rec.coverage_note
-        .as_deref()
-        .is_some_and(|note| note.starts_with(note::UNAVAILABLE))
+    rec.coverage
+        .iter()
+        .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
 }
 
 /// Attention counts survive dropping the full report for terminal output.
@@ -486,14 +484,14 @@ pub(super) fn analysis_unavailable(rec: &FetchRecord) -> bool {
 pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::DependencyAttention {
     let mut attention = crate::engine::DependencyAttention::default();
     for record in records {
-        let note = record.coverage_note.as_deref().unwrap_or_default();
-        if note.contains(note::FLAGGED) {
+        if record
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }))
+        {
             attention.flagged_candidates += 1;
         }
-        if note.starts_with(note::UNAVAILABLE)
-            || note.starts_with(note::INCOMPLETE)
-            || note.starts_with(note::PENDING)
-            || note.contains(note::VERSION_UNKNOWN)
+        if record.coverage.iter().any(Coverage::is_gap)
             || matches!(
                 record.outcome,
                 Outcome::Failed(_)
@@ -563,9 +561,9 @@ pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
         )
     {
         let flagged = rec
-            .coverage_note
-            .as_deref()
-            .is_some_and(|note| note.contains(note::FLAGGED));
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }));
         return FetchRow::new('\u{26a0}', "gap", CAUTION).detail(
             if flagged {
                 "candidate flagged"
@@ -702,21 +700,21 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     let mut incomplete = 0u32;
     for rec in records {
         bytes += rec.size.unwrap_or(0);
-        let note = rec.coverage_note.as_deref().unwrap_or_default();
+        let has = |pick: fn(&Coverage) -> bool| rec.coverage.iter().any(pick);
         if matches!(
             rec.outcome,
             Outcome::BudgetExceeded | Outcome::Unresolved(_)
-        ) || note.starts_with(note::PENDING)
+        ) || has(|fact| matches!(fact, Coverage::Pending { .. }))
         {
             pending += 1;
         }
-        if note.starts_with(note::SUPPLIED) {
+        if has(|fact| matches!(fact, Coverage::Supplied { .. })) {
             local += 1;
         }
-        if note.starts_with(note::DEVELOPMENT) {
+        if has(|fact| matches!(fact, Coverage::DevelopmentExcluded)) {
             dev += 1;
         }
-        if note.starts_with(note::INCOMPLETE) || note.starts_with(note::UNAVAILABLE) {
+        if has(is_analysis_gap) {
             incomplete += 1;
         }
         match &rec.outcome {
@@ -745,7 +743,7 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
         (pending, "pending"),
         (local, "supplied locally"),
         (dev, "development excluded"),
-        (incomplete, note::INCOMPLETE),
+        (incomplete, "analysis incomplete"),
     ] {
         if count > 0 {
             parts.push(format!("{count} {label}"));

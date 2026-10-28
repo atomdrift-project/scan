@@ -993,70 +993,87 @@ fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
         &report,
     );
 
-    // Every artifact keeps a header naming what it claims to be.
-    for (path, kind) in [
+    // Every artifact keeps a header naming what it claims to be. Each claim
+    // is checked inside its own member's section: the PE and the document
+    // both name "Contoso Ltd", so a whole-render search for one would pass
+    // on the other.
+    let members = [
         ("setup.exe", "pe"),
         ("libhelper.dylib", "macho"),
         ("invoice.docx", "docx"),
-    ] {
-        let header = ctx
-            .lines()
+    ];
+    let header = |path: &str, kind: &str| {
+        ctx.lines()
             .find(|l| l.contains(path) && l.contains(kind))
-            .unwrap_or_else(|| panic!("no header for {path} in:\n{ctx}"));
+            .unwrap_or_else(|| panic!("no header for {path} in:\n{ctx}"))
+    };
+    for (path, kind) in members {
+        let header = header(path, kind);
         assert!(
             header.matches('\t').count() >= 2,
             "{path} header lost its identity field: {header:?}"
         );
     }
+    let header_at = |path: &str, kind: &str| ctx.find(header(path, kind)).unwrap_or_default();
+    let section = |path: &str, kind: &str| {
+        let from = header_at(path, kind);
+        let to = members
+            .iter()
+            .map(|(p, k)| header_at(p, k))
+            .filter(|&at| at > from)
+            .min()
+            .unwrap_or(ctx.len());
+        ctx.get(from..to).unwrap_or_default()
+    };
+    let pe = section("setup.exe", "pe");
+    let macho = section("libhelper.dylib", "macho");
+    let docx = section("invoice.docx", "docx");
 
     // PE: the signer, and the product it claims to be. A signer that
     // disagrees with the company in the version resource is the finding a
     // reader can only make when both are present.
-    assert!(ctx.contains("Vanguard Tech Limited"), "PE signer: {ctx}");
-    assert!(ctx.contains("ca-signed"), "PE trust tier: {ctx}");
+    assert!(pe.contains("Vanguard Tech Limited"), "PE signer: {pe}");
+    assert!(pe.contains("ca-signed"), "PE trust tier: {ctx}");
     // The version resource's file version rides along with the name.
-    assert!(ctx.contains("3.5.1"), "PE version: {ctx}");
+    assert!(pe.contains("3.5.1"), "PE version: {ctx}");
     // What the binary claims about *itself*. The headline can name only
     // one party and picks the signature, so these reach the reader on
     // cleave's `claims` line — and the disagreement between the claimed
     // "Contoso Ltd" and the signing "Vanguard Tech Limited" is a signal
     // that exists only because both are rendered.
     assert!(
-        ctx.contains(r#"product="Contoso Updater""#),
+        pe.contains(r#"product="Contoso Updater""#),
         "PE product name: {ctx}"
     );
-    assert!(
-        ctx.contains(r#"company="Contoso Ltd""#),
-        "PE company: {ctx}"
-    );
+    assert!(pe.contains(r#"company="Contoso Ltd""#), "PE company: {ctx}");
     // The build path leaks the developer account and is rendered beside it.
-    assert!(ctx.contains("serde_json-1.0.114"), "PE build path: {ctx}");
+    assert!(pe.contains("serde_json-1.0.114"), "PE build path: {ctx}");
 
     // Mach-O: bundle identity, the Apple team, and the bundle version —
     // which the headline drops whenever the identifier is the subject.
     assert!(
-        ctx.contains("com.contoso.helper"),
+        macho.contains("com.contoso.helper"),
         "Mach-O identifier: {ctx}"
     );
-    assert!(ctx.contains("developer-id"), "Mach-O trust tier: {ctx}");
-    assert!(ctx.contains(r#"team="AB12CD34EF""#), "Mach-O team: {ctx}");
+    assert!(macho.contains("developer-id"), "Mach-O trust tier: {ctx}");
+    assert!(macho.contains(r#"team="AB12CD34EF""#), "Mach-O team: {ctx}");
     assert!(
-        ctx.contains(r#"version="1.4.0""#),
+        macho.contains(r#"version="1.4.0""#),
         "Mach-O bundle version: {ctx}"
     );
 
     // Office document: title, author, producing application.
-    assert!(ctx.contains("Q3 Vendor Invoice"), "docx title: {ctx}");
-    assert!(ctx.contains("Aleksandr Petrov"), "docx author: {ctx}");
+    assert!(docx.contains("Q3 Vendor Invoice"), "docx title: {ctx}");
+    assert!(docx.contains("Aleksandr Petrov"), "docx author: {ctx}");
     assert!(
-        ctx.contains("Microsoft Office Word"),
+        docx.contains("Microsoft Office Word"),
         "docx producer: {ctx}"
     );
     // The company the document claims, which its author outranked in the
     // headline: a document authored outside the company it names is the
     // same shape of tell as the PE above.
     assert!(
-        ctx.contains(r#"company="Contoso Ltd""#),
+        docx.contains(r#"company="Contoso Ltd""#),
         "docx company: {ctx}"
     );
 
