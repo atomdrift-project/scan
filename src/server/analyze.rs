@@ -225,7 +225,19 @@ impl Leader {
         // fallback makes from the blocking thread.
         let runtime = Handle::current();
         let tracker = phase.clone();
+        let request_id = self.request_id;
+        let crash_key = self.flight.key().to_string();
+        let crash_label = job.name().to_owned();
         let work = move || {
+            // Name this analysis in the SIGABRT dump: a stack overflow aborts
+            // the whole process, and the dump is the only record of which
+            // request was running. The guard frees the slot on any return.
+            let _in_flight = crate::crash_dump::register(
+                request_id,
+                crate::thread_dump::os_thread_id(),
+                &crash_key,
+                &crash_label,
+            );
             let analysis = Analysis {
                 cancellation: Some(&cancellation),
                 phase: Some(&tracker),
