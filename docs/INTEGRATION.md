@@ -5,7 +5,7 @@ Atomdrift Scan reads a file and calls it **benign**, **suspicious**, or
 no network calls unless you ask it to.
 
 This guide is for wiring it into a pipeline: a registry gating uploads, a CI
-check, an ingestion worker.
+check, an ingestion pipeline.
 
 ## Start in one minute
 
@@ -33,19 +33,16 @@ notice with `SCAN_NO_UPDATE_CHECK`.
 
 ## Choose a path
 
-All four paths return the **same JSON envelope** ([JSON.md](JSON.md)). Start
-with the CLI; move to a server or worker when volume demands it. Nothing
-about how you parse results changes.
+Start with the CLI; move to the server when volume demands it.
 
 | Path         | Use when                                                  | Cost                                            | Reference                          |
 | ------------ | -------------------------------------------------------- | ----------------------------------------------- | ---------------------------------- |
 | **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `atomscan --help`                 |
 | **HTTP server** | Sustained traffic past ~5 scans/min.                 | You run a long-lived process.                   | [SERVER_API.md](SERVER_API.md)     |
-| **Worker**   | Distributed ingestion: workers pull jobs from a [hopper](https://github.com/atomdrift-project/hopper) queue. | You run a hopper for them to poll. | [WORKERS.md](WORKERS.md)           |
 | **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | source — `classify_file`, `classify_bytes` |
 
 A registry gating uploads on ingest should start with the **CLI** and grow
-into the **Worker**.
+into the **HTTP server**.
 
 ## Gate on the exit code
 
@@ -152,8 +149,8 @@ file. `~/.tok/llm` is *our* endpoint's credential and is never sent to
 OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
 endpoint answers 401, which costs the second opinion but not the scan: the
 verdict falls back to ML alone and the reason appears in the `llm` section.
-The deploy scripts install `~/.tok/llm` into the service account's home, so
-servers and workers pick it up the same way.
+A server running under a service account reads `~/.tok/llm` from that
+account's home.
 
 ### Failing over between endpoints
 

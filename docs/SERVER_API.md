@@ -1,333 +1,80 @@
 # Atomdrift Scan Server API
 
-`atomscan serve` is an HTTP daemon that takes a file and returns a
-classification. It binds to loopback. Pass `--token-file` to require a
-bearer token on every route but `/_/health`; `make deploy` always does.
-
-For the pull-based worker, see [WORKERS.md](WORKERS.md).
-For the response schema, see [JSON.md](JSON.md).
+`atomscan serve` is an HTTP daemon that takes an artifact and answers whether
+to let it through. It binds to loopback by default. Pass `--token-file` to
+require a bearer token on every route but `/_/health`.
 
 ## Running the server
 
-    atomscan serve
+    atomscan serve --token-file ~/.tok/scan
 
-The defaults are deliberate. Override them only when you have a reason.
+| Flag                  | Default           | Meaning |
+| --------------------- | ----------------- | ------- |
+| `--bind`              | `127.0.0.1:49999` | Listen address. |
+| `--workers`           | 3 per physical core, at least 2 | Concurrent analyses. Past it a request gets `429`, never a queue. |
+| `--max-size-mb`       | `100`             | Largest artifact accepted, uploaded or read from disk. |
+| `--max-rss-gb`        | `0` (auto)        | RSS ceiling. `0` reads the cgroup or system limit; `-1` disables the check. |
+| `--allow-cidr`        | none              | Comma-separated networks, besides loopback, allowed to connect. |
+| `--token-file`        | none              | File holding the bearer token. See [Authentication](#authentication). |
+| `--allow-local-paths` | none              | Directory `?path=` may read from. Repeatable. See [Local files](#local-files). |
+| `--hopper`            | none              | Hopper base URL(s). Results are filed there, and lookups this server cannot answer are deferred to it. |
+| `--traits-dir`        | none              | Writable cleave traits directory. |
+| `--analysis-timeout`  | `2040`            | Per-request analysis budget in seconds; `0` disables. |
 
-| Flag             | Default            | Meaning                                                    |
-| ---------------- | ------------------ | ---------------------------------------------------------- |
-| `--bind`         | `127.0.0.1:49999`  | Listen address.                                            |
-| `--workers`      | physical performance-core count (min 2) | Hard cap on concurrent analyses. Excess requests get 503. |
-| `--max-size-mb`  | `100`              | Per-request upload limit.                                  |
-| `--max-rss-gb`   | `0` (auto)         | RSS ceiling. `0` reads the cgroup signal. `-1` disables.   |
-| `--allowed-dirs` | none               | Comma-separated roots permitted by `/analyze-path`.        |
-| `--allow-cidr`   | none               | Extra CIDR networks allowed beyond loopback.               |
-| `--token-file`   | none               | File holding the required bearer token. See below.         |
-| `--traits-dir`   | none               | Writable cleave traits directory (sets env on launch).     |
-| `--hopper`       | none               | Hopper base URL. Every analyzed result is renewed on its `/api/result`. Needs a hopper token; see below. |
-| `--idle-worker-slots` | on when `--hopper` is set | Runs a companion `atomscan worker` process that claims hopper queue work, frozen by the kernel for the whole of every analysis request. Any non-zero value enables it; `0` disables. |
+Global flags (`--follow`, `--llm`, `--level`, …) apply as they do to a scan;
+`atomscan --help` lists them. Environment variables are listed in
+[ENVIRONMENT.md](ENVIRONMENT.md).
 
-Environment variables read at startup:
-
-| Variable               | Effect                                                       |
-| ---------------------- | ------------------------------------------------------------ |
-| `CLEAVE_TRAITS_DIR`    | Traits directory. `--traits-dir` overrides.                  |
-| `CLEAVE_RAYON_THREADS` | Override rayon pool size. Default is system parallelism.     |
-| `SCAN_MODELS_REPO`   | Model repository URL.                                        |
-| `SCAN_WHALE_POOL_THREADS` | Threads in each whale's private pool (below); `0` sends whales to the global pool. Default: a quarter of the physical cores, 2–16. |
-| `SCAN_SMALL_POOL_THREADS` | Threads in a small payload's private pool; `0` keeps small payloads on the global pool. Default: an eighth of the physical cores, 2–8. |
-| `SCAN_LANE_SHARE` | `0` pins every private pool at its tier width above. Default: a lane gets an even share of the physical cores among the requests in flight (never below its tier width), and a request alone on the box uses the global pool. |
-| `SCAN_WHALE_SLOTS` | Big whales analyzing at once; the rest wait. Default: an eighth of the physical cores, 1–8. |
-| `SCAN_SMALL_JOB_MB`  | Payloads above this many MiB are whales. Default 1. Shared with the slot lanes. |
-| `SCAN_BIG_JOB_MB`    | Payloads above this many MiB are *big* whales and take a `SCAN_WHALE_SLOTS` slot. Default 8. |
-| `SCAN_LLM_CONCURRENCY` | In-flight LLM calls per process (default: physical cores, 4–16). |
-| `SCAN_LLM_BACKGROUND_CONCURRENCY` | Of those, how many queue work (a worker job, serve's own puller) may hold at once; the rest are reserved for requests with a caller waiting. Default: a quarter, at least one. vLLM shares each prefill step across every running request, so this is what keeps the fleet's background calls from setting serve's latency floor. |
-| `SCAN_LLM_SYSTEM_PROMPT_FILE` | Replace the built-in LLM system prompt with this file's contents (prompt-tuning A/B). Verdict caches key on the prompt text, so an override never replays built-in verdicts. |
-| `SCAN_INTERPRET_BUDGET_BYTES` | Byte budget for the primary artifact's LLM render; over budget, low-severity member files are dropped first. Default 98304. cleave's tiny view already caps each file at 12 KiB of context windows (`CLEAVE_TINY_LEGACY_WINDOWS=1` restores the uncapped windows, `CLEAVE_TINY_NO_RELABEL=1` the pre-2026-09-06 composite handling). |
-
-Every payload analyzes on a rayon pool of its own rather than on the global
-pool, sized by load: an even share of the physical cores among the requests
-in flight, floored at `SCAN_SMALL_POOL_THREADS` at or below
-`SCAN_SMALL_JOB_MB` and `SCAN_WHALE_POOL_THREADS` above it; a request that
-is alone on the box runs on the global pool instead. The floors are the
-widths measured best at concurrency 8 (64 cores / 8 = 8 for small), but at
-concurrency 1 a fixed 8-thread lane left 120 threads idle: purls-128 p90
-1.63 s against 1.12 s on the global pool, wall 164 → 111 s (2026-09-06). Each pool is built for one
-analysis and dropped after it (reusing idle pools measured as a wash). Every analysis runs on a blocking thread, so its inner parallel work is
-injected into a rayon pool from outside, and rayon workers only take injected
-work when their own queues are empty; while one 40 MB wheel's members fill
-those queues, every package that shares the pool waits. A single shared whale
-pool was the first cut (2026-09-05, 64 cores, concurrency 8 over 128 real
-PURLs): the p90 fell from 5.3s to 4.1s, but three 36–254 MB wheels in flight
-then starved each other and any 1–5 MB package that landed on the same pool
-for the whole 200s sweep. With a private pool per whale the same sweep runs in
-53s at 145 analyses/min, p99 31s, and each whale finishes in the 25–40s it
-takes alone. Big whales (`SCAN_BIG_JOB_MB`) also take one of
-`SCAN_WHALE_SLOTS`, so a burst queues instead of oversubscribing the host;
-mid-size payloads never wait. Sized to the host: a 4-core box runs one whale
-at a time on 2 threads, a 128-core box up to eight on 16 each. A whale's
-analysis tells cleave it owns its pool (`AnalysisOptions::dedicated_pool`),
-so it neither takes one of the shared pool's bounded inner-parallel owner
-slots (`CLEAVE_INNER_PARALLEL_OWNERS`, threads/32) nor counts as in flight
-there — otherwise four whales held all four slots for 30s each and every
-small package meanwhile analyzed its members serially, 2.5× slower than
-alone. With that exemption the 128-PURL sweep's p90 is 1.7–1.9s (LLM off) at
-160 analyses/min; raising the owner cap instead (8 or 16) lowers the p50 but
-lifts the p90 to 2.3–3.1s, so the cap stays where it is. Giving small
-payloads private pools as well (8 threads each, measured better than 16 for
-them) took the 256-PURL sweep from p50 0.48s to 0.36s, mean 1.64s to 1.3s
-and 205 to 235 analyses/min; nothing on the global pool then competes for
-the owner slots at all.
-
-The server also flushes cleave's learned regex list (`regex-warm-v1.json` in
-the cache dir) every 30s, so the next start prewarms the ~24k first-use trait
-regex compiles this workload needs instead of paying them on its first
-requests.
-
-Each completed request logs `phases="purl:fetch=53 cleave:analyze=555 …"`
-(milliseconds per phase, in order) next to `elapsed_ms`, so a server log
-attributes latency without a profiler: `purl:fetch` is registry lookup and
-download (overlapped), `whale:lane` the wait for a big-whale slot,
-`cleave:analyze` the analysis proper, `classify:report` features, model and
-dependency follow-up.
-
-The listener binds before the model is loaded. While loading, every
-route returns 503 with `{"error":"server starting"}`. Poll `/_/health`
-until the status flips to `ok`.
-
-Models and traits are refreshed once at startup — that is what a restart is
-for, and with `--traits-dir` it is also what installs traits into a directory
-that does not exist yet. `-u` forces the refresh even when the local copy looks
-current; `--no-update` (before the subcommand) skips it. If traits still cannot
-be resolved afterwards the server never reports ready: `/_/health` returns 503
-with `{"status":"failed","reason":"initialization_failed"}` and the log names
-the path, rather than reporting healthy and failing every analysis.
+The listener binds before the model loads. Until it has, analysis routes
+answer `503` with code `starting`; poll `/_/health` until `status` is `ok`.
+Models and traits are refreshed once at startup (`-u` forces it, `--no-update`
+skips it). If the traits cannot be resolved the server never reports ready:
+`/_/health` answers `503` with `{"status":"failed","reason":"initialization_failed"}`
+and the log names the path.
 
 ## Authentication
 
-`--token-file PATH` reads a token from the first non-empty line of `PATH`,
-stripped of surrounding whitespace — a trailing newline is not part of the
-secret — and requires it on every route except `/_/health`:
+`--token-file PATH` reads the token from the first non-empty line of `PATH`
+and requires it on every route except `/_/health`:
 
-    curl -H "Authorization: Bearer $(cat ~/.tok/scan)" ...
+    curl -H "Authorization: Bearer $(cat ~/.tok/scan)" …
 
-The examples further down abbreviate that as
-`AUTH="Authorization: Bearer $(cat ~/.tok/scan)"`.
+The examples below abbreviate that header as `$AUTH`.
 
-The scheme is case-insensitive; the token is compared byte-exactly. A
-missing or invalid token gets `401` with `WWW-Authenticate: Bearer` and an
-identical body either way, so the endpoint is not an oracle for guesses.
-
-The token itself must be at least 16 bytes and drawn from the character set a
-bearer credential is allowed to carry (RFC 6750 `token68`: `A-Z a-z 0-9 - . _
-~ + /`, plus trailing `=` padding). Hex, base64, and URL-safe base64 all pass.
-This is a sanity check, not a strength policy: a token containing anything
-else — a space, a quote, a stray `Bearer ` prefix pasted into the file — cannot
-be sent in a header at all, so the server refuses to start and names the
-offending character rather than 401ing every request for the rest of its life.
-
-Four properties are deliberate:
-
-- **Loopback is not exempt.** A Cloudflare tunnel runs `cloudflared` on the
-  host and dials the service over loopback, so every remote request arrives
-  with a loopback peer address. Exempting loopback would exempt the internet.
-  For the same reason `--allow-cidr` cannot filter tunnelled traffic, and
-  `/analyze-path`'s loopback-only restriction stops meaning "local" — leave
-  `--allowed-dirs` empty on a tunnelled host, which makes that route reject
-  everything.
-- **The token is a file, never an argument or an environment variable.**
-  `argv` is world-readable through `ps`, and systemd unit files are
-  world-readable in `/etc/systemd/system`. Only the SHA-256 digest is kept in
-  memory, so the token cannot surface in a log line or a core file.
+- **Loopback is not exempt.** A Cloudflare tunnel's connector dials the server
+  over loopback, so every remote request arrives with a loopback address.
+  Exempting loopback would exempt the internet.
+- **A token is at least 16 bytes** of the RFC 6750 `token68` alphabet. Anything
+  else could not be sent in a header, so the server refuses to start rather
+  than answer `401` forever.
 - **Missing means fatal.** If `--token-file` is set and the file is missing,
-  empty, or unreadable, the server refuses to start. It never falls back to
-  serving unauthenticated.
-- **Rotation needs a restart.** The token is read once at startup;
-  `/_/reload` does not re-read it. A rotated-but-not-restarted server is the
-  usual cause of a 401 against a token file that looks correct — the access
-  log's `cred_fp` field distinguishes that from a wrong token, see
-  [Logging](#logging).
+  empty or unreadable, the server does not start.
+- **Only a digest is kept**, so the token cannot surface in a log or a core.
+- **Rotation needs a restart.** The token is read once.
 
-`/_/health` stays open so tunnel and load-balancer probes work without a
-credential — but a valid token there upgrades the response, see below.
-
-### Deploy
-
-`make deploy` (alias of `make deploy-server`) installs a long-lived
-`atomscan serve`:
-
-- **FreeBSD.** Native host install, rc.d service `scan`
-  (`scripts/server/server-freebsd.sh`). Same shape as `make deploy-worker` on
-  FreeBSD: unprivileged `scan` user, `daemon(8)` supervision with a bounded
-  stop, `nice -20` plus `protect(1)`, traits under the service account's home.
-  The service definition is shared with the jailed deploy through
-  `scripts/server/lib/freebsd-rcd.sh`.
-- **Linux (systemd).** Native host install, unit `scan.service`
-  (`scripts/server/server-linux.sh`). Same shape as
-  `make deploy-worker` on Linux: unprivileged `scan` user, `MemoryMax=`,
-  traits under the deployed state directory (by default
-  `/var/lib/atomdrift/scan`; the systemd installer resolves symlinked mounts
-  such as `/var/lib/atomdrift` → `/data/atomdrift`).
-
-`make deploy-jail` is the FreeBSD alternative: a Bastille build jail plus a run
-jail (`scripts/server/rollout-bastille.sh`), for when the server should be
-isolated from the host rather than installed on it. `make uninstall-server`
-removes the native service, `make uninstall-jail` the jailed one.
-
-Both paths install an API token. It is read from `~/.tok/scan` on the
-deploying host — generated there on first deploy if absent — and copied into
-the service account's own `~/.tok/scan`, which the unit passes as
-`--token-file`. Rotate by editing `~/.tok/scan` and redeploying — a changed
-token restarts the service, since it is read only at startup. Hand clients
-`$(cat ~/.tok/scan)`.
-
-#### Uploading to hopper
-
-`HOPPER=` is **required**. The deploy refuses to install a server without it:
-
-    make deploy HOPPER=https://hopper-host
-
-A server with no `--hopper` answers every analysis and files none of them. The
-caller caches the verdict, so the same artifact is never asked for again, and
-hopper never receives it. Nothing fails at deploy time and nothing fails at
-request time — the loss only surfaces later, as a sample hopper should hold and
-does not. Pass `HOPPER=none` to opt out deliberately (a laptop, a CI box); it
-is the same shape as `TOKEN_SRC=` for a deliberately unauthenticated server.
-
-That adds `--hopper <url>` to the service. The credential it needs is a second,
-unrelated token: `~/.tok/scan` authenticates clients *to this server*,
-`~/.tok/hopper` authenticates *this server to hopper*. Without it, hopper
-rejects every result renewal with 401 — it requires a bearer token on every
-route and does not exempt loopback. See
-[WORKERS.md](WORKERS.md#authenticating-to-hopper).
-
-Every `make deploy` copies the deploying user's `~/.tok/hopper` into the
-service account's own `~/.tok/hopper` (`HOPPER_TOKEN_FILE=` overrides the
-source), whether or not `HOPPER=` is set — so turning renewal on later needs
-nothing else in place. The file is inert while `--hopper` is off.
-
-On FreeBSD the URL lands in `rc.conf` as `scan_hopper`, so it can also be
-changed in place — `sysrc scan_hopper=<url>` (`bastille sysrc <jail>
-scan_hopper=<url>` for the jailed deploy) plus a service restart — without a
-redeploy. Dropping `HOPPER=` from a later deploy is now refused rather than
-silently clearing it; `HOPPER=none` clears it explicitly, so renewal stops on
-purpose rather than by omission.
-
-Overrides (passed through the environment), shared by the Linux and FreeBSD
-host installs: `BIND=` (unset leaves atomscan's own default, `127.0.0.1:49999`, on the assumption that a
-Cloudflare tunnel or another local proxy provides the ingress; set
-`0.0.0.0:49999` to listen on every interface), `TOKEN_SRC=` (default
-`~/.tok/scan`; set empty to deploy without authentication), `ALLOW_CIDR=`
-(default `10.0.0.0/8`; set empty to omit), `LLM=` / `LLM_URL=` (`local`,
-`openrouter`, or a base URL), `LLM_MODEL=` (unset leaves atomscan's default:
-the largest served model, or `openrouter/auto` for OpenRouter),
-`WORKERS=`, `ALLOWED_DIRS=`, `IDLE=`.
-`make uninstall-server` tears the service down.
-
-The Cloudflare Tunnel connector is a separate, one-time step rather than part
-of every deploy: `CF_TUNNEL_TOKEN=<token> make deploy-tunnel` installs it
-(`scan-tunnel` under systemd, `scan_tunnel` under rc.d), and later runs reuse
-the stored token and leave an active, unchanged connector alone. Rerun it with
-a new `CF_TUNNEL_TOKEN=` after rotating the tunnel. It refuses to install
-beside a connector Cloudflare's own `cloudflared` service already runs.
-
-Memory is capped differently per platform, because FreeBSD has no cgroup to
-fall back on: Linux passes `MEMORY_MAX=` to systemd's `MemoryMax=` and turns
-the in-process throttle off, while FreeBSD keeps the in-process throttle on and
-takes `MAX_RSS_GB=` (unset leaves atomscan's default, which auto-resolves to
-the process memory limit). FreeBSD also takes `NICE=`, stored in `rc.conf` as `scan_nice`.
-
-`IDLE=` switches the companion pull worker on or off. `serve` runs it as a
-separate `atomscan worker` process and freezes it for the whole of each
-request, so an arriving analysis gets the entire machine; `make deploy IDLE=0`
-turns background claiming off, so the host only ever works on interactive
-requests. Any non-zero value means the same thing — it was once a slot count,
-but the worker sizes itself the way every standalone worker does. It applies on
-both platforms (the jail stores it as `scan_idle_slots` in rc.conf, changeable
-in place with `bastille sysrc`), and it is inert without `HOPPER=`, since there
-would be nothing to claim from.
-
-The freeze is kernel-enforced and acts on cgroup or reaper *membership*, not on
-a process group, so nothing escapes it — including the external analyzers a
-worker spawns, whose process behaviour is not ours to rely on. On Linux the
-unit needs `Delegate=yes`, which `make deploy` writes; without it the server
-says so at startup and runs with no background work rather than running work it
-cannot stop. On FreeBSD the worker acquires reaper status for its own subtree
-and needs nothing from `rc.d`.
-
-`ALLOW_CIDR=` and `TOKEN_SRC=` treat *empty* as a deliberate choice — no CIDR
-allow-list, no authentication — so unlike the others they are not declared in
-the Makefile, where they would be exported empty on every deploy. Pass them on
-the command line when you mean them.
-
-The jailed deploy (`make deploy-jail`) is the exception: it keeps `--bind
-0.0.0.0:49999` with `--allow-cidr 10.0.0.0/8` — inside a jail that is the
-jail's own address, and it is reached over the network rather than through a
-tunnel — and always requires a token. `HOPPER=`, `HOPPER_TOKEN_FILE=` and
-`IDLE=` apply there too, and the jail keeps its own tunnel knobs
-(`CLOUDFLARED=` / `CF_TUNNEL_TOKEN=`), since its connector lives inside the run
-jail; the other overrides above are for the host installs.
-
-On FreeBSD the service logs to `/var/log/scan.log` (`service scan status`,
-`tail -f /var/log/scan.log`) rather than to journald.
+A missing and a wrong token get the same `401` with `WWW-Authenticate: Bearer`.
+Without a token, `/_/reload` and `/_/update` answer loopback only, so
+`--allow-cidr` grants analysis and never administration.
 
 ## Endpoints
 
-### `POST /analyze`
+Every error has one shape, with a stable `code`:
 
-Multipart upload. One part named `file`. The filename is sanitised
-(`[A-Za-z0-9_.-]`, `..` collapsed, truncated to 63 bytes) and copied to
-a private temp directory so cleave sees a plausible extension.
-
-    curl -s -H "$AUTH" -F file=@/bin/ls http://127.0.0.1:49999/analyze | jq .ml
-
-Returns 200 with the [response envelope](JSON.md). 413 if the
-body exceeds `--max-size-mb`, 415 for unsupported types, 422 for
-truncated or malformed input, 503 if the server is starting or
-saturated, 504 if analysis exceeds the watchdog deadline.
-
-### `POST /analyze-path`
-
-JSON body: `{"path": "/absolute/path"}`. Loopback only, always — but see the
-tunnel caveat under [Authentication](#authentication): behind a tunnel,
-"loopback" includes every remote caller. The path is canonicalised before it
-is compared against `--allowed-dirs`, so symlinks cannot escape. Without
-`--allowed-dirs`, every request returns 403.
-
-    curl -s -H "$AUTH" -H 'content-type: application/json' \
-      -d '{"path":"/usr/bin/ls"}' \
-      http://127.0.0.1:49999/analyze-path | jq .ml
-
-Same response envelope as `/analyze`.
-
-### `POST /analyze-purl`
-
-JSON body: `{"purl": "pkg:npm/left-pad@1.3.0"}`. The `pkg:` scheme is
-optional (`npm/left-pad@1.3.0` is accepted). Scan resolves the package,
-looks up registry provenance itself, and returns the same envelope as
-`/analyze`. Takes an analyze slot. 400 if the argument is not a PURL.
-
-    curl -s -H "$AUTH" -H 'content-type: application/json' \
-      -d '{"purl":"pkg:npm/left-pad@1.3.0"}' \
-      http://127.0.0.1:49999/analyze-purl | jq .ml
-
-Beamline backends should start the server with `--follow --interpret
---analysis-timeout 1800` so dependency follow and LLM interpretation
-match a live `atomscan purl` run.
+    {"error": {"code": "invalid_purl", "message": "not a package URL"}}
 
 ### `GET /v1/lookup`
 
-What is known about an artifact, as a decision. Never analyzes.
+What is known about an artifact, as a decision. Never analyzes and never
+takes a slot.
 
     GET /v1/lookup?purl=<url-encoded>
-    GET /v1/lookup?sha256=<64hex>
-    GET /v1/lookup?purl=a&purl=b          up to 50 per URL
-    GET /v1/lookup?purl=<p>&false_positive_budget=25
+    GET /v1/lookup?sha256=<64 hex>
+    GET /v1/lookup?url=<url-encoded>
+    GET /v1/lookup?purl=a&purl=b                  up to 50 per request
+    GET /v1/lookup?purl=…&false_positive_budget=25
 
-Answers from this worker's own index first. On a miss it defers to the
-corpus — hopper's `/v1/lookup`, read from `--hopper-read` and falling
-back to `--hopper` — so one question gets one answer and a caller need
-not know two services exist. With neither configured it answers from
-the local index alone.
+Answers from this server's own index first, then from `--hopper`. With no
+hopper it answers from the index alone.
 
     {
       "decision": "block",
@@ -337,532 +84,180 @@ the local index alone.
       "fires_at": 3,
       "reason": "Postinstall launches a reverse shell.",
       "findings": [{"id": "objectives/execution/shell/bash", "crit": 5}],
-      "engine_version": "2.8.0",
+      "engine_version": "2.13.0",
       "analyzed_at": "2026-08-01T00:00:00Z"
     }
 
-One package answers with one object; a repeated `purl` answers with a
-list, in the order asked. A repeated `sha256` does the same for several exact
-artifacts; one `sha256` may pair with a `purl` naming the same bytes, but
-several cannot be combined with `purl` or `url` (`multiple_locators`). Every field is always present — `null` when
-unknown, `[]` when empty.
+One artifact answers with one object; repeated keys answer with a list, in
+the order asked.
 
-`decision` is one of:
+| `decision`    | Meaning |
+| ------------- | ------- |
+| `allow`       | Analyzed; not hostile at the caller's budget. |
+| `block`       | Analyzed; hostile at the caller's budget. |
+| `unanalyzed`  | Nobody has analyzed it. |
+| `unavailable` | We could not answer. Says nothing about the artifact. |
 
-| | |
-| --- | --- |
-| `allow` | Analyzed. Not hostile at the caller's budget. |
-| `block` | Analyzed. Hostile at the caller's budget. |
-| `unanalyzed` | Nobody has analyzed it, and nothing is wrong. |
-| `unavailable` | We could not answer. Nothing about the artifact. |
+`unanalyzed` is a claim about the artifact and `unavailable` a claim about
+us; a caller's policy is entitled to treat them differently.
 
-`unanalyzed` and `unavailable` are kept distinct on purpose: one is a
-claim about the package, the other about us, and a caller's policy is
-entitled to treat them differently. A verdict index that has not
-loaded, or a corpus that cannot be reached, is `unavailable` — never
-`unanalyzed`, which would report our own outage as a clean bill of health.
-
-`fires_at` is the stored `lvl`: the tightest false-positive budget per
-100 million benign files at which the artifact grades hostile, `-1` for
-one that fires at no level, `null` for a record predating levels or
-written under manual `--threshold-*`. It is measured.
-
-`false_positive_budget` is chosen: what the caller will tolerate.
-Default is this server's own `--level`, resolved as usual (flag, then
-the bundle's `default_severity_level`, then the shipped constant), so a
-retuned deploy moves with it. `decision` is `block` when `fires_at` is
-at or below it. A budget that is not a whole number from 0 to 65535 is
-a 400 rather than a silent fall back.
-
-`severity` is `benign`, `suspicious` or `hostile` — the same grades
-`Classification` uses, and independent of the caller's budget.
-
-Errors carry a stable code: `missing_package`, `invalid_purl`,
-`invalid_sha256`, `invalid_false_positive_budget`, `too_many_packages`.
+`fires_at` is the tightest false-positive budget, per 100 million benign
+files, at which the artifact grades hostile: `-1` when it fires at none,
+`null` for a verdict reached with manual thresholds. It is measured.
+`false_positive_budget` is chosen: what the caller tolerates. It defaults to
+this server's `--level`. `decision` is `block` when `fires_at` is at or below
+the budget. `severity` is `benign`, `suspicious` or `hostile`, independent of
+the budget.
 
 ### `POST /v1/analyze`
 
-Analyze a package and answer with a decision.
+Analyze an artifact and answer with the same decision.
 
-    POST /v1/analyze                  {"purl": "pkg:npm/evil@1.0.0"}
-    POST /v1/analyze?false_positive_budget=25
-    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&force=1
-    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=none
-    POST /v1/analyze?purl=pkg:npm/evil@1.0.0&follow=dependencies,references
-    POST /v1/analyze                  <the artifact, any other content type>
+    POST /v1/analyze?purl=pkg:npm/left-pad@1.3.0
+    POST /v1/analyze?url=https://example.com/app.tgz
+    POST /v1/analyze                         <the artifact as the body>
+    POST /v1/analyze?path=/srv/incoming/app.tgz
+    POST /v1/analyze?sha256=<64 hex>&refresh=1
 
-A named package is looked up before anything is analyzed, exactly the way
-`GET /v1/lookup` resolves it — same normalization, same index-then-corpus order,
-same budget. A verdict already held is returned immediately and costs no
-analysis slot; `unanalyzed` and `unavailable` are not verdicts, so both fall
-through and run. Pass `force=1` to analyze regardless of what is already known,
-which is what to use after an engine upgrade.
+Name exactly one artifact. A body is the artifact itself, analyzed under the
+digest of its bytes; `X-Filename` names it so cleave can type it by
+extension. A `?purl=` sent with a body is provenance, not the artifact.
 
-The requested artifact is always retrieved. `follow` controls which references
-discovered inside it are also retrieved and analyzed: `dependencies` follows
-manifest and lockfile declarations, `references` follows packages and URLs
-named by install/download commands, `ci-actions` follows third-party CI actions
-and implies dependencies, `all` selects every category, and `none` follows
-nothing. Values may be comma-separated or repeated. Omitting `follow` uses the
-server's configured policy. An explicit `follow` selection replaces the
-configured categories after validation; the server's depth, size, and fan-out
-limits still apply.
+A verdict already held answers immediately and takes no slot. `force=1`
+analyzes regardless. `fresh=1` (or `X-Hopper-Fresh: 1`) skips the bloom
+filters. `refresh=1` reconciles one digest with hopper, analyzing it here
+when hopper's verdict is missing or from other traits.
 
-An explicit policy that differs from the server default bypasses the local
-index and Hopper, gets its own single-flight key, and is not indexed or uploaded
-afterward. Policy changes can change the verdict, so such a result cannot safely
-replace the deployment's canonical answer.
+The requested artifact is always analyzed. `follow` chooses which references
+found inside it are also fetched and analyzed: `dependencies`, `references`,
+`ci-actions` (implies `dependencies`), `all` or `none`, comma-separated or
+repeated. It may narrow the server's own policy (`--follow`); naming a
+category the server does not follow is a `400 follow_not_allowed`. A request
+under any policy may be answered from a verdict already held,
+and every analysis is filed whatever policy produced it, so the index and
+hopper keep one verdict per artifact; pass `force=1` to analyze under exactly
+the requested policy. Requests under different policies never share an
+in-flight analysis. `X-Scan-Follow` names the policy an analysis ran under.
 
-An `application/json` body names a package; anything else is the artifact
-itself, staged and analyzed under the digest of its bytes. An upload is always
-analyzed: it is a request about *those bytes*, and a `?purl=` sent with it names
-provenance rather than the artifact in hand. The digest is the
-identity, so two callers uploading one artifact share a single analysis exactly
-as two naming one PURL do — and `?purl=` may still accompany the bytes, which
-grafts the registry provenance onto the report. `X-Filename` names the upload so
-cleave can type it by extension; without one it is typed by content. The upload
-is bounded by `--max-size-mb`, and an empty body is a 400.
-
-The reply is newline-delimited JSON: progress while the run is going,
-then the decision. Read lines until one carries `decision`.
+Two requests for the same artifact share one analysis. The reply is
+newline-delimited JSON: progress frames while the run goes on, then the
+decision. Read lines until one carries `decision`.
 
     {"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"…"}
-    {"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"…"}
     {"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0",…}
 
-This exists because a proxy gives up on a silent connection — measured
-at 125 seconds in front of this fleet — and tears it down, costing the
-caller an analysis that in fact completed: the worker finishes, files
-its verdict, and answers the next asker in milliseconds, but the reply
-to that request had nowhere to go. Progress frames keep the connection
-from being idle, and say what a long run is doing.
+Nothing is sent for the first 250 ms, so an outcome that needed no work keeps
+an ordinary status: `429` at capacity is a real `429` a router can act on.
+Once streaming starts the status is committed, and a failure arrives as
+`decision: unavailable` with a `reason`. A stream that ends without a
+decision was cut short; the analysis continues, and a retry joins it.
 
-Nothing is sent for the first 250ms, so an outcome that needed no work
-still gets an ordinary status code. That is what keeps `429 At
-capacity` a real 429 a router can act on rather than a decision buried
-in a 200 body — capacity is refused the instant a slot is asked for, so
-it never reaches the streaming path.
+Headers: `X-Total-Ms`, `X-Scan-Source` (`scan:index`, `scan:cached`,
+`scan:analysis`, …), `X-Scan-Follow`, and `X-Scan-Purl` with the normalized
+coordinate.
 
-Once streaming starts the status is committed, so an analysis that
-fails past that point arrives as `decision: unavailable` rather than a
-5xx. A caller reads `decision`, not the status line.
+#### Local files
 
-An analysis that finishes before the first frame is due emits only the
-decision, so a fast call is a single JSON object.
+`?path=` analyzes a file already on the server's host. It is off unless the
+server was started with `--allow-local-paths <DIR>`, and the server refuses to
+start with it unless it is bound to `127.0.0.1`, or both `--allow-cidr` and
+`--token-file` are set. Bound to `127.0.0.1` without a token, it warns at
+startup: a tunnel makes any caller a loopback caller.
 
-A stream that ends without a decision was cut short, not answered. The
-analysis continues regardless — it is not that connection's to lose —
-and a caller that reconnects joins the run already in progress rather
-than starting a second one.
-
-### `GET /lookup`
-
-What scan already knows about an artifact or a package. Reads stored
-verdicts and the bloom filters; **never analyzes**. Takes no analyze
-slot and answers while the model is still loading, so a restarting
-server keeps serving lookups.
-
-    GET /lookup?sha256=<64hex>
-    GET /lookup?purl=<url-encoded>
-    GET /lookup?purl=<url-encoded>&sha256=<64hex>
-
-Name at least one key; neither is a 400. On `purl`, the `pkg:` prefix
-is optional (`npm/left-pad@1.3.0` works), and the value is canonicalized
-the way `/analyze-purl` and `atomscan purl` canonicalize it.
-
-Sending both is the cheapest way to ask, and is what a caller holding an
-artifact it can also name should do. The filters are separate — a digest
-and a locator are keyed independently — so each is evidence about the
-same artifact, and asking with both costs four in-memory probes instead
-of two rather than a second request.
-
-The two answers are merged the way a single key's good and bad channels
-already are: bad from either key wins, good from either key wins, and
-holding both at once is the `conflicted` decision that already exists for
-a key in both sets. So a digest in the good set whose release is in the
-bad set does not come back `skip` because the digest was asked first — it
-comes back `conflicted`, and the caller scans.
-
-A stored verdict is looked up by digest first, since a digest names exact
-bytes. The PURL's verdict is a second chance when the digest is unknown,
-and is returned only if it resolved to the same digest: a release whose
-artifact has changed is answering about something other than what was
-asked about.
-
-Both identifiers travel as query parameters. A PURL's own grammar
-carries `/`, `?` and `#`, so `pkg:npm/x@1?arch=x64` in a path segment
-would have everything from the `?` parsed as the URL's query and a
-`#subpath` dropped by the client — silently keying on a different
-package. Qualifiers are part of the identity the filters key on.
-
-A stored verdict is a 200:
-
-    {
-      "sha": "2cf24dba…",
-      "purl": "pkg:npm/evil@1.0.0",
-      "lvl": 3,
-      "eng": "2.8.0-beta.1",
-      "why": "Postinstall launches a reverse shell.",
-      "hits": [ { "id": "objectives/…", "crit": 5, "file": "lib/install.js",
-                  "pkg": "pkg:npm/evil@1.0.0", "desc": "…",
-                  "off": 109, "line": 12 } ],
-      "bloom": "unknown"
-    }
-
-`lvl` is the tightest false-positive budget per 100M benigns at which the
-artifact grades hostile; `-1` never fires. Gate on it. `why` is the
-interpreter's sentence when `--interpret` ran. Empty fields are omitted.
-
-`hits` carries at most three findings of criticality 3 or worse, worst
-first. `off` is the byte offset of the match within `file` and `line` its
-1-based source line, read from the context window that recorded the
-match; either may be absent, since a binary has no line structure and a
-report whose context was trimmed keeps only a coarse evidence span.
-
-Only findings *native* to the file they are reported on become hits. An
-archive repeats its members' findings on itself, carrying no path or
-offset of its own; those copies are dropped in favour of the member's,
-and a cross-file composite — which has no single place to point at — is
-dropped with them.
-
-Holding nothing is a 404 — with the filter's opinion still attached, so
-one round trip answers both questions:
-
-    { "error": "unknown sample", "bloom": "skip" }
-
-`bloom` is `skip` (known-good, not revoked), `known-bad`, `conflicted`
-(in both sets), or `unknown`. It rides on the 200 as well. A filter hit
-is not an analysis: it says a published set vouches for this key, not
-what the artifact is, so the two never collapse into one field. Missing
-filters fail closed (`unknown`).
-
-Verdicts are stored per ruleset (scan release, traits commit, model
-bundle), so a rules or model update reads as a miss rather than serving
-a verdict the current detector would no longer give. `SCAN_ANALYSIS_CACHE=0`
-disables the store, which degrades every lookup to `unknown sample`.
-
-Headers: `X-SHA256`, `X-Scan-Source: index`, and `Cache-Control` —
-`max-age=86400` on a verdict (immutable for the ruleset that produced
-it), `no-store` on a miss (it becomes a hit the moment anything analyzes
-the artifact). The scope is `private` when a token is configured.
-
-400 for a malformed digest, for a string that is not a PURL, or for
-anything other than exactly one key.
-
-### `GET /status`
-
-`?sha256=…`, `?purl=…`, or both. Where an analysis of this artifact
-stands, without starting one:
-
-| state | meaning |
-| --- | --- |
-| `running` | an analysis is in progress here, with `elapsed_ms` and `attached` |
-| `complete` | a verdict is stored; fetch it from `/lookup` |
-| `unknown` | nothing running here and nothing stored |
-
-For the caller whose connection did not survive the analysis. A proxy
-that gives up at its own ceiling leaves the run going here, but from
-outside a run in progress and a run that never started are both
-`404 unknown sample` on `/lookup` — and confusing them means paying for
-a twenty-minute analysis twice. A caller that reconnects asks here
-first and sends the retry to whichever worker answers `running`, which
-attaches it to the run already going rather than starting another.
-
-`attached: 0` is the normal case, not an error: it says the proxy gave
-up but the analysis did not.
-
-There is no `lost`. That is the caller's own inference — they
-dispatched, their connection died, and this says `unknown` — and
-reporting it would mean keeping a record of every run that ever ended
-in order to tell a caller something they already know.
-
-`/lookup` carries the same signal on a miss: an `analyzing` object
-appears beside `bloom` when a run for that key is live, so a caller
-already making that request needs no second one.
-
-400 for a malformed digest, an unparseable PURL, or no key at all.
+The path must be absolute. It is resolved, checked against the allowed
+directories, and opened once without following a final symlink; the
+analysis runs on the bytes read from that handle, so what is analyzed is
+what was checked. A file that does not exist, lies outside the allowed
+directories, or is not a regular file gets the same `403 path_not_allowed`,
+so the route does not reveal which paths exist. The answer is the decision an
+upload of the same bytes would get.
 
 ### `GET /_/health`
 
-Liveness and load. 200 when ready, 503 while loading or failed. The only
-route that does not require a bearer token.
+Liveness and load: `200` when ready, `503` while starting or failed. The only
+route that needs no token. `status` is `ok`, `starting`, `failed`,
+`degraded` or `saturated`. A request with a valid token (or any request to a
+server without one) also gets the names of the samples being analyzed.
 
-    {
-      "status": "ok",
-      "rss_mb": 312,
-      "max_rss_mb": 16384,
-      "active_tasks": 1,
-      "max_concurrent_tasks": 4,
-      "load": 0.25,
-      "load_avg": 0.42,
-      "uptime_secs": 91
-    }
+### `GET /_/info`, `GET /_/stats`
 
-`status` is one of `ok`, `starting`, `failed`, `degraded`, `saturated`.
+`/_/info` is static: version, slots, CPUs, limits, model and traits commits.
+`/_/stats` is what a router reads to choose a server: free slots, CPU busy,
+recent latency by type and size, upload backlog.
 
-Because the route is public, that body carries no operational detail. A
-request that *does* present a valid token — or any request to a server with
-no `--token-file`, which behaves exactly as it did before tokens existed —
-additionally gets:
+### `POST /_/reload`, `POST /_/update`
 
-    "stuck_orphans": 0,
-    "long_running_tasks": [ ... ],
-    "oldest_task": { "name": "...", "elapsed_secs": 310 },
-    "rayon_threads": 8
-
-`long_running_tasks` and `oldest_task` name the samples currently being
-analysed, which is why they are not public.
-
-### `GET /_/info`
-
-Static facts: version, slot count, CPU count, upload and RSS limits,
-total memory, the model and traits commit hashes.
-
-### `POST /_/reload`
-
-Reread the model bundle from disk and hot-swap it atomically. Returns
-elapsed time. Use this after editing `evaluation.json` to change
-thresholds without restarting.
-
-### `POST /_/update`
-
-`git pull` the models and traits repositories, then reload. Returns
-which side changed and the new commits.
+`/_/reload` reloads the model bundle and traits from disk and swaps them in;
+on failure the previous model stays. `/_/update` pulls the latest models and
+traits first. One at a time; a concurrent call gets `409`.
 
 ### `GET /_/memory`, `GET /_/requests`, `GET /_/threads`
 
-Diagnostics. `/_/memory` exposes jemalloc counters and rayon pool
-size. `/_/requests` lists in-flight analyses with elapsed time and
-phase. `/_/threads` reports per-thread state (Linux: `wchan`, context
-switch counts; FreeBSD: rayon thread count; other platforms: error).
+Diagnostics: allocator counters, in-flight analyses with their phase, and
+per-thread state where the platform reports it.
 
 ## Status codes
 
-| Code | Cause                                                                   |
-| ---- | ----------------------------------------------------------------------- |
-| 400  | Malformed request body.                                                 |
-| 403  | `/analyze-path` outside `--allowed-dirs`, or non-loopback peer.         |
-| 413  | Body exceeds `--max-size-mb`.                                           |
-| 415  | Unsupported file, archive, or compression format.                       |
-| 422  | Corrupt, truncated, encrypted-without-password, depth or count limit.   |
-| 500  | Internal error.                                                         |
-| 503  | Starting, failed, overloaded, or at capacity.                           |
-| 504  | Analysis exceeded the per-request watchdog.                             |
-
-`/analyze`, `/analyze-purl`, and `/analyze-path` also set `X-Total-Ms` on the response.
-
-Errors share a single shape:
-
-    { "error": "string", "detail": "optional chain" }
+| Code | Cause |
+| ---- | ----- |
+| 400  | Malformed request: a bad locator or budget, a `follow` wider than the server's, or more than one artifact named. |
+| 401  | Missing or wrong bearer token. |
+| 403  | Peer not allowed, admin route without a token, or a `?path=` refused. |
+| 409  | A reload or update is already running. |
+| 413  | Artifact larger than `--max-size-mb`. |
+| 415  | Unsupported file, archive or compression format. |
+| 422  | The artifact is corrupt, truncated, encrypted, or past a depth or count limit, or could not be retrieved. |
+| 429  | At capacity. `Retry-After` says when to try again. |
+| 500  | Internal error. |
+| 503  | Starting, failed to start, or over the memory ceiling. |
+| 504  | The analysis exceeded `--analysis-timeout`. |
 
 ## Logging
 
-The server writes to stderr (journald under systemd). Every request produces
-exactly one access line when its response is ready:
+The server logs to stderr. Every request produces one access line when its
+response is ready, and every other line about it repeats its `id`:
 
-    INFO scan::server::access: POST /analyze-purl id=9 status=200 dur_ms=10351
-      peer=127.0.0.1 fwd=203.0.113.9 auth="token" req_bytes=33
-      purl="pkg:npm/left-pad@1.3.0" trace="bl-9f2c" ua="beamline/0.3"
+    INFO scan::server::access: POST /v1/analyze id=9 status=200 dur_ms=10351
+      peer=127.0.0.1 auth="token" purl="pkg:npm/left-pad@1.3.0" trace="bl-9f2c"
 
-A field with nothing to say is left off the line rather than printed empty.
+| Field       | Meaning |
+| ----------- | ------- |
+| `id`        | Server-assigned request id. |
+| `status`    | HTTP status returned. |
+| `dur_ms`    | Wall time from arrival to response. |
+| `peer`      | Socket peer. Behind a tunnel, always loopback. |
+| `fwd`       | Client address a proxy reported. Logged, never trusted. |
+| `auth`      | `token`, `open`, `anon`, or the reason a request was refused. |
+| `shared`    | `true` when the request rode an analysis already in flight. |
+| `streamed`  | `true` when the answer was streamed. |
+| `sha256`, `purl`, `url`, `path` | The artifact, as validated. Caller text is control-stripped and bounded, so it cannot forge a line. |
+| `cred_len`, `cred_fp` | On a `bad-token` rejection: the length and first four SHA-256 bytes of what was sent, to tell a wrong token from a server that has not been restarted since rotation. |
+| `trace`     | The caller's `X-Request-Id`. |
+| `ua`        | `User-Agent`, truncated. |
 
-| Field       | Meaning                                                                |
-| ----------- | ---------------------------------------------------------------------- |
-| `id`        | Server-assigned request id; every other line about this request repeats it. |
-| `status`    | HTTP status returned.                                                  |
-| `dur_ms`    | Wall time from arrival to response.                                    |
-| `peer`      | Socket peer address. Behind a tunnel this is always loopback.          |
-| `fwd`       | Client address a proxy reported (`CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`). Advisory: logged, never used for access control. |
-| `auth`      | `token`, `open` (no `--token-file`), `anon` (unauthenticated `/_/health`), or a rejection reason: `no-credential`, `malformed-credential`, `bad-token`, `peer-denied`, `loopback-only`, `no-peer-info`. |
-| `req_bytes` | Request `Content-Length`, when the client sent one.                    |
-| `shared`    | `true` when this request attached to an analysis already in flight for the same bytes or PURL and replayed its result instead of doing the work. Absent otherwise. |
-| `sha256`    | The artifact the request was about, by digest: the `/lookup?sha256=` key, or the digest of the bytes uploaded to `/analyze`. On a `/lookup?purl=` that hit, the digest that PURL resolved to. |
-| `purl`      | The artifact the request was about, by package locator, in canonical form — `/lookup?purl=` or `/analyze-purl`. A locator that failed to parse is echoed as sent, so a 400 names the typo. |
-| `path`      | The file `/analyze-path` was asked for, as the caller wrote it. Where the canonicalized form differs, a rejection line carries both. |
-| `cred_len`  | Length of the rejected bearer credential (`bad-token` only).           |
-| `cred_fp`   | First four bytes of its SHA-256, hex (`bad-token` only). See below.    |
-| `trace`     | The caller's `X-Request-Id`, for correlating with the calling service. |
-| `ua`        | `User-Agent`, control-stripped and truncated to 120 characters.        |
-
-### Following a result to hopper
-
-An analysis that succeeds writes a completion line before its access line, and
-that line ends with where the verdict goes next:
-
-    INFO scan::server::handlers: <-- 200 OK id=45 key=purl:pkg:npm/left-pad@1.3.0
-      elapsed_ms=11563 classification=benign analysis="fresh" hopper="queued"
-
-`hopper="queued"` means the verdict was handed to the background uploader;
-`hopper="disabled"` means the server was started without `--hopper`, so the
-answer lives only in this process's verdict index. A server with no `--hopper`
-also says so once, at startup.
-
-The uploader reports the outcome on its own thread, after the response has
-already gone back to the caller, naming the artifact by digest and — when the
-request named one — by PURL:
-
-    INFO scan::upload: upload: result renewed on hopper
-      sha256=870c0fe… purl="pkg:npm/left-pad@1.3.0" attempt=0
-
-    WARN scan::upload: upload: hopper unreachable, giving up after retries
-      sha256=870c0fe… purl="pkg:npm/left-pad@1.3.0" attempts=4
-
-A rejected upload logs `upload: rejected by hopper; not retrying` with the
-status and body — a 401 there means this server's `~/.tok/hopper` is not the
-token hopper loaded. See
-[WORKERS.md](WORKERS.md#authenticating-to-hopper).
-
-An upload failure never fails the request: the caller already has its answer,
-and hopper renewal is best-effort by design.
-
-The identifier is never taken from the raw query string or request body: each
-handler attaches the key it actually parsed and validated, control-stripped and
-bounded to 200 characters. A newline in a caller-supplied locator therefore
-cannot fabricate a second log line.
-
-A 401 never says which token was presented — but `cred_fp` identifies it to
-anyone already holding the token, without recording a secret. Compare it with
-whichever token file you believe is current:
-
-    printf %s "$(cat ~/.tok/scan)" | shasum -a 256 | cut -c1-8
-
-A match means the client is using the right token and the *server* is not —
-the token is read once at startup, so a rotation without a restart looks
-exactly like this. A mismatch means the client is holding a different token.
-The startup log names the file the running process actually read.
-
-Levels: 5xx logs at WARN, every access-control rejection at WARN, a missing
-peer address at ERROR, a successful `/_/health` probe at DEBUG (so liveness checks do not fill the log), and
-everything else at INFO. Rejected requests are logged only here — the ACL does
-not log a second line of its own.
-
-Analyses add `--> POST …` when they start and `<-- 200 OK` / `<-- analysis
-failed` when they finish, both carrying the same `id`. A successful analysis
-carries two fields naming where its answer came from, so a fast response is
-never a mystery:
-
-| Field      | Values                          | Meaning                          |
-| ---------- | ------------------------------- | -------------------------------- |
-| `analysis` | `fresh` / `cached`              | Whether cleave ran the pipeline or replayed the whole report from its on-disk cache (SQLite, keyed by content digest, options, and traits revision). Survives restarts. |
-| `llm`      | `queried` / `cached` / `failed` | Where the `--interpret` verdict came from. Absent when no pass ran. |
-
-Together with `shared=true` on the access line, those cover every way a request
-avoids work: riding another request's in-flight run (`shared`), replaying a
-stored report (`analysis=cached`), and skipping the LLM call (`llm=cached`). A failure line carries
-the whole error chain, which is the same text the response body returns as
-`detail`:
-
-    WARN scan::server::handlers: <-- analysis failed id=5 status=422
-      error=cleave analysis of bad.tgz: Failed to read tar entry: corrupt deflate stream
-
-`RUST_LOG` overrides the defaults (`scan=info,cleave=warn` in server mode) —
-`RUST_LOG=scan=debug` turns on health-probe lines and per-request diagnostics.
-
-## Thresholds
-
-The v7 envelope no longer wire-encodes a verdict class. `ml.lvl` is the
-lowest false-positive budget (FP per 100M benigns) at which the model
-flags the file as hostile — a property of the file and model, not of
-the deploy level:
-
-    lvl in grid        -> lowest level at which the file fires (lower = more hostile)
-    lvl == -1          -> fires at no grid level (clean)
-    lvl == null        -> manual --threshold-* mode (no level table)
-
-The calibrated grid currently tops out at L25000, and consumers should
-tolerate a future L50000. Atomdrift Scan also reserves off-grid `grid_max + 1`
-and `grid_max + 2` markers for trait-floor overrides where the model was
-clean but confident severe cleave traits manually raised the result to
-suspicious; with today's grid those are `25001` and `25002`.
-
-`ml.conf` is the same level rendered as a pessimistic integer confidence
-percent for display/export. It is `null` when `ml.lvl` is `null`, `0` for
-the benign `-1` sentinel, `100` at L0, `99` at L1, `98` at L2, `95` at
-L5, `90` at L50, `29` at L25000, `28`/`27` for `25001`/`25002`, and
-`17` at L50000. `ml.prob` remains the raw model score used for the
-decision.
-
-Because `lvl` is swept over the full grid independent of `-l`, the whole
-`ml` envelope is identical across deploy levels, so a result can be
-cached once and shared. The consumer derives the verdict from `lvl` and
-the active level `N` (default 50):
-
-    hostile     when lvl <= N                      (default lvl <= 50)
-    suspicious  when lvl <= min(grid_max, 4 × N)    (default lvl <= 200)
-    benign      otherwise
-
-The L×4 rule gives suspicious a 4× wider FP budget that catches more
-"maybe-bad" files while keeping hostile crisp. A file with `lvl = 500` is
-benign under the defaults yet still reports `lvl = 500`; raising `-l` is
-what reclassifies the same envelope. When `--threshold-*` is supplied
-(manual mode), `lvl` is `null` and only hostile/benign verdicts apply.
-
-The verdict mode is resolved as follows:
-
-1. **Level mode (default).** The model's per-level grid
-   (`route_policies.json`, falling back to `config.json` `levels[]`)
-   drives the per-file `lvl` sweep. The active level `N` sets the verdict
-   caps and comes from `-l <N>` / `--level <N>` for any integer in
-   `0`-`25000` (`src/main.rs`). The default deploy level is L50
-   (= 50 FP/100M = 0.5 FP/M). Higher `N` is more sensitive. Crucially, `N` only
-   moves the caps — it does **not** change `lvl` or the serialized envelope.
-2. **Manual mode.** `--threshold-hostile` / `--threshold-suspicious`
-   bypass the level grid entirely: the verdict comes from those raw
-   cutoffs, `ml.lvl` is `null`, and only hostile/benign verdicts are
-   possible (suspicious is not derived).
-3. If the bundle carries no level grid (e.g. a single-bundle dev model),
-   the verdict falls back to the bundle's recommended/fallback thresholds
-   and `ml.lvl` is `null`.
-
-The level/grid is baked in at server start. To change models: stop the
-server, or edit the bundle and `POST /_/reload`, or push new models and
-`POST /_/update`. The active level is fixed per server process; there is
-no per-request override.
-
-See [JSON.md](JSON.md) for the full `ml.lvl` encoding and how consumers
-derive hostile/suspicious/benign from it.
+`RUST_LOG` overrides the default levels (`scan=info,cleave=warn`).
 
 ## Security
 
-The server is built for trusted networks. The defaults reflect that.
-
-- **Bind is loopback.** Do not change `--bind` without thinking about
-  what else can now reach it.
-- **No authentication. No TLS.** If the server is reachable from
-  anywhere but localhost, put a reverse proxy in front of it that does
-  both.
-- **`/analyze-path` is loopback-only, always.** `--allow-cidr` does
-  not widen it. The path is `canonicalize()`d before the
-  `--allowed-dirs` prefix check, so symlinks cannot point outside the
-  allowed roots.
-- **Filenames are sanitised.** Alnum plus `_.-` only. `..` is
-  collapsed. The result is truncated to 63 bytes. The original name is
-  never used on disk.
-- **`--allow-cidr` is a footgun if `--bind` is loopback.** The CIDR
-  list cannot match a loopback peer. The server logs a warning at
-  startup; read it.
-- **Body size is capped** by `--max-size-mb` and enforced during
-  streaming, not after.
-- **RSS is capped.** New requests get 503 once the process exceeds
-  the limit. The auto value reads the cgroup signal; the fallback is
-  16 GiB; `-1` disables the check (use only behind `MemoryMax=` or
-  equivalent).
-- **Concurrency is a hard semaphore.** When `--workers` slots are
-  full, new requests get 503 immediately. There is no queue.
-- **Static analysis only.** No untrusted code is executed. Cleave
-  runs rizin in an isolated process group; if it gets stuck, the
-  watchdog kills the group, not just the parent.
+- **Bind is loopback.** Changing `--bind` changes who can reach every route.
+- **No TLS.** Put a proxy that terminates TLS in front of a server reachable
+  from anywhere else.
+- **Local files are opt-in, per directory**, and refused at startup on a
+  server reachable from the network without both an address allow-list and a
+  token.
+- **Upload names are sanitized** to `[A-Za-z0-9_.-]`, `..` collapsed, at most
+  63 bytes; the caller's name is never used on disk.
+- **Sizes are capped while streaming**, not after.
+- **Capacity is a hard limit.** Past `--workers`, `429`; past the RSS ceiling,
+  `503`. There is no queue.
+- **Static analysis only.** No artifact is executed.
 
 ## Example session
 
-    $ atomscan serve --bind 127.0.0.1:49999 --workers 4 --token-file ~/.tok/scan
+    $ atomscan serve --token-file ~/.tok/scan &
     $ AUTH="Authorization: Bearer $(cat ~/.tok/scan)"
     $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
     ok
-    $ curl -s -H "$AUTH" -F file=@/bin/ls http://127.0.0.1:49999/analyze \
-        | jq '.ml | {lvl, prob, version}'
-    {
-      "lvl": -1,
-      "prob": 0.01,
-      "version": "spec=4 abi=1 hash=8f3a91"
-    }
+    $ curl -s -H "$AUTH" -X POST \
+        'http://127.0.0.1:49999/v1/analyze?purl=pkg:npm/left-pad@1.3.0' | jq .decision
+    "allow"

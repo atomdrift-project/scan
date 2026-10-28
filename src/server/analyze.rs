@@ -40,7 +40,6 @@ pub(super) struct Upload {
     pub(super) path: PathBuf,
     /// Sanitized upload filename, used as the display path.
     pub(super) filename: String,
-    pub(super) size_bytes: u64,
 }
 
 impl Upload {
@@ -53,15 +52,12 @@ impl Upload {
             _dir: dir,
             path,
             filename: filename.to_owned(),
-            size_bytes: bytes.len() as u64,
         })
     }
 }
 
 /// What a flight's leader analyzes.
 pub(super) enum Job {
-    /// Bytes already staged on disk (multipart `/analyze`).
-    Upload(Upload),
     /// Bytes in memory, staged on the analysis thread (`/v1/analyze`).
     Bytes {
         filename: String,
@@ -77,7 +73,6 @@ impl Job {
     /// The payload size when it is known before the fetch.
     fn size_hint(&self) -> Option<u64> {
         match self {
-            Self::Upload(upload) => Some(upload.size_bytes),
             Self::Bytes { bytes, .. } => Some(bytes.len() as u64),
             Self::Purl(_) | Self::Url(_) => None,
         }
@@ -86,7 +81,6 @@ impl Job {
     /// How `/_/requests` and the phase tracker name the run.
     fn name(&self) -> &str {
         match self {
-            Self::Upload(upload) => &upload.filename,
             Self::Bytes { filename, .. } => filename,
             Self::Purl(name) | Self::Url(name) => name,
         }
@@ -247,7 +241,6 @@ impl Leader {
             // Fetched dependencies ride the hopper renewal, when there is one.
             let deps_for_upload = uploader.is_some();
             match job {
-                Job::Upload(upload) => classify_upload(&upload, analysis, uploader.as_deref()),
                 Job::Bytes { filename, bytes } => {
                     let upload = Upload::stage(&filename, &bytes)
                         .map_err(|e| anyhow::anyhow!("staging the upload: {e}"))?;
@@ -839,7 +832,6 @@ mod tests {
         let upload = Upload::stage("left-pad-1.3.0.tgz", b"bytes").expect("stage");
         assert!(upload.path.ends_with("left-pad-1.3.0.tgz"));
         assert_eq!(std::fs::read(&upload.path).expect("read"), b"bytes");
-        assert_eq!(upload.size_bytes, 5);
         let dir = upload
             .path
             .parent()

@@ -232,8 +232,10 @@ fn model_version() -> String {
     if let Some(commit) = crate::models_repo::version() {
         return sanitize(&commit);
     }
-    let config = crate::models_repo::install_target().join("config.json");
-    let Ok(meta) = std::fs::metadata(&config) else {
+    let Ok(dir) = crate::models_repo::install_target() else {
+        return "nomodel".to_string();
+    };
+    let Ok(meta) = std::fs::metadata(dir.join("config.json")) else {
         return "nomodel".to_string();
     };
     let stamp = meta

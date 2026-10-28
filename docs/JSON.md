@@ -1,8 +1,6 @@
 # Atomdrift Scan JSON Report
 
-Every analysis — whether returned by [the server](SERVER_API.md), posted
-by [a worker](WORKERS.md), or written to disk by the CLI — uses the
-same envelope:
+Every analysis the CLI writes uses the same envelope:
 
     {
       "ml":  { ... curated classification ... },

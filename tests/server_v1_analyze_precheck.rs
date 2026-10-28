@@ -147,20 +147,14 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
     Ok(())
 }
 
-/// A policy the operator did not configure is still a question the corpus can
-/// answer.
+/// A request narrower than the server's policy is answered from a verdict
+/// already held, whatever policy filed it.
 ///
-/// This guards the rule that cost the fleet its corpus. Sharing used to require
-/// the request's policy to equal this server's own default — and beamline
-/// resolves `references` for a PURL while an unflagged server defaults to
-/// `dependencies,references`, so no ordinary request ever matched. Every
-/// verdict was treated as private to its caller: not read from the index, not
-/// offered to hopper, not answerable from what the corpus already held. The
-/// analysis was correct and nothing was kept.
-///
-/// `follow=none` differs from any default this server can be started with, so a
-/// 200 here can only mean the precheck ran for a policy that is not the
-/// configured one. Under the old rule this analyzed instead, and answered
+/// Deliberate: callers routinely ask for less than a server follows (beamline
+/// asks `references` of servers that follow everything), and refusing to share
+/// across policies would leave every such request unanswerable from the corpus
+/// and every analysis unfiled. `follow=none` is narrower than any policy, so a
+/// 200 here can only have come from the precheck; an analysis would answer
 /// non-200 against the empty model directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_policy_the_operator_did_not_configure_still_reads_the_corpus() -> Result<()> {
@@ -186,6 +180,36 @@ async fn a_policy_the_operator_did_not_configure_still_reads_the_corpus() -> Res
         asked.count.load(Ordering::SeqCst),
         1,
         "the corpus was not asked exactly once"
+    );
+    Ok(())
+}
+
+/// A request wider than the server's policy is refused, by name, before
+/// anything is looked up or fetched: the operator's `--follow` is a ceiling a
+/// caller cannot lift, and quietly trimming the request would hand back a
+/// shallower answer than the one asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_wider_than_the_server_allows_is_refused() -> Result<()> {
+    let (base, asked) = stub_corpus(Holds::Verdict).await?;
+    let app = build_app(&ServerConfig {
+        hopper: Some(base),
+        fetch: "dependencies".parse().map_err(anyhow::Error::msg)?,
+        ..common::unready_config()
+    })
+    .await?;
+    let (status, body) = analyze(
+        app,
+        "/v1/analyze?purl=npm%2Fleft-pad%401.3.0&follow=references",
+        "",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "follow_not_allowed");
+    assert_eq!(
+        asked.count.load(Ordering::SeqCst),
+        0,
+        "a refused request must not reach the corpus"
     );
     Ok(())
 }

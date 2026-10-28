@@ -39,7 +39,7 @@ use crate::model::{Classification, Decision, Level, Model, RouteScore, SkippedRo
 /// What [`classify_report`] needs besides the report itself. Build one with
 /// [`ClassifyRequest::new`] and override the optional context with struct
 /// update syntax.
-pub struct ClassifyRequest<'a> {
+pub(crate) struct ClassifyRequest<'a> {
     /// Display label; becomes the result's path.
     pub label: &'a str,
     /// The artifact on disk, for reference discovery when root_bytes is absent.
@@ -74,7 +74,7 @@ pub struct ClassifyRequest<'a> {
 impl<'a> ClassifyRequest<'a> {
     /// A request with every optional input absent: no SHAP, LLM, fetching,
     /// renders, or tracking.
-    pub fn new(label: &'a str, root_path: &'a std::path::Path, model: &'a Model) -> Self {
+    pub(crate) fn new(label: &'a str, root_path: &'a std::path::Path, model: &'a Model) -> Self {
         Self {
             label,
             root_path,
@@ -101,7 +101,7 @@ impl<'a> ClassifyRequest<'a> {
 /// skips building anything no consumer looks at. The default is none of them —
 /// the bare JSON-verdict shape (server and validation).
 #[derive(Clone, Copy, Default)]
-pub struct OutputNeeds {
+pub(crate) struct OutputNeeds {
     /// Render `rendered_context` as the LLM query payload (`--format
     /// interpret`): byte-for-byte the user message a live `--interpret` query
     /// sends (the sanitized tiny render), without the system prompt.
@@ -127,7 +127,7 @@ pub struct OutputNeeds {
 /// usually the LLM `interpret` time when an endpoint is contended, or `fetch`
 /// on a wide `--fetch`.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct PhaseTimings {
+pub(crate) struct PhaseTimings {
     pub fetch: Duration,
     pub interpret: Duration,
     pub render: Duration,
@@ -135,7 +135,7 @@ pub struct PhaseTimings {
 }
 
 /// What [`classify_report`] produced: the result, and where its time went.
-pub struct ClassifiedReport {
+pub(crate) struct ClassifiedReport {
     pub phase: PhaseTimings,
     /// The verdict, with `path` set to the request label and the build fields
     /// (`version`, `analyzed_at`) left for [`Self::into_scan_result`].
@@ -146,7 +146,12 @@ impl ClassifiedReport {
     /// The wire result for this classification of `path` under `bundle`.
     /// `keep_report` retains the raw cleave report, which JSON output and
     /// hopper renewals need and terminal output does not.
-    pub fn into_scan_result(self, path: String, bundle: &Model, keep_report: bool) -> ScanResult {
+    pub(crate) fn into_scan_result(
+        self,
+        path: String,
+        bundle: &Model,
+        keep_report: bool,
+    ) -> ScanResult {
         let mut result = self.result;
         result.path = path;
         result.version = model_version_string(bundle.info());
@@ -160,7 +165,7 @@ impl ClassifiedReport {
 
 /// Run the full cleave-finalize + model inference pipeline on a report.
 /// This is the single authoritative inference path used by scan, ps, and the server.
-pub fn classify_report(
+pub(crate) fn classify_report(
     report: AnalysisReport,
     mut req: ClassifyRequest<'_>,
 ) -> Result<ClassifiedReport> {
@@ -1026,7 +1031,6 @@ fn interpret(
             decision.probability,
             levels,
             findings,
-            ctx,
             label,
         );
         if owner_runs_llm {
@@ -1095,13 +1099,10 @@ fn render(
         // `--interpret` query sends — the sanitized render with its annotations
         // recategorized, just without the system prompt. The recategorization is
         // applied here and in `interpret::interpret_admitted`, never in
-        // `render_interpret_context` itself: scan parses that render back for the
-        // LLM admission gate and for `Evidence` (`has_elevated_finding`,
-        // `has_hostile_finding`, `render_mostly_readable`), all of which key on
-        // the `SEV` letter this transform removes. Stripping it upstream silently
-        // withdrew samples from the gate — measured as seven true positives
-        // dropping from a caught verdict to `Level::Clean`. The dependency appendix
-        // is already part of that render.
+        // `render_interpret_context` itself: `render_mostly_readable` reads that
+        // render back and recognizes annotation lines by the `SEV` letter this
+        // transform removes. The dependency appendix is already part of that
+        // render.
         return recategorize_annotations(llm_context.unwrap_or_default());
     }
     if req.tiny_opts.header == cleave::output::HeaderStyle::Rich {

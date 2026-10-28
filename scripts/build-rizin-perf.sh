@@ -96,11 +96,11 @@ env['PKG_CONFIG_PATH'] = str(output / 'install/lib/pkgconfig') + os.pathsep + en
 flags = shlex.split(subprocess.check_output(
     ['pkg-config', '--static', '--cflags', '--libs', 'rz_flag'], env=env, text=True))
 subprocess.run([*shlex.split(env.get('CC', 'cc')), '-O2',
-                str(repo / 'tests/rizin-offset-index.c'), *flags,
+                str(repo / 'scripts/rizin/offset-index.c'), *flags,
                 '-o', str(output / 'test-offset-index')], check=True)
 LINK
 LD_LIBRARY_PATH="$output_dir/install/lib" "$output_dir/test-offset-index"
-python3 "$repo_dir/tests/rizin-function-projection.py" \
+python3 "$repo_dir/scripts/rizin/function-projection.py" \
     "$output_dir/install/bin/rizin" "$output_dir/test-offset-index"
 cat > "$output_dir/bin/rizin" <<'EOF'
 #!/bin/sh

@@ -72,7 +72,7 @@ impl ApiError {
     pub(super) fn init_failed() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "starting",
+            "init_failed",
             "Server failed to initialize",
         )
     }
@@ -113,16 +113,14 @@ impl ApiError {
     /// The answer an analysis failure becomes.
     ///
     /// Typed errors are recognized by type; cleave's are not typed, so the rest
-    /// fall to [`classify_analysis_error`]. A failure about the artifact keeps
-    /// its root cause as the message, because that is what the caller can act
-    /// on; one about us is a bare 500.
+    /// fall to [`classify_analysis_error`]. The message is fixed per class: the
+    /// error chain can carry paths and internals, so it goes to the log only.
     pub(super) fn from_analysis(error: &anyhow::Error) -> Self {
         if let Some(busy) = error.downcast_ref::<crate::analysis::WhaleSlotBusy>() {
             // The same shape admission refuses with before the stream starts,
             // so a router treats both as "full, try the next worker".
             return Self::at_capacity(busy.to_string(), Some("whale"), Some(30));
         }
-        let cause = || error.root_cause().to_string();
         // An artifact that could not be retrieved is answered from the type
         // rather than from any wording, because that verdict is the one this
         // fleet cannot afford to get wrong: see [`crate::fetch::Unretrievable`].
@@ -144,33 +142,38 @@ impl ApiError {
                     "Artifact exceeds the fetch size limit",
                 );
             }
-            return Self::new(StatusCode::UNPROCESSABLE_ENTITY, "unretrievable", cause());
+            return Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unretrievable",
+                "The artifact could not be retrieved.",
+            );
         }
         match classify_analysis_error(&format!("{error:#}")) {
             StatusCode::UNSUPPORTED_MEDIA_TYPE => Self::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_artifact",
-                cause(),
+                "Unsupported file, archive or compression format.",
             ),
             StatusCode::UNPROCESSABLE_ENTITY => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_artifact",
-                cause(),
+                "The artifact is corrupt, truncated, encrypted, or past a depth or count limit.",
             ),
             _ => Self::internal(),
         }
     }
 
-    /// Render in the `/v1` shape.
-    pub(super) fn v1(&self) -> Response {
+    /// Render as a response: `{"error": {"code", "message"}}`, with the routing
+    /// hints beside it.
+    pub(super) fn response(&self) -> Response {
         self.render(V1Detail {
             code: self.code,
             message: &self.message,
         })
     }
 
-    /// The `/v1` body alone, for a stream frame that carries an error.
-    pub(super) fn v1_body(&self) -> serde_json::Value {
+    /// The body alone, for a stream frame that carries an error.
+    pub(super) fn body_json(&self) -> serde_json::Value {
         serde_json::to_value(self.body(V1Detail {
             code: self.code,
             message: &self.message,
@@ -198,10 +201,9 @@ impl ApiError {
     }
 }
 
-/// The legacy shape.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        self.render(&*self.message)
+        self.response()
     }
 }
 
@@ -245,7 +247,6 @@ pub(super) fn classify_analysis_error(chain: &str) -> StatusCode {
         || normalized.contains("corrupt")
         || normalized.contains("unexpected end of")
         || normalized.contains("too small")
-        || normalized.contains("out of bounds")
         || normalized.contains("empty package.json")
         || normalized.contains("maximum archive depth")
         || normalized.contains("maximum decode depth")
@@ -426,9 +427,9 @@ mod tests {
         );
     }
 
-    /// Internal detail stays in the log. A 500 says only that it was ours, and
-    /// no answer carries the error chain, which names temp paths and context
-    /// only an operator needs.
+    /// Internal detail stays in the log. No answer carries the error chain,
+    /// which names temp paths and context only an operator needs; a failure
+    /// about the artifact says which class it was, and nothing more.
     #[tokio::test]
     async fn an_analysis_failure_carries_no_internal_detail() {
         use anyhow::Context as _;
@@ -437,42 +438,40 @@ mod tests {
             .context("cleave analysis of a.zip")
             .unwrap_err();
         let body = body_of(ApiError::from_analysis(&fault).into_response()).await;
-        assert_eq!(body, serde_json::json!({ "error": "Internal error" }));
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": { "code": "internal", "message": "Internal error" } })
+        );
 
-        // A failure about the artifact keeps its root cause, and only that.
-        let corrupt = Err::<(), _>(anyhow::anyhow!("corrupt deflate stream"))
+        let corrupt = Err::<(), _>(anyhow::anyhow!("corrupt deflate stream at /tmp/scan-x1y2"))
             .context("cleave analysis of /tmp/scan-x1y2/a.tgz")
             .unwrap_err();
         let body = body_of(ApiError::from_analysis(&corrupt).into_response()).await;
-        assert_eq!(
-            body,
-            serde_json::json!({ "error": "corrupt deflate stream" })
+        assert_eq!(body["error"]["code"], "invalid_artifact");
+        assert!(
+            !body.to_string().contains("/tmp"),
+            "the error chain leaked: {body}"
         );
     }
 
-    /// One error, two shapes: the legacy routes keep their string, `/v1` its
-    /// object, and the routing hints sit beside either one.
-    #[tokio::test]
-    async fn each_route_family_keeps_its_shape() {
-        let refusal = ApiError::at_capacity("whale lane at capacity", Some("whale"), Some(30));
-
-        let legacy = refusal.clone().into_response();
-        assert_eq!(legacy.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(legacy.headers()[header::RETRY_AFTER], "30");
+    /// A panic message is a bug of ours, not a malformed upload.
+    #[test]
+    fn an_index_out_of_bounds_is_ours() {
         assert_eq!(
-            body_of(legacy).await,
-            serde_json::json!({
-                "error": "whale lane at capacity",
-                "lane": "whale",
-                "retry_after_secs": 30,
-            })
+            classify_analysis_error("index out of bounds: the len is 3 but the index is 7"),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
 
-        let v1 = refusal.v1();
-        assert_eq!(v1.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(v1.headers()[header::RETRY_AFTER], "30");
+    /// One shape for every error, with the routing hints beside it.
+    #[tokio::test]
+    async fn every_error_has_one_shape() {
+        let refusal = ApiError::at_capacity("whale lane at capacity", Some("whale"), Some(30));
+        let response = refusal.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
         assert_eq!(
-            body_of(v1).await,
+            body_of(response).await,
             serde_json::json!({
                 "error": { "code": "at_capacity", "message": "whale lane at capacity" },
                 "lane": "whale",
@@ -483,7 +482,10 @@ mod tests {
         let timeout = body_of(ApiError::timeout(60).into_response()).await;
         assert_eq!(
             timeout,
-            serde_json::json!({ "error": "analysis timeout", "timeout_secs": 60 })
+            serde_json::json!({
+                "error": { "code": "analysis_timeout", "message": "analysis timeout" },
+                "timeout_secs": 60,
+            })
         );
     }
 }

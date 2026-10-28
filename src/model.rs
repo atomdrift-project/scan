@@ -873,6 +873,41 @@ impl std::fmt::Debug for FastTreeBackend {
     }
 }
 
+/// Whether `name` is an initializer holding the single value `1.0`.
+fn is_constant_one(graph: &tract_onnx::pb::GraphProto, name: &str) -> bool {
+    graph
+        .initializer
+        .iter()
+        .find(|tensor| tensor.name == name)
+        .is_some_and(|tensor| {
+            tensor.dims.iter().all(|&dim| dim == 1)
+                && (tensor.float_data == [1.0] || tensor.raw_data == 1.0f32.to_le_bytes())
+        })
+}
+
+/// Every tree must be one: each branch points inside its own tree, and no
+/// node is reached twice from the root. Together these make every walk in
+/// `predict` end at a leaf.
+fn check_trees(roots: &[usize], nodes: &[FastTreeNode]) -> Result<()> {
+    let mut seen = vec![false; nodes.len()];
+    for (tree, &root) in roots.iter().enumerate() {
+        let end = roots.get(tree + 1).copied().unwrap_or(nodes.len());
+        let mut stack = vec![root];
+        while let Some(idx) = stack.pop() {
+            if !(root..end).contains(&idx) || std::mem::replace(&mut seen[idx], true) {
+                anyhow::bail!("TreeEnsembleClassifier tree {tree} is not a tree");
+            }
+            if let FastTreeNode::Branch {
+                true_id, false_id, ..
+            } = nodes[idx]
+            {
+                stack.extend([true_id as usize, false_id as usize]);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl FastTreeBackend {
     fn load(path: &Path) -> Result<Self> {
         use tract_onnx::prelude::Framework;
@@ -883,11 +918,57 @@ impl FastTreeBackend {
             .graph
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("ONNX model has no graph"))?;
+        Self::from_graph(graph)
+    }
+
+    /// Accept only a graph this evaluator computes exactly: a
+    /// `TreeEnsembleClassifier` that reads the graph input, whose probabilities
+    /// reach the output through pass-through nodes alone. What happens to the
+    /// label output is irrelevant; it is never read. Anything else is left to
+    /// tract.
+    fn from_graph(graph: &tract_onnx::pb::GraphProto) -> Result<Self> {
         let node = graph
             .node
             .iter()
             .find(|node| node.op_type == "TreeEnsembleClassifier")
             .ok_or_else(|| anyhow::anyhow!("ONNX graph has no TreeEnsembleClassifier node"))?;
+        if node.input.first() != graph.input.first().map(|input| &input.name) {
+            anyhow::bail!("TreeEnsembleClassifier does not read the graph input directly");
+        }
+        // ONNX nodes are topologically sorted, so one pass follows every tensor
+        // derived from the probabilities.
+        let mut probabilities: std::collections::HashSet<&str> =
+            node.output.get(1).map(String::as_str).into_iter().collect();
+        for other in graph
+            .node
+            .iter()
+            .filter(|other| !std::ptr::eq(*other, node))
+        {
+            if !other
+                .input
+                .iter()
+                .any(|input| probabilities.contains(input.as_str()))
+            {
+                continue;
+            }
+            let pass_through = match other.op_type.as_str() {
+                "ZipMap" | "Identity" => true,
+                // LightGBM's exporter multiplies the probabilities by a constant 1.
+                "Mul" => other
+                    .input
+                    .iter()
+                    .find(|input| !probabilities.contains(input.as_str()))
+                    .is_some_and(|factor| is_constant_one(graph, factor)),
+                _ => false,
+            };
+            if !pass_through {
+                anyhow::bail!(
+                    "ONNX graph transforms the probabilities with {}, which the fast evaluator does not run",
+                    other.op_type
+                );
+            }
+            probabilities.extend(other.output.iter().map(String::as_str));
+        }
 
         let n_features = onnx_input_feature_count(graph)?;
         let n_classes = onnx_class_count(node)?;
@@ -942,10 +1023,15 @@ impl FastTreeBackend {
                 trees.push(nodes.len());
             }
 
+            let tree_offset = *trees
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing tree root"))?;
+            // Branch targets index this layout by node id, so a tree's ids
+            // must be exactly 0, 1, 2, … in the sorted order above.
+            if node_ids[node_idx] != nodes.len() - tree_offset {
+                anyhow::bail!("TreeEnsembleClassifier tree {tree_id} node ids are not dense");
+            }
             if let Some(cmp) = parse_fast_cmp(&node_modes[node_idx])? {
-                let tree_offset = *trees
-                    .last()
-                    .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing tree root"))?;
                 nodes.push(FastTreeNode::Branch {
                     feature_id: u32::try_from(nodes_featureids[node_idx])
                         .context("ONNX feature index exceeds compact node capacity")?,
@@ -993,6 +1079,7 @@ impl FastTreeBackend {
         if in_leaf_idx != leaf_order.len() {
             anyhow::bail!("TreeEnsembleClassifier has leaves that do not match any node");
         }
+        check_trees(&trees, &nodes)?;
         let max_feature = nodes_featureids.iter().copied().max().unwrap_or(0);
         if max_feature >= n_features {
             anyhow::bail!(
@@ -4592,5 +4679,167 @@ mod tests {
         let err = Model::load(dir.path(), None, None).expect_err("must fail");
         let _ = err;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fast_tree_tests {
+    use super::{FastTreeBackend, TractOnnxBackend};
+    use tract_onnx::pb::{AttributeProto, GraphProto, NodeProto};
+    use tract_onnx::prelude::Framework as _;
+
+    const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/cli-model.onnx");
+
+    fn fixture_graph() -> GraphProto {
+        tract_onnx::onnx()
+            .proto_model_for_read(&mut &FIXTURE[..])
+            .expect("fixture parses")
+            .graph
+            .expect("fixture has a graph")
+    }
+
+    fn tree_node(graph: &mut GraphProto) -> &mut NodeProto {
+        graph
+            .node
+            .iter_mut()
+            .find(|node| node.op_type == "TreeEnsembleClassifier")
+            .expect("fixture has a tree")
+    }
+
+    fn set_ints(node: &mut NodeProto, name: &str, ints: Vec<i64>) {
+        attribute(node, name).ints = ints;
+    }
+
+    fn attribute<'a>(node: &'a mut NodeProto, name: &str) -> &'a mut AttributeProto {
+        node.attribute
+            .iter_mut()
+            .find(|attr| attr.name == name)
+            .expect("fixture attribute")
+    }
+
+    /// The fast evaluator must agree with tract wherever it accepts a model.
+    #[test]
+    fn the_fast_path_agrees_with_tract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, FIXTURE).expect("write");
+        let fast = FastTreeBackend::load(&path).expect("the fixture takes the fast path");
+        let tract = TractOnnxBackend::load(&path).expect("tract loads the fixture");
+        for x in [-1.0, 0.0, 0.5, 1e9, f32::NAN] {
+            let (a, b) = (
+                fast.predict(&[x]).expect("fast"),
+                tract.predict(&[x]).expect("tract"),
+            );
+            assert!(
+                a == b || (a.is_nan() && b.is_nan()),
+                "fast {a} != tract {b} at {x}"
+            );
+        }
+    }
+
+    /// The same agreement over a real bundle, on deterministic pseudo-random
+    /// inputs, including values on and around each split.
+    #[test]
+    #[ignore = "needs SCAN_MODELS_DIR pointing at an installed model bundle"]
+    fn the_fast_path_agrees_with_tract_on_a_real_bundle() {
+        let dir = std::env::var("SCAN_MODELS_DIR").expect("SCAN_MODELS_DIR");
+        let models: Vec<_> = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "onnx"))
+            .collect();
+        assert!(!models.is_empty(), "no .onnx under SCAN_MODELS_DIR");
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Mostly small counts and ratios, the range features take.
+            (state % 10_000) as f32 / 100.0 - 5.0
+        };
+        for entry in models {
+            let fast = FastTreeBackend::load(entry.path()).expect("fast path");
+            let tract = TractOnnxBackend::load(entry.path()).expect("tract");
+            for _ in 0..200 {
+                let x: Vec<f32> = (0..fast.n_features).map(|_| next()).collect();
+                let (a, b) = (
+                    fast.predict(&x).expect("fast"),
+                    tract.predict(&x).expect("tract"),
+                );
+                assert!(
+                    (a - b).abs() <= 1e-6,
+                    "{}: fast {a} != tract {b}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    /// A branch that leads back to its own root would loop forever in
+    /// `predict`. Such a model is refused at load and left to tract.
+    #[test]
+    fn a_cyclic_tree_is_refused() {
+        let mut graph = fixture_graph();
+        let node = tree_node(&mut graph);
+        // Node 0 branches to node 1 (a leaf) and back to itself.
+        set_ints(node, "nodes_featureids", vec![0, 0]);
+        set_ints(node, "nodes_nodeids", vec![0, 1]);
+        set_ints(node, "nodes_treeids", vec![0, 0]);
+        set_ints(node, "nodes_truenodeids", vec![1, 0]);
+        set_ints(node, "nodes_falsenodeids", vec![0, 0]);
+        attribute(node, "nodes_values").floats = vec![0.5, 0.0];
+        attribute(node, "nodes_modes").strings = vec![b"BRANCH_LEQ".to_vec(), b"LEAF".to_vec()];
+        set_ints(node, "class_nodeids", vec![1, 1]);
+        let error = FastTreeBackend::from_graph(&graph).expect_err("cycle refused");
+        assert!(error.to_string().contains("is not a tree"), "{error}");
+    }
+
+    /// A node that transforms the probabilities changes the answer, and the
+    /// fast evaluator would skip it. One on the label path does not.
+    #[test]
+    fn only_a_probability_transform_is_left_to_tract() {
+        let mut graph = fixture_graph();
+        let probabilities = tree_node(&mut graph).output[1].clone();
+        let label = tree_node(&mut graph).output[0].clone();
+        graph.node.push(NodeProto {
+            op_type: "Cast".into(),
+            input: vec![label],
+            output: vec!["label_cast".into()],
+            ..NodeProto::default()
+        });
+        FastTreeBackend::from_graph(&graph).expect("a label cast is harmless");
+        graph.node.push(NodeProto {
+            op_type: "Scaler".into(),
+            input: vec![probabilities],
+            output: vec!["scaled".into()],
+            ..NodeProto::default()
+        });
+        let error = FastTreeBackend::from_graph(&graph).expect_err("refused");
+        assert!(error.to_string().contains("Scaler"), "{error}");
+    }
+
+    /// LightGBM's exporter multiplies the probabilities by a constant 1, which
+    /// changes nothing; a multiply by anything else does.
+    #[test]
+    fn only_a_multiply_by_one_passes() {
+        use tract_onnx::pb::TensorProto;
+        let with_factor = |factor: f32| {
+            let mut graph = fixture_graph();
+            let probabilities = tree_node(&mut graph).output[1].clone();
+            graph.initializer.push(TensorProto {
+                name: "factor".into(),
+                float_data: vec![factor],
+                ..TensorProto::default()
+            });
+            graph.node.push(NodeProto {
+                op_type: "Mul".into(),
+                input: vec![probabilities, "factor".into()],
+                output: vec!["scaled".into()],
+                ..NodeProto::default()
+            });
+            FastTreeBackend::from_graph(&graph)
+        };
+        with_factor(1.0).expect("a multiply by one is a pass-through");
+        assert!(with_factor(2.0).is_err());
     }
 }

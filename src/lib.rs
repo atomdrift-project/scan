@@ -8,12 +8,6 @@
 //!
 //! The other public modules exist for the `atomscan` binary and the
 //! integration tests, and change with them.
-
-#![cfg_attr(not(feature = "daemon-support"), allow(dead_code, unreachable_pub))]
-#![cfg_attr(
-    feature = "daemon-support",
-    allow(missing_docs, missing_debug_implementations)
-)]
 //!
 //! # Example
 //! ```no_run
@@ -27,52 +21,23 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-pub(crate) mod admission;
-pub(crate) mod allocator;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod analysis;
-#[cfg(not(feature = "daemon-support"))]
-mod analysis;
 pub(crate) mod analysis_cache;
 pub(crate) mod analyzer;
 pub mod auto_update;
-
 pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
 pub mod cache_cleanup;
 mod civil;
 pub mod cli;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod corpus_precheck;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod corpus_precheck;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod crash_dump;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod crash_dump;
 pub(crate) mod deptree;
 pub mod engine;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod explain;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod explain;
 pub mod features;
 pub mod fetch;
 pub mod heap_profile;
 pub(crate) mod hosts;
-pub(crate) mod inflight;
 pub mod interpret;
 mod interrupt;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod lookup;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod lookup;
 pub mod memory;
 pub mod model;
 pub mod model_update;
@@ -83,27 +48,33 @@ pub mod pkg;
 pub mod provenance;
 pub mod ps;
 pub mod remote;
+pub mod rules;
 pub mod runtime;
 pub mod server;
-pub(crate) mod suspend;
 pub mod sys;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod thread_dump;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod thread_dump;
-#[cfg(feature = "daemon-support")]
-#[doc(hidden)]
-pub mod thread_priority;
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) mod thread_priority;
 pub mod tools;
 pub mod traits_repo;
 pub mod update_check;
 pub(crate) mod update_manifest;
 pub mod upload;
 pub mod validate;
-pub mod worker;
+
+// Plumbing for the fleet daemon built on this crate. Public so it can link
+// against it, hidden because it is not a supported API and changes with it.
+#[doc(hidden)]
+pub mod analysis;
+#[doc(hidden)]
+pub mod corpus_precheck;
+#[doc(hidden)]
+pub mod crash_dump;
+#[doc(hidden)]
+pub mod explain;
+#[doc(hidden)]
+pub mod lookup;
+#[doc(hidden)]
+pub mod thread_dump;
+#[doc(hidden)]
+pub mod thread_priority;
 
 pub use analyzer::Analyzer;
 pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
@@ -151,36 +122,18 @@ impl std::fmt::Debug for ArchivePasswords {
 /// Convert a [`std::time::Duration`] to milliseconds as `u64`, saturating at [`u64::MAX`].
 ///
 /// Avoids the `u128 as u64` truncating cast that `as_millis()` requires.
-/// In practice elapsed durations are always tiny (seconds to minutes), so
-/// saturation never fires — this is purely for lint-cleanliness.
-#[cfg(feature = "daemon-support")]
 #[doc(hidden)]
+#[must_use]
 pub fn duration_ms(d: std::time::Duration) -> u64 {
     d.as_secs()
         .saturating_mul(1_000)
         .saturating_add(u64::from(d.subsec_millis()))
 }
 
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) fn duration_ms(d: std::time::Duration) -> u64 {
-    d.as_secs()
-        .saturating_mul(1_000)
-        .saturating_add(u64::from(d.subsec_millis()))
-}
-
 /// The 1-minute system load average, or `None` on unsupported platforms.
-#[cfg(feature = "daemon-support")]
 #[doc(hidden)]
+#[must_use]
 pub fn system_load_avg() -> Option<f64> {
-    system_load_avg_impl()
-}
-
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) fn system_load_avg() -> Option<f64> {
-    system_load_avg_impl()
-}
-
-fn system_load_avg_impl() -> Option<f64> {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
@@ -238,8 +191,22 @@ pub enum Mode {
     #[default]
     Balanced,
     /// No bloom lookups — every artifact is fully scanned. Always used by
-    /// long-lived workers, where each job must be analyzed on its own merits.
+    /// `serve`, where each request must be analyzed on its own merits.
     Slow,
+}
+
+/// `<platform data directory>/atomdrift/scan`, where the models and filters
+/// are installed.
+///
+/// # Errors
+/// When the platform reports no data directory: a user with no home. The
+/// working directory is no substitute — a scan run inside an untrusted
+/// checkout would load whatever models and filters that checkout supplied.
+pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    dirs::data_dir()
+        .map(|dir| dir.join("atomdrift").join("scan"))
+        .context("this user has no data directory (is HOME set?)")
 }
 
 /// Stack size for every analysis thread pool, in MiB. cleave's archive
@@ -252,7 +219,7 @@ pub const RAYON_STACK_MB: usize = 256;
 ///
 /// Long-lived daemons pick up new rules on restart, so this runs once at
 /// startup rather than on a timer. Failures are warned about and not fatal: a
-/// worker in a disconnected environment must still start with whatever is on
+/// daemon in a disconnected environment must still start with whatever is on
 /// disk. `force` updates even when the local copy looks current; `no_update`
 /// skips the step entirely.
 ///
@@ -271,9 +238,10 @@ pub fn refresh_rules_at_startup(force: bool, no_update: bool) -> anyhow::Result<
     }
     let traits = std::thread::scope(|s| {
         s.spawn(|| {
-            let dir = models_repo::install_target();
-            if let Err(e) = model_update::update(&dir, force, false) {
-                tracing::warn!(dir = %dir.display(), error = format!("{e:#}"), "model update failed");
+            if let Err(e) = models_repo::install_target()
+                .and_then(|dir| model_update::update(&dir, force, false))
+            {
+                tracing::warn!(error = format!("{e:#}"), "model update failed");
             }
         });
         s.spawn(|| traits_repo::update(force, false))

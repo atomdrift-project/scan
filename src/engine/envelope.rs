@@ -381,7 +381,7 @@ impl EmbeddedFile {
 /// `None` when the dependency carries no verdict (see [`DepResult::verdict`])
 /// — there is nothing to post, and scan does not invent one.
 #[must_use]
-pub fn dep_envelope(
+pub(crate) fn dep_envelope(
     dep: &DepResult,
     version: &str,
     analyzed_at: &str,
@@ -788,7 +788,7 @@ pub(super) mod tests {
         );
     }
 
-    pub fn base_result() -> ScanResult {
+    pub(crate) fn base_result() -> ScanResult {
         ScanResult {
             dependency_attention: super::super::DependencyAttention::default(),
             v: SCHEMA_VERSION,

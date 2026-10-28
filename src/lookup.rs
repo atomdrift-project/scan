@@ -242,6 +242,7 @@ pub const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 /// entirely, and its cache treats an engine-less body as short-lived and refuses
 /// to let it stand in for an analysis. Stamping a build here would make a filter
 /// hit read as a scan we never ran, which is the one thing this must not do.
+#[derive(Debug)]
 pub struct BloomClaim {
     /// The level this claim justifies on its own: [`Level::Clean`] for a skip.
     pub lvl: Level,
@@ -251,6 +252,7 @@ pub struct BloomClaim {
 }
 
 /// The finding a filter hit is reported as.
+#[derive(Debug)]
 pub struct BloomFinding {
     /// Criticality: 5 hostile, 4 suspicious.
     pub crit: u8,
@@ -269,6 +271,7 @@ pub struct BloomFinding {
 ///
 /// One definition, read by both the native lookup route and the `/v1` decision,
 /// so the two cannot drift into answering the same filter hit differently.
+#[must_use]
 pub fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> {
     use crate::bloom_repo::Decision;
     let convicted = |lvl, crit, id, desc| BloomClaim {
@@ -349,6 +352,7 @@ impl Verdict {
     /// Project the stored verdict onto the wire, worst findings first.
     /// `requested_purl` is what the caller asked by, which names the artifact
     /// more precisely than a locator recorded on some earlier analysis.
+    #[must_use]
     pub fn view<'a>(&'a self, bloom: &'a str, requested_purl: Option<&'a str>) -> View<'a> {
         View {
             sha: &self.sha256,
@@ -388,6 +392,7 @@ fn locate(
 }
 
 /// Handle to the index directory for the current ruleset version.
+#[derive(Debug)]
 pub struct Index {
     dir: PathBuf,
     /// Recently served verdicts, keyed by content sha. A PURL hit resolves to a
@@ -398,6 +403,7 @@ pub struct Index {
 /// Root of the verdict index (`…/atomdrift/scan/lookup`), above the
 /// per-ruleset-version subdirectory. Entries live at `lookup/<version>/…`, two
 /// levels below this root — the shape [`crate::cache_cleanup`] reclaims.
+#[must_use]
 pub fn index_base() -> Option<PathBuf> {
     Some(
         dirs::cache_dir()?
@@ -550,6 +556,26 @@ fn purl_key(purl: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     let identity = fletch::purl::identity(purl.trim())?;
     Some(format!("{:x}", Sha256::digest(identity.as_bytes())))
+}
+
+/// Digest first, because a digest names exact bytes and a verdict filed under
+/// it is about those bytes and nothing else. The PURL is consulted only when
+/// the digest is unknown — lazily, so an exact hit costs no index lookup at all
+/// — and its verdict is accepted only if it resolved to the same digest.
+///
+/// That last condition is the whole point of holding both keys. A release whose
+/// artifact has changed under it still has a perfectly good verdict; it is just
+/// a verdict about a different artifact than the caller asked about, and
+/// serving it would answer a question nobody posed.
+pub(crate) fn pick_verdict(
+    by_sha: Option<Verdict>,
+    by_purl: impl FnOnce() -> Option<Verdict>,
+    sha: &str,
+) -> Option<Verdict> {
+    if by_sha.is_some() {
+        return by_sha;
+    }
+    by_purl().filter(|v| v.sha256.eq_ignore_ascii_case(sha))
 }
 
 #[cfg(test)]
@@ -846,5 +872,70 @@ mod tests {
         // an attacker-chosen path.
         idx.put(&verdict("../../etc/passwd"));
         assert!(!idx.dir.join("../../etc/passwd.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod pick_verdict_tests {
+    use super::pick_verdict;
+    use crate::lookup::Verdict;
+
+    fn verdict(sha: &str, eng: &str) -> Verdict {
+        Verdict {
+            sha256: sha.to_owned(),
+            lvl: crate::model::Level::Clean,
+            eng: eng.to_owned(),
+            at: "2026-01-01T00:00:00Z".to_owned(),
+            purl: None,
+            why: None,
+            hits: Vec::new(),
+        }
+    }
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_digest_hit_wins_and_costs_no_purl_lookup() {
+        let mut asked = false;
+        let got = pick_verdict(
+            Some(verdict(SHA, "by-sha")),
+            || {
+                asked = true;
+                Some(verdict(SHA, "by-purl"))
+            },
+            SHA,
+        );
+        assert_eq!(got.expect("verdict").eng, "by-sha");
+        assert!(!asked, "an exact hit must not cost a second index lookup");
+    }
+
+    // The second chance: the index knows the release even though these exact
+    // bytes are new to it, and the digests agree.
+    #[test]
+    fn the_purl_answers_when_the_digest_is_unknown() {
+        let got = pick_verdict(None, || Some(verdict(SHA, "by-purl")), SHA);
+        assert_eq!(got.expect("verdict").eng, "by-purl");
+    }
+
+    // The guard the pair exists for: the release resolved to other bytes.
+    #[test]
+    fn a_purl_verdict_for_other_bytes_is_refused() {
+        let got = pick_verdict(None, || Some(verdict(OTHER, "different-artifact")), SHA);
+        assert!(
+            got.is_none(),
+            "served a verdict about bytes nobody asked about"
+        );
+    }
+
+    #[test]
+    fn digest_comparison_is_case_insensitive() {
+        let got = pick_verdict(None, || Some(verdict(&SHA.to_uppercase(), "by-purl")), SHA);
+        assert!(got.is_some(), "hex case must not decide identity");
+    }
+
+    #[test]
+    fn neither_key_known_is_no_verdict() {
+        assert!(pick_verdict(None, || None, SHA).is_none());
     }
 }

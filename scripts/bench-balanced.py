@@ -167,7 +167,7 @@ def main():
         CLEAVE_SKIP_YARA_CACHE="0",
         SCAN_NO_UPDATE_CHECK="1",
         SCAN_FOLLOW="none",
-        SCAN_FETCH="none",
+        SCAN_FOLLOW="none",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:

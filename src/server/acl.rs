@@ -1,22 +1,16 @@
-//! Per-request access control for the litmus HTTP API: a peer-IP ACL, and
+//! Per-request access control for the HTTP API: a peer-IP ACL, and
 //! bearer-token authentication when `--token-file` is set.
 //!
 //! Two gates run in order on every request:
 //!
 //! 1. **Peer IP.** Loopback connections pass. Every other peer must match one
-//!    of the configured `--allow-cidr` networks, and may never reach a
-//!    [`LOOPBACK_ONLY_ROUTES`] entry.
+//!    of the configured `--allow-cidr` networks.
 //! 2. **Bearer token.** When a token is configured, every route except
 //!    [`HEALTH_ROUTE`] requires `Authorization: Bearer <token>`. Loopback is
 //!    deliberately *not* exempt: the server is meant to sit behind a
 //!    Cloudflare tunnel, where `cloudflared` runs on the host and dials the
 //!    service over loopback, so every remote request arrives with a loopback
 //!    peer address. Exempting loopback would exempt the entire internet.
-//!
-//! That same property makes [`LOOPBACK_ONLY_ROUTES`] defence in depth rather
-//! than a guarantee: behind a tunnel, "loopback" means "local *or* tunnelled".
-//! `/analyze-path` stays on that list, but the real protection is an empty
-//! `--allowed-dirs`, which makes it reject every request.
 //!
 //! The admin routes ([`ADMIN_ROUTES`]) change what the server runs. With a
 //! token configured they need it like every other route; without one they are
@@ -40,13 +34,14 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::Response;
 use sha2::{Digest, Sha256};
 
 use super::AppState;
 use super::access::{Auth, Fingerprint};
+use super::error::ApiError;
 
 /// A single CIDR network parsed from `--allow-cidr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,13 +264,6 @@ fn fingerprint(credential: &[u8]) -> Fingerprint {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Trusted;
 
-/// Routes that may only be reached from loopback regardless of
-/// `--allow-cidr`. `/analyze-path` accepts a server-side path and is gated
-/// against `--allowed-dirs`, but exposing it to the network would still hand
-/// any allowed peer a remote-read primitive against those directories. Keep
-/// it loopback-only.
-const LOOPBACK_ONLY_ROUTES: &[&str] = &["/analyze-path"];
-
 /// Routes that reload or update the models and rules the server runs. The
 /// bearer token is their credential; on a server without one, only loopback
 /// may call them.
@@ -287,13 +275,9 @@ const ADMIN_ROUTES: &[&str] = &["/_/reload", "/_/update"];
 /// diagnostic body; see [`Trusted`].
 pub(super) const HEALTH_ROUTE: &str = "/_/health";
 
-fn forbidden(message: &str, auth: Auth) -> Response {
+fn forbidden(message: &'static str, auth: Auth) -> Response {
     tag(
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": message })),
-        )
-            .into_response(),
+        ApiError::new(StatusCode::FORBIDDEN, "forbidden", message).response(),
         auth,
     )
 }
@@ -308,12 +292,16 @@ fn tag(mut response: Response, auth: Auth) -> Response {
 /// indistinguishable, so the endpoint cannot be used as an oracle for whether
 /// a guessed token exists.
 fn unauthorized() -> Response {
-    (
+    let mut response = ApiError::new(
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        Json(serde_json::json!({ "error": "missing or invalid bearer token" })),
+        "unauthorized",
+        "missing or invalid bearer token",
     )
-        .into_response()
+    .response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
 }
 
 /// Per-request access-control middleware: peer-IP ACL, then bearer token.
@@ -326,8 +314,7 @@ pub(super) async fn acl(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let loopback_only = LOOPBACK_ONLY_ROUTES.contains(&path)
-        || (ADMIN_ROUTES.contains(&path) && state.config.auth_digest.is_none());
+    let loopback_only = ADMIN_ROUTES.contains(&path) && state.config.auth_digest.is_none();
     let auth_exempt = path == HEALTH_ROUTE;
 
     let peer = req

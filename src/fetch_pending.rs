@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
-/// Most entries one root may hold. The backlog is shared, and past
-/// [`MAX_ENTRIES`] every checkpoint fails for *every* root; one hostile root
-/// naming a hundred thousand URLs must not wedge the rest. Additions past this
-/// are dropped (and logged), never the backlog.
+/// Most entries one root may hold, so one hostile root naming a hundred
+/// thousand URLs cannot crowd out the rest. Additions past this are dropped
+/// (and logged). Past [`MAX_ENTRIES`] or [`MAX_BYTES`] overall, the oldest
+/// entries are evicted instead, so a checkpoint never fails for being full.
 const MAX_ROOT_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +83,9 @@ impl Store {
     /// never overwrite another root's pending work. A failed write leaves the
     /// previous state intact. Corrupt/unknown state is never silently replaced.
     pub(super) fn update(&self, additions: &[Entry], completed: &[Entry]) -> io::Result<()> {
+        if additions.is_empty() && completed.is_empty() {
+            return Ok(());
+        }
         let parent = self
             .path
             .parent()
@@ -118,9 +121,11 @@ impl Store {
             )
         };
         let done: std::collections::HashSet<_> = completed.iter().map(completion_key).collect();
+        let before = state.entries.len();
         state
             .entries
             .retain(|entry| !done.contains(&completion_key(entry)));
+        let mut changed = state.entries.len() != before;
         let mut indices: std::collections::HashMap<_, _> = state
             .entries
             .iter()
@@ -136,9 +141,11 @@ impl Store {
         for entry in additions {
             let signature = key(entry);
             if let Some(&i) = indices.get(&signature) {
-                state.entries[i].reason.clone_from(&entry.reason);
-                state.entries[i].redirect_credit =
-                    state.entries[i].redirect_credit.max(entry.redirect_credit);
+                let held = &mut state.entries[i];
+                let credit = held.redirect_credit.max(entry.redirect_credit);
+                changed |= held.reason != entry.reason || held.redirect_credit != credit;
+                held.reason.clone_from(&entry.reason);
+                held.redirect_credit = credit;
                 continue;
             }
             let held = per_root.entry(entry.root_sha.clone()).or_default();
@@ -149,6 +156,7 @@ impl Store {
             *held += 1;
             indices.insert(signature, state.entries.len());
             state.entries.push(entry.clone());
+            changed = true;
         }
         if dropped > 0 {
             tracing::warn!(
@@ -157,12 +165,12 @@ impl Store {
                 "fetch backlog: root at its entry cap; additions dropped"
             );
         }
-        if state.entries.len() > MAX_ENTRIES {
-            return Err(io::Error::other("fetch backlog exceeds entry limit"));
+        if !changed {
+            return Ok(());
         }
-        let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
-        if bytes.len() as u64 > MAX_BYTES {
-            return Err(io::Error::other("fetch backlog exceeds size limit"));
+        let (bytes, evicted) = fit(&mut state, MAX_ENTRIES, MAX_BYTES)?;
+        if evicted > 0 {
+            tracing::warn!(evicted, "fetch backlog full; oldest entries evicted");
         }
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         temp.write_all(&bytes)?;
@@ -172,6 +180,22 @@ impl Store {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+/// Evict the oldest entries until `state` holds at most `max_entries` and
+/// serializes to at most `max_bytes`; the serialized form and how many went.
+fn fit(state: &mut State, max_entries: usize, max_bytes: u64) -> io::Result<(Vec<u8>, usize)> {
+    // Entries are appended, so the front is the oldest.
+    let mut evicted = state.entries.len().saturating_sub(max_entries);
+    state.entries.drain(..evicted);
+    let mut bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    while bytes.len() as u64 > max_bytes && !state.entries.is_empty() {
+        let quarter = state.entries.len().div_ceil(4);
+        state.entries.drain(..quarter);
+        evicted += quarter;
+        bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    }
+    Ok((bytes, evicted))
 }
 
 #[cfg(test)]
@@ -277,6 +301,58 @@ mod tests {
         // Another root still checkpoints.
         store.update(&[entry("other", 0)], &[]).unwrap();
         assert_eq!(store.entries("other").unwrap().len(), 1);
+    }
+
+    /// A full backlog makes room by dropping its oldest work, so a checkpoint
+    /// never fails for being full and later entries are always recorded.
+    #[test]
+    fn a_full_backlog_evicts_its_oldest_entries() {
+        let mut state = State {
+            entries: (0..10)
+                .map(|i| {
+                    let mut e = entry(&format!("root-{i}"), 0);
+                    e.reason = format!("{i}");
+                    e
+                })
+                .collect(),
+            ..State::default()
+        };
+        let (_, evicted) = fit(&mut state, 6, MAX_BYTES).unwrap();
+        assert_eq!(evicted, 4);
+        assert_eq!(state.entries.first().unwrap().reason, "4");
+
+        let one = serde_json::to_vec(&State {
+            entries: vec![entry("x", 0)],
+            ..State::default()
+        })
+        .unwrap()
+        .len() as u64;
+        let (bytes, _) = fit(&mut state, 6, one * 3).unwrap();
+        assert!(bytes.len() as u64 <= one * 3);
+        assert_eq!(
+            state.entries.last().unwrap().reason,
+            "9",
+            "the newest stays"
+        );
+    }
+
+    /// Nothing to change means nothing written: no lock file, no fsync, and
+    /// no failure where the directory cannot be written at all.
+    #[cfg(unix)]
+    #[test]
+    fn an_update_that_changes_nothing_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.json");
+        let store = Store::open(&path).unwrap();
+        store.update(&[], &[]).unwrap();
+        assert!(!path.exists());
+
+        store.update(&[entry("root", 0)], &[]).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let repeated = store.update(&[entry("root", 0)], &[]);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        repeated.unwrap();
     }
 
     #[test]

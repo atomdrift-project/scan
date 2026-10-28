@@ -2,7 +2,7 @@
 //! SHAP table, and runtime config so library consumers don't have to wire
 //! them together by hand.
 //!
-//! This is the recommended entry point for embedding litmus in other
+//! This is the recommended entry point for embedding scan in other
 //! processes (proxies, daemons, fuzz harnesses). The lower-level
 //! [`Model`], [`ShapImportance`], and [`ScanConfig`] types remain available
 //! for callers
@@ -83,8 +83,11 @@ impl Analyzer {
     /// # Errors
     /// Returns an error if the supplied thresholds are invalid (suspicious
     /// must be ≤ hostile, both in `[0, 1]`).
+    ///
+    /// Reloads the model under the new thresholds, so call it once, at setup.
     pub fn with_thresholds(mut self, thresholds: Thresholds) -> Result<Self> {
         self.config = self.rebuild_config(Some(thresholds), self.config.slow_rule_ms())?;
+        self.model = Model::load(&self.model_dir, Some(thresholds), self.config.level())?;
         Ok(self)
     }
 
@@ -99,13 +102,17 @@ impl Analyzer {
         Ok(self)
     }
 
-    /// Attach the FPR severity level (0..=10000) that produced the resolved
-    /// thresholds. Pass `None` to indicate manual thresholds with no level
-    /// metadata.
-    #[must_use]
-    pub fn with_level(mut self, level: Option<u16>) -> Self {
+    /// Classify at the given operating level (false positives per 100M
+    /// benign files). `None` leaves the model's own thresholds in force.
+    ///
+    /// Reloads the model at the new level, so call it once, at setup.
+    ///
+    /// # Errors
+    /// Propagates `Model::load` failures.
+    pub fn with_level(mut self, level: Option<u16>) -> Result<Self> {
         self.config = self.config.with_level(level);
-        self
+        self.model = Model::load(&self.model_dir, self.config.thresholds(), level)?;
+        Ok(self)
     }
 
     /// Directory the analyzer was loaded from.
@@ -168,7 +175,7 @@ impl Analyzer {
     /// # Errors
     /// Propagates filesystem errors and cleave analysis failures.
     pub fn scan_path(&self, path: &Path) -> Result<ScanSummary> {
-        engine::run(path, &self.config)
+        engine::run_with(&self.model, self.shap.as_ref(), path, &self.config)
     }
 
     fn rebuild_config(

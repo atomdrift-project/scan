@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare filefacts-consumed fields from full and compact Rizin output.
 
-Usage: python3 tests/rizin-function-projection.py RIZIN_BINARY INPUT_BINARY
+Usage: python3 scripts/rizin/function-projection.py RIZIN_BINARY INPUT_BINARY
 The input is statically analyzed, never executed.
 """
 

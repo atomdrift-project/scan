@@ -11,10 +11,13 @@ DATASET=$2
 OUT=$3
 LIST=${4:-}
 
-SNAP=/private/tmp/claude-501/-Users-t-dev-atomdrift-scan/e6ef4f79-beda-4e4a-bf24-4f5010d7032c/scratchpad/traits-snapshot
+# Pin the traits to a frozen snapshot: the installed traits update themselves,
+# which would make the two legs (or two runs) disagree for reasons unrelated
+# to the binaries under test.
+: "${CLEAVE_TRAITS_DIR:?set CLEAVE_TRAITS_DIR to a frozen traits snapshot}"
+export CLEAVE_TRAITS_DIR
 export SCAN_NO_ANALYSIS_CACHE=1
-export SCAN_FETCH=none
-export CLEAVE_TRAITS_DIR=$SNAP
+export SCAN_FOLLOW=none
 export SCAN_NO_UPDATE=1
 export RUST_LOG=scan=info,cleave=error
 

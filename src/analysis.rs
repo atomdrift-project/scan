@@ -40,6 +40,15 @@ pub struct Analysis<'a> {
     pub cpu_lease: Option<CpuLease>,
 }
 
+impl std::fmt::Debug for Analysis<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Analysis")
+            .field("label", &self.label)
+            .field("follow", &self.follow)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> Analysis<'a> {
     pub fn new(label: &'a str, resources: &'a ModelResources, slow_rule_ms: u64) -> Self {
         Self {
@@ -206,11 +215,13 @@ impl RequestPhase {
     }
 
     /// The current phase name, as the tracker reports it.
+    #[must_use]
     pub fn get(&self) -> String {
         self.0.tracker.get()
     }
 
     /// The underlying tracker, for cleave's own phase reporting.
+    #[must_use]
     pub fn tracker(&self) -> &cleave::PhaseTracker {
         &self.0.tracker
     }
@@ -271,6 +282,7 @@ pub struct ModelResources {
 /// Payloads at or below this many bytes count as small — for the slot lanes
 /// and for [`whale_lane_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
 /// worker's cleave gate reads; 1 MiB unless set.
+#[must_use]
 pub fn small_job_max_bytes() -> u64 {
     std::env::var("SCAN_SMALL_JOB_MB")
         .ok()
@@ -420,6 +432,7 @@ fn whale_config() -> &'static WhaleConfig {
 static WHALE_SLOTS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
 /// One of [`whale_slots`], released on drop.
+#[derive(Debug)]
 struct WhaleSlot;
 
 /// Every big-whale slot is taken. Surfaced as 429 so the router places the
@@ -497,6 +510,7 @@ impl Drop for WhaleSlot {
 /// `SCAN_WHALE_POOL_THREADS` sets the per-whale width (0 sends whales to the
 /// global pool); `SCAN_WHALE_SLOTS` the big-whale concurrency;
 /// `SCAN_SMALL_JOB_MB` (shared with the slot lanes) says where whale starts.
+#[derive(Debug)]
 pub struct WhaleLane {
     pool: rayon::ThreadPool,
     /// Held for the pool's life when the payload is a big whale.
@@ -511,6 +525,7 @@ impl WhaleLane {
 }
 
 /// Big-whale slots in use and available, for `/_/stats`.
+#[must_use]
 pub fn whale_slot_usage() -> (usize, usize) {
     (WhaleSlot::in_use(), whale_config().slots)
 }

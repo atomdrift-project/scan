@@ -101,6 +101,38 @@ pub fn collector_registry(artifact: &Path, sha256: &str) -> Option<RegistryProve
     RegistryProvenance::from_json(&serde_json::to_vec(&document).ok()?)
 }
 
+/// The sidecar's bytes, if it is a regular file of at most
+/// [`MAX_COLLECTOR_SIDECAR_BYTES`].
+///
+/// The sidecar sits beside a scanned artifact, so whoever supplied the artifact
+/// chose it: it may be a symlink to `/dev/zero` or a FIFO nobody writes to. One
+/// open, checked on the handle and read through a bound, stops either from
+/// exhausting memory or hanging the scan.
+fn read_sidecar(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        tracing::warn!(
+            "ignoring provenance sidecar {}: not a regular file",
+            path.display()
+        );
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_COLLECTOR_SIDECAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_COLLECTOR_SIDECAR_BYTES {
+        tracing::warn!("ignoring oversized provenance sidecar {}", path.display());
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Read and authenticate the collector sidecar beside `artifact`.
 ///
 /// Shared by the upload and display paths so both agree on what counts as a
@@ -110,11 +142,8 @@ fn collector_document(artifact: &Path, sha256: &str) -> Option<serde_json::Value
     let mut path = artifact.as_os_str().to_os_string();
     path.push(COLLECTOR_SIDECAR_SUFFIX);
     let path = std::path::PathBuf::from(path);
-    if std::fs::metadata(&path).ok()?.len() > MAX_COLLECTOR_SIDECAR_BYTES {
-        tracing::warn!("ignoring oversized provenance sidecar {}", path.display());
-        return None;
-    }
-    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?)
+    let bytes = read_sidecar(&path)?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| {
             tracing::warn!(
                 "ignoring unparseable provenance sidecar {}: {e}",
@@ -232,6 +261,26 @@ mod collector_sidecar_tests {
         std::fs::write(&artifact, b"bytes").expect("write");
         assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
         std::fs::write(dir.path().join("a.tgz.forage.json"), b"{not json").expect("write");
+        assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
+    }
+
+    /// The sidecar is chosen by whoever supplied the artifact, so one that
+    /// would never end, or never arrive, must be ignored rather than read.
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_sidecar_is_ignored_without_reading_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("a.tgz");
+        std::fs::write(&artifact, b"bytes").expect("write");
+        let sidecar = dir.path().join("a.tgz.forage.json");
+
+        std::os::unix::fs::symlink("/dev/zero", &sidecar).expect("symlink");
+        assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
+
+        std::fs::remove_file(&sidecar).expect("remove");
+        let c_path = std::ffi::CString::new(sidecar.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         assert!(collector_sidecar(&artifact, "a.tgz", "cafe", 5).is_none());
     }
 

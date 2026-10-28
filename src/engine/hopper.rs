@@ -12,7 +12,7 @@ use crate::upload::{ArtifactBytes, UploadArtifact, Uploader};
 /// Where a scanned artifact came from: its path (for a fetched root, its
 /// display label) and the provenance that travels with it to hopper.
 #[derive(Clone, Copy)]
-pub struct Origin<'a> {
+pub(crate) struct Origin<'a> {
     pub path: &'a Path,
     /// Registry metadata for the artifact itself, when a registry or a
     /// collector supplied it.
@@ -23,7 +23,7 @@ pub struct Origin<'a> {
 
 impl<'a> Origin<'a> {
     /// A file on disk, with no provenance beyond what may sit beside it.
-    pub const fn local(path: &'a Path) -> Self {
+    pub(crate) const fn local(path: &'a Path) -> Self {
         Self {
             path,
             registry: None,
@@ -45,7 +45,7 @@ pub fn upload_collector() -> &'static str {
 /// artifacts are queued before the result so a never-seen top-level file's row
 /// exists before its verdict lands. Blocking (reads sidecars from disk); callers
 /// on an async runtime must run it off the executor.
-pub fn upload_scan_result(
+pub(crate) fn upload_scan_result(
     uploader: &Uploader,
     origin: Origin<'_>,
     sha256: String,
@@ -147,6 +147,7 @@ fn registry_fallback_route(
 /// The provenance-only artifact a registry-metadata stand-in backfills onto
 /// the real content hopper already holds for `purl` under `real_sha`; `None`
 /// (logged) when its sidecar cannot be built.
+#[must_use]
 pub fn registry_fallback_artifact(
     name: &str,
     real_sha: &str,
@@ -318,7 +319,7 @@ const MAX_ARTIFACT_FILENAME: usize = 128;
 /// Both inputs are hostile. A redirect chooses `url`'s final segment, and a
 /// locator can come from references discovered inside the sample, so the result
 /// is [sanitized](sanitize_artifact_filename) before it leaves this process.
-pub fn artifact_filename(url: &str, locator: &str) -> String {
+pub(crate) fn artifact_filename(url: &str, locator: &str) -> String {
     // Split on the Windows separator too: a consumer that resolves `a\..\..\b`
     // as a path must not be handed one.
     let from_url = url
