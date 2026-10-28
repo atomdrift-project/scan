@@ -18,14 +18,15 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SendError, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use reqwest::blocking::multipart::{Form, Part};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+mod queue;
 
 use crate::engine::ScanResultEnvelope;
 
@@ -258,9 +259,9 @@ const HOPPER_MAX_RESULT_BODY_BYTES: usize = 512 << 20;
 /// analysis that produced the payload.
 const ZSTD_RESULT_LEVEL: i32 = 3;
 
-/// Bound on results buffered ahead of the uploader thread. A small queue applies
-/// backpressure: a slow hopper throttles the scan rather than letting envelopes
-/// (each up to hundreds of KB) accumulate unbounded in memory.
+/// Bound on resident jobs buffered ahead of the uploader thread. Overflow is
+/// spooled to temporary files rather than blocking analysis or retaining large
+/// reports in RAM. Shutdown still drains every accepted job.
 const UPLOAD_QUEUE_DEPTH: usize = 16;
 
 /// Cap on the uploader's reconciled-sha dedup set (~64-byte hex strings; the cap
@@ -454,7 +455,7 @@ pub fn default_worker_name() -> String {
 /// Where an artifact's bytes can be loaded from, on demand — only after the
 /// negotiation says hopper is missing them, so a known sha never reads a file or
 /// decompresses a cache blob.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ArtifactBytes {
     /// The scanned file itself, read from disk.
     File(PathBuf),
@@ -472,7 +473,7 @@ pub enum ArtifactBytes {
 /// hopper, with the provenance to record if hopper doesn't already have it.
 /// Bytes are loaded lazily so the common "hopper already has it" case moves only
 /// the 64-char sha across the wire, never the payload.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UploadArtifact {
     /// SHA-256 of the artifact's bytes — the negotiation and storage key.
     pub sha256: String,
@@ -516,11 +517,10 @@ impl Body {
 
 /// Work handed to the background uploader thread. Artifacts are reconciled before
 /// a result so a never-seen top-level file's row exists before its verdict POST.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Job {
-    /// Renew a verdict on hopper (the original `--upload` behavior). Boxed: the
-    /// envelope dwarfs the other variant, so an unboxed enum would bloat every
-    /// queued job to its size.
+    /// Renew a verdict on hopper (the original `--upload` behavior). Encoding
+    /// before handoff makes the job spoolable without reconstructing reports.
     Result {
         sha256: String,
         /// The package this artifact was analyzed as, when it was requested by
@@ -528,7 +528,7 @@ enum Job {
         /// operator asked about rather than a digest they would have to
         /// resolve back to it by hand.
         purl: Option<String>,
-        envelope: Box<ScanResultEnvelope>,
+        body: EncodedResult,
     },
     /// Ensure hopper has these artifacts' bytes+provenance, uploading only the
     /// ones it's missing.
@@ -541,13 +541,71 @@ enum Job {
     },
     /// Mirror fetched dependencies into hopper as their own samples: bytes (only
     /// if missing) + provenance, then the verdict scan computed for each.
-    Dependencies {
-        deps: Vec<crate::engine::DepResult>,
-        /// Model version and analysis time stamped on each dependency's verdict,
-        /// carried from the parent result so the `ml` section is self-describing.
-        version: String,
-        analyzed_at: String,
-    },
+    Dependencies { deps: Vec<PreparedDependency> },
+}
+
+/// Wire-ready payload, identical whether resident or restored from the spool.
+#[derive(Debug, Serialize, Deserialize)]
+struct EncodedResult {
+    bytes: Vec<u8>,
+    zstd: bool,
+}
+
+fn prepare_result(
+    worker: &str,
+    sha256: &str,
+    envelope: ScanResultEnvelope,
+    tally: &Tally,
+) -> Option<EncodedResult> {
+    let payload = ResultPayload {
+        sha256: sha256.to_owned(),
+        worker: worker.to_owned(),
+        error: None,
+        duration_ms: 0,
+        envelope: Some(envelope),
+    };
+    match encode_result_body(payload, sha256) {
+        Some((bytes, encoding)) => Some(EncodedResult {
+            bytes,
+            zstd: encoding.is_some(),
+        }),
+        None => {
+            tally.failed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Only upload inputs cross the queue, not the dependency's analysis graph.
+#[derive(Debug, Serialize, Deserialize)]
+struct PreparedDependency {
+    sha256: String,
+    locator: String,
+    artifact: Option<UploadArtifact>,
+    result: Option<EncodedResult>,
+}
+
+fn prepare_dependencies(
+    worker: &str,
+    deps: Vec<crate::engine::DepResult>,
+    version: &str,
+    analyzed_at: &str,
+    tally: &Tally,
+) -> Vec<PreparedDependency> {
+    let collector = format!("scan+{worker}");
+    deps.into_iter()
+        .map(|dep| {
+            let artifact = dep_artifact(&dep, &collector, analyzed_at);
+            let result = crate::engine::dep_envelope(&dep, version, analyzed_at)
+                .and_then(|envelope| prepare_result(worker, &dep.sha256, envelope, tally));
+            PreparedDependency {
+                sha256: dep.sha256,
+                locator: dep.locator,
+                artifact,
+                result,
+            }
+        })
+        .collect()
 }
 
 /// The two ends a renewal can reach, counted together because they are only
@@ -570,11 +628,11 @@ struct Tally {
 #[derive(Debug)]
 pub struct Uploader {
     /// `None` once flushed, or when the uploader thread failed to spawn.
-    tx: Option<SyncSender<Job>>,
+    tx: Option<queue::Sender<Job>>,
     worker: Option<JoinHandle<()>>,
-    /// Jobs accepted but not yet handled. A `SyncSender` cannot be asked its
-    /// depth, and this is the difference between "quiet because nothing needs
-    /// filing" and "quiet because the filing is stuck".
+    /// Identity embedded into payloads before handing them to the queue.
+    worker_name: String,
+    /// Jobs accepted but not yet handled, including disk overflow.
     pending: Arc<AtomicUsize>,
     tally: Arc<Tally>,
 }
@@ -584,7 +642,7 @@ pub struct Uploader {
 pub struct UploadStats {
     /// Jobs accepted but not yet handled.
     pub pending: usize,
-    /// Queue capacity; at this depth `submit` blocks the analysis thread.
+    /// Resident payload capacity; further queued jobs spill to disk.
     pub capacity: usize,
     /// Renewals that gave up after exhausting their retries.
     pub failed: usize,
@@ -600,10 +658,11 @@ impl Uploader {
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
         use_hopper(hopper_url);
-        let (tx, jobs) = std::sync::mpsc::sync_channel::<Job>(UPLOAD_QUEUE_DEPTH);
+        let (tx, jobs) = queue::channel::<Job>(UPLOAD_QUEUE_DEPTH);
         let pending = Arc::new(AtomicUsize::new(0));
         let tally = Arc::new(Tally::default());
         let url = hopper_url.to_owned();
+        let worker_name = worker.clone();
         let (thread_pending, thread_tally) = (Arc::clone(&pending), Arc::clone(&tally));
         let spawned = std::thread::Builder::new()
             .name("scan-upload".into())
@@ -623,6 +682,7 @@ impl Uploader {
                 Self {
                     tx: Some(tx),
                     worker: Some(handle),
+                    worker_name,
                     pending,
                     tally,
                 }
@@ -632,6 +692,7 @@ impl Uploader {
                 Self {
                     tx: None,
                     worker: None,
+                    worker_name,
                     pending,
                     tally,
                 }
@@ -641,9 +702,9 @@ impl Uploader {
 
     /// A point-in-time view of the upload queue.
     ///
-    /// `pending` at capacity means analyses are blocking on `submit`; `failed`
-    /// climbing means verdicts are being computed and then lost, which no other
-    /// signal reports.
+    /// `pending` above capacity means the backlog can include disk-spooled jobs;
+    /// it no longer means analyzers are blocked on network I/O. `failed` counts
+    /// verdicts that could not be delivered.
     #[must_use]
     pub fn stats(&self) -> UploadStats {
         UploadStats {
@@ -654,32 +715,32 @@ impl Uploader {
         }
     }
 
-    /// Hand a job to the uploader thread, blocking briefly when the queue is
-    /// full (backpressure). The pending count covers exactly the jobs the
-    /// thread will see; a job that cannot be queued comes back to the caller.
+    /// Hand a job to the uploader without waiting for network progress. When
+    /// resident slots are full, only local spool I/O delays the caller. A spool
+    /// failure is explicit, and returns ownership for staging cleanup.
     fn enqueue(&self, job: Job) -> Result<(), Job> {
         let Some(tx) = &self.tx else {
             return Err(job);
         };
         self.pending.fetch_add(1, Ordering::Relaxed);
-        tx.send(job).map_err(|SendError(job)| {
+        tx.send(job).map_err(|(job, error)| {
             self.pending.fetch_sub(1, Ordering::Relaxed);
+            tracing::error!(%error, "upload: could not queue job");
             job
         })
     }
 
-    /// Queue a result for upload. A stopped uploader drops the result, and
-    /// says so.
+    /// Queue a result for upload. A failed handoff is logged and counted.
     pub fn submit(&self, sha256: String, purl: Option<String>, envelope: ScanResultEnvelope) {
-        let job = Job::Result {
-            sha256,
-            purl,
-            envelope: Box::new(envelope),
+        let Some(body) = prepare_result(&self.worker_name, &sha256, envelope, &self.tally) else {
+            return;
         };
+        let job = Job::Result { sha256, purl, body };
         if let Err(Job::Result { sha256, .. }) = self.enqueue(job) {
+            self.tally.failed.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 sha256 = %sha256,
-                "upload: uploader stopped before result could be sent to hopper"
+                "upload: could not queue result for hopper"
             );
         }
     }
@@ -690,7 +751,7 @@ impl Uploader {
     /// new top-level file's row exists before its verdict lands.
     pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>) {
         if !self.enqueue_artifacts(artifacts, Vec::new()) {
-            tracing::error!("upload: uploader stopped before artifacts could be queued");
+            tracing::error!("upload: could not queue artifacts for hopper");
         }
     }
 
@@ -745,7 +806,7 @@ impl Uploader {
         if self.enqueue_artifacts(artifacts, vec![staging_path]) {
             Ok(())
         } else {
-            Err("uploader stopped before durable artifacts could be queued".to_string())
+            Err("could not queue durable artifacts for hopper".to_string())
         }
     }
 
@@ -774,7 +835,7 @@ impl Uploader {
         if self.enqueue_artifacts(vec![artifact], vec![staging_path]) {
             Ok(())
         } else {
-            Err("uploader stopped before durable artifact could be queued".to_string())
+            Err("could not queue durable artifact for hopper".to_string())
         }
     }
 
@@ -786,21 +847,23 @@ impl Uploader {
     pub fn submit_dependencies(
         &self,
         deps: Vec<crate::engine::DepResult>,
-        version: String,
-        analyzed_at: String,
+        version: &str,
+        analyzed_at: &str,
     ) {
         if deps.is_empty() {
             return;
         }
         let job = Job::Dependencies {
-            deps,
-            version,
-            analyzed_at,
+            deps: prepare_dependencies(&self.worker_name, deps, version, analyzed_at, &self.tally),
         };
         if let Err(Job::Dependencies { deps, .. }) = self.enqueue(job) {
+            self.tally.failed.fetch_add(
+                deps.iter().filter(|d| d.result.is_some()).count(),
+                Ordering::Relaxed,
+            );
             tracing::error!(
                 dependencies = deps.len(),
-                "upload: uploader stopped before dependencies could be queued"
+                "upload: could not queue dependencies for hopper"
             );
         }
     }
@@ -905,7 +968,7 @@ impl Hopper {
 
     /// The uploader thread's loop: handle every queued job until the sender
     /// side is dropped.
-    fn serve(&self, jobs: Receiver<Job>, pending: &AtomicUsize) {
+    fn serve(&self, jobs: queue::Receiver<Job>, pending: &AtomicUsize) {
         // The same default blob cache scan fetched dependencies into, so a
         // missing dep's bytes are loaded locally rather than re-fetched.
         let cache = crate::fetch::open_blob_cache()
@@ -918,6 +981,14 @@ impl Hopper {
             // Handled below whatever the outcome; the depth is about the
             // queue, not about success.
             pending.fetch_sub(1, Ordering::Relaxed);
+            let job = match job {
+                Ok(job) => job,
+                Err(error) => {
+                    self.tally.failed.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(%error, "upload: could not read spooled job");
+                    continue;
+                }
+            };
             // Bound the dedup set: a long-lived `serve --hopper` process
             // reconciles an unbounded stream of unique shas. Clearing past the
             // cap only costs a redundant /known round-trip for shas negotiated
@@ -932,11 +1003,9 @@ impl Hopper {
                 // answer aged the moment it arrived, because only the store is
                 // ordered against the other producers pushing the same
                 // dependency (hopper's `unchangedStore`).
-                Job::Result {
-                    sha256,
-                    purl,
-                    envelope,
-                } => self.renew(&sha256, purl.as_deref(), *envelope),
+                Job::Result { sha256, purl, body } => {
+                    self.renew_encoded(&sha256, purl.as_deref(), body)
+                }
                 Job::Artifacts {
                     artifacts,
                     cleanup_dirs,
@@ -944,12 +1013,8 @@ impl Hopper {
                     self.reconcile(cache.as_ref(), &mut seen, artifacts);
                     cleanup_upload_dirs(cleanup_dirs);
                 }
-                Job::Dependencies {
-                    deps,
-                    version,
-                    analyzed_at,
-                } => {
-                    self.sync_dependencies(&version, &analyzed_at, cache.as_ref(), &mut seen, deps)
+                Job::Dependencies { deps } => {
+                    self.sync_prepared_dependencies(cache.as_ref(), &mut seen, deps)
                 }
             }
         }
@@ -1054,24 +1119,31 @@ impl Hopper {
         seen: &mut HashSet<String>,
         deps: Vec<crate::engine::DepResult>,
     ) {
+        let deps = prepare_dependencies(&self.worker, deps, version, analyzed_at, &self.tally);
+        self.sync_prepared_dependencies(cache, seen, deps);
+    }
+
+    fn sync_prepared_dependencies(
+        &self,
+        cache: Option<&fletch::fetch::BlobCache>,
+        seen: &mut HashSet<String>,
+        deps: Vec<PreparedDependency>,
+    ) {
         // Each dependency is reconciled and verdict-posted once per run; a dependency
         // shared by many scanned files is handled the first time it is seen.
-        let fresh: Vec<crate::engine::DepResult> = deps
+        let mut fresh: Vec<PreparedDependency> = deps
             .into_iter()
             .filter(|d| seen.insert(d.sha256.clone()))
             .collect();
         if fresh.is_empty() {
             return;
         }
-        let collector = format!("scan+{}", self.worker);
         // Bytes + provenance first, so each dependency's row exists before its
         // verdict UPDATE (hopper's `/api/result` no-ops on a missing row). The
         // local seen set starts empty — the run-level dedup above already
         // removed repeats.
-        let artifacts: Vec<UploadArtifact> = fresh
-            .iter()
-            .filter_map(|d| dep_artifact(d, &collector, analyzed_at))
-            .collect();
+        let artifacts: Vec<UploadArtifact> =
+            fresh.iter_mut().filter_map(|d| d.artifact.take()).collect();
         self.reconcile(cache, &mut HashSet::new(), artifacts);
         // Then the verdict for each dependency that has one, keyed by its content
         // sha. A dependency the embedded pass never reached carries none: its bytes
@@ -1088,7 +1160,7 @@ impl Hopper {
         // The store settles it now, in one indexed read, because the store is the
         // only place ordered against the other producers.
         for dep in fresh {
-            let Some(envelope) = crate::engine::dep_envelope(&dep, version, analyzed_at) else {
+            let Some(body) = dep.result else {
                 tracing::info!(
                     sha256 = %dep.sha256,
                     locator = %dep.locator,
@@ -1102,7 +1174,7 @@ impl Hopper {
                 .locator
                 .starts_with("pkg:")
                 .then_some(dep.locator.as_str());
-            self.renew(&dep.sha256, purl, envelope);
+            self.renew_encoded(&dep.sha256, purl, body);
         }
     }
 
@@ -1232,22 +1304,10 @@ impl Hopper {
 
     /// POST one result to hopper, retrying transient failures within
     /// [`RENEW_BUDGET`]. A permanent refusal stops at once.
-    fn renew(&self, sha256: &str, purl: Option<&str>, envelope: ScanResultEnvelope) {
-        let payload = ResultPayload {
-            sha256: sha256.to_string(),
-            worker: self.worker.clone(),
-            error: None,
-            // fs renews don't track per-file analysis time; hopper treats this as
-            // cosmetic. 0 keeps the wire shape identical to the worker's.
-            duration_ms: 0,
-            envelope: Some(envelope),
-        };
-        let Some((body, encoding)) = encode_result_body(payload, sha256) else {
-            self.tally.failed.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
+    fn renew_encoded(&self, sha256: &str, purl: Option<&str>, encoded: EncodedResult) {
+        let encoding = encoded.zstd.then_some("zstd");
         // Shared, not copied, across attempts: a compressed report can be large.
-        let body = bytes::Bytes::from(body);
+        let body = bytes::Bytes::from(encoded.bytes);
 
         let started = Instant::now();
         let mut retry_after: Option<Duration> = None;
@@ -2044,11 +2104,12 @@ mod tests {
     /// counter is what tells "nothing to file" from "filing is stuck".
     #[test]
     fn a_refused_job_does_not_leak_the_pending_count() {
-        let (tx, jobs) = std::sync::mpsc::sync_channel::<Job>(UPLOAD_QUEUE_DEPTH);
+        let (tx, jobs) = queue::channel::<Job>(UPLOAD_QUEUE_DEPTH);
         drop(jobs);
         let uploader = Uploader {
             tx: Some(tx),
             worker: None,
+            worker_name: "test".to_owned(),
             pending: Arc::default(),
             tally: Arc::default(),
         };
@@ -2062,7 +2123,7 @@ mod tests {
             members: crate::engine::MemberEvals::new(),
             report: None,
         };
-        uploader.submit_dependencies(vec![dep], "v".into(), "t".into());
+        uploader.submit_dependencies(vec![dep], "v", "t");
         uploader.submit_artifacts(vec![artifact(
             &"e".repeat(64),
             1,
