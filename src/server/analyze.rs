@@ -458,7 +458,7 @@ pub(super) async fn index_query<T: Send + 'static>(
 fn renew(uploader: &Uploader, result: &mut ScanResult, purl: Option<String>) {
     let deps = std::mem::take(&mut result.dependency_results);
     if !deps.is_empty() {
-        uploader.submit_dependencies(deps, result.version.clone(), result.analyzed_at.clone());
+        uploader.submit_dependencies(deps, &result.version, &result.analyzed_at);
     }
     let sha = match &result.hopper_route {
         HopperRoute::Suppress => return,

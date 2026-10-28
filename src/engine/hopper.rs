@@ -67,8 +67,8 @@ pub fn upload_scan_result(
     if !dependency_results.is_empty() {
         uploader.submit_dependencies(
             dependency_results,
-            envelope.ml.version.clone(),
-            envelope.ml.analyzed_at.clone(),
+            &envelope.ml.version,
+            &envelope.ml.analyzed_at,
         );
     }
     // `scan purl` names a package outright and a registry URL still identifies
