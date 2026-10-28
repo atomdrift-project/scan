@@ -16,11 +16,9 @@
 //! offending file is one of the in-flight set, not necessarily the last to
 //! start — dumping them all is the honest answer.
 
-#[cfg(not(feature = "daemon-support"))]
-pub(crate) use imp::{install, register};
-#[cfg(feature = "daemon-support")]
+pub(crate) use imp::install;
 #[doc(hidden)]
-pub use imp::{install, register};
+pub use imp::register;
 
 #[cfg(unix)]
 mod imp {
@@ -156,7 +154,7 @@ mod imp {
     /// `has overflowed its stack` line, then calls `abort()`. Catching the
     /// resulting `SIGABRT` adds our dump *after* that message while preserving
     /// it, and also covers panics-as-abort and OOM aborts.
-    pub fn install() {
+    pub(crate) fn install() {
         // SAFETY: a zeroed `sigaction` is a valid empty disposition; we set the
         // handler, an empty mask, and run on the alternate signal stack the
         // Rust runtime already established (the faulting thread's own stack is

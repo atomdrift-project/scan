@@ -35,7 +35,8 @@ impl Fixture {
                 "presence_vocab": ["metadata"],
                 "feature_names": ["present:metadata"],
                 "total_features": 1,
-                "standardized": false
+                "standardized": false,
+                "metric_transforms": {}
             }))
             .unwrap(),
         )

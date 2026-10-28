@@ -62,14 +62,7 @@ jobs:
           persist-credentials: false
 
       - name: Reject local path overrides
-        # Same regex as scripts/pre-commit, including the `[^#]` guard that
-        # keeps commented-out patches (Cargo.toml keeps a running log of them)
-        # from tripping it. Keep the two in sync.
-        run: |
-          if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
-            echo "::error file=Cargo.toml::local path override committed - push the dep and pin a git rev instead"
-            exit 1
-          fi
+        run: scripts/check-lock.sh
 
       - name: Cache cargo home
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

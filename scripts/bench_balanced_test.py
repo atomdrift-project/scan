@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-RUNNER = Path(__file__).resolve().parents[1] / 'scripts/bench-balanced.py'
+RUNNER = Path(__file__).resolve().parent / 'bench-balanced.py'
 
 
 @unittest.skipUnless(sys.platform == 'linux', 'Linux helper affinity')

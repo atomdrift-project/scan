@@ -38,10 +38,31 @@ use crate::{Mode, OutputFormat};
 /// Returns an error if the target path does not exist, model artifacts cannot
 /// be loaded, or `cleave` analysis fails for the overall scan operation.
 pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
+    let (model, shap) = load_model(config)?;
+    run_with(&model, shap.as_ref(), path, config)
+}
+
+/// [`run`] with a model already loaded, for callers that scan repeatedly.
+///
+/// # Errors
+/// As [`run`].
+pub fn run_with(
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    path: &Path,
+    config: &ScanConfig,
+) -> Result<ScanSummary> {
     if !path.is_file() && !path.is_dir() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
-    run_paths(&[path.to_path_buf()], config, None)
+    run_paths_with(model, shap, &[path.to_path_buf()], config, None)
+}
+
+/// The model and SHAP table `config` names.
+fn load_model(config: &ScanConfig) -> Result<(Model, Option<ShapImportance>)> {
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let shap = ShapImportance::load(config.model_dir())?;
+    Ok((model, shap))
 }
 
 /// Scan a set of file and directory paths, classifying every file.
@@ -64,8 +85,23 @@ pub fn run_paths(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<ScanSummary> {
+    let (model, shap) = load_model(config)?;
+    run_paths_with(&model, shap.as_ref(), paths, config, registry_map)
+}
+
+/// [`run_paths`] with a model already loaded.
+///
+/// # Errors
+/// As [`run_paths`].
+pub fn run_paths_with(
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    paths: &[PathBuf],
+    config: &ScanConfig,
+    registry_map: Option<&HashMap<String, RegistryProvenance>>,
+) -> Result<ScanSummary> {
     prefetch_cleave_resources();
-    let mut session = Session::start(config)?;
+    let mut session = Session::start(config, model, shap);
 
     // Partition the requested paths: explicit files become one unfiltered batch
     // (a named file is always analyzed), each directory is walked upfront into
@@ -194,8 +230,9 @@ pub fn run_bytes(
     // indexes (a multi-hundred-ms regex build) are left to build lazily only if
     // an analysis actually misses, and are skipped entirely on a warm scan. The
     // lazy build then runs on this main thread, so there is no rayon re-entrancy
-    // to guard against. Directory/worker paths still prefetch (they do fan out).
-    let session = Session::start(config)?;
+    // to guard against. Directory paths still prefetch (they do fan out).
+    let (model, shap) = load_model(config)?;
+    let session = Session::start(config, &model, shap.as_ref());
     // isotope13 first, under `--enriched`: by digest in `auto`, by upload in
     // `remote`. A registry document standing in for an unfetchable package is
     // never asked about — its bytes differ on every fetch.
@@ -251,7 +288,8 @@ pub fn report_remote(
     purl: Option<&str>,
     verdict: &Verdict,
 ) -> Result<ScanSummary> {
-    let session = Session::start(config)?;
+    let (model, shap) = load_model(config)?;
+    let session = Session::start(config, &model, shap.as_ref());
     session.record_remote(label, sha, purl, verdict);
     session.finish()
 }
@@ -356,8 +394,8 @@ fn analysis_options(config: &ScanConfig) -> AnalysisOptions {
 /// shares, from the loaded model to the tally the summary is built from.
 struct Session<'a> {
     config: &'a ScanConfig,
-    model: Model,
-    shap: Option<ShapImportance>,
+    model: &'a Model,
+    shap: Option<&'a ShapImportance>,
     /// What every file is analyzed with, the bloom skip predicate and the
     /// Ctrl-C flag included.
     opts: AnalysisOptions,
@@ -373,11 +411,9 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    /// The one setup every CLI entry point shares: load the model, arm Ctrl-C,
+    /// The one setup every CLI entry point shares: arm Ctrl-C,
     /// and build the analysis options and the hopper uploader.
-    fn start(config: &'a ScanConfig) -> Result<Self> {
-        let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-        let shap = ShapImportance::load(config.model_dir())?;
+    fn start(config: &'a ScanConfig, model: &'a Model, shap: Option<&'a ShapImportance>) -> Self {
         let cancel = crate::interrupt::arm("Interrupted — finishing current file…");
         let mut opts = analysis_options(config);
         opts.cancellation = Some(Arc::clone(&cancel));
@@ -385,7 +421,7 @@ impl<'a> Session<'a> {
         let uploader = config
             .hopper()
             .map(|url| crate::upload::Uploader::new(url, crate::upload::default_worker_name()));
-        Ok(Self {
+        Self {
             config,
             model,
             shap,
@@ -396,7 +432,7 @@ impl<'a> Session<'a> {
             uploader,
             broken_pipe: AtomicBool::new(false),
             started: Instant::now(),
-        })
+        }
     }
 
     /// Print the banner and start the bar, when a terminal scan covers more
@@ -411,8 +447,8 @@ impl<'a> Session<'a> {
     fn classifier(&self) -> Classifier<'_> {
         Classifier {
             config: self.config,
-            model: &self.model,
-            shap: self.shap.as_ref(),
+            model: self.model,
+            shap: self.shap,
             cancel: Some(self.cancel.as_ref()),
         }
     }
@@ -863,7 +899,7 @@ fn write_error_record(file_path: &Path, msg: &str) -> io::Result<()> {
 
 /// Cleave context density for machine/LLM output. The primary terminal artifact
 /// and its fetched appendix use Scan's own global three-trait cards.
-pub fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
+pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     if matches!(
         config.format(),
         OutputFormat::Tiny | OutputFormat::Interpret
@@ -954,7 +990,7 @@ pub(crate) fn bloom_gate(
 /// scans, which decide before analysis; path scans apply the same override in
 /// [`Session::record`], where cleave has already produced a minimal report by
 /// the time the decision is known and a fresh known-good is re-analyzed in place.
-pub fn bloom_gate_fresh(
+pub(crate) fn bloom_gate_fresh(
     config: &ScanConfig,
     path: &Path,
     decision: BloomDecision,
@@ -1076,7 +1112,7 @@ fn is_attached_sidecar(path: &Path) -> bool {
 /// The two distinct detection inventories shown in the banner. Bloom entries
 /// are SHA-256/PURL signatures; traits, composites, and YARA are actual rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DetectionCounts {
+pub(crate) struct DetectionCounts {
     pub hashes_and_purls: u64,
     pub rules: u64,
 }
@@ -1084,7 +1120,7 @@ pub struct DetectionCounts {
 /// Detection inventory after resource load. `cleave::version_info()` loads (or
 /// reuses) shared resources; `hashes_and_purls` comes from the already-loaded
 /// Bloom repository.
-pub fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
+pub(crate) fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
     let info = cleave::version_info();
     DetectionCounts {
         hashes_and_purls,
@@ -1094,7 +1130,7 @@ pub fn detection_counts_from(hashes_and_purls: u64) -> DetectionCounts {
 
 /// Detection inventory already resident in memory for the scan banner. Shared
 /// by [`run`], [`run_paths`], and `ps` so every scanner reports the same counts.
-pub fn detection_counts(config: &ScanConfig) -> DetectionCounts {
+pub(crate) fn detection_counts(config: &ScanConfig) -> DetectionCounts {
     let hashes_and_purls = config
         .bloom()
         .map_or(0, crate::bloom_repo::Lookup::rule_count);

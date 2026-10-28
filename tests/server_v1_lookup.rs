@@ -157,9 +157,9 @@ async fn several_sha256_cannot_pair_with_a_purl() -> Result<()> {
     Ok(())
 }
 
-/// Over the cap is a request we decline whole, naming the limit and the route
-/// that has no limit. Discovering it as a truncated query string instead would
-/// silently drop packages from a security decision.
+/// Over the cap is a request we decline whole, naming the limit. Discovering it
+/// as a truncated query string instead would silently drop packages from a
+/// security decision.
 #[tokio::test]
 async fn too_many_packages_is_refused_by_name() -> Result<()> {
     let many = (0..51)
@@ -167,13 +167,13 @@ async fn too_many_packages_is_refused_by_name() -> Result<()> {
         .collect::<Vec<_>>()
         .join("&");
     let (status, body) = get(&format!("/v1/lookup?{many}")).await?;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "too_many_packages");
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("POST /v1/lookup")),
-        "the error must name the route that has no limit",
+            .is_some_and(|m| m.contains("50")),
+        "the error must name the limit",
     );
     Ok(())
 }

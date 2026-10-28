@@ -19,22 +19,20 @@ pub const KEY_SCHEME: &str = "nsrl/sha256/v1";
 const PREFIX: &str = "nsrl/modern/v1";
 
 /// Where the separately installed NSRL bundle lives.
-#[must_use]
-pub fn install_dir() -> PathBuf {
-    std::env::var_os("SCAN_NSRL_DIR").map_or_else(
-        || {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("atomdrift/scan/nsrl-modern")
-        },
-        PathBuf::from,
-    )
+///
+/// # Errors
+/// When there is no override and no data directory; see [`crate::data_dir`].
+pub fn install_dir() -> anyhow::Result<PathBuf> {
+    match std::env::var_os("SCAN_NSRL_DIR") {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(crate::data_dir()?.join("nsrl-modern")),
+    }
 }
 
 /// The installed NSRL identity, without loading its large bit array.
 #[must_use]
 pub fn installed_manifest() -> Option<Manifest> {
-    let manifest = burton::build::read_manifest(&install_dir())?;
+    let manifest = burton::build::read_manifest(&install_dir().ok()?)?;
     validate_manifest(&manifest).ok()?;
     Some(manifest)
 }
@@ -42,7 +40,7 @@ pub fn installed_manifest() -> Option<Manifest> {
 /// Upstream NSRL release version, independent of Scan and the ADBL layout.
 #[must_use]
 pub fn installed_release() -> Option<String> {
-    let text = std::fs::read_to_string(install_dir().join("bloom.toml")).ok()?;
+    let text = std::fs::read_to_string(install_dir().ok()?.join("bloom.toml")).ok()?;
     source_release(&text)
 }
 

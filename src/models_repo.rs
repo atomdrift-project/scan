@@ -48,7 +48,7 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
         anyhow::bail!("SCAN_MODELS_DIR={explicit} does not exist");
     }
 
-    let data_dir = default_models_dir();
+    let data_dir = default_models_dir()?;
     // `settle`: an update between its swap's two renames is not a first run.
     if has_models(&data_dir) || (crate::model_update::settle(&data_dir) && has_models(&data_dir)) {
         tracing::debug!("Using models from {}", data_dir.display());
@@ -64,15 +64,19 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
 /// Get the installed model commit (short), from the bundle's sidecar.
 #[must_use]
 pub fn version() -> Option<String> {
-    crate::model_update::installed(&install_target()).map(|i| i.commit.chars().take(12).collect())
+    crate::model_update::installed(&install_target().ok()?)
+        .map(|i| i.commit.chars().take(12).collect())
 }
 
 /// The models directory in use: the `SCAN_MODELS_DIR` override (which the
 /// updater leaves alone) or the default bundle path the updater fills. Doesn't
 /// bootstrap or require the dir to exist.
-#[must_use]
-pub fn install_target() -> PathBuf {
-    std::env::var_os("SCAN_MODELS_DIR").map_or_else(default_models_dir, PathBuf::from)
+///
+/// # Errors
+/// When there is no override and no data directory; see [`crate::data_dir`].
+pub fn install_target() -> Result<PathBuf> {
+    std::env::var_os("SCAN_MODELS_DIR")
+        .map_or_else(default_models_dir, |dir| Ok(PathBuf::from(dir)))
 }
 
 /// Feature dimensionality of the installed model: the number of inputs each
@@ -85,7 +89,7 @@ pub fn feature_dimension() -> Option<usize> {
     struct Dim {
         total_features: usize,
     }
-    let base = install_target();
+    let base = install_target().ok()?;
     let spec = [
         base.join("general").join("feature_spec.json"),
         base.join("feature_spec.json"),
@@ -103,7 +107,7 @@ pub fn feature_dimension() -> Option<usize> {
 /// no model is installed. Used by `scan version`.
 #[must_use]
 pub fn model_count() -> Option<usize> {
-    let base = install_target();
+    let base = install_target().ok()?;
     if !base.is_dir() {
         return None;
     }
@@ -118,15 +122,12 @@ pub fn model_count() -> Option<usize> {
 
 /// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,
 /// where `<bundle>` is named by `SCAN_MODELS_REPO` (see [`bundle_name`]).
-fn default_models_dir() -> PathBuf {
+fn default_models_dir() -> Result<PathBuf> {
     let repo = std::env::var("SCAN_MODELS_REPO");
     let bundle = bundle_name(repo.as_deref().unwrap_or(DEFAULT_MODELS_REPO_URL));
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("atomdrift")
-        .join("scan")
+    Ok(crate::data_dir()?
         .join("models")
-        .join(bundle.unwrap_or("azoth"))
+        .join(bundle.unwrap_or("azoth")))
 }
 
 /// The bundle directory name for an upstream git URL: its last path segment,

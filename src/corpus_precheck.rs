@@ -325,6 +325,7 @@ pub enum Standing {
 
 impl Standing {
     /// Whether this standing spares us the analysis at all.
+    #[must_use]
     pub const fn skips_analysis(&self) -> bool {
         !matches!(self, Self::Analyze)
     }

@@ -90,10 +90,22 @@ impl Lookup {
     /// is about to be analyzed that need not have been.
     #[must_use]
     pub fn load() -> Self {
-        let primary = install_dir();
+        let primary = match install_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "no bloom filters: every file will be analyzed"
+                );
+                return Self::default();
+            }
+        };
         let mut lookup = Self::load_from(&primary);
         if crate::nsrl_repo::enabled() {
-            lookup.attach_nsrl(&primary, &crate::nsrl_repo::install_dir());
+            match crate::nsrl_repo::install_dir() {
+                Ok(nsrl) => lookup.attach_nsrl(&primary, &nsrl),
+                Err(error) => tracing::warn!(error = format!("{error:#}"), "no NSRL filter"),
+            }
         }
         lookup
     }
@@ -332,22 +344,19 @@ pub fn counts() -> BloomCounts {
 /// bundle is installed. Used by `scan version`.
 #[must_use]
 pub fn installed_manifest() -> Option<burton::Manifest> {
-    burton::build::read_manifest(&install_dir())
+    burton::build::read_manifest(&install_dir().ok()?)
 }
 
 /// Where filters are read from: `SCAN_BLOOM_DIR` if set (which the updater
 /// then leaves alone), else the canonical data path the updater fills.
-#[must_use]
-pub fn install_dir() -> PathBuf {
-    std::env::var("SCAN_BLOOM_DIR").map_or_else(|_| default_install_dir(), PathBuf::from)
-}
-
-fn default_install_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("atomdrift")
-        .join("scan")
-        .join("bloom")
+///
+/// # Errors
+/// When there is no override and no data directory; see [`crate::data_dir`].
+pub fn install_dir() -> anyhow::Result<PathBuf> {
+    match std::env::var_os("SCAN_BLOOM_DIR") {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(crate::data_dir()?.join("bloom")),
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +565,58 @@ mod tests {
             assert_eq!(lk.memo_sha256(&digest(6)), Decision::SightedHostile);
             assert_eq!(lk.memo_sha256(&digest(7)), Decision::Unknown);
         }
+    }
+
+    #[test]
+    fn filters_answer_skip_known_bad_and_unknown() {
+        use crate::bloom_repo::{Decision, KEY_SCHEME, Lookup, purl_key};
+        use burton::{KeySets, Record, Tier};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut good_sha = [0u8; 32];
+        good_sha[0] = 1;
+        let mut bad_sha = [0u8; 32];
+        bad_sha[0] = 2;
+
+        let mut sets = KeySets::new();
+        sets.insert(
+            Tier::Good,
+            Record {
+                purl: purl_key("pkg:npm/good@1"),
+                sha256: Some(good_sha),
+            },
+        );
+        sets.insert(
+            Tier::Bad,
+            Record {
+                purl: purl_key("pkg:npm/evil@1"),
+                sha256: Some(bad_sha),
+            },
+        );
+        burton::build::write_bundle(
+            tmp.path(),
+            &sets.into_filters(1e-9),
+            "2026-08-31",
+            KEY_SCHEME,
+        )
+        .expect("write bundle");
+
+        let lk = Lookup::load_from(tmp.path());
+        assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
+        assert_eq!(lk.memo_purl("pkg:npm/evil@1"), Decision::KnownBad);
+        assert_eq!(lk.memo_sha256(&good_sha), Decision::Skip);
+        let mut unseen = [0u8; 32];
+        unseen[0] = 0xab;
+        assert_eq!(lk.memo_sha256(&unseen), Decision::Unknown);
+    }
+
+    /// Without filters installed every key is `unknown` — fail closed, never
+    /// an error, so a lookup still answers.
+    #[test]
+    fn filters_absent_reads_unknown() {
+        use crate::bloom_repo::{Decision, Lookup};
+        let lk = Lookup::default();
+        assert_eq!(lk.memo_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
+        assert_eq!(lk.memo_sha256(&[7u8; 32]), Decision::Unknown);
     }
 }

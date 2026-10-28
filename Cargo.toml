@@ -119,7 +119,11 @@ sha2 = "0.10"
 # direct dependency.
 base64 = "0.22"
 terminal-colorsaurus = "0.4"
-axum = { version = "0.8", features = ["multipart"] }
+axum = "0.8"
+# The accept loop `serve` runs instead of `axum::serve`, which sets no header
+# read timeout and no connection cap. Both are already in the graph via axum.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful", "service"] }
 # Repeated query keys (?purl=a&purl=b) need sequence-aware decoding.
 form_urlencoded = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
@@ -233,9 +237,6 @@ default = ["cleave-breadcrumbs"]
 #     ./out/scan.heap -f json <sample>
 # Analyze with: jeprof --text ./out/scan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
-# Unstable support surface used only by postdoc's daemon implementations.
-# Without this feature the same modules and symbols retain crate-only visibility.
-daemon-support = []
 
 # Emit per-member rayon-thread breadcrumbs in the wedge dump. On by default
 # (see `default` above); needs a cleave that exposes `cleave::breadcrumb`.
@@ -332,11 +333,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "atomscan"
 path = "src/main.rs"
-
-# Mock hopper for self-contained worker benchmarks.
-[[bin]]
-name = "scan-bench-hopper"
-path = "src/bin/bench_hopper.rs"
 
 # Bloom filter producer: builds known-good/known-bad filters from a labelled
 # pool export and writes a publishable bundle (see `make publish-bloom`).

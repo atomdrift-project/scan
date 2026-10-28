@@ -2,17 +2,20 @@
 # Interleaved full-corpus A/B: for each sample run both binaries back-to-back,
 # alternating which goes first, so thermal/load drift hits both legs equally.
 # Usage: gauntlet-ab.sh <binA> <binB> <dataset-dir> <out-dir>
-set -u
+set -eu
 
 BIN_A=$1
 BIN_B=$2
 DATASET=$3
 OUT=$4
 
-SNAP=/private/tmp/claude-501/-Users-t-dev-atomdrift-scan/e6ef4f79-beda-4e4a-bf24-4f5010d7032c/scratchpad/traits-snapshot
+# Pin the traits to a frozen snapshot: the installed traits update themselves,
+# which would make the two legs (or two runs) disagree for reasons unrelated
+# to the binaries under test.
+: "${CLEAVE_TRAITS_DIR:?set CLEAVE_TRAITS_DIR to a frozen traits snapshot}"
+export CLEAVE_TRAITS_DIR
 export SCAN_NO_ANALYSIS_CACHE=1
-export SCAN_FETCH=none
-export CLEAVE_TRAITS_DIR=$SNAP
+export SCAN_FOLLOW=none
 export SCAN_NO_UPDATE=1
 export RUST_LOG=scan=warn,cleave=error
 

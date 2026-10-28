@@ -241,19 +241,6 @@ pub(super) struct Info {
     total_mem_mb: u64,
     model_commit: Option<String>,
     traits_commit: Option<String>,
-    /// Whether the idle worker is configured, running, and standing aside for
-    /// a request. Published because its absence is otherwise invisible — it
-    /// either starts or it does not, and until this existed the only evidence
-    /// was a log line that never appeared.
-    idle_worker: InfoIdleWorker,
-}
-
-#[derive(Serialize)]
-pub(super) struct InfoIdleWorker {
-    running: bool,
-    frozen: bool,
-    hopper: bool,
-    interactive_in_flight: usize,
 }
 
 impl Info {
@@ -268,12 +255,6 @@ impl Info {
             total_mem_mb: cleave::memory_tracker::total_memory().map_or(0, |bytes| bytes / MIB),
             model_commit: crate::models_repo::version(),
             traits_commit: cleave::traits_repo::version(),
-            idle_worker: InfoIdleWorker {
-                running: state.idle_worker_running(),
-                frozen: state.is_busy(),
-                hopper: state.config.hopper().is_some(),
-                interactive_in_flight: state.in_flight.len(),
-            },
         }
     }
 }
@@ -356,12 +337,6 @@ pub(super) struct Uploads {
     uploaded: usize,
 }
 
-#[derive(Serialize)]
-pub(super) struct StatsIdleWorker {
-    running: bool,
-    frozen: bool,
-}
-
 /// `/_/stats`. The comment on each field says what a router reads it for.
 #[derive(Serialize)]
 pub(super) struct Stats<'a> {
@@ -376,12 +351,6 @@ pub(super) struct Stats<'a> {
     slots: usize,
     slots_free: usize,
     in_flight: usize,
-    /// Cores of this box's load that will not be there when a request
-    /// arrives, for a router to subtract before calling the box saturated.
-    /// Without it, load alone made a server full of sheddable work look
-    /// identical to one full of requests (2026-09-05). See beamline's
-    /// `foregroundPressure`.
-    background_in_flight: usize,
     /// The basis `slots` was sized on, so a caller can read `load1` against
     /// the right denominator. Worth reporting because `in_flight` is this
     /// process's own count and nothing else's: measured on a 64-core node,
@@ -452,8 +421,6 @@ pub(super) struct Stats<'a> {
     /// Whether the verdicts it computes are actually reaching hopper.
     /// `failed` climbing means work is being done and then lost.
     uploads: Option<Uploads>,
-    /// Whether spare capacity is genuinely spare.
-    idle_worker: StatsIdleWorker,
 }
 
 impl<'a> Stats<'a> {
@@ -480,7 +447,6 @@ impl<'a> Stats<'a> {
             slots: state.config.workers,
             slots_free: state.available_analysis_permits(),
             in_flight,
-            background_in_flight: state.sheddable_cores(),
             physical_cpus: cleave::memory_tracker::physical_cpu_count(),
             cpu_busy_cores: state.cpu_busy.sample(),
             whale_slots: WhaleSlots {
@@ -532,10 +498,6 @@ impl<'a> Stats<'a> {
                     uploaded: s.uploaded,
                 }
             }),
-            idle_worker: StatsIdleWorker {
-                running: state.idle_worker_running(),
-                frozen: state.is_busy(),
-            },
         }
     }
 }
@@ -888,7 +850,6 @@ mod tests {
                 "slots",
                 "slots_free",
                 "in_flight",
-                "background_in_flight",
                 "physical_cpus",
                 "cpu_busy_cores",
                 "whale_slots",
@@ -921,7 +882,6 @@ mod tests {
                 "model_commit",
                 "ready",
                 "uploads",
-                "idle_worker",
             ]
         );
         let stats = serde_json::to_value(Stats::collect(&state)).expect("serializes");
@@ -939,7 +899,6 @@ mod tests {
         );
         assert_eq!(keys(&stats["recent"]), ["samples", "p80_ms", "mean_ms"]);
         assert_eq!(keys(&stats["whale_slots"]), ["in_use", "max"]);
-        assert_eq!(keys(&stats["idle_worker"]), ["running", "frozen"]);
 
         let info = Info::collect(&state);
         assert_eq!(
@@ -953,12 +912,7 @@ mod tests {
                 "total_mem_mb",
                 "model_commit",
                 "traits_commit",
-                "idle_worker",
             ]
-        );
-        assert_eq!(
-            keys(&info.idle_worker),
-            ["running", "frozen", "hopper", "interactive_in_flight"]
         );
 
         let trusted_ok = HealthOk {
@@ -1046,25 +1000,5 @@ mod tests {
             uptime_secs: 1,
         };
         assert_eq!(keys(&failed), ["status", "reason", "uptime_secs"]);
-
-        let running = super::super::handlers::StatusBody {
-            state: "running",
-            purl: None,
-            url: None,
-            sha256: Some("a".repeat(64)),
-            elapsed_ms: Some(5),
-            attached: Some(1),
-        };
-        assert_eq!(
-            keys(&running),
-            ["state", "purl", "url", "sha256", "elapsed_ms", "attached"]
-        );
-        let unknown = super::super::handlers::StatusBody {
-            state: "unknown",
-            elapsed_ms: None,
-            attached: None,
-            ..running
-        };
-        assert_eq!(keys(&unknown), ["state", "purl", "url", "sha256"]);
     }
 }

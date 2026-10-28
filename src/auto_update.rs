@@ -166,13 +166,25 @@ fn refresh() -> Outcome {
     let bloom_dir = crate::bloom_repo::install_dir();
     let results = std::thread::scope(|s| {
         let traits = s.spawn(|| crate::traits_repo::update(false, true));
-        let models = s.spawn(|| crate::model_update::update(&models_dir, false, true));
-        let bloom = s.spawn(|| crate::bloom_update::update(&bloom_dir, false, true));
+        let models = s.spawn(|| {
+            crate::model_update::update(
+                models_dir.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?,
+                false,
+                true,
+            )
+        });
+        let bloom = s.spawn(|| {
+            crate::bloom_update::update(
+                bloom_dir.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?,
+                false,
+                true,
+            )
+        });
         // NSRL follows its own manifest on the normal daily rules check,
         // including first install. SCAN_NSRL=0 disables this source.
         let nsrl = s.spawn(|| {
             if crate::nsrl_repo::enabled() {
-                crate::nsrl_repo::update(&crate::nsrl_repo::install_dir(), true)
+                crate::nsrl_repo::update(&crate::nsrl_repo::install_dir()?, true)
             } else {
                 Ok(false)
             }
@@ -220,10 +232,12 @@ fn print_checkmark(mode: Mode) {
     let counts = crate::engine::detection_counts_from(hashes_and_purls);
 
     let traits_dir = cleave::traits_repo::install_target();
-    let models_dir = crate::models_repo::install_target();
+    let models_dir = crate::models_repo::install_target().ok();
     let newest = [
         cleave::rule_update::installed(&traits_dir).map(|i| i.date),
-        crate::model_update::installed(&models_dir).map(|i| i.date),
+        models_dir
+            .and_then(|dir| crate::model_update::installed(&dir))
+            .map(|i| i.date),
     ]
     .into_iter()
     .flatten()

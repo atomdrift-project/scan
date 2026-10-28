@@ -562,15 +562,22 @@ impl FetchPolicy {
         Self::parse_selection(value, false)
     }
 
-    /// Copy only the selected reference kinds onto an operator-configured
-    /// policy, preserving depth, age, byte, platform, and fan-out ceilings.
+    /// This operator-configured policy, following only the reference kinds
+    /// `selected` names, or `None` when `selected` names a kind this policy
+    /// does not follow: a request can narrow what the operator allowed, never
+    /// widen it. Depth, age, byte, platform and fan-out ceilings stay.
     #[must_use]
-    pub const fn with_selection(mut self, selected: Self) -> Self {
-        self.urls = selected.urls;
-        self.packages = selected.packages;
-        self.deps = selected.deps;
-        self.ci = selected.ci;
-        self
+    pub const fn restricted_to(self, selected: Self) -> Option<Self> {
+        if selected.selection_bits() & !self.selection_bits() != 0 {
+            return None;
+        }
+        Some(Self {
+            urls: selected.urls,
+            packages: selected.packages,
+            deps: selected.deps,
+            ci: selected.ci,
+            ..self
+        })
     }
 
     /// Compact identity for single-flight keys and structured logs.
@@ -4376,6 +4383,19 @@ pub struct Unretrievable {
 }
 
 impl Unretrievable {
+    /// Whether the artifact is gone: its source answered that there is no
+    /// such release, or there is nothing to fetch it from. Only then is the
+    /// registry's record all there is to scan.
+    pub(crate) fn gone(&self) -> bool {
+        matches!(
+            &self.outcome,
+            Outcome::Failed(FetchError::Status(404 | 410))
+                | Outcome::Unresolved(
+                    fletch::fetch::Unresolved::NoRelease | fletch::fetch::Unresolved::Unsupported
+                )
+        )
+    }
+
     /// Whether a healthier worker may retrieve this artifact. Infrastructure
     /// failures and local budget stops say nothing about the package.
     pub(crate) fn infrastructure_failure(&self) -> bool {
@@ -4456,6 +4476,32 @@ impl std::error::Error for Unretrievable {}
 #[cfg(test)]
 mod retrieval_failure_tests {
     use super::*;
+
+    /// Only an answer that the release does not exist lets `scan purl` judge
+    /// a package on its registry record alone. A size cap, a refused address
+    /// or an outage says nothing about the package.
+    #[test]
+    fn only_a_missing_release_is_gone() {
+        let gone = |outcome| {
+            Unretrievable {
+                target: "https://registry.test/x".into(),
+                outcome,
+            }
+            .gone()
+        };
+        assert!(gone(Outcome::Failed(FetchError::Status(404))));
+        assert!(gone(Outcome::Failed(FetchError::Status(410))));
+        assert!(gone(Outcome::Unresolved(
+            fletch::fetch::Unresolved::NoRelease
+        )));
+        assert!(!gone(Outcome::Failed(FetchError::TooLarge)));
+        assert!(!gone(Outcome::Failed(FetchError::Refused(
+            "private address".into()
+        ))));
+        assert!(!gone(Outcome::Failed(FetchError::Timeout)));
+        assert!(!gone(Outcome::Failed(FetchError::Status(503))));
+        assert!(!gone(Outcome::BudgetExceeded));
+    }
 
     struct FailingMetadata(FetchError);
 
@@ -5493,32 +5539,16 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
         }
     }
 
-    // Run the lookups on the existing rayon pool rather than spawning a fresh
-    // batch of OS threads.
-    //
-    // `std::thread::scope` here created `REGISTRY_LOOKUP_CONCURRENCY` threads per
-    // batch, and a directory scan reaches this once per scanned root (times each
-    // `--fetch-depth` hop). Every spawn and exit takes the address space's
-    // `mmap_lock` to map and unmap a stack, and with the whole rayon pool already
-    // resident that serializes into `native_queued_spin_lock_slowpath` — measured
-    // at 65% of all samples, with the fetch path burning ~1350s of system time
-    // against ~13s for the same scan offline. Rayon's workers already exist, so
-    // this is the same fan-out with no thread churn.
-    //
-    // The lookups are also not the I/O-bound work the old fan-out assumed: nearly
-    // all are blob-cache hits that parse JSON and map an ecosystem, i.e. CPU. A
-    // separate experiment raising the old constant 8 -> 64 made the scan *slower*
-    // (40s vs 33s) for exactly that reason.
-    let fresh: Vec<(usize, Option<Lookup>)> = {
+    // On the rayon pool, not fresh OS threads: nearly every lookup is a
+    // blob-cache hit that parses JSON, i.e. CPU, and a thread spawned per lookup
+    // per scanned root serializes on the address space's mmap lock.
+    let fresh: Vec<(usize, Result<Lookup, fletch::RegistryError>)> = {
         use rayon::prelude::*;
         misses
             .par_iter()
             .map(|&i| {
-                // The raw, un-aged record (or `None` for an unresolved or
-                // unsupported package) — both worth memoizing so the lookup isn't
-                // re-attempted for every file that names it.
                 let (record, sources) =
-                    fletch::registry_with_sources(&selected[i].locator, &res.net, &res.cache);
+                    fletch::try_registry_with_sources(&selected[i].locator, &res.net, &res.cache);
                 let lookup = record.map(|record| Lookup {
                     record,
                     sources: Some(sources),
@@ -5531,9 +5561,19 @@ fn lookup_registries(selected: &[Reference], res: &Resources, now: u64) -> Vec<O
     let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(fresh.len());
     for (i, lookup) in fresh {
         let key = locator(&selected[i]).to_owned();
-        let Some(Lookup { record, sources }) = lookup else {
-            writes.push((key, None));
-            continue;
+        let Lookup { record, sources } = match lookup {
+            Ok(lookup) => lookup,
+            // A registry that could not be reached may answer next time, so
+            // the miss is not remembered; every other answer is final.
+            Err(fletch::RegistryError::Unavailable(error)) => {
+                tracing::warn!(locator = %key, %error, "registry unavailable; not caching the miss");
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(locator = %key, %error, "no registry record");
+                writes.push((key, None));
+                continue;
+            }
         };
         // Keep only the release times `with_age` can still count from any later
         // clock: a release older than the cadence window at memo time can never

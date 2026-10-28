@@ -91,6 +91,7 @@ pub fn register_self() {
 /// Matches what `/proc/<pid>/task`, `ps`, and a debugger report, so log lines,
 /// the in-flight census, and the wait-channel lookup can all correlate on it.
 /// The single canonical implementation for the crate.
+#[must_use]
 pub fn os_thread_id() -> u64 {
     #[cfg(target_os = "linux")]
     {

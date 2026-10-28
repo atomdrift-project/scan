@@ -31,7 +31,7 @@ exec '$system_rizin' "\$@"
 EOF
 chmod +x "$output_dir/bin/rizin"
 ${CC:-cc} -O2 $(pkg-config --cflags rz_flag) \
-    "$repo_dir/tests/rizin-offset-index.c" $(pkg-config --libs rz_flag) \
+    "$repo_dir/scripts/rizin/offset-index.c" $(pkg-config --libs rz_flag) \
     -o "$output_dir/test-offset-index"
 LD_LIBRARY_PATH="$output_dir/lib" "$output_dir/test-offset-index"
 echo "Built and tested: $output_dir/bin/rizin"

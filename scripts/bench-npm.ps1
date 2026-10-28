@@ -7,7 +7,7 @@ param([Parameter(Mandatory=$true)][string]$Id,
       [string]$Mode = 'balanced')
 $env:CLEAVE_SKIP_CACHE = '1'
 $env:CLEAVE_SKIP_YARA_CACHE = '0'
-$env:SCAN_FETCH = 'none'
+$env:SCAN_FOLLOW = 'none'
 $env:SCAN_NO_UPDATE_CHECK = '1'
 # Rule set: explicit -Traits wins; otherwise an inherited CLEAVE_TRAITS_DIR is
 # honoured, and only a bare invocation falls back to the installed bundle.

@@ -19,19 +19,26 @@ pub(crate) fn from_days(days: i64) -> (i64, u32, u32) {
     (yoe + era * 400 + i64::from(month <= 2), month, day)
 }
 
-/// Days since 1970-01-01 for a civil date; `None` when the month or day is
-/// out of range.
+/// Days since 1970-01-01 for a civil date; `None` when the date does not
+/// exist (month 13, February 30th).
 pub(crate) fn to_days(year: i64, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // The arithmetic below accepts any day up to 31 and rolls an impossible one
+    // into the next month, so a date is real only if it survives the round trip.
+    let days = days_from_civil(year, month, day);
+    (from_days(days) == (year, month, day)).then_some(days)
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = year - i64::from(month <= 2);
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400); // [0, 399]
     let mp = i64::from(month) + if month > 2 { -3 } else { 9 };
     let doy = (153 * mp + 2) / 5 + i64::from(day) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    Some(era * 146_097 + doe - 719_468)
+    era * 146_097 + doe - 719_468
 }
 
 /// `secs` after the Unix epoch as RFC 3339 in UTC (`2026-10-01T13:02:22Z`).
@@ -63,5 +70,9 @@ mod tests {
         }
         assert_eq!(to_days(2026, 13, 1), None);
         assert_eq!(to_days(2026, 2, 0), None);
+        assert_eq!(to_days(2026, 2, 31), None);
+        assert_eq!(to_days(2026, 4, 31), None);
+        assert_eq!(to_days(2100, 2, 29), None);
+        assert_eq!(to_days(2000, 2, 29), Some(11_016));
     }
 }

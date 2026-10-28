@@ -82,6 +82,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CROSS_REV: 55f847251389c5406df85579191c0eac412fab3a
+  # The exact rustc every release binary is built with. Bump deliberately.
+  RUST_TOOLCHAIN: "1.99.1"
   RUST_BACKTRACE: "1"
   SCAN_NO_UPDATE: "1"
 
@@ -138,8 +140,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
           rustup target add "$TARGET"
           rustc --version --verbose
 
@@ -1145,8 +1147,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
           rustup target add "$TARGET"
           rustc --version --verbose
 

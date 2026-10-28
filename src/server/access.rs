@@ -115,11 +115,12 @@ impl Subject {
         }
     }
 
-    /// A request about a file already on this host — `/analyze-path`. The path
-    /// as the caller wrote it, which is what they will search the log for; the
-    /// canonicalized form is on the handler's own line when they differ.
-    pub(super) fn path(value: &str) -> Self {
+    /// A request about a file already on this host — `?path=`. The path as
+    /// the caller wrote it, which is what they will search the log for, and
+    /// the digest of what was read, once it was.
+    pub(super) fn path(value: &str, sha256: Option<&str>) -> Self {
         Self {
+            sha256: sha256.and_then(subject_field),
             path: subject_field(value),
             ..Self::default()
         }
@@ -387,7 +388,7 @@ mod tests {
     /// A local-file request is named by the path the caller asked for.
     #[test]
     fn subject_carries_a_path() {
-        let subject = Subject::path("/srv/samples/a.bin");
+        let subject = Subject::path("/srv/samples/a.bin", None);
         assert_eq!(subject.path.as_deref(), Some("/srv/samples/a.bin"));
         assert_eq!(subject.sha256, None);
         assert_eq!(subject.purl, None);

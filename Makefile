@@ -70,143 +70,17 @@ else
 endif
 
 OUT_DIR = out
-BUILD ?= build
-SERVER_RUN ?= scan
-WORKER_RUN ?= litworker
 DATASET ?= slow
-
-# Truthy ("1") iff the user explicitly passed BUILD or WORKER_RUN on the make
-# command line or via the environment, rather than inheriting the defaults
-# above. Used to opt into the SSH-orchestrated worker deploy on Linux; with no
-# override the Linux dispatch installs locally via systemd.
-WORKER_REMOTE := $(if $(strip \
-    $(filter command line environment,$(origin BUILD)) \
-    $(filter command line environment,$(origin WORKER_RUN))),1,)
-# $(HOME)/data/benchmark on every platform — the hardcoded /Users/t path meant
-# every benchmark/profile target aborted with "benchmark path not found" on the
-# Linux box the nightly gauntlet actually runs on.
 BENCHMARK_ROOT ?= $(HOME)/data/benchmark
 BENCHMARK_PATH ?= $(BENCHMARK_ROOT)/$(DATASET)
 SCAN_THREADS ?=
-MAX_JOBS ?= 25
-WORKERS  ?=
-MAX_RSS_GB ?=
-URL ?= http://10.9.8.10:8081/
-# Hopper's API token. Hopper requires `Authorization: Bearer <token>` on every
-# route and does not exempt loopback, so the pull worker and every
-# `--hopper`/`--upload` run need it. `atomscan` reads it from `~/.tok/hopper`
-# in its own home (`$HOPPER_TOKEN` overrides); the deploy scripts copy this
-# file into the service account's home, since a supervised service does not
-# share the operator's. Exported so a command-line override reaches them.
-HOPPER_TOKEN_FILE ?= $(HOME)/.tok/hopper
-export HOPPER_TOKEN_FILE
-
-# The LLM endpoint's bearer token. Our vLLM requires one on every /v1 route, so
-# a deploy without it drops that endpoint from the failover chain and grades on
-# whatever is left (OpenRouter, or nothing). `atomscan` reads it from
-# `~/.tok/llm` in its own home (`SCAN_LLM_KEY` overrides); the deploy scripts
-# copy this file into the service account's home, since a supervised service
-# does not share the operator's. Exported so a command-line override reaches
-# them.
-LLM_TOKEN_FILE ?= $(HOME)/.tok/llm
-export LLM_TOKEN_FILE
-
-# --- `make deploy` / `make deploy-server` knobs ------------------------------
-# Read by scripts/server/server-linux.sh (Linux), server-freebsd.sh (FreeBSD)
-# and rollout-bastille.sh (`make deploy-jail`); see docs/SERVER_API.md.
-#
-#   make deploy HOPPER=https://hops.isotope13.ai
-#
-# HOPPER is the hopper the server renews results on (`serve --hopper`). Setting
-# it is also what makes the deploy install HOPPER_TOKEN_FILE for the service
-# account — hopper rejects an unauthenticated renewal with 401.
-#
-# It may name the same corpus twice, replica first and primary behind it, so a
-# replica outage costs a retry rather than a lost verdict. That pairing is the
-# default, so a plain `make deploy` gets it without saying so:
-#
-#   HOPPER = https://hops-ro.isotope13.ai,https://hops.isotope13.ai
-#
-# Lookups and renewals walk that list. The idle worker does not: it claims from
-# the primary alone, because a replica refuses worker routes with a 403.
-#
-# It is REQUIRED: `deploy-server` refuses to install a server that files
-# nothing. Pass HOPPER=none to opt out deliberately (HOPPER= — empty — also
-# clears the default and hits the same refusal).
-HOPPER ?= https://hops-ro.isotope13.ai,https://hops.isotope13.ai
-BIND ?=
-ALLOWED_DIRS ?=
-MEMORY_MAX ?=
-
-# IDLE switches the companion pull worker on or off. `serve` runs it as its own
-# `atomscan worker` process and freezes it — kernel-enforced, covering every
-# child it has spawned — for the whole of each request, so an arriving analysis
-# gets the entire machine. 0 turns it off, and the host only ever works on
-# interactive requests:
-#
-#   make deploy IDLE=0
-#
-# Any non-zero value means the same thing. It was once a slot count, and the
-# name is kept because deploys and muscle memory use it, but the worker is a
-# separate process now and sizes itself the way every standalone worker does —
-# three slots per physical core, a rayon pool the width of the cores, an RSS
-# ceiling resolved from the cgroup or sysctl basis — which already spans the
-# fleet from six cores to 128.
-#
-# Off regardless when HOPPER is unset, since there would be nothing to claim
-# from. On Linux the unit needs Delegate=yes for the freeze to work; the deploy
-# writes it.
-IDLE ?=
-
-# HOPPER=none is the deliberate opt-out. It collapses to an empty HOPPER here,
-# before the export, so the deploy scripts see "unset" and emit no --hopper —
-# they must never receive the literal string as a URL.
-ifeq ($(strip $(HOPPER)),none)
-override HOPPER :=
-HOPPER_OPTOUT := 1
-endif
-
-export HOPPER BIND ALLOWED_DIRS MEMORY_MAX IDLE
-# ALLOW_CIDR and TOKEN_SRC are deliberately NOT declared here. They default
-# with `${VAR-default}` (unset) rather than `${VAR:-default}` (unset or empty),
-# because empty is a meaningful value: no CIDR allow-list, and no
-# authentication at all. Declaring them would export an empty value on every
-# deploy and silently strip both. Pass them on the command line instead — make
-# exports command-line variables, so they still reach the script:
-#   make deploy ALLOW_CIDR=192.168.0.0/16
-#   make deploy TOKEN_SRC=            # deliberately unauthenticated
-
-# LLM second-opinion pass. LLM / LLM_URL becomes SCAN_LLM (`local`,
-# `openrouter`, or a base URL). The endpoint requires a bearer token; atomscan
-# reads it from ~/.tok/llm, and the deploy scripts install that file for the
-# service account (LLM_TOKEN_FILE overrides). The benchmark/profile targets
-# deliberately omit interpret so LLM round-trips don't distort wall/RSS
-# measurements.
-#
-# Comma-separated is a failover chain, tried in order: our own vLLM first, the
-# billed public API only when it cannot answer. This is the ONE place the
-# site's chain is defined: it is exported below, every deploy script and
-# `make worker` read it from the environment, and none of them carry a
-# fallback of their own. It is kept here rather than left to the flag default
-# because `--llm` alone means a loopback endpoint, which no dev box or deploy
-# host runs. `make deploy LLM=` exports an empty value, which the scripts pass
-# through so the pass can be turned off.
-#
-# LLM_MODEL is deliberately NOT defaulted here, nor in the deploy scripts.
-# Defaults for atomscan flags live in atomscan, in one place: unpinned, it
-# takes the largest model a vLLM/Ollama endpoint reports serving, and
-# `openrouter/auto` for OpenRouter. Pass LLM_MODEL= only to pin one; it pairs
-# positionally with a comma-separated LLM chain, and a blank slot leaves that
-# endpoint on its default.
-LLM ?= https://llm.isotope13.ai/v1,openrouter
-export LLM
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys) inherit a
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: pgo-train ensure-llm-token bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo check-hopper-token check-hopper-url tarball deploy deploy-server deploy-tunnel deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux uninstall-server uninstall-jail uninstall-server-nodes stop-worker kill-scan uninstall-worker uninstall-jail-worker uninstall-worker-nodes rollout rollout-workers rollout-servers rollout-servers-fast rollout-bastille benchmark benchmark-worker worker-benchmark server-benchmark server-heap-benchmark worker profile-worker profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -250,41 +124,17 @@ PGO_FLAGS = $(if $(wildcard $(PGO_PROFDATA)),-C profile-use=$(abspath $(PGO_PROF
 
 release: check-cargo $(OUT_DIR)
 	@if [ -n "$(PGO_FLAGS)" ]; then echo "release: PGO enabled ($(PGO_PROFDATA))"; else echo "release: no PGO profile at $(PGO_PROFDATA) — run 'make pgo-train' to create one"; fi
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --release
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --locked --release
 	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
 
-# Kill any locally-running atomscan processes before a build so a busy worker
-# (or server) doesn't steal CPU from the compile. Wired into `worker` and
-# `deploy-worker`. Portable across Linux/macOS/FreeBSD via pkill/pgrep, matching
-# the exact process name (-x) so cargo/make/grep aren't caught. Friendly SIGTERM
-# first, then SIGKILL for anything still alive after ~5s. A missing pkill or no
-# matching process is not an error.
-kill-scan:
-	@if command -v pkill >/dev/null 2>&1; then \
-		if pkill -x $(BINARY) 2>/dev/null; then \
-			echo "kill-scan: sent SIGTERM to running $(BINARY); waiting for graceful exit..."; \
-			i=0; while pgrep -x $(BINARY) >/dev/null 2>&1 && [ $$i -lt 5 ]; do sleep 1; i=$$((i+1)); done; \
-			if pgrep -x $(BINARY) >/dev/null 2>&1; then \
-				echo "kill-scan: process still alive, sending SIGKILL"; \
-				pkill -9 -x $(BINARY) 2>/dev/null || true; \
-			fi; \
-			echo "kill-scan: cleared existing $(BINARY) process(es)"; \
-		else \
-			echo "kill-scan: no running $(BINARY) to stop"; \
-		fi; \
-	else \
-		echo "kill-scan: pkill not available; skipping"; \
-	fi
-
-
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
 release-lto: check-cargo $(OUT_DIR)
 	@if [ -n "$(PGO_FLAGS)" ]; then echo "release-lto: PGO enabled ($(PGO_PROFDATA))"; fi
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --profile release-lto
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --locked --profile release-lto
 	cp target/release-lto/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
@@ -302,7 +152,7 @@ pgo-train: check-cargo
 	rm -rf /tmp/scan-pgo-train && mkdir -p /tmp/scan-pgo-train build/pgo
 	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="-C profile-generate=/tmp/scan-pgo-train" cargo build --release
 	@echo "pgo-train: scanning $(PGO_TRAIN_PATH) with the instrumented binary (slow: ~2x)"
-	SCAN_FETCH=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 target/release/$(BINARY) -f json "$(PGO_TRAIN_PATH)" > /dev/null || true
+	SCAN_FOLLOW=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 target/release/$(BINARY) -f json "$(PGO_TRAIN_PATH)" > /dev/null || true
 	$$(find ~/.rustup -name llvm-profdata | head -1) merge -o $(PGO_PROFDATA) /tmp/scan-pgo-train/*.profraw
 	@echo "✓ PGO profile: $(PGO_PROFDATA) — subsequent 'make release' builds use it"
 
@@ -349,411 +199,12 @@ tarball: release
 	tar -czf $(OUT_DIR)/$(BINARY).tgz -C $(OUT_DIR) $(BINARY)
 	@echo "Tarball: $(OUT_DIR)/$(BINARY).tgz"
 
-# Bring the checkout up to date before a deploy. Deploy hosts are checkouts,
-# not workspaces, so what has to hold here is "the tree is the upstream
-# branch" -- and `git pull` cannot promise that: when main has been
-# force-pushed it aborts with "Not possible to fast-forward", taking the whole
-# deploy (and, from `make rollout`, the whole fleet) down with it. Fetching and
-# resetting reaches the same commit either way, and discards exactly the local
-# commits and edits a deploy host is not supposed to have. Untracked files --
-# build artifacts, caches, token files -- are left alone.
-SYNC_REPO = git fetch --prune && \
-	git reset --hard "$$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo origin/main)"
-
-# Clear MAKEFLAGS for deploy recipes: GNU Make would otherwise inject the
-# outer invocation's `-j`/`--jobserver-*` flags plus command-line `URL=` into
-# the env, which tikv-jemalloc-sys's build.rs re-passes to its bundled `make`,
-# producing `*** No rule to make target '-j'` inside the jemalloc build.
-deploy-server deploy-jail deploy-worker deploy-jail-worker deploy-worker-nodes rollout-bastille: export MAKEFLAGS :=
-
-# HOPPER defaults to the server's hopper pair, and `export HOPPER` above puts it
-# in the environment of every recipe. The worker deploys have no use for it —
-# a worker is told its hopper by URL=, and nothing under scripts/worker reads
-# HOPPER — so clear it for them rather than let a server default leak into a
-# worker's environment. An explicit HOPPER= on the command line still wins,
-# per make's normal precedence; it just does nothing on this path.
-deploy-worker deploy-jail-worker deploy-worker-nodes deploy-workers deploy-workers-tmux: export HOPPER :=
-
-deploy: deploy-server
-
-# Long-lived `atomscan serve`, installed natively on this host: a FreeBSD rc.d
-# service (`service scan`) or a systemd unit (`scan.service`). Override BIND=,
-# ALLOW_CIDR=, LLM= / LLM_URL=, LLM_MODEL=, MEMORY_MAX= (Linux), MAX_RSS_GB=
-# (FreeBSD) — see scripts/server/server-freebsd.sh and
-# scripts/server/server-linux.sh. For a jailed FreeBSD server use `make
-# deploy-jail`. The Cloudflare Tunnel is separate: `make deploy-tunnel`.
-# Put the LLM key where the deploy scripts look for it, if it is not there
-# already. They copy $(LLM_TOKEN_FILE) into the service account's home; this
-# only covers the case where the operator has the key in the environment and no
-# file yet, which is how a fresh host gets one. Never overwrites: a file already
-# on disk is the operator's, and clobbering it would silently rotate the fleet's
-# credential on an unrelated deploy.
-#
-# Deliberately not fatal, unlike check-hopper-token. A worker without a hopper
-# token is a silent no-op; a scan without an LLM key still scans — it loses the
-# second opinion on that endpoint and falls through to the rest of the chain.
-ensure-llm-token:
-	@if [ -s "$(LLM_TOKEN_FILE)" ]; then exit 0; fi; \
-	if [ -n "$${SCAN_LLM_KEY:-}" ]; then \
-		umask 077; mkdir -p "$$(dirname "$(LLM_TOKEN_FILE)")"; \
-		printf '%s\n' "$${SCAN_LLM_KEY}" > "$(LLM_TOKEN_FILE)"; \
-		chmod 600 "$(LLM_TOKEN_FILE)"; \
-		echo "installed the LLM endpoint token at $(LLM_TOKEN_FILE)"; \
-	else \
-		echo "warning: no LLM token at $(LLM_TOKEN_FILE) and SCAN_LLM_KEY unset."; \
-		echo "         An endpoint that requires one will refuse this deploy's"; \
-		echo "         second-opinion pass with 401; the chain falls through to"; \
-		echo "         whatever else \$$LLM names. Write the token to that file"; \
-		echo "         or pass SCAN_LLM_KEY=<token> to install it."; \
-	fi
-
-deploy-server: check-hopper-url ensure-llm-token
-	$(SYNC_REPO)
-	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/server-freebsd.sh ;; \
-		Linux)   if command -v systemctl >/dev/null 2>&1; then \
-		           ./scripts/server/server-linux.sh; \
-		         else \
-		           echo "error: unsupported Linux (systemd required for server deploy)"; exit 1; \
-		         fi ;; \
-		*) echo "error: no deploy-server target for $$(uname -s) (FreeBSD/rc.d or Linux/systemd)"; exit 1 ;; \
-	esac
-
-# Cloudflare Tunnel connector for a host-installed server, kept apart from
-# deploy-server: the tunnel is set up once, while the server is redeployed all
-# the time, and a connector problem (a rotated token, a second connector owned
-# by Cloudflare's own package) should never fail or bounce a server deploy.
-# Idempotent — an active, unchanged connector is left alone. The tunnel and its
-# ingress live in the Cloudflare dashboard; this only installs the connector.
-#
-#   CF_TUNNEL_TOKEN='...' make deploy-tunnel   # first time, or after rotation
-#   make deploy-tunnel                         # reuse the stored token
-#
-# CF_TUNNEL_TOKEN is read from the environment, never from here, so the token
-# stays out of the repository and out of ps(1). The origin follows BIND= (its
-# port), the same as deploy-server. The jailed deploy manages its own connector
-# inside the run jail; see rollout-bastille.sh.
-deploy-tunnel:
-	@bind="$${BIND:-127.0.0.1:49999}"; origin="http://127.0.0.1:$${bind##*:}"; \
-	case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/cloudflared-freebsd.sh "$$origin" ;; \
-		Linux)   ./scripts/server/cloudflared-linux.sh "$$origin" ;; \
-		*) echo "error: no deploy-tunnel target for $$(uname -s) (FreeBSD/rc.d or Linux/systemd)"; exit 1 ;; \
-	esac
-
-# Refuse to start a worker without a hopper credential. Hopper requires
-# `Authorization: Bearer <token>` on every route and does not exempt loopback,
-# so a worker without one 401s on every poll and retries forever behind a
-# heartbeat that still looks healthy — a silent no-op that used to cost a whole
-# run. Mirrors `resolve_credential` in src/upload.rs: `$HOPPER_TOKEN` wins,
-# otherwise the file must hold a non-blank line. Deliberately not wired into
-# `deploy-worker-nodes` / `deploy-workers`, which use each remote account's own
-# token and never ship one from here.
-check-hopper-token:
-	@if [ -n "$${HOPPER_TOKEN:-}" ] && printf '%s' "$${HOPPER_TOKEN}" | grep -q '[^[:space:]]'; then exit 0; fi; \
-	if [ ! -f "$(HOPPER_TOKEN_FILE)" ]; then \
-		echo "error: no hopper API token at $(HOPPER_TOKEN_FILE)"; \
-		echo "       an authenticated hopper rejects every poll from this worker with 401."; \
-		echo "       install the token there, or pass HOPPER_TOKEN_FILE=<path> / HOPPER_TOKEN=<token>."; \
-		exit 1; \
-	fi; \
-	if ! grep -q '[^[:space:]]' "$(HOPPER_TOKEN_FILE)" 2>/dev/null; then \
-		echo "error: hopper API token at $(HOPPER_TOKEN_FILE) is empty"; \
-		echo "       an authenticated hopper rejects every poll from this worker with 401."; \
-		echo "       write the token to that file, or pass HOPPER_TOKEN_FILE=<path> / HOPPER_TOKEN=<token>."; \
-		exit 1; \
-	fi
-
-# Refuse to install a server that files nothing. Without `serve --hopper` the
-# server answers every analysis and stores none of them: the caller caches the
-# verdict, so the same PURL is never asked again, and hopper never receives the
-# artifact. Nothing fails at deploy time and nothing fails at request time —
-# the gap only surfaces much later, as a sample hopper should have had and
-# does not. That is the failure this check exists to prevent; a scan server
-# with no hopper to feed is not a configuration anyone wants by accident.
-#
-# Mirrors check-hopper-token: HOPPER=none is the explicit escape hatch, the
-# same shape as `TOKEN_SRC=` for a deliberately unauthenticated server.
-check-hopper-url:
-	@if [ -n "$(HOPPER_OPTOUT)" ]; then \
-		echo "warning: HOPPER=none — this server will analyze and file nothing on hopper"; \
-		exit 0; \
-	fi; \
-	if [ -n "$(strip $(HOPPER))" ]; then exit 0; fi; \
-	echo "error: HOPPER is empty, so the server would run without --hopper."; \
-	echo "       It would answer every analysis and file none of them: the caller"; \
-	echo "       caches the verdict and hopper never sees the artifact, so the loss"; \
-	echo "       is silent until something asks hopper for a sample it should hold."; \
-	echo; \
-	echo "       make deploy HOPPER=https://hops.isotope13.ai"; \
-	echo "       make deploy HOPPER=none    # deliberately file nothing"; \
-	exit 1
-
-deploy-worker: check-hopper-token ensure-llm-token kill-scan
-	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker URL=<url> [BUILD=<host>] [WORKER_RUN=<host>]"; exit 1; }
-	$(SYNC_REPO)
-	@case "$$(uname -s)" in \
-		Darwin)  ./scripts/worker/worker-macos.sh "$(URL)" ;; \
-		FreeBSD) ./scripts/worker/worker-freebsd.sh "$(URL)" ;; \
-		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
-		           ./scripts/worker/worker-debian.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)"; \
-		         elif [ -f /etc/alpine-release ]; then \
-		           ./scripts/worker/worker-alpine.sh "$(URL)"; \
-		         elif command -v systemctl >/dev/null 2>&1; then \
-		           ./scripts/worker/worker-linux.sh "$(URL)"; \
-		         else \
-		           echo "error: unsupported Linux (no systemd; not Alpine; pass BUILD+WORKER_RUN for SSH deploy)"; exit 1; \
-		         fi ;; \
-		OpenBSD) ./scripts/worker/worker-openbsd.sh "$(URL)" ;; \
-		SunOS)   ./scripts/worker/worker-omnios.sh "$(URL)" ;; \
-		MINGW*|MSYS*) \
-		         if command -v pwsh >/dev/null 2>&1; then ps=pwsh; else ps=powershell; fi; \
-		         "$$ps" -NoProfile -ExecutionPolicy Bypass -File scripts/worker/worker-windows.ps1 -Url "$(URL)" ;; \
-		*) echo "error: no deploy-worker target for $$(uname -s)"; exit 1 ;; \
-	esac
-
-# Jailed worker deploy: builds in a Bastille build jail and runs the rc.d
-# service inside a separate run jail. Use this instead of deploy-worker when
-# isolating the worker in a jail; deploy-worker installs natively on the host.
-deploy-jail-worker:
-	@[ -n "$(URL)" ] || { echo "Usage: make deploy-jail-worker URL=<url> [BUILD=<jail>] [WORKER_RUN=<jail>]"; exit 1; }
-	$(SYNC_REPO)
-	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/worker/worker-bastille.sh "$(BUILD)" "$(WORKER_RUN)" "$(URL)" ;; \
-		*) echo "error: jail worker deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
-	esac
-
-uninstall-server:
-	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/uninstall-freebsd.sh ;; \
-		Linux)   if command -v systemctl >/dev/null 2>&1; then \
-		           ./scripts/server/uninstall-linux.sh; \
-		         else \
-		           echo "error: unsupported Linux (systemd required)"; exit 1; \
-		         fi ;; \
-		*) echo "error: no uninstall-server target for $$(uname -s)"; exit 1 ;; \
-	esac
-
-# Hard-stop the running worker without uninstalling it: stops the systemd unit
-# (so Restart= can't respawn) then escalates SIGTERM -> SIGKILL. Used before a
-# redeploy so the old process frees its RAM before the rebuild. Idempotent.
-stop-worker:
-	./scripts/worker/stop-worker.sh
-
-uninstall-worker:
-	@case "$$(uname -s)" in \
-		Darwin)  ./scripts/worker/uninstall-macos.sh ;; \
-		FreeBSD) ./scripts/worker/uninstall-freebsd.sh ;; \
-		Linux)   if [ -n "$(WORKER_REMOTE)" ]; then \
-		           ./scripts/worker/uninstall-debian.sh "$(WORKER_RUN)"; \
-		         elif [ -f /etc/alpine-release ]; then \
-		           ./scripts/worker/uninstall-alpine.sh; \
-		         elif command -v systemctl >/dev/null 2>&1; then \
-		           ./scripts/worker/uninstall-linux.sh; \
-		         else \
-		           echo "error: unsupported Linux"; exit 1; \
-		         fi ;; \
-		OpenBSD) ./scripts/worker/uninstall-openbsd.sh ;; \
-		MINGW*|MSYS*) \
-		         if command -v pwsh >/dev/null 2>&1; then ps=pwsh; else ps=powershell; fi; \
-		         "$$ps" -NoProfile -ExecutionPolicy Bypass -File scripts/worker/uninstall-windows.ps1 ;; \
-		*) echo "error: no uninstall-worker target for $$(uname -s)"; exit 1 ;; \
-	esac
-
-# Remove the jailed worker service (counterpart to deploy-jail-worker).
-uninstall-jail-worker:
-	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/worker/uninstall-bastille.sh "$(WORKER_RUN)" ;; \
-		*) echo "error: jail worker deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
-	esac
-
-deploy-worker-nodes:
-	@[ -n "$(URL)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
-	@[ -n "$(NODES)" ] || { echo "Usage: make deploy-worker-nodes URL=<url> NODES=\"node1 node2\""; exit 1; }
-	./scripts/worker/update-nodes.sh "$(URL)" $(NODES)
-
-# Roll the standing worker pool, one node at a time (YubiKey-friendly), then
-# redeploy hopper. Each worker runs `git pull && make stop-worker &&
-# make deploy-worker` over SSH. Override defaults with URL=, WORKER_NODES=,
-# HOPPER_NODE= (see scripts/worker/deploy-workers.sh).
-deploy-workers:
-	URL="$(URL)" WORKER_NODES="$(WORKER_NODES)" HOPPER_NODE="$(HOPPER_NODE)" \
-		./scripts/worker/deploy-workers.sh
-
-# Same roll, but fanned out into one tmux window per node (builds run in
-# parallel). Launches are staggered (STAGGER=5s) so the YubiKey faces one SSH
-# touch prompt at a time. Override URL=, WORKER_NODES=, HOPPER_NODE=, STAGGER=.
-deploy-workers-tmux:
-	URL="$(URL)" WORKER_NODES="$(WORKER_NODES)" HOPPER_NODE="$(HOPPER_NODE)" STAGGER="$(STAGGER)" \
-		./scripts/worker/deploy-workers-tmux.sh
-
-# Roll the whole fleet: every host that checked in with hopper over the last
-# DAYS days, rediscovered each run rather than kept in a list here.
-#
-# Workers first, BATCH at a time — though each batch authenticates one host at a
-# time, so a YubiKey touch or password prompt is never contended. Then the
-# servers, one at a time, each proving itself healthy (its own /_/health, then a
-# pinned beamline lookup over the public edge) before the next is touched. A
-# server that does not come back healthy stops the roll where it stands.
-#
-# Each host is redeployed as whatever it is already installed as: `make deploy`
-# for a server, `make stop-worker && make deploy-worker` for a worker.
-#
-# Every knob is an environment variable the script documents, and make exports a
-# command-line assignment straight into the recipe, so any of them works here:
-#
-#   make rollout DRY_RUN=1                 # print the plan, connect to nothing
-#   make rollout DAYS=3 BATCH=4
-#   make rollout SKIP="Mac.lan" URL=...
-#
-# See scripts/rollout.sh for the full list.
-# Hosts the rollout leaves alone, whatever hopper's roster says.
-#
-# The roster is check-ins, so it cannot tell "retired" from "quiet": a host that
-# stopped answering SSH keeps its row until `last_seen` ages past DAYS, and
-# until then every rollout spends its connect timeout on a machine that is not
-# coming back. Mac.lan has been that host. Clear it (`make rollout SKIP=`) to
-# try it again.
-SKIP ?= Mac.lan
-export SKIP
-
-rollout: ## Redeploy every scan host hopper has seen in the last DAYS days
-	./scripts/rollout.sh
-
-# The two halves of `rollout`, for when only one of them needs moving. Between
-# them they still cover the whole fleet: the hopper host rides with the workers
-# because it is a worker box that also happens to serve the queue, and a worker
-# rollout wants the queue restarted ahead of it either way.
-rollout-workers: ## Redeploy only the workers (and the hopper host), never the servers
-	PHASES="hopper workers" ./scripts/rollout.sh
-
-rollout-servers: ## Redeploy only the dedicated servers, one at a time, each health-gated
-	PHASES="servers" ./scripts/rollout.sh
-
-# Every server at once. This takes the whole serving tier down together, so it
-# is for when there is no working capacity left to protect — a bad build already
-# out everywhere — or a window where the tier may go down anyway. The health and
-# pin checks still run afterwards; only the sequencing is given up.
-rollout-servers-fast: ## Redeploy all servers SIMULTANEOUSLY — takes the serving tier down at once
-	PHASES="servers" SERVER_BATCH=0 ./scripts/rollout.sh
-
-uninstall-server-nodes:
-	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-server-nodes NODES=\"node1 node2\""; exit 1; }
-	./scripts/server/uninstall-nodes.sh $(NODES)
-
-uninstall-worker-nodes:
-	@[ -n "$(NODES)" ] || { echo "Usage: make uninstall-worker-nodes NODES=\"node1 node2\""; exit 1; }
-	./scripts/worker/uninstall-nodes.sh $(NODES)
-
-# Jailed server deploy: builds in a Bastille build jail and runs the rc.d
-# service inside a separate run jail. Use this instead of deploy-server when
-# isolating the server in a jail; deploy-server installs natively on the host.
-deploy-jail: check-hopper-url
-	./scripts/server/rollout-bastille.sh "$(BUILD)" "$(SERVER_RUN)"
-
-# Remove the jailed server service (counterpart to deploy-jail).
-uninstall-jail:
-	@case "$$(uname -s)" in \
-		FreeBSD) ./scripts/server/uninstall-bastille.sh "$(SERVER_RUN)" ;; \
-		*) echo "error: jail server deployments are FreeBSD/bastille-only; run from a FreeBSD host"; exit 1 ;; \
-	esac
-
-# Historical name for deploy-jail; kept so existing muscle memory and scripts
-# keep working.
-rollout-bastille: deploy-jail
-
 benchmark: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	@# Exit 1/2 mean hostile/suspicious found — expected on a malware corpus;
 	@# only scan errors (3+) fail the benchmark.
 	CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) -f json "$(BENCHMARK_PATH)" > /tmp/litmus-benchmark-$(DATASET).json; \
 	status=$$?; [ $$status -le 2 ] || exit $$status
-
-benchmark-worker: release
-	@[ -n "$(URL)" ] || { echo "Usage: make benchmark-worker URL=<hopper-url>"; exit 1; }
-	./out/$(BINARY) worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
-		$(if $(WORKERS),--workers $(WORKERS),) \
-		2>&1 | tee /tmp/litmus-worker-benchmark.log
-
-# Run a worker in the foreground for interactive use. The worker self-nices
-# to 10 by default; pass NICE=0 to disable.
-worker: check-hopper-token kill-scan release
-	@[ -n "$(URL)" ] || { echo "Usage: make worker URL=<hopper-url> [WORKERS=<n>] [NICE=<int>] [LLM=<endpoint>] [LLM_MODEL=<name>]"; exit 1; }
-	@# Runs as the invoking user, so atomscan finds $(HOPPER_TOKEN_FILE) on its
-	@# own; `check-hopper-token` has already established that it is there.
-	SCAN_LLM="$(LLM)" $(if $(LLM_MODEL),SCAN_LLM_MODEL="$(LLM_MODEL)",) ./out/$(BINARY) worker --url "$(URL)" \
-		--interpret \
-		$(if $(WORKERS),--workers $(WORKERS),) \
-		$(if $(NICE),--nice $(NICE),)
-
-# Self-contained worker benchmark: start the bundled mock hopper on a local
-# dataset, point a real worker at it, and measure the worker's wall + maxrss
-# plus per-job latency (claim → result, measured hopper-side). Completeness
-# reads the summary's `done` (dataset jobs matched by sha): with a fetch
-# policy on, mirrored dependency verdicts also post to /api/result, so raw
-# post counts overshoot the job count. Iterate with
-# realworld-small; reserve realworld for final verification. Override the
-# dataset, slot count, and job handout order, e.g.:
-#   make worker-benchmark WORKER_BENCH_DATASET=realworld-small WORKERS=12 ORDER=big-first
-# ORDER: fifo (default), shuffle[:seed] (reproducible realistic mix),
-# big-first (small-job-starvation worst case), small-first, mixed.
-WORKER_BENCH_DATASET ?= $(DATASET)
-WORKER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(WORKER_BENCH_DATASET)
-HEARTBEAT_SECS       ?= 5
-ORDER                ?= fifo
-BENCH_SUMMARY        ?= /tmp/litmus-worker-bench-summary.json
-BENCH_BODIES         ?= /tmp/litmus-worker-bodies
-# Disable persisted analysis-result reuse while retaining compiled mapper/YARA
-# caches. Long-lived workers pay compilation once, so forcing those caches cold
-# would measure artificial startup work rather than sustained throughput.
-worker-benchmark: release ## Benchmark the worker model over a local dataset via the bundled mock hopper
-	@[ -e "$(WORKER_BENCH_PATH)" ] || { echo "error: dataset not found: $(WORKER_BENCH_PATH)"; exit 1; }
-	@echo "worker-benchmark: dataset=$(WORKER_BENCH_PATH) workers=$(if $(WORKERS),$(WORKERS),default) order=$(ORDER) max_rss_gb=$(if $(MAX_RSS_GB),$(MAX_RSS_GB),auto)"
-	@out=$$(mktemp); results=/tmp/litmus-worker-results.jsonl; rm -f $$results "$(BENCH_SUMMARY)"; \
-	mkdir -p "$(BENCH_BODIES)" && rm -f "$(BENCH_BODIES)"/*.json; \
-	./target/release/scan-bench-hopper --dataset "$(WORKER_BENCH_PATH)" --port 0 --dump $$results \
-		--dump-bodies "$(BENCH_BODIES)" --order "$(ORDER)" --summary "$(BENCH_SUMMARY)" \
-		>$$out 2>/tmp/scan-bench-hopper.err & \
-	hp=$$!; \
-	trap 'kill $$hp 2>/dev/null' EXIT INT TERM; \
-	port=; jobs=; \
-	for i in $$(seq 1 100); do \
-		port=$$(sed -n 's/^PORT=//p' $$out); \
-		jobs=$$(sed -n 's/^JOBS=//p' $$out); \
-		[ -n "$$port" ] && [ -n "$$jobs" ] && break; \
-		sleep 0.1; \
-	done; \
-	[ -n "$$port" ] || { echo "error: mock hopper did not start"; cat $$out; exit 1; }; \
-	echo "hopper: port=$$port jobs=$$jobs"; \
-	tflag=$$( [ "$$(uname -s)" = "Darwin" ] && echo -l || echo -v ); \
-	SCAN_NO_ANALYSIS_CACHE=1 SCAN_HEARTBEAT_SECS=$(HEARTBEAT_SECS) \
-	$(if $(GRID),SCAN_PER_SLOT_POOLS=1,) \
-	/usr/bin/time $$tflag ./out/$(BINARY) worker \
-		--url "http://127.0.0.1:$$port" \
-		--data-dir "$(WORKER_BENCH_PATH)" \
-		--exit-if-empty --nice 0 --no-update --no-validate \
-		$(if $(WORKERS),--workers $(WORKERS),) \
-		$(if $(MAX_RSS_GB),--max-rss-gb $(MAX_RSS_GB),) \
-		2>&1 | tee /tmp/litmus-worker-benchmark.log; \
-	sleep 0.5; \
-	received=$$(python3 -c 'import json;print(json.load(open("$(BENCH_SUMMARY)"))["done"])' 2>/dev/null || echo 0); \
-	echo "✓ log: /tmp/litmus-worker-benchmark.log"; \
-	echo "--- thread budget (from log) ---"; \
-	grep -E "thread budget|oversubscribes|rayon pool ready" /tmp/litmus-worker-benchmark.log | head; \
-	echo "--- completeness (SERVER-side): hopper matched $$received / $$jobs job results ---"; \
-	[ "$$received" = "$$jobs" ] && echo "✓ COMPLETE: all $$jobs results reached the hopper" \
-		|| echo "❌ INCOMPLETE: $$received/$$jobs — worker dropped results (see /tmp/scan-bench-hopper.err)"; \
-	echo "--- latency summary (hopper-side, claim → result) ---"; \
-	cat "$(BENCH_SUMMARY)" 2>/dev/null || echo "(no summary written)"; \
-	echo "✓ summary: $(BENCH_SUMMARY)"
-
-profile-worker:
-	$(CARGO) build --profile profiling --bin $(BINARY)
-	@[ -n "$(URL)" ] || { echo "Usage: make profile-worker URL=<hopper-url>"; exit 1; }
-	samply record -o /tmp/litmus-worker-profile.json.gz -- \
-		./target/profiling/$(BINARY) worker --url "$(URL)" --max-jobs $(MAX_JOBS) \
-		$(if $(WORKERS),--workers $(WORKERS),) \
-		2>&1 | tee /tmp/litmus-worker-benchmark.log
 
 profile-slow:
 	$(CARGO) build --profile profiling --bin $(BINARY)
@@ -790,11 +241,11 @@ ARCHIVE_RUNS    ?= 3
 # warm analysis cache turns a 400 s scan into 14 s and the benchmark silently
 # measures cache hits. CLEAVE_SKIP_YARA_CACHE=0 keeps the compiled rule set (it
 # is not what we're measuring, and recompiling costs 4-18 s of pure noise).
-# SCAN_FETCH=none keeps the scan offline: fetching defaults to ON, and a
+# SCAN_FOLLOW=none keeps the scan offline: fetching defaults to ON, and a
 # benchmark that fetches measures the network (and drifts run to run — the
 # fetched-node set differed by ~400 entries between two otherwise identical
 # runs, which broke detection comparison). Matches sampled-benchmark/profile-slow.
-ARCHIVE_ENV = SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 SCAN_FOLLOW=none SCAN_FETCH=none CLEAVE_RAYON_THREADS="$(SCAN_THREADS)"
+ARCHIVE_ENV = SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 SCAN_FOLLOW=none CLEAVE_RAYON_THREADS="$(SCAN_THREADS)"
 
 bench-archive: release ## Time+RSS+output an archive-mode scan, best of ARCHIVE_RUNS (ARCHIVE_DATASET=typed-4k|typed-16k|typed)
 	@[ -e "$(ARCHIVE_PATH)" ] || { echo "error: archive dataset not found: $(ARCHIVE_PATH)"; exit 1; }
@@ -944,35 +395,6 @@ heap-benchmark: heap-build ## Benchmark with jemalloc heap profiling
 	@echo "✓ Heap profiles: $(OUT_DIR)/heap/jeprof.*.heap"
 	@echo "  Analyze with: jeprof --text $(OUT_DIR)/$(BINARY).heap $(OUT_DIR)/heap/jeprof.*.heap"
 
-# Long-lived server benchmark. Unlike the CLI profiling targets above, this
-# exercises the production /analyze path, fans the whole dataset out at once,
-# enables every fetch kind, and leaves the process alive long enough to sample
-# both VmHWM and post-batch RSS. Analysis caches are disabled across scan,
-# cleave, filefacts, and stng; fetch/registry blob caches stay warm so this
-# measures analysis rather than the network. Outputs include one response per
-# sample plus a deterministic ML fingerprint for parity checks.
-SERVER_BENCH_DATASET ?= realworld-small
-SERVER_BENCH_PATH    ?= $(BENCHMARK_ROOT)/$(SERVER_BENCH_DATASET)
-SERVER_BENCH_OUT     ?= $(OUT_DIR)/server-bench
-SERVER_BENCH_PORT    ?= 49997
-SERVER_BENCH_WORKERS ?= 20
-
-server-benchmark: bench-build ## Benchmark real /analyze requests in server mode with --fetch=all
-	@[ -e "$(SERVER_BENCH_PATH)" ] || { echo "error: dataset not found: $(SERVER_BENCH_PATH)"; exit 1; }
-	SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
-		scripts/bench-serve.sh "$(OUT_DIR)/$(BINARY).bench" "$(SERVER_BENCH_PATH)" \
-		"$(SERVER_BENCH_OUT)" "$(SERVER_BENCH_PORT)" "$(SERVER_BENCH_WORKERS)"
-
-server-heap-benchmark: heap-build ## Heap-profile the server-mode --fetch=all benchmark
-	@[ -e "$(SERVER_BENCH_PATH)" ] || { echo "error: dataset not found: $(SERVER_BENCH_PATH)"; exit 1; }
-	@rm -rf "$(OUT_DIR)/server-heap" && mkdir -p "$(OUT_DIR)/server-heap"
-	SCAN_NO_ANALYSIS_CACHE=1 SCAN_FETCH=all SCAN_NO_UPDATE_CHECK=1 \
-	_RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:30,prof_prefix:$(OUT_DIR)/server-heap/jeprof" \
-		scripts/bench-serve.sh "$(OUT_DIR)/$(BINARY).heap" "$(SERVER_BENCH_PATH)" \
-		"$(SERVER_BENCH_OUT)" "$(SERVER_BENCH_PORT)" "$(SERVER_BENCH_WORKERS)"
-	@echo "✓ Heap profiles: $(OUT_DIR)/server-heap/jeprof.*.heap"
-	@echo "  Analyze with: jeprof --text $(OUT_DIR)/$(BINARY).heap <profile.heap>"
-
 # cleave-tuna: LLM-driven CPU+memory autoresearch loop. See ../cleave-tuna/README.md.
 TUNA_REPO            ?= ../cleave-tuna
 TUNA_BIN             ?= $(TUNA_REPO)/out/cleave-tuna
@@ -1034,10 +456,7 @@ fix:
 test:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
-		$(CARGO) test --bin scan-bench-hopper --quiet; \
-		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
-		$(CARGO) nextest run --workspace -- \
-			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
+		$(CARGO) nextest run --workspace; \
 		$(CARGO) test --doc --quiet; \
 	else \
 		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
@@ -1052,10 +471,7 @@ test-cli:
 test-unit:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
-		$(CARGO) test --bin scan-bench-hopper --quiet; \
-		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
-		$(CARGO) nextest run --lib -- \
-			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
+		$(CARGO) nextest run --lib; \
 	else \
 		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
 		$(CARGO) test --lib -- \

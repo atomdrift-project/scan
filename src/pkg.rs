@@ -152,14 +152,23 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 None,
             )
         }
-        // The artifact couldn't be fetched — most often because the version was
-        // unpublished/removed (the metadata still resolves). Rather than fail the
-        // whole scan, fall back to scanning the registry record so its signals —
-        // including `registry.version_removed` and the freshness/custody anomalies
-        // — still produce a verdict. A removed days-old package is itself a strong
-        // supply-chain tell.
-        Err(e) => match registry.as_ref().and_then(crate::fetch::registry_document) {
+        // A release that is gone — unpublished or removed, while its metadata
+        // still resolves — has only its registry record left to scan, and that
+        // record's signals (`registry.version_removed`, freshness, custody) still
+        // produce a verdict; a removed days-old package is itself a tell. Any
+        // other failure (a size cap, a refused address, the network) is not an
+        // answer about the package, so the scan fails rather than judge it on
+        // less than the operator asked for.
+        Err(e) => match registry
+            .as_ref()
+            .filter(|_| {
+                e.downcast_ref::<crate::fetch::Unretrievable>()
+                    .is_some_and(crate::fetch::Unretrievable::gone)
+            })
+            .and_then(crate::fetch::registry_document)
+        {
             Some((name, bytes)) => {
+                tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), "artifact gone; scanning registry metadata only");
                 if progress {
                     warn_metadata_only("artifact unavailable");
                 }
@@ -173,7 +182,10 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                     Some(fallback_locator.as_str()),
                 )
             }
-            None => Err(e),
+            None => {
+                tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), "artifact could not be fetched");
+                Err(e)
+            }
         },
     }
 }

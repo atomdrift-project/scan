@@ -1,9 +1,8 @@
-//! HTTP API server for litmus malware classification.
+//! The HTTP API server.
 //!
-//! Accepts artifacts — uploaded bytes, a package URL, an exact URL, or a local
-//! path — runs cleave static analysis and the model, and answers with the
-//! classification: the full scan envelope on the legacy routes, a decision on
-//! `/v1`.
+//! Accepts artifacts — uploaded bytes, a package URL, an exact URL, or a file
+//! on this host — runs cleave static analysis and the model, and answers with
+//! a decision.
 //!
 //! Routes:
 //!   GET  /_/health      — liveness (public; detail only when trusted)
@@ -12,11 +11,6 @@
 //!   GET  /_/memory, /_/requests, /_/threads — diagnostics
 //!   POST /_/reload      — reload the model bundle from disk (admin)
 //!   POST /_/update      — pull models and traits, then reload (admin)
-//!   GET  /lookup        — stored verdict by ?sha256= or ?purl= (no slot)
-//!   GET  /status        — whether an analysis of an artifact is running
-//!   POST /analyze       — upload a file, receive the scan envelope
-//!   POST /analyze-purl  — fetch a PURL (registry provenance included) and analyze
-//!   POST /analyze-path  — analyze a local path (loopback)
 //!   GET  /v1/lookup     — decisions for one or many artifacts (no slot)
 //!   POST /v1/analyze    — a decision, streamed if the analysis is slow
 //!
@@ -25,15 +19,16 @@
 
 mod access;
 mod acl;
+mod admin;
 mod analyze;
 mod corpus;
 mod decision;
 mod diag;
 mod error;
 mod flight;
-mod handlers;
-mod idle;
+mod input;
 mod latency;
+mod local;
 mod v1;
 
 pub use acl::{Cidr, TokenDigest, parse_cidr_list};
@@ -41,7 +36,7 @@ pub use acl::{Cidr, TokenDigest, parse_cidr_list};
 use crate::analysis::{ACTIVE_REQUESTS, ModelResources, RequestPhase};
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::middleware;
 use axum::routing::{get, post};
 use std::future::Future;
@@ -94,17 +89,13 @@ pub struct ServerConfig {
     pub level: Option<u16>,
     /// Per-rule time budget before cleave logs a slow rule.
     pub slow_rule_ms: u64,
-    /// Directories `/analyze-path` may read. Empty refuses every request.
-    pub allowed_dirs: Vec<PathBuf>,
+    /// Canonical directories `POST /v1/analyze?path=` may read files from.
+    /// Empty refuses every `path=` request without touching the filesystem.
+    pub local_paths: Vec<PathBuf>,
     /// Concurrent analyses; at least one. Past it requests are refused, not
     /// queued.
     pub workers: usize,
-    /// Non-zero runs the companion pull worker beside the server (needs
-    /// `hopper`). Kept as a count because `--idle-worker-slots` has always
-    /// been one; the worker sizes itself.
-    pub idle_worker_slots: usize,
-    /// Peer networks besides loopback allowed to connect. `/analyze-path` is
-    /// loopback-only regardless.
+    /// Peer networks besides loopback allowed to connect.
     pub allow_cidrs: Vec<Cidr>,
     /// Digest of the bearer token required on every route but `/_/health`;
     /// `None` leaves the API open. Loopback is not exempt: behind a Cloudflare
@@ -118,8 +109,7 @@ pub struct ServerConfig {
     /// upload server driving outbound fetches is an SSRF-shaped exposure, so
     /// turning it on is an explicit operator decision.
     pub fetch: crate::fetch::FetchPolicy,
-    /// Hopper API root(s). Enables result renewal, corpus deferral, and the
-    /// companion idle worker.
+    /// Hopper API root(s). Enables result renewal and corpus deferral.
     pub hopper: Option<String>,
     /// Passwords to try against encrypted archives.
     pub zip_passwords: crate::ArchivePasswords,
@@ -140,9 +130,8 @@ impl Default for ServerConfig {
             thresholds: None,
             level: None,
             slow_rule_ms: crate::cli::DEFAULT_SLOW_RULE_MS,
-            allowed_dirs: Vec::new(),
+            local_paths: Vec::new(),
             workers: 1,
-            idle_worker_slots: 0,
             allow_cidrs: Vec::new(),
             auth_digest: None,
             analysis_timeout_secs: DEFAULT_ANALYSIS_TIMEOUT_SECS,
@@ -169,6 +158,16 @@ impl ServerConfig {
         if self.workers == 0 {
             anyhow::bail!("workers must be >= 1");
         }
+        // Reading local files is for a caller on this host, or for remote
+        // callers the operator has both named and credentialed. Anything else
+        // would hand a file-reading primitive to whoever reaches the socket.
+        let loopback = self.bind.ip() == std::net::Ipv4Addr::LOCALHOST;
+        let vetted = !self.allow_cidrs.is_empty() && self.auth_digest.is_some();
+        if !self.local_paths.is_empty() && !loopback && !vetted {
+            anyhow::bail!(
+                "--allow-local-paths requires --bind 127.0.0.1, or both --allow-cidr and --token-file"
+            );
+        }
         Ok(())
     }
 
@@ -192,27 +191,23 @@ pub struct Startup {
     pub max_size_mb: usize,
     /// The process RSS ceiling (`--max-rss-gb`).
     pub max_rss: crate::memory::MaxRssPolicy,
-    /// Comma-separated directories `/analyze-path` may read. Empty means the
-    /// route refuses every request, which is the safe default.
-    pub allowed_dirs: Option<String>,
+    /// Directories `POST /v1/analyze?path=` may read files from. Empty, the
+    /// default, refuses every `path=` request.
+    pub allow_local_paths: Vec<PathBuf>,
     /// Concurrent request slots. `None` takes the worker default.
     pub workers: Option<NonZeroUsize>,
     /// Comma-separated CIDRs allowed to reach non-loopback routes.
     pub allow_cidr: Option<String>,
     /// File holding the bearer token. `None` disables authentication.
     pub token_file: Option<PathBuf>,
-    /// Hopper API root. Enables result renewal, corpus deferral, and the
-    /// companion idle worker.
+    /// Hopper API root. Enables result renewal and corpus deferral.
     pub hopper: Option<String>,
-    /// Slots for the companion idle worker. `None` takes half the request
-    /// slots; ignored without `hopper`, since there would be nothing to claim.
-    pub idle_worker_slots: Option<usize>,
     /// Per-request analysis timeout in seconds. Zero disables.
     pub analysis_timeout_secs: u64,
     /// Rules, model and analysis settings, shared with the pull worker.
     /// Fetching is off by default: a server driving outbound fetches is an
     /// SSRF-shaped exposure, so turning it on is an operator decision.
-    pub rules: crate::worker::RulesStartup,
+    pub rules: crate::rules::RulesStartup,
 }
 
 impl Startup {
@@ -228,22 +223,25 @@ impl Startup {
     pub fn resolve(self) -> anyhow::Result<ServerConfig> {
         let rules = self.rules.resolve()?;
 
-        // Canonicalized at startup so symlink-resolved request paths match in
-        // the `starts_with` checks `/analyze-path` gates on.
-        let allowed_dirs: Vec<PathBuf> = self
-            .allowed_dirs
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let path = PathBuf::from(s);
-                path.canonicalize().unwrap_or(path)
+        // Canonicalized here, so a request's canonical path can be checked
+        // with a plain prefix match.
+        let local_paths = self
+            .allow_local_paths
+            .iter()
+            .map(|dir| {
+                let canonical = dir
+                    .canonicalize()
+                    .map_err(|e| anyhow::anyhow!("--allow-local-paths {}: {e}", dir.display()))?;
+                if !canonical.is_dir() {
+                    anyhow::bail!("--allow-local-paths {}: not a directory", dir.display());
+                }
+                Ok(canonical)
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let workers = self
             .workers
-            .unwrap_or_else(crate::worker::default_workers)
+            .unwrap_or_else(crate::rules::default_workers)
             .get();
 
         let allow_cidrs = match self.allow_cidr {
@@ -276,13 +274,6 @@ impl Startup {
         };
 
         let hopper = self.hopper.filter(|s| !s.trim().is_empty());
-        // Half the request slots for background work. Disabled without
-        // hopper: nothing to claim.
-        let idle_worker_slots = match (hopper.as_deref(), self.idle_worker_slots) {
-            (None, _) => 0,
-            (Some(_), Some(n)) => n.min(workers / 2),
-            (Some(_), None) => workers / 2,
-        };
 
         let config = ServerConfig {
             bind: self.bind,
@@ -292,9 +283,8 @@ impl Startup {
             thresholds: rules.thresholds,
             level: rules.level,
             slow_rule_ms: rules.slow_rule_ms,
-            allowed_dirs,
+            local_paths,
             workers,
-            idle_worker_slots,
             allow_cidrs,
             auth_digest,
             analysis_timeout_secs: self.analysis_timeout_secs,
@@ -470,9 +460,6 @@ pub(super) struct RequestGuard {
     cancellation: Arc<AtomicBool>,
     /// Held here so the slot and core are released when the guard drops.
     _permit: AnalysisPermit,
-    /// Keeps the idle worker frozen for the whole analysis, which outlives the
-    /// handler whenever the client hangs up before it finishes.
-    _busy: idle::BusyToken,
 }
 
 impl RequestGuard {
@@ -493,7 +480,6 @@ impl RequestGuard {
             state: Arc::clone(state),
             cancellation,
             _permit: permit,
-            _busy: state.enter_busy(),
         }
     }
 
@@ -563,8 +549,7 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        // The permit is released with `_permit`; `_busy` thaws the worker if
-        // this was the last holder.
+        // The permit is released with `_permit`.
         self.cancellation.store(true, Ordering::Release);
         self.state.in_flight.remove(&self.request_id);
         ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
@@ -811,10 +796,10 @@ enum Readiness {
     Ready(Arc<ModelResources>),
 }
 
-/// How many cached-upload repairs may hold their bytes at once. Each holds up
-/// to `--max-size-mb`; a repeat past this is skipped, and the next repeat of
-/// the same artifact repairs it instead.
-const MAX_REPAIRS: usize = 4;
+/// How many artifacts may be held in memory outside an analysis slot at once:
+/// cached-upload repairs and `refresh=1` downloads. Each holds up to
+/// `--max-size-mb`, and nothing else bounds them.
+const MAX_BUFFERED: usize = 4;
 
 /// How long shutdown waits for analyses no client is waiting on.
 /// Comfortably inside systemd's default 90-second stop timeout.
@@ -846,8 +831,8 @@ struct AppState {
     /// life; the permit drops with the analysis or with its orphan follower,
     /// so a slot is always released — even on panic or runtime shutdown.
     slots: Arc<Semaphore>,
-    /// One permit per rayon thread, shared with the idle worker: every analysis
-    /// in this process, whoever asked for it, runs on the same pool.
+    /// One permit per rayon thread: every analysis in this process runs on the
+    /// same pool.
     cpu: Arc<Semaphore>,
     lanes: Option<SlotLanes>,
     /// Tasks stuck past the timeout — still occupying a slot until the
@@ -867,15 +852,11 @@ struct AppState {
     /// index and upload tails — counted so shutdown can drain it.
     tasks: Arc<Tasks>,
     jobs: Jobs,
-    /// Requests outstanding, and the worker they freeze. See [`idle::Busy`].
-    busy: Arc<idle::Busy>,
-    /// The companion pull worker, when one is running.
-    idle_worker: Option<Arc<idle::Worker>>,
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
-    /// Bounds the cached-upload repairs in flight; see [`MAX_REPAIRS`].
-    repairs: Arc<Semaphore>,
+    /// Bounds the artifacts held outside a slot; see [`MAX_BUFFERED`].
+    buffered: Arc<Semaphore>,
     /// Background hopper uploader (`--hopper`); `None` disables result renewal.
     uploader: Option<Arc<crate::upload::Uploader>>,
     /// The corpus behind this worker's index. `None` when no hopper is
@@ -988,49 +969,6 @@ impl AppState {
         self.check_memory().await
     }
 
-    /// Mark the server busy until the returned token drops, freezing the
-    /// companion worker for exactly that window.
-    ///
-    /// Taken at handler entry — before the memory check, before the multipart
-    /// parse, before the upload streams — because the cores have to be free by
-    /// the time the analysis wants them, not by the time it starts.
-    pub(super) fn enter_busy(&self) -> idle::BusyToken {
-        self.busy.enter(self.idle_worker.as_ref())
-    }
-
-    /// Whether a request is outstanding right now. While one is, the
-    /// companion worker is frozen.
-    pub(super) fn is_busy(&self) -> bool {
-        self.busy.is_busy()
-    }
-
-    /// Whether a companion worker process is alive right now.
-    pub(super) fn idle_worker_running(&self) -> bool {
-        self.idle_worker.as_ref().is_some_and(|w| w.is_running())
-    }
-
-    /// Cores of this box's current load that a request will not queue behind,
-    /// published as `background_in_flight`.
-    ///
-    /// All of them, or none: the worker is frozen for the whole of every
-    /// request, so there is no partial answer to give.
-    ///
-    /// Counted in *logical* cores, because that is the unit `cpu_busy_cores`
-    /// is in — a router subtracts one from the other, and the two must agree.
-    /// Reporting physical cores here read correctly on a host without SMT and
-    /// wrongly on one with it: ionos measured `cpu_busy_cores=10.7` against
-    /// `physical_cpus=6` with its worker busy, so subtracting 6 left 0.78 of
-    /// phantom foreground load, and a fully saturated worker would have left
-    /// exactly 1.0 — beamline's `HOST_PRESSURE_LIMIT`, past which the box is
-    /// dropped from routing for work that steps aside the moment it arrives.
-    pub(super) fn sheddable_cores(&self) -> usize {
-        if self.idle_worker_running() && !self.is_busy() {
-            std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
-        } else {
-            0
-        }
-    }
-
     /// When the server first went over its memory ceiling, if it still is.
     pub(super) fn overload_mark(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
         lock(&self.overloaded_since)
@@ -1095,11 +1033,16 @@ impl AppState {
     /// Stop background work, cancel what no client is waiting on, and wait a
     /// bounded time for it to wind down — so an analysis that finished as the
     /// server stopped still files its verdict.
-    async fn drain(&self) {
+    /// Stop background work and cancel every analysis in flight.
+    fn stop(&self) {
         self.shutdown.send_replace(true);
         for entry in &self.in_flight {
             entry.cancellation.store(true, Ordering::Release);
         }
+    }
+
+    async fn drain(&self) {
+        self.stop();
         if tokio::time::timeout(DRAIN_TIMEOUT, self.tasks.drained())
             .await
             .is_err()
@@ -1250,25 +1193,10 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
     // CPU-bound cleave + ONNX work overlaps poorly across many threads, so a
     // smaller pool typically delivers higher aggregate throughput than 1/core.
     let max_concurrent = config.workers;
-    let cores = crate::worker::cleave_concurrency(max_concurrent);
+    let cores = crate::rules::cleave_concurrency(max_concurrent);
     tracing::info!(max_concurrent, cores, "concurrency limit set");
 
     let (shutdown, _) = watch::channel(false);
-    let busy = Arc::new(idle::Busy::default());
-    // Started before the models load, not after: it is its own process and
-    // loads its own, so there is nothing here for it to wait on.
-    let idle_worker = if config.idle_worker_slots > 0 {
-        idle::start(
-            config.hopper(),
-            &crate::upload::default_worker_name(),
-            &busy,
-            shutdown.subscribe(),
-        )
-    } else {
-        tracing::info!("idle worker disabled: --idle-worker-slots is 0");
-        None
-    };
-
     // Said once here rather than on every analysis: a server nobody gave a
     // hopper still answers, but every verdict it computes dies with the
     // process, and that is worth one line at startup instead of silence.
@@ -1311,9 +1239,7 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
         shutdown,
         tasks: Arc::new(Tasks::default()),
         jobs: Jobs::default(),
-        busy,
-        idle_worker,
-        repairs: Arc::new(Semaphore::new(MAX_REPAIRS)),
+        buffered: Arc::new(Semaphore::new(MAX_BUFFERED)),
         uploader,
         corpus,
         config,
@@ -1321,10 +1247,6 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
 
     state.tasks.spawn(load_resources(Arc::clone(&state)));
     spawn_watchdog(&state);
-
-    // `{"purl": …}` needs a few hundred bytes; the router-wide upload limit
-    // would let it buffer a full artifact's worth of JSON before rejecting it.
-    const PURL_BODY_MAX: usize = 64 * 1024;
 
     // No ConcurrencyLimitLayer: each analyze handler refuses past capacity
     // with a 429 rather than queueing. Layers apply bottom-up, so the last
@@ -1334,21 +1256,13 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
         .route("/_/health", get(diag::health))
         .route("/_/info", get(diag::info))
         .route("/_/stats", get(diag::stats))
-        .route("/_/reload", post(handlers::reload))
-        .route("/_/update", post(handlers::update))
+        .route("/_/reload", post(admin::reload))
+        .route("/_/update", post(admin::update))
         .route("/_/memory", get(diag::memory_stats))
         .route("/_/requests", get(diag::requests))
         .route("/_/threads", get(diag::threads))
-        .route("/lookup", get(handlers::lookup))
-        .route("/status", get(handlers::status))
         .route("/v1/lookup", get(v1::v1_lookup))
         .route("/v1/analyze", post(v1::v1_analyze))
-        .route("/analyze", post(handlers::analyze))
-        .route(
-            "/analyze-purl",
-            post(handlers::analyze_purl).layer(DefaultBodyLimit::max(PURL_BODY_MAX)),
-        )
-        .route("/analyze-path", post(handlers::analyze_path))
         .layer(DefaultBodyLimit::max(state.config.max_body_size))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), acl::acl))
         // Outermost: every request gets an id and an access-log line, including
@@ -1569,7 +1483,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         max_body_mb = config.max_body_size / 1024 / 1024,
         analysis_timeout_secs = config.analysis_timeout_secs,
         allow_cidrs = config.allow_cidrs.len(),
-        allowed_dirs = config.allowed_dirs.len(),
+        local_paths = config.local_paths.len(),
         authenticated = config.auth_digest.is_some(),
         "listening (resources loading in background)",
     );
@@ -1584,15 +1498,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         );
     }
 
-    // /analyze-path reads any file under --allowed-dirs and is restricted to
-    // loopback peers — but a tunnel makes every peer a loopback peer, so that
-    // restriction stops protecting it. Leave --allowed-dirs empty unless the
-    // host is genuinely local-only; with no allowed directory the route
-    // rejects every request.
-    if !config.allowed_dirs.is_empty() {
+    // A loopback bind does not make local-path reads local: a tunnel delivers
+    // remote callers over loopback too, and without a token nothing tells them
+    // apart.
+    if !config.local_paths.is_empty() && config.auth_digest.is_none() {
         tracing::warn!(
-            allowed_dirs = config.allowed_dirs.len(),
-            "--allowed-dirs is set: /analyze-path can read those directories for any peer reaching loopback, including through a tunnel",
+            local_paths = config.local_paths.len(),
+            "--allow-local-paths without --token-file: any caller reaching loopback, including through a tunnel, can have files under those directories scanned",
         );
     }
 
@@ -1606,23 +1518,93 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         );
     }
 
-    // ConnectInfo<SocketAddr> is required by the ACL middleware so it can
-    // see the peer IP. Tests inject ConnectInfo manually on each Request.
     let stopping = Arc::clone(&state);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    serve(listener, app, async move {
         shutdown_signal().await;
-        // Background tasks stop now; open requests finish first.
-        stopping.shutdown.send_replace(true);
+        // Cancel analyses now, not after the last connection closes: a
+        // streamed answer holds its connection open until its analysis ends.
+        stopping.stop();
     })
-    .await?;
+    .await;
 
     state.drain().await;
     tracing::info!("server shut down");
     Ok(())
+}
+
+/// Most connections served at once. Past it, accepting waits: idle sockets
+/// cannot exhaust file descriptors, and each analysis holds a slot of its own.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// How long a client has to send its request headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Accept connections and serve `app` on them until `stop` resolves, then
+/// wait up to [`DRAIN_TIMEOUT`] for open connections to finish.
+///
+/// Each request carries its peer address as [`ConnectInfo`], which the ACL
+/// reads.
+async fn serve(listener: tokio::net::TcpListener, app: Router, stop: impl Future<Output = ()>) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::ServiceExt as _;
+
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut stop = std::pin::pin!(stop);
+    loop {
+        // Held across the accept below: that is what makes a full server stop
+        // accepting. The semaphore is never closed, so `Err` cannot happen.
+        let permit = tokio::select! {
+            permit = Arc::clone(&connections).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_closed) => break,
+            },
+            () = &mut stop => break,
+        };
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // Out of descriptors, most likely; spinning would not help.
+                    drop(permit);
+                    tracing::warn!(%error, "accept failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+            () = &mut stop => break,
+        };
+        let service = app
+            .clone()
+            .map_request(move |mut req: axum::http::Request<_>| {
+                req.extensions_mut().insert(ConnectInfo(peer));
+                req
+            });
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
+            .serve_connection(
+                TokioIo::new(stream),
+                hyper_util::service::TowerToHyperService::new(service),
+            );
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = conn.await {
+                tracing::debug!(%peer, %error, "connection ended");
+            }
+        });
+    }
+    drop(listener);
+    if tokio::time::timeout(DRAIN_TIMEOUT, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "shutdown: connections still open after {}s; closing them",
+            DRAIN_TIMEOUT.as_secs()
+        );
+    }
 }
 
 async fn shutdown_signal() {

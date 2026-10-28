@@ -223,11 +223,10 @@ statically, allowing LTO across their boundaries; system runtime libraries
 remain dynamic. These build scripts retain their output locally and do not
 replace installed tools.
 
-- [Integration guide](docs/INTEGRATION.md) — CLI, server, worker, exit codes,
+- [Integration guide](docs/INTEGRATION.md) — CLI, server, library, exit codes,
   and deployment choices
 - [JSON report schema](docs/JSON.md) — machine-readable output fields
 - [Server API](docs/SERVER_API.md) — long-running HTTP service
-- [Workers](docs/WORKERS.md) — distributed scanning with hopper
 - [Dependency behavior](docs/DEPENDENCIES.md) — fetched dependency graph and
   provenance
 

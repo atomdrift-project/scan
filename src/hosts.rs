@@ -64,7 +64,10 @@ const THIRD_PARTY: &[&str] = &[
     "bugzilla.mozilla.org",        // user-attached files on bug reports
     "bugzilla.redhat.com",         // user-attached files on bug reports
     "build.opensuse.org",          // Open Build Service: user-built packages
+    "cdnjs.cloudflare.com",        // community-contributed libraries
+    "community.cloudflare.com",    // forum attachments
     "cran.r-project.org",          // user-published R packages
+    "discuss.python.org",          // forum attachments
     "download.opensuse.org",       // OBS home: projects: user-built packages
     "exchange.adobe.com",          // third-party Adobe plugins
     "extensions.blender.org",      // user-submitted Blender extensions
@@ -73,6 +76,7 @@ const THIRD_PARTY: &[&str] = &[
     "files.slack.com",             // user-uploaded workspace files
     "forge.puppet.com",            // user-published Puppet modules
     "forgeapi.puppet.com",         // user-published Puppet module archives
+    "forums.developer.nvidia.com", // forum attachments
     "galaxy.ansible.com",          // user-published Ansible collections
     "gitlab.alpinelinux.org",      // user-hosted repositories
     "gitlab.freedesktop.org",      // user-hosted repositories
@@ -108,7 +112,9 @@ const THIRD_PARTY: &[&str] = &[
     "store.kde.org",               // user-submitted themes and widgets
     "sum.golang.org",              // Go checksum database
     "supermarket.chef.io",         // user-published Chef cookbooks
+    "techcommunity.microsoft.com", // forum attachments
     "updates.jenkins.io",          // third-party Jenkins plugins
+    "users.rust-lang.org",         // forum attachments
     "wiki.creativecommons.org",    // user-authored pages and uploads
 ];
 
@@ -1343,6 +1349,9 @@ mod tests {
             "https://pastebin.com/raw/abcd",
             "https://cdn.jsdelivr.net/npm/x@1/y.js",
             "https://unpkg.com/x@1/y.js",
+            "https://cdnjs.cloudflare.com/ajax/libs/x/1.0.0/x.min.js",
+            "https://community.cloudflare.com/uploads/default/original/x.zip",
+            "https://discuss.python.org/uploads/short-url/x.zip",
             "https://web.archive.org/web/2020/http://x.test/y.exe",
             "https://www.virustotal.com/api/v3/files/abc/download",
             "https://bit.ly/abc",

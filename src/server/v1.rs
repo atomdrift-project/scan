@@ -2,7 +2,7 @@
 //! by package URL, exact URL or digest, or sent as bytes.
 //!
 //! Every error here is the v1 shape, `{"error": {"code", "message"}}` — see
-//! [`ApiError::v1`] — whichever layer produced it.
+//! [`ApiError::response`] — whichever layer produced it.
 
 use axum::body::HttpBody as _;
 use axum::extract::{Extension, State};
@@ -19,7 +19,8 @@ use super::corpus::{self, Reached};
 use super::decision;
 use super::error::ApiError;
 use super::flight::{Attachment, FlightKey, Outcome};
-use super::handlers::{normalize_pkg_purl, pick_verdict, sanitize_upload_filename, valid_http_url};
+use super::input::{normalize_pkg_purl, sanitize_upload_filename, valid_http_url};
+use crate::lookup::pick_verdict;
 use crate::model::Level;
 
 /// Query for `GET /v1/lookup` and `POST /v1/analyze`. `purl`, `url` and
@@ -67,10 +68,9 @@ pub(super) struct V1LookupQuery {
     /// result is reusable only when it was produced by this worker's traits;
     /// otherwise the immutable sample bytes are fetched and analyzed here.
     refresh: bool,
-    /// Return the complete scan envelope instead of the compact v1 decision.
-    /// A full envelope cannot be reconstructed from the verdict index, so this
-    /// also bypasses decision-only fast paths.
-    full: bool,
+    /// A file on this host to analyze (`/v1/analyze` only, and only when the
+    /// server was started with `--allow-local-paths`).
+    path: Vec<String>,
     /// Which references discovered inside the root artifact the caller wants
     /// followed. Repeated keys and comma-separated values are both accepted.
     /// Empty means use the deployment policy.
@@ -123,7 +123,7 @@ impl V1LookupQuery {
             force: false,
             fresh: false,
             refresh: false,
-            full: false,
+            path: Vec::new(),
             follow: Vec::new(),
         };
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
@@ -145,7 +145,7 @@ impl V1LookupQuery {
                 // This is intentionally stricter than the older boolean
                 // spellings: `refresh=1` is the one public wire contract.
                 "refresh" => q.refresh = value.as_ref() == "1",
-                "full" => q.full = value.as_ref() == "1",
+                "path" => q.path.push(value.into_owned()),
                 "follow" => q.follow.push(value.into_owned()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
@@ -171,9 +171,10 @@ impl V1LookupQuery {
     }
 }
 
-/// Resolve a request's follow selection. The configured policy supplies the
-/// default and the operational limits; an explicit request replaces only the
-/// selected reference categories after its syntax has been validated.
+/// Resolve a request's follow selection: the configured policy, restricted to
+/// what the request names. A request may follow less than the operator allows;
+/// asking for more is refused rather than quietly trimmed, so a caller never
+/// mistakes a shallower answer for the one it asked for.
 fn v1_follow_policy(
     q: &V1LookupQuery,
     configured: crate::fetch::FetchPolicy,
@@ -183,7 +184,17 @@ fn v1_follow_policy(
     }
     let selected = crate::fetch::FetchPolicy::parse_follow(&q.follow.join(","))
         .map_err(|message| ApiError::bad_request("invalid_follow_policy", message))?;
-    Ok(configured.with_selection(selected))
+    configured.restricted_to(selected).ok_or_else(|| {
+        ApiError::bad_request(
+            "follow_not_allowed",
+            format!(
+                "This server follows {}; follow= may only narrow that.",
+                configured
+                    .follow_name()
+                    .unwrap_or_else(|| "a custom selection".to_owned())
+            ),
+        )
+    })
 }
 
 /// How many packages one URL may name.
@@ -223,6 +234,9 @@ struct V1Analyze {
     purl: Option<(String, String)>,
     /// The exact URL, validated.
     url: Option<String>,
+    /// A file on this host, absolute; the server reads it only if it lies
+    /// under `--allow-local-paths`.
+    path: Option<std::path::PathBuf>,
 }
 
 impl V1Analyze {
@@ -231,16 +245,42 @@ impl V1Analyze {
     fn parse(state: &AppState, request_id: u64, q: V1LookupQuery) -> Result<Self, Box<Response>> {
         let started = Instant::now();
         let reject =
-            |code, message: &'static str| Box::new(ApiError::bad_request(code, message).v1());
+            |code, message: &'static str| Box::new(ApiError::bad_request(code, message).response());
         let locators = usize::from(!q.purl.is_empty())
             + usize::from(!q.url.is_empty())
-            + usize::from(!q.sha256.is_empty());
-        if locators > 1 || q.sha256.len() > 1 {
+            + usize::from(!q.sha256.is_empty())
+            + usize::from(!q.path.is_empty());
+        if locators > 1 || q.sha256.len() > 1 || q.path.len() > 1 {
             return Err(reject(
                 "multiple_locators",
-                "Use ?purl=, ?url=, or ?sha256=, not more than one.",
+                "Use one of ?purl=, ?url=, ?sha256= or ?path=.",
             ));
         }
+        // Refused before anything looks at the path, so a server that does not
+        // read local files never touches the filesystem on a caller's behalf.
+        let path = match q.path.first() {
+            None => None,
+            Some(_) if state.config.local_paths.is_empty() => {
+                return Err(Box::new(
+                    ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "local_paths_disabled",
+                        "This server does not read local files (see --allow-local-paths).",
+                    )
+                    .response(),
+                ));
+            }
+            Some(raw) => {
+                let path = std::path::PathBuf::from(raw);
+                if !path.is_absolute() || raw.contains('\0') {
+                    return Err(reject(
+                        "invalid_path",
+                        "path must be an absolute file path.",
+                    ));
+                }
+                Some(path)
+            }
+        };
         if let Some(raw_sha) = q.sha256.first()
             && burton::parse_sha256_hex(raw_sha).is_none()
         {
@@ -269,19 +309,17 @@ impl V1Analyze {
         // they named the artifact, and answering it only after the body has
         // been read would make the same request a 400 or a 503 depending on
         // whether the model happened to be loaded.
-        let budget = q.budget(state.config.level).map_err(|e| Box::new(e.v1()))?;
-        // Everything this server analyses is filed, whatever policy produced
-        // it: a corpus that records a shallower answer than it might have is
-        // worth more than one that records nothing at all.
-        //
-        // TODO(t): Refactor the data model to allow realtime follow reassembly.
-        // Dependencies, references, and CI actions belong in their own tables
-        // rather than folded into one verdict; a caller's `follow=` is then a
-        // view assembled from what is stored, and the question of which policy
-        // owns the row stops being asked. Until then hopper is deliberately
-        // policy-blind and the last writer wins.
+        let budget = q
+            .budget(state.config.level)
+            .map_err(|e| Box::new(e.response()))?;
+        // Everything this server analyzes is filed, whatever policy produced
+        // it, and a narrower request may be answered from what a wider one
+        // filed: a shallower verdict kept is worth more than none. The cost is
+        // that the index and hopper hold one verdict per artifact, whichever
+        // policy filed it first; holding one per policy is a data-model
+        // change, not a flag.
         let follow = RequestFollow {
-            policy: v1_follow_policy(&q, state.config.fetch).map_err(|e| Box::new(e.v1()))?,
+            policy: v1_follow_policy(&q, state.config.fetch).map_err(|e| Box::new(e.response()))?,
             refresh: q.refresh,
         };
         let url = match q.url.as_slice() {
@@ -298,12 +336,11 @@ impl V1Analyze {
             }
             _ => {
                 return Err(Box::new(
-                    ApiError::new(
-                        StatusCode::PAYLOAD_TOO_LARGE,
+                    ApiError::bad_request(
                         "too_many_packages",
                         "Only one exact url may be analyzed per request.",
                     )
-                    .v1(),
+                    .response(),
                 ));
             }
         };
@@ -316,7 +353,7 @@ impl V1Analyze {
                 Ok(purl) => Some((asked.clone(), purl)),
                 Err(message) => {
                     return Err(Box::new(with_subject(
-                        ApiError::bad_request("invalid_purl", message).v1(),
+                        ApiError::bad_request("invalid_purl", message).response(),
                         Subject::purl(asked, None),
                     )));
                 }
@@ -330,6 +367,7 @@ impl V1Analyze {
             follow,
             purl,
             url,
+            path,
         })
     }
 
@@ -373,6 +411,16 @@ pub(super) async fn v1_analyze(
         Ok(req) => req,
         Err(rejected) => return *rejected,
     };
+    if let Some(path) = req.path.clone() {
+        if !body.is_end_stream() {
+            return ApiError::bad_request(
+                "path_with_body",
+                "Use either ?path= or an uploaded artifact, not both.",
+            )
+            .response();
+        }
+        return analyze_path(&state, &req, &path).await;
+    }
 
     // Memory is checked before the body is read: an artifact of up to
     // `--max-size-mb` is read only by a server with room for it. Full admission
@@ -384,7 +432,7 @@ pub(super) async fn v1_analyze(
         && !body.is_end_stream()
         && let Err(refusal) = state.check_memory().await
     {
-        return refusal.v1();
+        return refusal.response();
     }
     let (bytes, sha) = match read_body(body, state.config.max_body_size).await {
         Ok(read) => read,
@@ -394,7 +442,7 @@ pub(super) async fn v1_analyze(
                 status = refusal.status.as_u16(),
                 "request body refused"
             );
-            return refusal.v1();
+            return refusal.response();
         }
     };
     if !bytes.is_empty() {
@@ -403,14 +451,14 @@ pub(super) async fn v1_analyze(
                 "sha256_with_body",
                 "Use either ?sha256=&refresh=1 or an uploaded artifact, not both.",
             )
-            .v1();
+            .response();
         }
         if req.url.is_some() {
             return ApiError::bad_request(
                 "url_with_body",
                 "Use either an exact url or an uploaded artifact, not both.",
             )
-            .v1();
+            .response();
         }
         return analyze_bytes(&state, &req, &headers, bytes, sha).await;
     }
@@ -427,7 +475,7 @@ pub(super) async fn v1_analyze(
         "missing_package",
         "Name an artifact with ?purl= or ?url=, or send it as the body.",
     )
-    .v1()
+    .response()
 }
 
 /// Read a request body of at most `limit` bytes, hashing it as it arrives so
@@ -513,7 +561,7 @@ async fn analyze_bytes(
     // these bytes, which is why the caller sent them, and `unavailable` means
     // we could not find out — turning either into an answer would report on
     // work never done.
-    if !req.q.full && !req.q.force && !req.q.refresh {
+    if !req.q.force && !req.q.refresh {
         let key = Key {
             sha: Some(sha.clone()),
             ..Key::default()
@@ -579,15 +627,49 @@ async fn analyze_bytes(
     answer(req, attachment, named).await
 }
 
+/// Analyze a file on this host, as an upload of the bytes read from it.
+async fn analyze_path(state: &Arc<AppState>, req: &V1Analyze, path: &std::path::Path) -> Response {
+    if let Err(refusal) = state.check_memory().await {
+        return refusal.response();
+    }
+    let request_id = req.request_id;
+    let allowed = state.config.local_paths.clone();
+    let limit = state.config.max_body_size;
+    let owned = path.to_owned();
+    let asked = path.to_string_lossy();
+    let file = match tokio::task::spawn_blocking(move || {
+        super::local::read(&owned, &allowed, limit)
+    })
+    .await
+    {
+        Ok(Ok(file)) => file,
+        Ok(Err(refusal)) => return with_subject(refusal.response(), Subject::path(&asked, None)),
+        Err(error) => {
+            tracing::error!(id = request_id, %error, "reading a local path panicked");
+            return ApiError::internal().response();
+        }
+    };
+    tracing::info!(id = request_id, path = ?path, sha256 = %file.sha256, size_bytes = file.bytes.len(), "--> POST /v1/analyze (path)");
+    let mut headers = HeaderMap::new();
+    if let Ok(name) = HeaderValue::from_str(&file.filename) {
+        headers.insert("x-filename", name);
+    }
+    let subject = Subject::path(&asked, Some(&file.sha256));
+    with_subject(
+        analyze_bytes(state, req, &headers, file.bytes, file.sha256).await,
+        subject,
+    )
+}
+
 /// Re-offer bytes already analyzed to hopper, off the reactor and at most
-/// [`super::MAX_REPAIRS`] at once: each holds the whole upload until it is
+/// [`super::MAX_BUFFERED`] at once: each holds the whole upload until it is
 /// staged, and a repeat past the bound is skipped — the next repeat of the
 /// same artifact repairs it instead.
 fn repair(state: &AppState, request_id: u64, filename: &str, sha: &str, bytes: bytes::Bytes) {
     let Some(uploader) = state.uploader.clone() else {
         return;
     };
-    let Ok(permit) = Arc::clone(&state.repairs).try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&state.buffered).try_acquire_owned() else {
         tracing::debug!(id = request_id, sha256 = %sha, "repair skipped: enough already in flight");
         return;
     };
@@ -625,27 +707,25 @@ fn repair(state: &AppState, request_id: u64, filename: &str, sha: &str, bytes: b
 async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap) -> Response {
     let request_id = req.request_id;
     let Some(sha) = req.q.sha256.first().map(|sha| sha.to_ascii_lowercase()) else {
-        return ApiError::bad_request("missing_sha256", "refresh=1 requires ?sha256=.").v1();
+        return ApiError::bad_request("missing_sha256", "refresh=1 requires ?sha256=.").response();
     };
     // The local index is already namespaced by the currently loaded traits
     // version. It is the cheapest and most reliable answer, and a refresh must
     // not turn a valid Scan-local result into a Hopper dependency merely to
     // prove what Scan already knows.
-    if !req.q.full {
-        let key = sha.clone();
-        if let Some(verdict) = index_query(move |index| index.get_sha(&key))
-            .await
-            .flatten()
-        {
-            let mut resp = answered(
-                V1Decision::stored(&verdict, None, req.budget),
-                "scan:index",
-                req.elapsed_ms(),
-            );
-            resp.extensions_mut().insert(Subject::sha256(&sha));
-            tracing::info!(id = request_id, sha256 = %sha, "refresh answered from Scan's current local index");
-            return resp;
-        }
+    let key = sha.clone();
+    if let Some(verdict) = index_query(move |index| index.get_sha(&key))
+        .await
+        .flatten()
+    {
+        let mut resp = answered(
+            V1Decision::stored(&verdict, None, req.budget),
+            "scan:index",
+            req.elapsed_ms(),
+        );
+        resp.extensions_mut().insert(Subject::sha256(&sha));
+        tracing::info!(id = request_id, sha256 = %sha, "refresh answered from Scan's current local index");
+        return resp;
     }
 
     let Some(corpus) = state.corpus.as_ref() else {
@@ -654,13 +734,11 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
             "hopper_unavailable",
             "refresh requires a configured Hopper corpus.",
         )
-        .v1();
+        .response();
     };
 
     let (reached, source) = corpus.known_fresh_with_source(Some(&sha), None).await;
-    if !req.q.full
-        && let Reached::Record(record) = reached
-    {
+    if let Reached::Record(record) = reached {
         // Reads the installed traits on first use, so off the reactor.
         let local = tokio::task::spawn_blocking(crate::corpus_precheck::local_traits)
             .await
@@ -680,6 +758,14 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
         }
     }
 
+    // The sample is held in memory until the analysis takes it, so the memory
+    // check and the bound on buffered artifacts come before the download.
+    let Ok(_buffered) = Arc::clone(&state.buffered).try_acquire_owned() else {
+        return ApiError::at_capacity("Too many artifacts downloading", None, Some(5)).response();
+    };
+    if let Err(refusal) = state.admit_request(request_id).await {
+        return refusal.response();
+    }
     let sample = match corpus.sample(&sha, state.config.max_body_size).await {
         Ok(sample) => sample,
         Err(message) => {
@@ -690,7 +776,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
                 "sample_unavailable",
                 "Hopper could not serve the sample.",
             )
-            .v1();
+            .response();
         }
     };
     if sample.sha256 != sha {
@@ -700,10 +786,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
             "sample_digest_mismatch",
             "Hopper returned bytes that do not match the requested SHA-256.",
         )
-        .v1();
-    }
-    if let Err(refusal) = state.admit_request(request_id).await {
-        return refusal.v1();
+        .response();
     }
     let short_sha: String = sha.chars().take(12).collect();
     if let Ok(value) = HeaderValue::from_str(&format!("refresh-{short_sha}")) {
@@ -717,7 +800,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
 async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Response {
     let request_id = req.request_id;
     if let Err(refusal) = state.admit_request(request_id).await {
-        return refusal.v1();
+        return refusal.response();
     }
     let attachment = state.flights.join(FlightKey::url_follow(
         url.clone(),
@@ -749,7 +832,8 @@ async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Res
 async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     let request_id = req.request_id;
     let Some((asked, purl)) = req.purl.clone() else {
-        return ApiError::bad_request("missing_package", "Name an artifact with ?purl=.").v1();
+        return ApiError::bad_request("missing_package", "Name an artifact with ?purl=.")
+            .response();
     };
 
     // Already answered?
@@ -767,7 +851,7 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     // answer short-circuits: `unanalyzed` is the whole reason the caller is
     // here, and `unavailable` means we could not find out — turning that into
     // a refusal to work would make a corpus outage look like an answer.
-    if !req.q.full && !req.q.force && !req.q.refresh {
+    if !req.q.force && !req.q.refresh {
         let key = Key {
             purl: Some(purl.clone()),
             ..Key::default()
@@ -827,7 +911,7 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
 /// A request refused admission, named with the follow policy it would have
 /// run under — as every other analyze answer is, refusals included.
 fn refused(req: &V1Analyze, refusal: &ApiError) -> Response {
-    let mut resp = refusal.v1();
+    let mut resp = refusal.response();
     if let Some(name) = req.follow.policy.follow_name()
         && let Ok(value) = HeaderValue::from_str(&name)
     {
@@ -904,34 +988,14 @@ impl Named {
     }
 }
 
-/// A successful full v1 response keeps the ordinary terminal marker while
-/// exposing the complete scan envelope at the same top level.
-#[derive(serde::Serialize)]
-struct V1FullResult {
-    status: &'static str,
-    #[serde(flatten)]
-    envelope: crate::engine::ScanResultEnvelope,
-}
-
-impl V1FullResult {
-    fn from_scan(result: &crate::engine::ScanResult) -> Self {
-        Self {
-            status: "analyzed",
-            envelope: result.to_envelope(),
-        }
-    }
-}
-
 /// The per-request framing an answer renders with: the budget the decision
 /// cites, the clock its `elapsed_ms` fields count from, the follow policy
-/// named on its headers, and whether the terminal frame is the full report or
-/// the verdict.
+/// named on its headers.
 struct V1Framing {
     request_id: u64,
     budget: u16,
     started: Instant,
     follow: Option<String>,
-    full: bool,
 }
 
 /// Answer within the grace window if the analysis lands inside it, otherwise
@@ -942,7 +1006,6 @@ async fn answer(req: &V1Analyze, attachment: Attachment, named: Named) -> Respon
         budget: req.budget,
         started: req.started,
         follow: req.follow.policy.follow_name(),
-        full: req.q.full,
     };
     // Inside the grace window the ordinary response still applies, which is
     // what keeps `429 At capacity` a real 429 the router can act on rather than
@@ -966,11 +1029,7 @@ fn outcome_response(
 ) -> Response {
     let mut resp = match outcome {
         Outcome::Report(result) => {
-            let mut resp = if framing.full {
-                Json(V1FullResult::from_scan(result)).into_response()
-            } else {
-                Json(named.decision(result, framing.budget)).into_response()
-            };
+            let mut resp = Json(named.decision(result, framing.budget)).into_response();
             resp.headers_mut().insert(
                 "X-Total-Ms",
                 crate::duration_ms(framing.started.elapsed()).into(),
@@ -992,7 +1051,7 @@ fn outcome_response(
         // A refusal keeps its status: the caller's router uses it to send the
         // work somewhere that can take it, which a decision in a 200 body
         // cannot be made to do.
-        Outcome::Failed(refusal) => refusal.v1(),
+        Outcome::Failed(refusal) => refusal.response(),
     };
     // Which question this answer answers. The caller resolved a policy before
     // asking, but only this server knows what it applied on top of its own
@@ -1081,7 +1140,6 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
         budget,
         started,
         follow,
-        full,
     } = framing;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     let canonical = named.key.clone();
@@ -1112,10 +1170,6 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
         let decided = match outcome.as_ref() {
             Outcome::Report(result) => {
                 tracing::info!(id = request_id, subject = %named.subject, elapsed_ms = elapsed, "streamed analysis answered");
-                if full {
-                    v1_send(&tx, &V1FullResult::from_scan(result)).await;
-                    return;
-                }
                 named.decision(result, budget)
             }
             Outcome::Failed(refusal) if refusal.status == StatusCode::TOO_MANY_REQUESTS => {
@@ -1130,7 +1184,7 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
                     "elapsed_ms": elapsed,
                 });
                 if let (Some(frame), serde_json::Value::Object(body)) =
-                    (frame.as_object_mut(), refusal.v1_body())
+                    (frame.as_object_mut(), refusal.body_json())
                 {
                     frame.extend(body);
                 }
@@ -1247,7 +1301,7 @@ pub(super) async fn v1_lookup(
     let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
     let response = v1_lookup_inner(&state, &q)
         .await
-        .unwrap_or_else(|refusal| refusal.v1());
+        .unwrap_or_else(|refusal| refusal.response());
     state
         .jobs
         .lookups
@@ -1308,21 +1362,17 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Res
     }
     let named = purls.len().max(urls.len()).max(shas.len());
     if named > V1_MAX_KEYS {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(ApiError::bad_request(
             "too_many_packages",
-            format!(
-                "{named} packages exceeds the limit of {V1_MAX_KEYS} for a URL. Use POST /v1/lookup."
-            ),
+            format!("{named} packages exceeds the limit of {V1_MAX_KEYS} per request."),
         ));
     }
 
     if let Some(&url) = urls.first() {
         if urls.len() > 1 {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
+            return Err(ApiError::bad_request(
                 "too_many_packages",
-                "Only one exact url may be analyzed per request.",
+                "Only one exact url may be looked up per request.",
             ));
         }
         let key = Key::parse(sha, None, Some(url))?;
@@ -2100,6 +2150,7 @@ mod tests {
             },
             purl: Some((purl.into(), purl.into())),
             url: None,
+            path: None,
         };
         let named = Named {
             key: Some(purl.into()),
@@ -2311,16 +2362,6 @@ mod tests {
     }
 
     #[test]
-    fn full_has_one_unambiguous_wire_spelling() {
-        let q = |raw: &str| -> bool { V1LookupQuery::parse(Some(raw)).full };
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&full=1"));
-        for value in ["", "0", "true", "yes", "2"] {
-            let raw = format!("purl=pkg:npm/left-pad@1.3.0&full={value}");
-            assert!(!q(&raw));
-        }
-    }
-
-    #[test]
     fn refresh_reuses_only_an_explicit_matching_traits_version() {
         assert!(matching_traits_version(Some("abc12"), Some("abc12")));
         assert!(!matching_traits_version(Some("old00"), Some("abc12")));
@@ -2330,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_policy_repeats_union_and_overrides_the_server_default() {
+    fn follow_policy_repeats_union_and_only_narrows_the_server_default() {
         use crate::fetch::FetchPolicy;
 
         let configured: FetchPolicy = "all".parse().unwrap();
@@ -2341,12 +2382,20 @@ mod tests {
         let effective = v1_follow_policy(&query, configured).expect("valid selection");
         assert!(effective.urls && effective.packages && effective.deps && effective.ci);
 
+        // A server configured not to follow references must not be talked into
+        // it, and must say so rather than answer a shallower question.
         let dependencies_only: FetchPolicy = "dependencies".parse().unwrap();
-        let references = V1LookupQuery::parse(Some("follow=references"));
-        let effective = v1_follow_policy(&references, dependencies_only)
-            .expect("a request may override the configured categories");
-        assert!(effective.urls && effective.packages);
-        assert!(!effective.deps && !effective.ci);
+        let widen = V1LookupQuery::parse(Some("follow=references,dependencies"));
+        let refused = v1_follow_policy(&widen, dependencies_only).expect_err("widening refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.code, "follow_not_allowed");
+        let within = V1LookupQuery::parse(Some("follow=dependencies"));
+        let effective = v1_follow_policy(&within, dependencies_only).expect("same policy");
+        assert!(effective.deps && !effective.urls && !effective.packages && !effective.ci);
+
+        let narrow = V1LookupQuery::parse(Some("follow=none"));
+        let effective = v1_follow_policy(&narrow, configured).expect("valid selection");
+        assert!(!effective.urls && !effective.packages && !effective.deps && !effective.ci);
 
         let legacy = V1LookupQuery::parse(Some("follow=deps"));
         assert!(v1_follow_policy(&legacy, configured).is_err());

@@ -502,30 +502,37 @@ pub(crate) fn recategorize_annotations(rendered: &str) -> String {
     out
 }
 
-/// One annotation line, or `None` when the line is not one.
-fn recategorize_annotation(line: &str) -> Option<String> {
+/// A cleave finding annotation, split into its parts:
+/// `{indent}{marker} {SEV} {rest}`, where `marker` is `//`, `--` or `#` and
+/// `SEV` is one letter of `HSNBCF`, followed by a space or the end of the line.
+///
+/// The one definition of the grammar: everything that asks whether a line is
+/// an annotation asks here. Strict on purpose, so it never takes a real source
+/// comment like `// Something` or `# S3 bucket` for one.
+pub(crate) fn split_annotation(line: &str) -> Option<(&str, &'static str, char, &str)> {
     let indent_len = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(indent_len);
-    // The marker set must match `interpret::parse_annotation`, which is what
-    // decides a line *is* an annotation: any marker it recognizes and this one
-    // does not passes through with its grade letter intact, which is precisely
-    // what recategorizing is meant to prevent.
-    let (comment, rest) = ["//", "--", "#"]
+    let (marker, rest) = ["//", "--", "#"]
         .into_iter()
         .find_map(|m| Some((m, rest.strip_prefix(m)?.strip_prefix(' ')?)))?;
-    // `SEV ` — one grade letter then a space. Parsed by chars rather than byte
-    // offsets: an annotation body can open with a multi-byte character, and
-    // splitting at a computed byte index lands inside it and panics (observed on
-    // browser-extension samples whose descriptions begin with 'ü').
+    // By chars, not byte offsets: a body can open with a multi-byte character.
     let mut head = rest.chars();
     let sev = head.next()?;
-    // `C` and `F` belong here too — same reason as the marker set above.
-    if !matches!(sev, 'H' | 'S' | 'N' | 'B' | 'C' | 'F') || head.next() != Some(' ') {
+    if !matches!(sev, 'H' | 'S' | 'N' | 'B' | 'C' | 'F') {
         return None;
     }
-    // `sev` is ASCII and the char after it is a space, so this index is a
-    // boundary by construction; `get` keeps that from resting on a panic.
-    let rest = rest.get(sev.len_utf8() + 1..)?;
+    let rest = match head.next() {
+        None => "",
+        // `sev` is ASCII and the char after it a space, so this is a boundary.
+        Some(' ') => rest.get(sev.len_utf8() + 1..)?,
+        Some(_) => return None,
+    };
+    Some((indent, marker, sev, rest))
+}
+
+/// One annotation line, or `None` when the line is not one.
+fn recategorize_annotation(line: &str) -> Option<String> {
+    let (indent, comment, _grade, rest) = split_annotation(line)?;
     if let Some(body) = recategorize_suppression(rest) {
         return Some(format!("{indent}{comment} {body}"));
     }
@@ -1092,6 +1099,43 @@ fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grade(line: &str) -> Option<char> {
+        split_annotation(line).map(|(_, _, sev, _)| sev)
+    }
+
+    #[test]
+    fn annotation_parser_recognizes_findings_not_source_comments() {
+        // Annotations with a location, without one, and at every marker parse to
+        // their severity letter…
+        assert_eq!(grade("// N 22:21 fetch() API call"), Some('N'));
+        assert_eq!(
+            grade("// H Anomalous package hides exfiltration"),
+            Some('H')
+        );
+        assert_eq!(grade("  # S 2:2 suspicious thing"), Some('S'));
+        assert_eq!(grade("-- B"), Some('B'));
+        // …while real source comments that superficially resemble the shape do
+        // not (lower-case word, no space after a capital, prose after a colon).
+        assert_eq!(grade("// Suspicious behavior handled here"), None);
+        assert_eq!(grade("# Note: N is the count"), None);
+        assert_eq!(grade("-- hostile is a variable"), None);
+        assert_eq!(grade("code();"), None);
+    }
+
+    /// Suppression records share the annotation grammar, so the readability
+    /// gate skips them as non-source like any other annotation.
+    #[test]
+    fn suppression_records_are_annotations() {
+        for line in [
+            "// H withheld objectives/exfil/x::y by metadata/pkg/test-fixture::z @30",
+            "  # H downgraded objectives/a::b",
+            "-- S suppressed objectives/a::b by micro-behaviors/c::d; metadata/e::f, +2 more",
+        ] {
+            assert!(split_annotation(line).is_some(), "{line}");
+        }
+    }
+
     use crate::engine::MemberEvals;
     use crate::engine::pipeline::root_needs_registry_graft;
 

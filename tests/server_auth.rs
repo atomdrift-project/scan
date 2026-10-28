@@ -47,7 +47,7 @@ async fn loopback_is_not_exempt_from_the_token() -> Result<()> {
     let app = build_app(&config(true)?).await?;
 
     let response = app
-        .oneshot(loopback(get("/analyze", None)?))
+        .oneshot(loopback(get("/v1/analyze", None)?))
         .await
         .context("request failed")?;
 
@@ -229,7 +229,7 @@ async fn admin_routes_need_loopback_or_a_token() -> Result<()> {
         // Analysis stays open to the allowed peer.
         let response = open
             .clone()
-            .oneshot(with_peer(get("/analyze", None)?, allowed))
+            .oneshot(with_peer(get("/v1/analyze", None)?, allowed))
             .await?;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }

@@ -2,9 +2,9 @@
 # Pre-commit gate for atomdrift-scan. Install with `make install-precommit`.
 #
 # Refuses the commit unless:
-#   1. Cargo.toml has no active local path overrides ([patch] entries pointing
-#      at a sibling checkout via `path = "../..."`). These build against an
-#      unpublished local crate and must never be committed.
+#   1. scripts/check-lock.sh finds no local path override in Cargo.toml,
+#      .cargo/config.toml or Cargo.lock. These build against an unpublished
+#      local crate and must never be committed.
 #   2. `make test` passes.
 #   3. `make lint` passes (clippy with -D warnings).
 #   4. `atomscan validate` exits cleanly (model loads and benign fixtures stay benign).
@@ -16,16 +16,14 @@
 #
 # Bypass intentionally with `git commit --no-verify`.
 
-set -e
+set -eu
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
-# 1. Reject uncommented `path = "../..."` overrides in Cargo.toml. The active
-# wasmtime [patch] uses a git source, so only a relative path = ".." is flagged.
-if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
-	echo "pre-commit: refusing commit — Cargo.toml has a local path override (shown above)." >&2
-	echo "Comment it out before committing, or bypass with: git commit --no-verify" >&2
+if ! scripts/check-lock.sh; then
+	echo "pre-commit: refusing commit — local dependency override (shown above)." >&2
+	echo "Remove it before committing, or bypass with: git commit --no-verify" >&2
 	exit 1
 fi
 
