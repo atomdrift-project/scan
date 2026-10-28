@@ -495,7 +495,8 @@ impl Model {
         &self,
         report: &cleave::types::CompactReport,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
-        let parsed = ParsedReport::from_compact_report(report, RawNeeds::all(), None);
+        let needs = self.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
+        let parsed = ParsedReport::from_compact_report(report, needs, None);
         let mut features = self.ctx.extract_from_parsed(&parsed);
         self.spec.standardize(&mut features);
         let file_type = report
@@ -760,6 +761,27 @@ impl Model {
     #[must_use]
     pub const fn ctx(&self) -> &ExtractContext {
         &self.ctx
+    }
+
+    /// The optional raw inputs a report must have parsed for every route that
+    /// will score it: the general route, and the specialists each of
+    /// `file_types` selects. Specialists load here if they have not yet;
+    /// scoring the same types would load them next anyway.
+    pub(crate) fn raw_needs<'a>(&self, file_types: impl IntoIterator<Item = &'a str>) -> RawNeeds {
+        let mut needs = self.ctx.raw_needs();
+        let mut seen = HashSet::new();
+        for file_type in file_types {
+            if !seen.insert(file_type) {
+                continue;
+            }
+            let (type_key, group_key) = self.routes.specialist_keys(file_type);
+            let group = group_key.and_then(|name| self.routes.filegroups.get(name));
+            let filetype = self.routes.filetypes.get(&type_key);
+            for (_, route) in group.iter().chain(filetype.iter()) {
+                needs = needs.union(route.ctx.raw_needs());
+            }
+        }
+        needs
     }
 
     /// Largest calibrated grid level, which caps the suspicious ceiling (see

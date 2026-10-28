@@ -55,7 +55,11 @@ fn isolate_caches() {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("cache tempdir");
-        scan::set_cache_dir(dir.path().to_owned()).expect("caches not opened yet");
+        scan::settings::configure(scan::settings::Settings {
+            cache_dir: Some(dir.path().to_owned()),
+            ..scan::settings::Settings::default()
+        })
+        .expect("settings not read yet");
         dir
     });
 }

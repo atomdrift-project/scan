@@ -141,14 +141,12 @@ impl Palette {
     }
 }
 
-/// Process-global theme, chosen once at startup — by [`set_theme`] from a CLI
-/// flag, or by [`detect_theme`] — before any output. Dark until then.
-static THEME: OnceLock<Theme> = OnceLock::new();
-
-/// Detect the terminal theme and keep it for the rest of the process (unless
-/// [`set_theme`] already chose one): the terminal's own answer, else dark.
+/// The terminal's own theme, asked once and remembered: its answer, else
+/// dark. Only ask on a terminal that answers; the query blocks on one that
+/// does not.
 pub fn detect_theme() -> Theme {
-    *THEME.get_or_init(|| {
+    static DETECTED: OnceLock<Theme> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
         // Terminal queries must only be attempted on a real TTY. Without one,
         // the read blocks indefinitely or the kernel sends SIGTTIN.
         if !std::io::stderr().is_terminal() {
@@ -163,15 +161,9 @@ pub fn detect_theme() -> Theme {
     })
 }
 
-/// Choose the theme (called from CLI flags before any output). The first
-/// choice stands for the life of the process.
-pub fn set_theme(theme: Theme) {
-    let _ = THEME.set(theme);
-}
-
-/// The active theme, dark when none was chosen.
+/// The active theme; see [`crate::settings::Settings::theme`].
 fn current_theme() -> Theme {
-    THEME.get().copied().unwrap_or(Theme::Dark)
+    crate::settings::get().theme.unwrap_or(Theme::Dark)
 }
 
 fn palette() -> &'static Palette {

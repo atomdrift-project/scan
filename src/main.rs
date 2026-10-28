@@ -824,7 +824,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
     warn_on_broken_freebsd_malloc_conf();
     scan::heap_profile::report_debug_allocator();
     scan::runtime::install_rayon_pool();
-    set_theme(&global, &command);
     scan::runtime::install_diagnostics();
 
     #[cfg(debug_assertions)]
@@ -931,34 +930,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-/// The process-global settings every command shares: the Rizin deadline, the
-/// fetch ceilings, and the cache sweeper.
+/// Settle the process's settings from its flags, and start the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
-    if let Some(path) = &global.fetch_pending {
-        scan::fetch::configure_pending(path)?;
-    }
-    // Before any analysis can start: every analysis's options read it.
-    scan::engine::set_rizin_timeout(std::time::Duration::from_secs(global.rizin_timeout_secs))?;
-    if let Some(seconds) = global.rizin_retry_timeout_secs {
-        scan::engine::set_rizin_retry_timeout(std::time::Duration::from_secs(seconds))?;
-    }
-    // The fetch client and blob cache are built once per process, on first use,
-    // so their settings are fixed here: every mode (interactive scan and server
-    // alike) honors `--fetch-max-size` and `--registry-ttl`.
-    scan::fetch::configure(scan::fetch::Settings {
-        max_fetch_bytes: global.fetch_max_size,
-        registry_ttl: global.registry_ttl,
+    use std::time::Duration;
+    scan::settings::configure(scan::settings::Settings {
+        rizin_timeout: Some(Duration::from_secs(global.rizin_timeout_secs)),
+        rizin_retry_timeout: global.rizin_retry_timeout_secs.map(Duration::from_secs),
+        // Every mode, interactive scan and server alike, honors
+        // `--fetch-max-size` and `--registry-ttl`.
+        fetch: scan::fetch::Settings {
+            max_fetch_bytes: global.fetch_max_size,
+            registry_ttl: global.registry_ttl,
+        },
+        // A hard cap across one invocation. The daemons scan unboundedly many
+        // jobs over their lifetime, so each job is bounded by
+        // `--fetch-max-file-*` instead.
+        fetch_total: (!command.is_daemon()).then_some(scan::settings::FetchTotal {
+            fetches: global.fetch_max_total_fetches,
+            bytes: global.fetch_max_total_size,
+        }),
+        fetch_backlog: global.fetch_pending.clone(),
+        cache_dir: None,
+        theme: theme(global, command),
     })?;
     // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
     // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
     // loop for the never-exiting daemons. Non-blocking either way.
     scan::cache_cleanup::start(command.is_daemon());
-    // Per-execution fetch ceiling: a hard cap across the whole invocation. The
-    // daemons scan unboundedly many jobs over their lifetime, so they're exempt
-    // — each job is bounded by `--fetch-max-file-*` instead.
-    if !command.is_daemon() {
-        scan::fetch::set_total_budget(global.fetch_max_total_fetches, global.fetch_max_total_size);
-    }
     Ok(())
 }
 
@@ -1022,17 +1020,19 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
     }
 }
 
-/// Pick the terminal color theme. Detection is only for an interactive scan
+/// The terminal color theme. Detection is only for an interactive scan
 /// drawing to a terminal: the OSC color-scheme query blocks on a TTY response
 /// and hangs in any environment that doesn't reply (SSH, some tmux configs,
 /// daemons).
-fn set_theme(global: &GlobalArgs, command: &Commands) {
+fn theme(global: &GlobalArgs, command: &Commands) -> Option<scan::output::Theme> {
     if global.light {
-        scan::output::set_theme(scan::output::Theme::Light);
+        Some(scan::output::Theme::Light)
     } else if global.dark {
-        scan::output::set_theme(scan::output::Theme::Dark);
+        Some(scan::output::Theme::Dark)
     } else if global.format == scan::OutputFormat::Terminal && command.is_scan() {
-        scan::output::detect_theme();
+        Some(scan::output::detect_theme())
+    } else {
+        None
     }
 }
 

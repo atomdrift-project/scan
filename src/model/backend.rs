@@ -364,10 +364,7 @@ impl IsotonicCalibrator {
             return self.y[self.y.len() - 1];
         }
         // Binary search for the interval containing `raw`.
-        let i = match self
-            .x
-            .binary_search_by(|p| p.partial_cmp(&raw).unwrap_or(std::cmp::Ordering::Equal))
-        {
+        let i = match self.x.binary_search_by(|p| p.total_cmp(&raw)) {
             Ok(idx) => return self.y[idx], // exact hit on a breakpoint
             Err(idx) => idx,
         };
