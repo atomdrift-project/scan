@@ -273,13 +273,16 @@ mod tests {
 
     #[test]
     fn failed_filter_download_keeps_the_previous_installation() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut connection, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            connection.read(&mut request).unwrap();
+            let mut reader = BufReader::new(&mut connection);
+            let mut request = String::new();
+            while !request.ends_with("\r\n\r\n") {
+                assert!(reader.read_line(&mut request).unwrap() > 0);
+            }
             connection
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
                 .unwrap();

@@ -2160,8 +2160,6 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("text", "most_common_char_is_null", "text", "top_char_null"),
     ("text", "most_common_ratio", "text", "top_char_ratio"),
     ("text", "total_lines", "text", "lines"),
-    // Later renames: filefacts' 2026-10-01 schema cleanup, and metrics cleave
-    // computed before filefacts took over parsing.
     ("ast", "member_depth_max", "ast", "max_member_depth"),
     (
         "binary",
@@ -2202,11 +2200,176 @@ const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("pe", "tls_callbacks", "pe", "tls_callback_count"),
     ("pe", "version_info_present", "pe", "has_version_info"),
     ("text", "max_ws_run", "text", "max_whitespace_run"),
+    ("apk", "declared_size", "apk", "installed_size"),
+    ("apk", "depend_count", "apk", "dependency_count"),
+    ("archive", "prefix_bytes", "archive", "leading_bytes"),
+    (
+        "archive",
+        "timing.mtime_dominant_fraction",
+        "archive",
+        "timing.mtime_dominant_ratio",
+    ),
+    ("ast", "max_array_len", "ast", "max_array_length"),
+    ("ast", "max_numeric_seq", "ast", "max_numeric_sequence"),
+    ("binary", "basic_blocks", "binary", "basic_block_count"),
+    ("binary", "huge_func_count", "binary", "huge_function_count"),
+    ("binary", "leaf_func_count", "binary", "leaf_function_count"),
+    ("binary", "tiny_func_count", "binary", "tiny_function_count"),
+    (
+        "class",
+        "constant_pool_size",
+        "class",
+        "constant_pool_count",
+    ),
+    ("deb", "depends_count", "deb", "dependency_count"),
+    ("deb", "installed_size", "deb", "installed_size_kib"),
+    (
+        "dmg",
+        "total_uncompressed_bytes",
+        "dmg",
+        "uncompressed_size",
+    ),
+    (
+        "elf",
+        "compressed_sections_count",
+        "elf",
+        "compressed_section_count",
+    ),
+    (
+        "elf",
+        "has_direct_loader_dep",
+        "elf",
+        "has_direct_loader_dependency",
+    ),
+    (
+        "iso",
+        "blank_identifier_fields",
+        "iso",
+        "blank_identifier_count",
+    ),
+    ("iso", "dir_count", "iso", "directory_count"),
+    ("iso", "udf.dir_count", "iso", "udf.directory_count"),
+    ("jpeg", "appended_bytes", "jpeg", "trailing_bytes"),
+    (
+        "lnk",
+        "args_leading_spaces",
+        "lnk",
+        "arguments_leading_spaces",
+    ),
+    ("lnk", "args_leading_tabs", "lnk", "arguments_leading_tabs"),
+    (
+        "lnk",
+        "args_max_whitespace_run",
+        "lnk",
+        "arguments_max_whitespace_run",
+    ),
+    (
+        "lnk",
+        "args_whitespace_total",
+        "lnk",
+        "arguments_whitespace_count",
+    ),
+    (
+        "office",
+        "vba.mean_identifier_length",
+        "office",
+        "vba.avg_identifier_length",
+    ),
+    ("office", "vba_project_size", "office", "vba.project_size"),
+    (
+        "pdf",
+        "decoded_form_value_max_len",
+        "pdf",
+        "decoded_form_value_max_length",
+    ),
+    ("pdf", "leading_bytes_before_header", "pdf", "leading_bytes"),
+    ("pdf", "trailing_bytes_after_eof", "pdf", "trailing_bytes"),
+    (
+        "pe",
+        "clr.strong_name_sig_size",
+        "pe",
+        "clr.strong_name_signature_size",
+    ),
+    ("pe", "recovered_exports", "pe", "recovered_export_count"),
+    (
+        "pe",
+        "recovered_functions",
+        "pe",
+        "recovered_function_count",
+    ),
+    ("pe", "recovered_imports", "pe", "recovered_import_count"),
+    ("pe", "recovered_sections", "pe", "recovered_section_count"),
+    (
+        "pe",
+        "reloc_overhang_bytes",
+        "pe",
+        "relocation_overhang_bytes",
+    ),
+    (
+        "pe",
+        "reloc_overhang_ratio",
+        "pe",
+        "relocation_overhang_ratio",
+    ),
+    ("png", "chunks_after_iend", "png", "trailing_chunk_count"),
+    ("rar", "encrypted_header", "rar", "headers_encrypted"),
+    (
+        "registry",
+        "first_published_at",
+        "registry",
+        "first_published_unix",
+    ),
+    ("registry", "maintainers", "registry", "maintainer_count"),
+    (
+        "registry",
+        "previous_published_at",
+        "registry",
+        "previous_published_unix",
+    ),
+    ("registry", "published_at", "registry", "published_unix"),
+    ("rtf", "group_depth_max", "rtf", "max_group_depth"),
+    ("scpt", "calls", "scpt", "call_count"),
+    ("scpt", "decoded", "scpt", "decoded_count"),
+    ("scpt", "events", "scpt", "event_count"),
+    ("scpt", "handlers", "scpt", "handler_count"),
+    ("sections", "entropy_max", "sections", "max_entropy"),
+    ("sections", "entropy_mean", "sections", "avg_entropy"),
+    ("source", "ast_walk_panic", "source", "ast_walk_panicked"),
+    ("source", "extract_panic", "source", "extract_panicked"),
 ];
 
-/// Borrow metric values under their original names and missing legacy aliases.
-/// Both numeric features and categorical tokens use this view; no report copy
-/// or mutation is needed.
+type MetricAliasKey = (&'static str, &'static str);
+
+// Same equivalence classes/order as collimator: canonical spelling first,
+// then historical names in the table's order. Never overwrite explicit data.
+static METRIC_EQUIVALENTS: LazyLock<Vec<Vec<MetricAliasKey>>> = LazyLock::new(|| {
+    let renames: HashMap<MetricAliasKey, MetricAliasKey> = METRIC_RENAMES
+        .iter()
+        .map(|&(og, ok, ng, nk)| ((og, ok), (ng, nk)))
+        .collect();
+    let mut groups: Vec<Vec<MetricAliasKey>> = Vec::new();
+    let mut positions = HashMap::new();
+    for &(og, ok, _, _) in METRIC_RENAMES {
+        let old = (og, ok);
+        let mut canonical = old;
+        let mut seen = HashSet::new();
+        while let Some(&next) = renames.get(&canonical) {
+            assert!(seen.insert(canonical), "cyclic metric rename");
+            canonical = next;
+        }
+        let index = *positions.entry(canonical).or_insert_with(|| {
+            groups.push(vec![canonical]);
+            groups.len() - 1
+        });
+        if !groups[index].contains(&old) {
+            groups[index].push(old);
+        }
+    }
+    groups
+});
+
+/// Borrow numeric/categorical facts under old and new metric spellings.
+/// Missing aliases are filled; explicit values and malformed groups win.
 fn metric_fields(
     source: Option<&serde_json::Value>,
 ) -> impl Iterator<Item = (&str, &str, &serde_json::Value)> {
@@ -2221,20 +2384,20 @@ fn metric_fields(
                     .map(move |(key, value)| (group.as_str(), key.as_str(), value))
             })
         });
-    let aliases =
-        METRIC_RENAMES
+    let aliases = METRIC_EQUIVALENTS.iter().flat_map(move |equivalents| {
+        let value = equivalents
             .iter()
-            .filter_map(move |&(old_group, old_key, new_group, new_key)| {
-                let groups = groups?;
-                if let Some(fields) = groups.get(old_group) {
-                    // Malformed old groups and explicitly present old values stay as-is.
-                    if fields.as_object()?.contains_key(old_key) {
-                        return None;
-                    }
-                }
-                let value = groups.get(new_group)?.as_object()?.get(new_key)?;
-                Some((old_group, old_key, value))
-            });
+            .find_map(|&(group, key)| groups?.get(group)?.as_object()?.get(key));
+        equivalents.iter().filter_map(move |&(group, key)| {
+            let groups = groups?;
+            if let Some(fields) = groups.get(group)
+                && fields.as_object()?.contains_key(key)
+            {
+                return None;
+            }
+            Some((group, key, value?))
+        })
+    });
     original.chain(aliases)
 }
 
@@ -4457,6 +4620,29 @@ mod tests {
                 assert_eq!(metrics, original, "aliasing must not mutate the report");
             }
         }
+    }
+
+    #[test]
+    fn historical_metrics_fill_v9_names_and_sibling_aliases() {
+        for &(old_group, old_key, new_group, new_key) in METRIC_RENAMES {
+            for value in [
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                serde_json::json!(false),
+                serde_json::json!(5.27),
+                serde_json::json!("signed"),
+            ] {
+                let metrics = serde_json::json!({old_group: {old_key: value}});
+                let original = metrics.clone();
+                let fields: Vec<_> = metric_fields(Some(&metrics)).collect();
+                assert!(fields.contains(&(new_group, new_key, &value)));
+                assert_eq!(metrics, original);
+            }
+        }
+        let metrics = serde_json::json!({"ast": {"max_array_len": 0, "max_array_length": 12}});
+        let fields: Vec<_> = metric_fields(Some(&metrics)).collect();
+        assert!(fields.contains(&("ast", "array_literal_max_length", &serde_json::json!(12))));
+        assert!(fields.contains(&("ast", "max_array_len", &serde_json::json!(0))));
     }
 
     #[test]
