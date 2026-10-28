@@ -6051,11 +6051,14 @@ const TRAIT_AUTOINSTALL: &str = "objectives/execution/autoinstall/";
 const TRAIT_GITHUB_RUNNER_SHELL: &str =
     "micro-behaviors/process/create/shell/bridge::github-runner-shell-execution";
 const TRAIT_IMAGE_FILE_URL: &str = "micro-behaviors/communications/http/url/path::image-file-url";
+const TRAIT_BROWSER_PAC_URL: &str =
+    "micro-behaviors/os/network/webextension::chrome-pac-script-literal-url";
 const TRAIT_SECURITY_HOLD_RECORD: &str = "registry-security-hold-record";
 
 /// Trait-id namespaces whose findings show that a file downloads something in
 /// order to run it: dropper objectives, a pipeline into a shell or an
-/// auto-install / CI-runner shell bridge, and a process spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
+/// auto-install / CI-runner shell bridge, a browser PAC configuration URL,
+/// and a process spawn of `curl`/`wget`. Ordered most- to least-specific; the first match
 /// names the reason a member was hunted.
 fn download_intent(findings: &[Finding]) -> Option<&str> {
     let rank = |id: &str| {
@@ -6066,6 +6069,10 @@ fn download_intent(findings: &[Finding]) -> Option<&str> {
             || id == TRAIT_GITHUB_RUNNER_SHELL
         {
             Some(1)
+        } else if id == TRAIT_BROWSER_PAC_URL {
+            // A PAC URL identifies executable proxy configuration, including
+            // inside extension archives whose source bytes were discarded.
+            Some(2)
         } else if id.starts_with(TRAIT_PROCESS_CREATE)
             && (id.contains("curl") || id.contains("wget"))
         {
@@ -6194,7 +6201,14 @@ fn hunt_download_members(
                 continue;
             }
         };
-        let hunted = find::references_in_bytes(&bytes, member);
+        let mut hunted = find::references_in_bytes(&bytes, member);
+        if trigger == TRAIT_BROWSER_PAC_URL {
+            // The lightweight trait only gates re-reading. Require the
+            // API/mode/binding check before adding a PAC code dependency;
+            // generic URL strings in comments or overwritten settings do
+            // not become new archive fetches through this gate.
+            hunted.retain(|reference| reference.source == "ast-browser-pac-url");
+        }
         tracing::info!(
             member,
             trigger,
@@ -9374,6 +9388,45 @@ mod tests {
         Or run `curl -fsSL https://docs.test/install.sh`.\n";
 
     #[test]
+    fn archive_browser_pac_program_keeps_member_source_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let javascript = b"browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://proxy.test/config.pac'}});";
+        let shadowed = b"function f(browser){browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://shadow.test/decoy.pac'}});}";
+        let root = write_tar_zst(
+            tmp.path(),
+            &[("background.js", javascript), ("shadowed.js", shadowed), ("README.md", README)],
+        );
+        let path = root.to_string_lossy().into_owned();
+        let owner = "bb".repeat(32);
+        let report: AnalysisReport = serde_json::from_value(serde_json::json!({
+            "version": "3",
+            "files": [
+                { "id": 0, "path": path, "depth": 0, "file_type": "tar",
+                  "sha256": "aa".repeat(32), "size": 4096u64 },
+                { "id": 1, "parent_id": 0, "path": format!("{path}!!background.js"),
+                  "depth": 1, "file_type": "javascript", "sha256": owner,
+                  "size": javascript.len() as u64,
+                  "findings": [{ "id": TRAIT_BROWSER_PAC_URL }] },
+                { "id": 2, "parent_id": 0, "path": format!("{path}!!README.md"),
+                  "depth": 1, "file_type": "markdown", "sha256": "cc".repeat(32),
+                  "size": README.len() as u64 },
+                { "id": 3, "parent_id": 0, "path": format!("{path}!!shadowed.js"),
+                  "depth": 1, "file_type": "javascript", "sha256": "dd".repeat(32),
+                  "size": shadowed.len() as u64,
+                  "findings": [{ "id": TRAIT_BROWSER_PAC_URL }] }
+            ]
+        })).expect("report deserializes");
+        let groups = collect_references(&report, &root, CiRefs::Skip);
+        let matches: Vec<_> = groups.iter().flat_map(|(sha, refs)| refs.iter().map(move |r| (sha, r)))
+            .filter(|(_, reference)| reference.source == "ast-browser-pac-url").collect();
+        assert_eq!(matches.len(), 1, "{groups:?}");
+        assert_eq!(matches[0].0, &owner);
+        assert_eq!(locator(matches[0].1), "https://proxy.test/config.pac");
+        assert!(!groups.iter().flat_map(|(_, refs)| refs).any(|r| locator(r).contains("docs.test")));
+        assert!(!groups.iter().flat_map(|(_, refs)| refs).any(|r| locator(r).contains("shadow.test")));
+    }
+
+    #[test]
     fn member_with_download_intent_is_hunted_for_spawned_urls() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = write_tar_zst(
@@ -10437,6 +10490,41 @@ mod tests {
 #[cfg(test)]
 mod dependency_gap_tests {
     use super::*;
+    #[test]
+    fn real_compact_archive_keeps_glib_stylesheet_import_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("theme.tar");
+        let source = br#"GLib.file_set_contents(path, "@import url('https://theme.fixturetests.net/style.css');\n" + "/* local */\n");
+logger.file_set_contents(path, "@import 'https://theme.fixturetests.net/logger.css';");
+GLib.file_set_contents(path, unknown + "@import 'https://theme.fixturetests.net/unknown.css';");
+GLib.file_set_contents(path, "status", "@import 'https://theme.fixturetests.net/ignored.css';");
+"#;
+        let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        let mut header = tar::Header::new_ustar();
+        header.set_size(source.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, "extension.js", &source[..]).unwrap();
+        archive.finish().unwrap();
+        let mut report = cleave::Engine::empty()
+            .with_compact_members(true)
+            .analyze_file(&path, &AnalysisOptions::default())
+            .unwrap();
+        report.finalize();
+        // Exercise the retained, serialized archive view, not a separately
+        // reparsed source file that would hide compaction regressions.
+        let report: AnalysisReport = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let groups = collect_references(&report, Path::new("not-on-disk"), CiRefs::Skip);
+        let imports: Vec<_> = groups.iter().flat_map(|(sha, refs)| {
+            refs.iter().filter(|r| r.source == "ast-glib-stylesheet-import").map(move |r| (sha, r))
+        }).collect();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(locator(imports[0].1), "https://theme.fixturetests.net/style.css");
+        assert_eq!(imports[0].1.kind, RefKind::Dependency);
+        assert_eq!(imports[0].1.offset, Some(0));
+        assert!(report.files.iter().any(|f| f.path.ends_with("!!extension.js") && &f.sha256 == imports[0].0));
+    }
+
     #[test]
     fn real_compact_archive_retains_local_identity_entry_points_and_install_hooks() {
         let dir = tempfile::tempdir().unwrap();
