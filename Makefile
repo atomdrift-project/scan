@@ -1040,7 +1040,9 @@ test:
 			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 		$(CARGO) test --doc --quiet; \
 	else \
-		$(CARGO) test --workspace; \
+		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
+		$(CARGO) test --workspace -- \
+			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 	fi
 
 .PHONY: test-cli
@@ -1055,7 +1057,9 @@ test-unit:
 		$(CARGO) nextest run --lib -- \
 			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 	else \
-		$(CARGO) test --lib; \
+		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
+		$(CARGO) test --lib -- \
+			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
 	fi
 
 # Install the pre-commit gate (no local Cargo.toml path overrides + make lint +
