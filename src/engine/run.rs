@@ -290,7 +290,13 @@ pub fn scan_bytes(
         shap,
         cancel: None,
     };
-    classifier.classify(report, Origin::local(Path::new(filename)), None, Path::new(filename), Some(data))
+    classifier.classify(
+        report,
+        Origin::local(Path::new(filename)),
+        None,
+        Path::new(filename),
+        Some(data),
+    )
 }
 
 /// Scan a payload that already lives on disk, returning the same [`ScanResult`]
@@ -322,7 +328,13 @@ pub fn scan_file(
         shap,
         cancel: None,
     };
-    classifier.classify(report, Origin::local(Path::new(filename)), None, read_path, None)
+    classifier.classify(
+        report,
+        Origin::local(Path::new(filename)),
+        None,
+        read_path,
+        None,
+    )
 }
 
 /// The cleave options a config implies, before any per-scan additions.
@@ -413,7 +425,12 @@ impl<'a> Session<'a> {
 
     /// Keep an in-memory root available through dependency discovery. The
     /// classifier consumes this shared handle and releases it after that phase.
-    fn record_input(&self, target: &Target<'_>, analyzed: Result<AnalysisReport>, root_bytes: Option<bytes::Bytes>) {
+    fn record_input(
+        &self,
+        target: &Target<'_>,
+        analyzed: Result<AnalysisReport>,
+        root_bytes: Option<bytes::Bytes>,
+    ) {
         // The bloom verdict, re-derived from the sha cleave computed. A file
         // cleave skipped at our request (a stale known-good, or a fast-mode
         // unknown) arrives as a minimal report and is counted here without an
@@ -451,8 +468,13 @@ impl<'a> Session<'a> {
         }
 
         let classified = analyzed.and_then(|report| {
-            self.classifier()
-                .classify(report, target.origin, bloom_mark, target.origin.path, root_bytes)
+            self.classifier().classify(
+                report,
+                target.origin,
+                bloom_mark,
+                target.origin.path,
+                root_bytes,
+            )
         });
         self.advance();
         match classified {
@@ -542,9 +564,16 @@ impl<'a> Session<'a> {
 
     fn report(&self, target: &Target<'_>, result: ScanResult) {
         self.tally.count(result.classification);
-        self.tally.static_flags.fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
-        self.tally.dependency_gaps.fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
-        self.tally.flagged_candidates.fetch_add(result.dependency_attention.flagged_candidates, Ordering::Relaxed);
+        self.tally
+            .static_flags
+            .fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
+        self.tally
+            .dependency_gaps
+            .fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
+        self.tally.flagged_candidates.fetch_add(
+            result.dependency_attention.flagged_candidates,
+            Ordering::Relaxed,
+        );
         // An adversely bloom-marked file is always surfaced — its flag replaces
         // the old unconditional banner, so the benign filter must not swallow a
         // known-bad file the model happens to rate benign. JSON, tiny, and
@@ -993,7 +1022,10 @@ const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSum
         suspicious,
         benign,
         errors: 0,
-        dependency_attention: super::DependencyAttention { gaps: 0, flagged_candidates: 0 },
+        dependency_attention: super::DependencyAttention {
+            gaps: 0,
+            flagged_candidates: 0,
+        },
         static_flags: 0,
         duration_ms: 0,
     }

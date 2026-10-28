@@ -423,7 +423,9 @@ pub struct DependencyAttention {
 impl DependencyAttention {
     pub(crate) fn add(&mut self, other: Self) {
         self.gaps = self.gaps.saturating_add(other.gaps);
-        self.flagged_candidates = self.flagged_candidates.saturating_add(other.flagged_candidates);
+        self.flagged_candidates = self
+            .flagged_candidates
+            .saturating_add(other.flagged_candidates);
     }
 }
 
