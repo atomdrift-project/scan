@@ -67,8 +67,7 @@ fn family_of(name: &str) -> &'static str {
 #[test]
 #[ignore = "diagnostic: needs SCAN_MODELS_DIR with per-route fixtures; run with --nocapture"]
 fn audit_per_route_divergences() {
-    let dir = std::env::var_os("SCAN_MODELS_DIR")
-        .map(std::path::PathBuf::from)
+    let dir = scan::env::path(scan::env::SCAN_MODELS_DIR)
         .expect("set SCAN_MODELS_DIR to a model bundle to run this audit");
     let mut found = 0usize;
     for parent in ["filetypes", "filegroups"] {

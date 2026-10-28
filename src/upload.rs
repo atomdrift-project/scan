@@ -1,12 +1,12 @@
 //! Best-effort upload of scan results to a hopper instance.
 //!
-//! Mirrors the pull-based worker's `/api/result` contract — the same
-//! `ResultPayload` wire shape, the same zstd-compressed envelope — but driven
-//! by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
+//! Mirrors the `/api/result` contract of postdoc's pull-based worker — the
+//! same `ResultPayload` wire shape, the same zstd-compressed envelope — but
+//! driven by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
 //! uses it to *renew* a sample hopper has already ingested with this build's
 //! traits and model: hopper's `/api/result` is a lease-free `UPDATE ... WHERE
 //! sha256 = ?`, so posting a result for an already-scanned SHA replaces its
-//! stored cleave/litmus envelope (and an unknown SHA is a harmless no-op).
+//! stored analysis envelope (and an unknown SHA is a harmless no-op).
 //!
 //! Uploads run on a dedicated thread so blocking network I/O never stalls the
 //! analysis pool. Network upload failures do not fail the local scan, but they
@@ -17,237 +17,20 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use reqwest::StatusCode;
 use reqwest::blocking::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 
 mod queue;
 
 use crate::engine::ScanResultEnvelope;
-
-/// A hopper bearer token and where it was found. The origin is a path or an
-/// environment variable name — never the secret — so it is safe to log.
-#[derive(Debug)]
-struct Credential {
-    token: String,
-    origin: String,
-}
-
-/// The process's hopper credential, and the file it was (or would have been)
-/// read from — resolved once, environment included.
-///
-/// `$HOPPER_TOKEN` wins, for callers that inject the token some other way;
-/// otherwise it is the first non-empty line of `~/.tok/hopper`, unless
-/// `$HOPPER_TOKEN_FILE` names another file — the same convention as
-/// `~/.tok/openrouter` and `~/.tok/scan`. A locally supervised worker inherits
-/// the service account's `HOME`, so it finds the file with no plumbing. The
-/// variable names the file rather than the secret, so the token stays off argv
-/// and out of the environment.
-///
-/// Resolved once per process: hopper reads its own copy once at startup too,
-/// so rotation is a restart on both ends.
-fn credentials() -> &'static (Option<Credential>, Option<PathBuf>) {
-    static CREDENTIALS: OnceLock<(Option<Credential>, Option<PathBuf>)> = OnceLock::new();
-    CREDENTIALS.get_or_init(|| {
-        let env = std::env::var("HOPPER_TOKEN").ok();
-        let path = std::env::var_os("HOPPER_TOKEN_FILE")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty())
-            .or_else(|| crate::interpret::tok_path("hopper"));
-        (resolve_credential(env.as_deref(), path.as_deref()), path)
-    })
-}
-
-/// Bearer token for hopper's API, or `None` when hopper is unauthenticated.
-/// Never the origin, never logged.
-#[must_use]
-pub fn hopper_token() -> Option<&'static str> {
-    credentials().0.as_ref().map(|c| c.token.as_str())
-}
-
-/// The process's blocking HTTP client for hopper, with [`REQUEST_TIMEOUT`] as
-/// its default per-request ceiling.
-///
-/// Built on first use, on whichever plain thread first needs it — the uploader
-/// thread or an analysis thread, never the async runtime `serve` builds its
-/// uploader from, where reqwest refuses to build a blocking client and panics
-/// dropping the half-built one. A static is never dropped there either. `None`,
-/// said once, when it cannot be built: callers then stop rather than fall back
-/// to a client without timeouts.
-pub fn hopper_http() -> Option<&'static reqwest::blocking::Client> {
-    static HTTP: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
-    HTTP.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                tracing::error!(error = %error_chain(&e), "cannot build the hopper HTTP client; hopper calls disabled");
-            })
-            .ok()
-    })
-    .as_ref()
-}
-
-/// Split `--hopper` into the endpoints to try, in preference order.
-///
-/// One address is the ordinary case. Several — comma-separated, as `SCAN_URL`
-/// and `--allowed-dirs` already are — name the same hopper reached two ways:
-/// put the replica first and the primary behind it, and a replica outage costs
-/// a retry rather than a lost verdict. Reads and writes take the same list on
-/// purpose. Routing them separately is a topology this worker would have to
-/// know, and hopper's write relay exists precisely so it does not: a replica
-/// answers lookups locally and forwards the renewals.
-#[must_use]
-pub fn endpoints(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|url| url.trim().trim_end_matches('/').trim().to_string())
-        .filter(|url| !url.is_empty())
-        .collect()
-}
-
-/// Warn, once per address, when the hopper token would cross the network in
-/// cleartext: a plain `http://` hopper that is not on loopback. The token is
-/// fleet-wide write access to the corpus, so it should only travel over TLS or
-/// a network that encrypts on its own (a WireGuard/Tailscale address, which
-/// this cannot tell apart and so still names).
-pub fn warn_if_cleartext(raw: &str) {
-    if hopper_token().is_none() {
-        return;
-    }
-    for endpoint in endpoints(raw) {
-        let Ok(url) = reqwest::Url::parse(&endpoint) else {
-            continue;
-        };
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        if url.scheme() == "http" && !loopback {
-            tracing::warn!(
-                hopper = %endpoint,
-                "the hopper token is sent to this address in cleartext; use https unless the network itself is encrypted"
-            );
-        }
-    }
-}
-
-/// The one address a worker may poll: the primary, which [`endpoints`] puts
-/// last.
-///
-/// Worker routes are the exception to the rule above. A replica answers
-/// lookups and relays renewals, but it refuses `/api/next` and the plain
-/// `/api/result` with a 403 even when its relay is enabled — the fleet's queue
-/// is the primary's to hand out, and passing the worker firehose through a
-/// replica helps no one. So there is nothing to fail over to here: the second
-/// address is not another way to reach the same answer, it is the only one.
-///
-/// Returns `None` for an empty or blank `--hopper`, which is how the deploy
-/// says "do not file results anywhere".
-#[must_use]
-pub fn worker_endpoint(raw: &str) -> Option<String> {
-    endpoints(raw).pop()
-}
-
-/// One hopper route, at every address it can be reached.
-///
-/// Ordered as `--hopper` named them. A retry walks down the list rather than
-/// hammering one address, so the second attempt after a replica stops answering
-/// lands on the primary instead of on the same silence.
-#[derive(Debug, Clone)]
-struct Route(Vec<String>);
-
-impl Route {
-    fn new(bases: &[String], suffix: &str) -> Self {
-        Self(bases.iter().map(|base| format!("{base}{suffix}")).collect())
-    }
-
-    /// The address to use on this attempt, clamped to the last: a budget longer
-    /// than the list keeps retrying the final address rather than wrapping back
-    /// to one already known to be failing.
-    fn at(&self, attempt: usize) -> &str {
-        let last = self.0.len().saturating_sub(1);
-        self.0.get(attempt.min(last)).map_or("", String::as_str)
-    }
-
-    /// Every address, for a caller that tries each exactly once rather than
-    /// retrying on a schedule.
-    fn each(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(String::as_str)
-    }
-}
-
-/// The precedence behind [`credentials`], split out so it is testable without
-/// touching process-wide environment or the `OnceLock`.
-fn resolve_credential(env: Option<&str>, path: Option<&std::path::Path>) -> Option<Credential> {
-    if let Some(value) = env.map(str::trim).filter(|value| !value.is_empty()) {
-        return Some(Credential {
-            token: value.to_string(),
-            origin: "$HOPPER_TOKEN".to_string(),
-        });
-    }
-    let path = path?;
-    Some(Credential {
-        token: crate::interpret::read_token_file(path)?,
-        origin: path.display().to_string(),
-    })
-}
-
-/// Point this process at `hopper_url`: report where the bearer token came from,
-/// and arm the fleet-shared dependency precheck against that same host.
-///
-/// Both halves belong to one decision — "this is the hopper we talk to" — and
-/// every entry point that reaches hopper calls this, so
-/// `crate::corpus_precheck`'s "the hopper you submit to is the hopper you ask"
-/// holds by construction. It used to hold only by each caller remembering, and
-/// the pull worker did not: it logged the credential and never armed the
-/// precheck, so it re-analyzed and re-mirrored dependencies the corpus already
-/// held at this analyzer version — which hopper records as "result renewed with
-/// no analyzer change; the re-analysis learned nothing".
-pub fn use_hopper(hopper_url: &str) {
-    log_hopper_credential();
-    crate::corpus_precheck::configure(hopper_url);
-}
-
-/// Log where the hopper credential came from, or warn that there is none.
-///
-/// Hopper requires `Authorization: Bearer <token>` on every route and does not
-/// exempt loopback, so an unauthenticated worker or `--hopper` upload is
-/// rejected with 401 on every request. Say so once at startup rather than
-/// leaving an operator to infer it from a retry loop.
-fn log_hopper_credential() {
-    match credentials() {
-        (Some(credential), _) => {
-            tracing::info!(source = %credential.origin, "hopper API token loaded");
-        }
-        (None, expected) => tracing::warn!(
-            expected = %expected.as_deref().unwrap_or(std::path::Path::new("")).display(),
-            "no hopper API token found; unless hopper runs unauthenticated every \
-             request will be rejected with 401 — install the token at \
-             ~/.tok/hopper (mode 0600) or set $HOPPER_TOKEN",
-        ),
-    }
-}
-
-/// Attach a bearer token to a blocking request, if there is one.
-fn bearer(
-    request: reqwest::blocking::RequestBuilder,
-    token: Option<&str>,
-) -> reqwest::blocking::RequestBuilder {
-    match token {
-        Some(token) => request.bearer_auth(token),
-        None => request,
-    }
-}
+use crate::hopper::{
+    Route, backoff, bearer, endpoints, error_chain, fuzz, is_permanent, parse_retry_after,
+};
 
 /// Hopper bounds the decompressed result body at 512 MiB (`maxResultBodyBytes`
 /// in hopper's api.go); a larger document is truncated mid-stream and rejected
@@ -270,12 +53,12 @@ const SEEN_SHAS_MAX: usize = 100_000;
 
 /// Per-attempt request timeouts for `/api/upload`, separate from
 /// [`REQUEST_TIMEOUT`] because that ceiling was sized for the small JSON
-/// verdicts a renewal sends, not for streaming a multi-GiB
-/// artifact — with `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` raised to 8 GiB
-/// (2026-08-27), a legitimate transfer on a merely mediocre link would blow
-/// through 120s and get cut off as a timeout rather than a real failure.
-/// The final ceiling matches hopper's own `uploadBodyTimeout` (30 min, same
-/// change) — no point the client giving up before the server would have.
+/// verdicts a renewal sends, not for streaming a multi-GiB artifact: with
+/// artifacts up to [`HOPPER_MAX_UPLOAD_ARTIFACT_BYTES`], a legitimate transfer
+/// on a mediocre link would outlast a short ceiling and be cut off as a timeout
+/// rather than a real failure. The final ceiling matches hopper's own
+/// `uploadBodyTimeout` (30 min) — no point the client giving up before the
+/// server would have.
 const UPLOAD_ATTEMPT_TIMEOUTS: [Duration; 4] = [
     Duration::from_secs(30),
     Duration::from_secs(120),
@@ -291,19 +74,18 @@ const UPLOAD_ATTEMPT_TIMEOUTS: [Duration; 4] = [
 /// because receiver is gone", indistinguishable from a real network fault.
 /// Checked client-side so an oversized dependency is skipped with one clear
 /// log line instead of spending 4 retries on a request that can never
-/// succeed (confirmed against hopper's `samples` table on 2026-08-27: every
-/// artifact over the then-100-MiB cap that scan attempted to upload landed
-/// with an empty `path` — the bytes never arrived — while everything under
-/// it landed clean). Raised to 8 GiB alongside hopper's own cap the same
-/// day; keep the two in sync — this can only shrink the set of artifacts
-/// scan bothers attempting, never rescue one hopper would reject.
+/// succeed (an over-cap upload lands in hopper with an empty `path`: the bytes
+/// never arrive). Keep this in sync with hopper's cap — it can only shrink the
+/// set of artifacts scan bothers attempting, never rescue one hopper would
+/// reject.
 const HOPPER_MAX_UPLOAD_ARTIFACT_BYTES: u64 = 8 << 30;
 
 /// Hopper's ingestion lane header. A result renewed by `serve --hopper` is
 /// one-shot: the caller that asked for the scan is already holding the verdict
 /// in its own cache, so it will never ask again, and a renewal that does not
-/// land means the artifact never enters the corpus at all. A worker result is
-/// retryable for free — the job returns to the queue and is dispatched again.
+/// land means the artifact never enters the corpus at all. A fleet worker's
+/// result is retryable for free — the job returns to the queue and is
+/// dispatched again.
 ///
 /// Hopper reserves ingestion slots for this lane so the retryable firehose
 /// cannot starve the irreversible trickle. Declaring it is what claims the
@@ -315,50 +97,18 @@ const HOPPER_LANE_RENEW: &str = "renew";
 ///
 /// Hopper sheds result submissions with 503 + Retry-After when its ingestion
 /// slots are saturated, and that saturation is driven by the worker fleet's
-/// backlog — it can persist for many minutes. The old budget was four attempts
-/// over ~16s, which is not a retry so much as a coin flip: measured against a
-/// saturated hopper it lost every renewal it was given.
+/// backlog — it can persist for many minutes. A budget of a few attempts over
+/// seconds is not a retry so much as a coin flip: against a saturated hopper it
+/// loses every renewal it is given.
 const RENEW_BUDGET: Duration = Duration::from_secs(15 * 60);
-
-/// Ceiling on one backoff sleep, so a long budget still probes often enough to
-/// catch a short window of free capacity rather than sleeping through it.
-const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// Floor on one backoff sleep. Full jitter can draw near zero, and a retry
-/// that fires instantly just spends a slot-acquire on a pool it was told is
-/// full.
-const RETRY_MIN_BACKOFF: Duration = Duration::from_millis(250);
-
-/// Request timeout per POST. Matches the worker so a wedged hopper can't pin an
-/// uploader thread indefinitely.
-///
-/// One ceiling for every attempt, deliberately: `/api/result` is not a request
-/// a client can abandon cheaply. Hopper writes the parent and every archive
-/// member in one transaction, and runs it on a context *detached* from the
-/// request (`context.WithoutCancel`, `resultStoreTimeout` = 10 min in its
-/// `api.go`) precisely so a client that gives up cannot discard completed
-/// analysis. Timing out early therefore cancels nothing — it leaves the first
-/// store running, holding one of hopper's few reserved renewal slots, and sends
-/// a second copy of the same result to contend with it on the same rows. The
-/// escalating 15s/30s/60s table this replaces was built on the opposite
-/// assumption ("slow spells are brief, so fail fast and try again") and made
-/// every store slower than 15 seconds look like a network fault.
-///
-/// Slower than 15 seconds is ordinary: hopper buckets its store phase out to
-/// 60s (`hopper.result_phase.seconds`), and a loaded broker is slower still —
-/// smaug's log for 2026-09-07/08 carries 1,509 ingestion sheds and 712 slow
-/// slot-waits in 23 hours. The `send failed ... operation timed out` this
-/// fixes was one such store: hopper accepted and committed it, and a later
-/// attempt landed a second copy of the same verdict.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hopper's `validWorkerName` cap (`maxWorkerNameLen` in api.go).
 const MAX_WORKER_NAME_LEN: usize = 64;
 
 /// The JSON body POSTed to hopper's `/api/result`. The `{ml, llm?, raw}`
 /// envelope is flattened onto the payload so the wire form is
-/// `{sha256, worker, duration_ms, ml, llm, raw}` — byte-for-byte the shape the
-/// pull-based worker sends, so hopper handles both identically.
+/// `{sha256, worker, duration_ms, ml, llm, raw}` — byte-for-byte the shape
+/// postdoc's pull-based worker sends, so hopper handles both identically.
 #[derive(Debug, Serialize)]
 pub struct ResultPayload {
     /// SHA-256 of the analyzed artifact.
@@ -396,7 +146,7 @@ pub fn encode_result_body(
             "upload: result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
         );
         // Empty the cleave report but keep the ml/llm verdict. An empty report
-        // (not null) mirrors the envelope litmus emits when there is no cleave
+        // (not null) mirrors the envelope scan emits when there is no cleave
         // report, so the dropped-raw form stays a structurally valid envelope.
         if let Some(envelope) = payload.envelope.as_mut() {
             envelope.raw = std::sync::Arc::clone(crate::engine::empty_report());
@@ -657,7 +407,7 @@ impl Uploader {
     /// reports that the uploader stopped; the scan itself still completes.
     #[must_use]
     pub fn new(hopper_url: &str, worker: String) -> Self {
-        use_hopper(hopper_url);
+        crate::hopper::configure(hopper_url);
         let (tx, jobs) = queue::channel::<Job>(UPLOAD_QUEUE_DEPTH);
         let pending = Arc::new(AtomicUsize::new(0));
         let tally = Arc::new(Tally::default());
@@ -670,7 +420,7 @@ impl Uploader {
                 // On this thread, never the caller's: `serve` builds its
                 // uploader inside its async runtime. Returning drops `jobs`,
                 // so every submission says the uploader stopped.
-                let Some(http) = hopper_http() else {
+                let Some(http) = crate::hopper::http() else {
                     return;
                 };
                 let hopper = Hopper::new(http.clone(), &url, worker, thread_tally);
@@ -907,30 +657,6 @@ impl Drop for Uploader {
     }
 }
 
-/// Flatten an error and its `source()` chain into one message. reqwest's
-/// top-level `Display` is just "error sending request for url (...)"; the real
-/// cause (connection refused, DNS failure, timeout) lives one or more links down
-/// the chain, so log the whole chain to make a failed upload diagnosable.
-pub fn error_chain(err: &dyn std::error::Error) -> String {
-    use std::fmt::Write;
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        let _ = write!(out, ": {cause}");
-        source = cause.source();
-    }
-    out
-}
-
-/// Whether hopper refused a request for good: any 4xx but 408 and 429, which
-/// ask to be retried. Resending a permanent refusal can never succeed.
-#[must_use]
-pub fn is_permanent(status: StatusCode) -> bool {
-    status.is_client_error()
-        && status != StatusCode::REQUEST_TIMEOUT
-        && status != StatusCode::TOO_MANY_REQUESTS
-}
-
 /// One hopper, as every call to it needs it: the HTTP client, each route at
 /// every address `--hopper` named, the bearer token, and the name results are
 /// filed under.
@@ -960,7 +686,7 @@ impl Hopper {
             result: Route::new(&bases, "/api/result"),
             known: Route::new(&bases, "/api/known"),
             upload: Route::new(&bases, "/api/upload"),
-            token: hopper_token(),
+            token: crate::hopper::token(),
             worker,
             tally,
         }
@@ -1184,11 +910,10 @@ impl Hopper {
     /// direction: a failed probe re-sends bytes hopper had, where the other way
     /// round would withhold an artifact it does not.
     ///
-    /// One question, deliberately. It also used to ask which verdicts were
-    /// already current, which is a different question about a different column,
-    /// and the answer aged before it could be acted on — hopper decides that at
-    /// the store now (`unchangedStore`), where it is ordered against the other
-    /// producers.
+    /// One question, deliberately. Whether a verdict is already current is a
+    /// different question about a different column, and its answer ages before
+    /// it can be acted on — hopper decides that at the store (`unchangedStore`),
+    /// where it is ordered against the other producers.
     fn known(&self, shas: &[&str]) -> HashSet<String> {
         #[derive(Serialize)]
         struct KnownRequest<'a> {
@@ -1392,7 +1117,7 @@ fn cleanup_upload_dirs(dirs: Vec<PathBuf>) {
 }
 
 /// Mirror a result's fetched dependencies into a hopper instance from a caller
-/// that has no [`Uploader`] (the pull-based worker). Dedups within this call,
+/// that has no [`Uploader`] (postdoc's pull-based worker). Dedups within this call,
 /// and reconciles bytes + provenance before posting each verdict. Best-effort:
 /// every failure is logged, never propagated, so a dependency sync never
 /// disturbs the result it followed.
@@ -1508,72 +1233,6 @@ fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
     true
 }
 
-/// Look up whether hopper already holds real content for a purl coordinate —
-/// synchronously, for `scan purl`/`scan url`'s registry-metadata fallback
-/// (`crate::pkg::run`), which has no async runtime to bridge into
-/// Postdoc's async corpus reader, the daemon side of this
-/// same fix uses. Returns the sha256 of the sample hopper already has
-/// analyzed under this purl, if any; `None` on any failure or absence — the
-/// caller's fallback is to post nothing, never to guess.
-#[must_use]
-pub fn known_sha_for_purl(
-    client: &reqwest::blocking::Client,
-    hopper_url: &str,
-    purl: &str,
-) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct LookupResponse {
-        #[serde(default)]
-        sha256: Option<String>,
-    }
-    for base in endpoints(hopper_url) {
-        let request = client
-            .get(format!("{base}/v1/lookup"))
-            .query(&[("purl", purl)]);
-        match bearer(request, hopper_token()).send() {
-            Ok(resp) if resp.status().is_success() => {
-                return resp
-                    .json::<LookupResponse>()
-                    .map_err(|e| tracing::warn!(endpoint = %base, error = %error_chain(&e), "upload: purl lookup answer unreadable"))
-                    .ok()
-                    .and_then(|r| r.sha256);
-            }
-            Ok(resp) => {
-                tracing::warn!(endpoint = %base, status = %resp.status(), "upload: purl lookup non-success");
-            }
-            Err(e) => {
-                tracing::warn!(endpoint = %base, error = %error_chain(&e), "upload: purl lookup failed");
-            }
-        }
-    }
-    None
-}
-
-/// Sleep before retry `attempt` (1-based) of any hopper write.
-///
-/// Exponential with full jitter: the sleep is drawn from `[0, ceiling)` where
-/// the ceiling doubles per attempt up to [`RETRY_MAX_BACKOFF`]. The jitter
-/// matters more than the growth here — every scan server writing to the same
-/// saturated hopper would otherwise retry in lockstep and re-saturate it the
-/// instant a slot frees.
-///
-/// `retry_after` is hopper's own hint and acts as a floor: returning before it
-/// only spends a slot-acquire on a pool that just said it was full.
-///
-/// Pure, with the random draw passed in, so the policy is testable without
-/// sleeping or seeding.
-fn backoff(attempt: usize, retry_after: Option<Duration>, fuzz: f64) -> Duration {
-    let ceiling = RETRY_MAX_BACKOFF.min(
-        RETRY_MIN_BACKOFF
-            .saturating_mul(1u32 << attempt.min(16))
-            .max(RETRY_MIN_BACKOFF),
-    );
-    ceiling
-        .mul_f64(fuzz.clamp(0.0, 1.0))
-        .max(retry_after.unwrap_or(RETRY_MIN_BACKOFF))
-        .max(RETRY_MIN_BACKOFF)
-}
-
 /// [`backoff`] within the renewal budget, or `None` once the budget is spent.
 /// Never sleeps past the budget: a sleep that outlives it would turn the
 /// ceiling into a lie and delay the give-up log.
@@ -1587,41 +1246,6 @@ fn renew_delay(
         .checked_sub(elapsed)
         .filter(|left| !left.is_zero())?;
     Some(backoff(attempt, retry_after, fuzz).min(remaining))
-}
-
-/// A uniform-ish draw in `[0, 1)` for backoff jitter.
-///
-/// Deliberately not a `rand` dependency: spreading retries needs decorrelation,
-/// not statistical quality. Mixes the clock through splitmix64 so two uploader
-/// threads starting in the same millisecond still diverge.
-fn fuzz() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Seconds and sub-second nanos combined without going through u128, so
-    // there is no truncating cast to explain away.
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
-        d.as_secs()
-            .wrapping_shl(20)
-            .wrapping_add(u64::from(d.subsec_nanos()))
-    });
-    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    // 53 bits is the mantissa width, so this maps onto [0, 1) without bias.
-    (z >> 11) as f64 / (1u64 << 53) as f64
-}
-
-/// Parse `Retry-After` in its delta-seconds form. The HTTP-date form and any
-/// unparseable value yield `None`, leaving the caller on its own backoff.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (secs > 0).then(|| Duration::from_secs(secs).min(RETRY_MAX_BACKOFF))
 }
 
 #[cfg(test)]
@@ -1688,78 +1312,8 @@ mod tests {
         }
     }
 
-    /// `--hopper` may name the same corpus twice: the replica first, the
-    /// primary behind it. Reads and writes take the same list, because routing
-    /// them apart is a topology this worker would have to know and hopper's
-    /// write relay exists so that it does not.
-    #[test]
-    fn hopper_endpoints_are_a_preference_order() {
-        assert_eq!(endpoints("https://ro/"), vec!["https://ro"]);
-        assert_eq!(
-            endpoints(" https://ro/ , http://rw:8081/ "),
-            vec!["https://ro", "http://rw:8081"],
-        );
-        assert!(endpoints("").is_empty());
-        assert!(endpoints(" , , ").is_empty());
-    }
-
-    /// The worker loop is the exception: hopper refuses `/api/next` on a
-    /// replica with a 403 whether or not its relay is on, so a worker takes the
-    /// primary — the last address — and nothing else. Handing it the raw string
-    /// instead put the commas inside a hostname, and every poll for the life of
-    /// the process failed with `invalid dns name`.
-    #[test]
-    fn a_worker_polls_the_primary_only() {
-        assert_eq!(
-            worker_endpoint("https://ro,https://rw").as_deref(),
-            Some("https://rw"),
-        );
-        assert_eq!(
-            worker_endpoint(" https://ro/ , https://rw/ ").as_deref(),
-            Some("https://rw"),
-        );
-        // The ordinary single-address case is unchanged.
-        assert_eq!(
-            worker_endpoint("https://rw/").as_deref(),
-            Some("https://rw")
-        );
-        // Nowhere to file results is a valid deploy, not an address.
-        assert_eq!(worker_endpoint(""), None);
-        assert_eq!(worker_endpoint(" , , "), None);
-        // Whatever a worker polls, it is one address — never a list.
-        for raw in ["https://ro,https://rw", "https://rw", " a , b , c "] {
-            let picked = worker_endpoint(raw).expect("an address");
-            assert!(
-                !picked.contains(','),
-                "a worker was handed a list: {picked}"
-            );
-        }
-    }
-
-    /// A retry walks down the list rather than hammering one address, so the
-    /// attempt after a replica stops answering lands on the primary instead of
-    /// on the same silence. Past the end it holds on the last: a budget longer
-    /// than the list must not wrap back to an address already known to fail.
-    #[test]
-    fn a_retry_moves_to_the_next_address() {
-        let bases = endpoints("https://ro,http://rw");
-        let route = Route::new(&bases, "/api/result");
-        assert_eq!(route.at(0), "https://ro/api/result");
-        assert_eq!(route.at(1), "http://rw/api/result");
-        assert_eq!(route.at(9), "http://rw/api/result");
-    }
-
-    /// One address is the ordinary case, and every attempt uses it.
-    #[test]
-    fn a_single_address_is_used_for_every_attempt() {
-        let route = Route::new(&endpoints("https://only"), "/api/known");
-        assert_eq!(route.at(0), "https://only/api/known");
-        assert_eq!(route.at(5), "https://only/api/known");
-    }
-
     /// The budget is the whole point: a renewal is one-shot, so it must outlive
-    /// a saturated hopper rather than the ~16s the old four-attempt loop gave
-    /// it.
+    /// a saturated hopper rather than give up after a few seconds.
     #[test]
     fn renew_delay_respects_the_budget() {
         assert!(renew_delay(1, None, Duration::ZERO, 0.5).is_some());
@@ -1780,29 +1334,6 @@ mod tests {
         );
     }
 
-    /// Full jitter: the draw scales the ceiling, so a fleet retrying against one
-    /// saturated hopper spreads out instead of re-saturating it in lockstep.
-    #[test]
-    fn backoff_applies_full_jitter() {
-        let low = backoff(10, None, 0.0);
-        let high = backoff(10, None, 1.0);
-        assert!(high > low, "jitter had no effect: {low:?} vs {high:?}");
-        assert!(
-            low >= RETRY_MIN_BACKOFF,
-            "a near-zero draw must still back off: {low:?}"
-        );
-        assert!(high <= RETRY_MAX_BACKOFF, "exceeded the ceiling: {high:?}");
-    }
-
-    /// The ceiling grows with the attempt and then stops.
-    #[test]
-    fn backoff_grows_exponentially_then_caps() {
-        let at = |n| backoff(n, None, 1.0);
-        assert!(at(1) < at(3), "not growing: {:?} then {:?}", at(1), at(3));
-        assert!(at(3) < at(6), "not growing: {:?} then {:?}", at(3), at(6));
-        assert_eq!(at(20), RETRY_MAX_BACKOFF, "ceiling not enforced");
-    }
-
     /// Hopper knows when its slots free; a shorter sleep just burns a
     /// slot-acquire on a pool that has already said it is full. Uploads and
     /// renewals share the rule.
@@ -1813,47 +1344,6 @@ mod tests {
         assert!(renew_delay(1, Some(hint), Duration::ZERO, 0.0).unwrap() >= hint);
     }
 
-    /// 408 and 429 ask to be retried; every other 4xx is final.
-    #[test]
-    fn only_retryable_refusals_are_retried() {
-        assert!(is_permanent(StatusCode::BAD_REQUEST));
-        assert!(is_permanent(StatusCode::UNAUTHORIZED));
-        assert!(is_permanent(StatusCode::PAYLOAD_TOO_LARGE));
-        assert!(!is_permanent(StatusCode::REQUEST_TIMEOUT));
-        assert!(!is_permanent(StatusCode::TOO_MANY_REQUESTS));
-        assert!(!is_permanent(StatusCode::SERVICE_UNAVAILABLE));
-    }
-
-    #[test]
-    fn parse_retry_after_forms() {
-        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-        let with = |v: &str| {
-            let mut h = HeaderMap::new();
-            h.insert(RETRY_AFTER, HeaderValue::from_str(v).unwrap());
-            parse_retry_after(&h)
-        };
-        assert_eq!(with("2"), Some(Duration::from_secs(2)));
-        assert_eq!(with(" 5 "), Some(Duration::from_secs(5)));
-        assert_eq!(with("0"), None);
-        assert_eq!(with("-1"), None);
-        // The HTTP-date form is legal but unparsed here; fall back to our own.
-        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), None);
-        // A hostile value must not park an uploader thread for hours.
-        assert_eq!(with("86400"), Some(RETRY_MAX_BACKOFF));
-        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
-    }
-
-    #[test]
-    fn fuzz_is_in_range_and_varies() {
-        let draws: Vec<f64> = (0..64).map(|_| fuzz()).collect();
-        assert!(draws.iter().all(|d| (0.0..1.0).contains(d)), "out of range");
-        let distinct = draws
-            .iter()
-            .map(|d| d.to_bits())
-            .collect::<std::collections::HashSet<_>>();
-        assert!(distinct.len() > 1, "fuzz returned a constant");
-    }
-
     /// Claiming hopper's reserved lane is what keeps a one-shot renewal from
     /// competing with the retryable worker firehose.
     #[test]
@@ -1862,46 +1352,9 @@ mod tests {
         assert_eq!(HOPPER_LANE_RENEW, "renew");
     }
 
-    /// `$HOPPER_TOKEN` wins, for callers that inject the token some other
-    /// way; otherwise it comes from `~/.tok/hopper`. A blank env value is not
-    /// a credential and must fall through to the file rather than suppress
-    /// it.
-    #[test]
-    fn hopper_token_precedence() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("hopper");
-        std::fs::write(&file, "from-file\n").expect("write token");
-        let token = |env, path| resolve_credential(env, path).map(|c| c.token);
-
-        assert_eq!(
-            token(Some("from-env"), Some(&file)).as_deref(),
-            Some("from-env")
-        );
-        assert_eq!(token(Some("  "), Some(&file)).as_deref(), Some("from-file"));
-        assert_eq!(token(None, Some(&file)).as_deref(), Some("from-file"));
-        assert_eq!(token(Some(" padded "), None).as_deref(), Some("padded"));
-        assert_eq!(token(None, None), None);
-        assert_eq!(token(None, Some(&dir.path().join("absent"))), None);
-    }
-
-    /// The logged origin names the source, never the secret.
-    #[test]
-    fn hopper_token_origin_names_its_source() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("hopper");
-        std::fs::write(&file, "from-file\n").expect("write token");
-
-        let from_env = resolve_credential(Some("from-env"), Some(&file)).expect("credential");
-        assert_eq!(from_env.origin, "$HOPPER_TOKEN");
-
-        let from_file = resolve_credential(None, Some(&file)).expect("credential");
-        assert_eq!(from_file.origin, file.display().to_string());
-        assert!(!from_file.origin.contains("from-file"));
-    }
-
     /// The wire body round-trips through zstd back to the exact JSON serde
     /// produced: this is the same shape hopper's `/api/result` decodes, so an fs
-    /// upload is byte-identical to a worker upload of the same payload.
+    /// upload is byte-identical to postdoc's worker uploading the same payload.
     #[test]
     fn encode_result_body_round_trips_through_zstd() {
         let payload = ResultPayload {
@@ -1918,7 +1371,7 @@ mod tests {
         assert_eq!(decoded, expected);
 
         // The flattened payload carries the transport fields and omits `error`
-        // (skip_serializing_if), matching the worker's wire form.
+        // (skip_serializing_if), matching postdoc's worker's wire form.
         let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(value["worker"], "scan-fs");
         assert_eq!(value["duration_ms"], 0);

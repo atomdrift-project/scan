@@ -1,7 +1,7 @@
 //! Default-on, quiet refresh of detection rules and models when they go stale.
 //!
 //! On an interactive scan, if the local ruleset hasn't been checked in 24 hours
-//! (and `--no-update` / `SCAN_NO_UPDATE` is not set), scan refreshes the cleave
+//! (and `--no-update` is not given), scan refreshes the cleave
 //! trait bundle, the ML model bundle, and the bloom filters before it starts.
 //! The check is gated by a tiny on-disk stamp, so the common case touches
 //! neither the network nor the terminal: most runs return in microseconds
@@ -16,7 +16,6 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,14 +46,6 @@ fn stamp_path() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("atomdrift").join("scan").join(name))
 }
 
-/// Current Unix time in seconds (0 if the clock predates the epoch).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Unix time of the last refresh attempt (0 when never stamped or unreadable).
 fn last_checked() -> u64 {
     let Some(path) = stamp_path() else { return 0 };
@@ -71,7 +62,7 @@ fn write_stamp() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = toml::to_string(&Stamp {
-        checked_unix: now_unix(),
+        checked_unix: crate::civil::now_secs(),
     }) {
         let _ = std::fs::write(&path, text);
     }
@@ -80,7 +71,7 @@ fn write_stamp() {
 /// Refresh the trait and model bundles when they are stale, by default.
 ///
 /// `force` (from `-u/--update`) bypasses the 24h gate. `disabled` (from
-/// `--no-update`) — like `SCAN_NO_UPDATE` — turns the whole mechanism off.
+/// `--no-update`) turns the whole mechanism off.
 /// `mode` matches the run's bloom usage so the reported rule count equals the
 /// banner's. `terminal` gates the transient/checkmark UI: a non-terminal run
 /// still refreshes, silently.
@@ -99,10 +90,10 @@ pub fn refresh_if_stale(
     mode: Mode,
     terminal: bool,
 ) -> anyhow::Result<()> {
-    if disabled || std::env::var_os("SCAN_NO_UPDATE").is_some() {
+    if disabled {
         return Ok(());
     }
-    if !force && now_unix().saturating_sub(last_checked()) < CHECK_INTERVAL_SECS {
+    if !force && crate::civil::now_secs().saturating_sub(last_checked()) < CHECK_INTERVAL_SECS {
         return Ok(());
     }
 
@@ -146,8 +137,8 @@ pub fn refresh_if_stale(
     Ok(())
 }
 
-/// Whether a refresh installed anything new, and whether any of the three
-/// bundles failed to update.
+/// Whether a refresh installed anything new, and whether any source failed
+/// to update.
 struct Outcome {
     changed: bool,
     failed: bool,
@@ -155,70 +146,23 @@ struct Outcome {
     refused: Option<String>,
 }
 
-/// Refresh the three bundle types — traits, models, bloom filters — concurrently
-/// and quietly. Each runs on its own thread so the slow path is one network
-/// round-trip, not three; a failure of one (offline, mirror error) is recorded
-/// and never blocks the others. This is the same per-type `update()` machinery
-/// that first-run auto-install uses — staleness, rather than absence, is the only
+/// Refresh every rule source, quietly: the same refresh `update-rules` and a
+/// server's startup run. Staleness, rather than absence, is the only
 /// difference in trigger.
 fn refresh() -> Outcome {
-    let models_dir = crate::models_repo::install_target();
-    let bloom_dir = crate::bloom_repo::install_dir();
-    let results = std::thread::scope(|s| {
-        let traits = s.spawn(|| crate::traits_repo::update(false, true));
-        let models = s.spawn(|| {
-            crate::model_update::update(
-                models_dir.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?,
-                false,
-                true,
-            )
-        });
-        let bloom = s.spawn(|| {
-            crate::bloom_update::update(
-                bloom_dir.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?,
-                false,
-                true,
-            )
-        });
-        // NSRL follows its own manifest on the normal daily rules check,
-        // including first install. SCAN_NSRL=0 disables this source.
-        let nsrl = s.spawn(|| {
-            if crate::nsrl_repo::enabled() {
-                crate::nsrl_repo::update(&crate::nsrl_repo::install_dir()?, true)
-            } else {
-                Ok(false)
-            }
-        });
-        [
-            ("traits", traits.join()),
-            ("model", models.join()),
-            ("bloom", bloom.join()),
-            ("nsrl", nsrl.join()),
-        ]
-    });
-
-    let mut outcome = Outcome {
-        changed: false,
-        failed: false,
-        refused: None,
-    };
-    for (bundle, result) in results {
-        match result {
-            Ok(Ok(changed)) => outcome.changed |= changed,
-            Ok(Err(e)) => {
-                if let Some(why) = crate::traits_repo::enriched_refusal(&e) {
-                    outcome.refused = Some(why.to_owned());
-                }
-                outcome.failed = true;
-                tracing::debug!(bundle, error = format!("{e:#}"), "auto update failed");
-            }
-            Err(_) => {
-                outcome.failed = true;
-                tracing::debug!(bundle, "auto update panicked");
-            }
-        }
+    let refreshed = crate::rules::refresh(&crate::rules::Source::ALL, None, false, true);
+    for (source, e) in refreshed.failures() {
+        tracing::debug!(
+            source = source.name(),
+            error = format!("{e:#}"),
+            "auto update failed"
+        );
     }
-    outcome
+    Outcome {
+        changed: refreshed.changed(),
+        failed: refreshed.failures().next().is_some(),
+        refused: refreshed.enriched_refusal().map(str::to_owned),
+    }
 }
 
 /// Erase the transient line and print the update checkmark: the current split

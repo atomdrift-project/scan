@@ -5,8 +5,8 @@
 //! single-threaded — whose caller sits parked in the pool until they finish.
 //! Those helpers are on the critical path of the archive that owns them, yet
 //! they share cores as equals with every pool worker that could just as well
-//! run later. Measured on the npm corpus: a 3 MB arm64 `.so` whose rizin pass
-//! takes 26 s alone stretched to ~50 s inside a saturated scan. Demoting the
+//! run later, so a rizin pass that takes 26 s alone can stretch to ~50 s
+//! inside a saturated scan. Demoting the
 //! workers lets the scheduler hand such helpers a whole core the moment they
 //! become runnable; total pool throughput is unchanged because the demoted
 //! threads still own every idle cycle.

@@ -1,13 +1,7 @@
-//! Live jemalloc counters and operator-triggered heap profiles.
+//! Live jemalloc counters.
 //!
-//! FreeBSD uses jemalloc in libc, so the bundled `tikv-jemallocator` profiling
-//! feature is not present in the production worker.  This module talks to the
-//! native allocator through its public `mallctl` interface.  It is deliberately
-//! opt-in: setting `SCAN_HEAP_PROFILE_DIR` enables `SIGUSR1` heap dumps, while
-//! the lightweight counters are always available on FreeBSD.
-
-use std::path::PathBuf;
-use std::sync::OnceLock;
+//! FreeBSD uses jemalloc in libc, so this module talks to the native allocator
+//! through its public `mallctl` interface; elsewhere there is nothing to read.
 
 /// A point-in-time view of jemalloc's own byte counters.
 #[derive(Debug, Clone, Copy)]
@@ -22,61 +16,8 @@ pub struct Stats {
     pub retained: usize,
 }
 
-static PROFILE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-#[cfg(target_os = "freebsd")]
-fn prepare_profile_dir(dir: &std::path::Path) -> bool {
-    if read_ctl::<bool>(b"config.prof\0") != Some(true) {
-        tracing::warn!(
-            path = %dir.display(),
-            "SCAN_HEAP_PROFILE_DIR is ignored: the system jemalloc was built without profiling"
-        );
-        return false;
-    }
-    if let Err(error) = std::fs::create_dir_all(dir) {
-        tracing::warn!(path = %dir.display(), %error, "cannot create heap profile directory");
-        false
-    } else {
-        true
-    }
-}
-
-/// Linux with the bundled tikv-jemalloc built for profiling (`jemalloc-prof`
-/// feature): dumps go through the same `prof.dump` mallctl, on the `_rjem_`
-/// prefixed symbol. Profiling must also be switched on at runtime
-/// (`_RJEM_MALLOC_CONF=prof:true,...`) or the dump is an empty profile.
-#[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
-fn prepare_profile_dir(dir: &std::path::Path) -> bool {
-    if let Err(error) = std::fs::create_dir_all(dir) {
-        tracing::warn!(path = %dir.display(), %error, "cannot create heap profile directory");
-        false
-    } else {
-        true
-    }
-}
-
-#[cfg(not(any(
-    target_os = "freebsd",
-    all(feature = "jemalloc-prof", target_os = "linux")
-)))]
-fn prepare_profile_dir(dir: &std::path::Path) -> bool {
-    tracing::warn!(
-        path = %dir.display(),
-        "SCAN_HEAP_PROFILE_DIR is ignored: heap dumps need FreeBSD's libc jemalloc or a \
-         `--features jemalloc-prof` build on Linux"
-    );
-    false
-}
-
-/// Initialize the opt-in profile destination.
+/// Log the allocator's counters and settings at startup.
 pub fn install() {
-    let configured = std::env::var_os("SCAN_HEAP_PROFILE_DIR").map(PathBuf::from);
-    let value = configured.filter(|dir| prepare_profile_dir(dir));
-    let enabled = value.is_some();
-    let _ = PROFILE_DIR.set(value);
-    if enabled {
-        tracing::info!("live jemalloc heap dumps enabled; send SIGUSR1 to write a profile");
-    }
     if let Some(stats) = stats() {
         tracing::info!(
             allocated_mb = stats.allocated / (1024 * 1024),
@@ -95,79 +36,6 @@ pub fn install() {
         profiling_compiled = ?read_ctl::<bool>(b"config.prof\0"),
         "native jemalloc startup options",
     );
-}
-
-/// Dump the current jemalloc heap when the operator requested a signal dump.
-///
-/// This runs on the dedicated signal-wait thread, not in an async signal
-/// handler, so filesystem and allocator calls are safe here.
-pub fn dump_on_signal() {
-    let Some(dir) = PROFILE_DIR.get().and_then(Option::as_ref) else {
-        return;
-    };
-    let pid = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let path = dir.join(format!("atomscan-{pid}-{stamp}.heap"));
-
-    #[cfg(target_os = "freebsd")]
-    {
-        let Some(path) = path.to_str() else {
-            tracing::warn!(path = %path.display(), "heap profile path is not valid UTF-8");
-            return;
-        };
-        match dump_freebsd(path) {
-            Ok(()) => tracing::info!(path = %path, "jemalloc heap profile written"),
-            Err(error) => tracing::warn!(%error, path = %path, "jemalloc heap profile failed"),
-        }
-    }
-
-    #[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
-    {
-        let Some(path) = path.to_str() else {
-            tracing::warn!(path = %path.display(), "heap profile path is not valid UTF-8");
-            return;
-        };
-        match dump_tikv(path) {
-            Ok(()) => tracing::info!(path = %path, "jemalloc heap profile written"),
-            Err(error) => tracing::warn!(%error, path = %path, "jemalloc heap profile failed"),
-        }
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        all(feature = "jemalloc-prof", target_os = "linux")
-    )))]
-    let _ = path;
-}
-
-/// `prof.dump` against the bundled tikv-jemalloc (Linux, `jemalloc-prof`).
-#[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
-fn dump_tikv(path: &str) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::ptr;
-
-    let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
-        .map_err(|_nul_error| "heap profile path contains NUL".to_string())?;
-    let mut filename = c_path.as_ptr();
-    // SAFETY: `prof.dump` reads one `const char *` from `newp`; the CString
-    // outlives the call and the pointer-to-pointer matches `newlen`.
-    let status = unsafe {
-        tikv_jemalloc_sys::mallctl(
-            c"prof.dump".as_ptr().cast(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            (&mut filename as *mut *const std::ffi::c_char).cast(),
-            size_of::<*const std::ffi::c_char>(),
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(format!("mallctl prof.dump returned errno {status}"))
-    }
 }
 
 /// Read allocator counters, when the host exposes native jemalloc.
@@ -249,56 +117,25 @@ fn refresh_epoch() -> Option<()> {
     (status == 0).then_some(())
 }
 
-#[cfg(target_os = "freebsd")]
-fn dump_freebsd(path: &str) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::mem::size_of;
-    use std::os::unix::ffi::OsStrExt;
-    use std::ptr;
-
-    let c_path = CString::new(std::path::Path::new(path).as_os_str().as_bytes())
-        .map_err(|_nul_error| "heap profile path contains NUL".to_string())?;
-    let mut filename = c_path.as_ptr();
-    // jemalloc's prof.dump command expects newp to point to a `const char *`.
-    // SAFETY: the C string and pointer remain alive for the duration of the
-    // mallctl call; the command does not retain the pointer after returning.
-    let status = unsafe {
-        freebsd::mallctl(
-            c"prof.dump".as_ptr().cast(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            (&mut filename as *mut *const std::ffi::c_char).cast(),
-            size_of::<*const std::ffi::c_char>(),
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(format!("mallctl prof.dump returned errno {status}"))
-    }
-}
-
 /// Report what the host's in-libc jemalloc is charging for every allocation.
 ///
 /// FreeBSD builds libc's jemalloc with `--enable-debug` and `--enable-fill` on
 /// -CURRENT, so each allocation runs jemalloc's invariant assertions and both
 /// `malloc` and `free` memset the region (`opt.junk`). Neither shows up as
 /// application time: profiles blame whatever called `malloc`, so the tax is
-/// invisible unless something looks for it. Measured on uruk-hai (128-core
-/// arm64, 16.0-CURRENT) over four large nested archives at 96 worker slots with
-/// warm YARA caches: 284.7 s stock against 227.7 s with `junk:false`, at an
-/// identical result hash. For reference, swapping the whole allocator out for
-/// mimalloc scored 231.2 s on the same workload — i.e. `junk:false` alone
-/// recovers what a different allocator would, which is why there is no bundled
-/// allocator on this platform.
+/// invisible unless something looks for it. On a many-core arm64 -CURRENT host
+/// scanning large nested archives, junk filling costs about a fifth of wall
+/// time, and `junk:false` alone recovers what swapping in a different allocator
+/// (mimalloc) would, at an identical result hash. That is why there is no
+/// bundled allocator on this platform.
 ///
 /// The two halves are not the same size and do not have the same remedy, so
 /// they are not the same log line. Junk filling is the expensive one and is
 /// settable at startup, by `MALLOC_CONF` for one service or by an
 /// `/etc/malloc.conf` symlink for every process on the host — that one warns.
 /// The assertions are compiled in and need a `MALLOC_PRODUCTION` world, which
-/// is nothing a deploy can do; on the measurement above they are worth little
-/// beside the filling, so they are reported at info and left alone.
+/// is nothing a deploy can do; they are worth little beside the filling, so
+/// they are reported at info and left alone.
 pub fn report_debug_allocator() {
     #[cfg(target_os = "freebsd")]
     {

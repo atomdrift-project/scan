@@ -1,8 +1,8 @@
 //! `Analyzer`'s builders must change what the analyzer classifies with.
 //!
-//! They used to rewrite only the analyzer's config, while the model it scans
-//! with kept the thresholds it was loaded under, so a caller who set a cutoff
-//! got no error and no effect.
+//! Rewriting only the analyzer's config would leave the model it scans with on
+//! the thresholds it was loaded under, so a caller who set a cutoff would get
+//! no error and no effect.
 
 use anyhow::Result;
 use scan::{Analyzer, Thresholds};

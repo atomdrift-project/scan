@@ -1,9 +1,9 @@
 //! Integration tests for `POST /v1/analyze`.
 //!
 //! The route exists for one reason: an analysis that outlives a proxy's idle
-//! ceiling. Measured in front of this fleet, that ceiling is 125 seconds, and
-//! crossing it silently costs the caller an analysis that in fact completed —
-//! the worker finishes and files its verdict, but the reply had nowhere to go.
+//! ceiling. That ceiling can be as low as 125 seconds, and crossing it silently
+//! costs the caller an analysis that in fact completed — the server finishes and
+//! files its verdict, but the reply has nowhere to go.
 //!
 //! These run against an empty model directory, so nothing here reaches a real
 //! analysis. What they check is the part that does not need one: that the route
@@ -90,11 +90,11 @@ async fn a_malformed_budget_is_refused() -> Result<()> {
 }
 
 /// Not ready is a refusal about this server, and it keeps a status: a router
-/// reads it to send the work to a worker that can take it, which a decision
+/// reads it to send the work to a server that can take it, which a decision
 /// buried in a 200 body cannot be made to do.
 ///
 /// With no model directory the server never becomes ready, so this is the
-/// refusal an unready worker gives — the same shape `429 At capacity` takes,
+/// refusal an unready server gives — the same shape `429 At capacity` takes,
 /// and the reason the grace window answers the ordinary way instead of
 /// streaming everything.
 #[tokio::test]
@@ -176,8 +176,8 @@ async fn something_is_said_almost_immediately() -> Result<()> {
             .uri("/v1/analyze?purl=npm%2Fleft-pad%401.3.0&force=1")
             .body(Body::empty())?,
     );
-    // 125s is what was measured in front of this fleet; the first byte must
-    // arrive with room to spare for a slower hop elsewhere.
+    // A proxy's idle ceiling can be as low as 125s; the first byte must arrive
+    // with room to spare for a slower hop elsewhere.
     let response = tokio::time::timeout(std::time::Duration::from_secs(10), app.oneshot(req))
         .await
         .context("nothing was sent within 10s: a proxy would eventually cut this connection")??;

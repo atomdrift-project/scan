@@ -22,9 +22,7 @@
 /// unset vars are filled in: a per-layer var the operator set explicitly
 /// always wins over the umbrella.
 fn propagate_no_analysis_cache() {
-    let on = std::env::var("SCAN_NO_ANALYSIS_CACHE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if !on {
+    if !crate::env::flag(crate::env::SCAN_NO_ANALYSIS_CACHE) {
         return;
     }
     // CLEAVE_SKIP_CACHE=1 also drags cleave's YARA rule-compilation cache with
@@ -35,10 +33,15 @@ fn propagate_no_analysis_cache() {
         ("STNG_STRING_CACHE", "0"),
         ("CLEAVE_SKIP_CACHE", "1"),
         ("CLEAVE_SKIP_YARA_CACHE", "0"),
-        ("SCAN_ANALYSIS_CACHE", "0"),
     ];
     for (key, value) in defaults {
-        if std::env::var_os(key).is_none() {
+        // Another crate's variable, so read with std rather than declared here.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "these variables belong to the crates below"
+        )]
+        let unset = std::env::var_os(key).is_none();
+        if unset {
             // SAFETY: the caller's documented precondition is that no thread
             // has been spawned, so no concurrent environment access can race.
             unsafe { std::env::set_var(key, value) };
@@ -46,46 +49,24 @@ fn propagate_no_analysis_cache() {
     }
 }
 
-/// Accept the older spelling of the reference-following variables.
-///
-/// `SCAN_FETCH`/`SCAN_FETCH_DEPTH` predate `SCAN_FOLLOW`/`SCAN_FOLLOW_DEPTH`.
-/// A deployment still setting the old names must not silently stop following
-/// references, so the old name fills the new one when the new one is unset.
-/// The canonical variable wins when both are present.
-fn propagate_follow_aliases() {
-    for (canonical, legacy) in [
-        ("SCAN_FOLLOW", "SCAN_FETCH"),
-        ("SCAN_FOLLOW_DEPTH", "SCAN_FETCH_DEPTH"),
-    ] {
-        if std::env::var_os(canonical).is_none()
-            && let Some(value) = std::env::var_os(legacy)
-        {
-            // SAFETY: as above — before any thread exists.
-            unsafe { std::env::set_var(canonical, value) };
-        }
-    }
-}
-
 /// Raise the soft open-file limit as far as the hard limit allows.
 ///
 /// systemd starts every service at a soft `RLIMIT_NOFILE` of 1024 (the hard
-/// limit is 524288), and unlike Go, Rust's runtime never lifts it. A worker
-/// holds several descriptors per in-flight analysis — the sample, its extracted
-/// members, rizin's pipes — so 1024 is a ceiling on concurrency that nothing
-/// reports. uruk-hai's idle worker sat pinned at exactly 1024 with ~1,170
-/// analyses in flight (2026-09-25), logging ~680 EMFILE errors a minute, and
-/// every symptom was somewhere else: each file the process tried to open
-/// failed, so `traits_repo::version()` read no sidecar (every report went out
-/// without `rev`, hopper could not skip re-posts, and the dashboard showed no
-/// traits), `/proc/self` was unreadable (no RSS), and `TempDir`'s drop, which
-/// ignores errors, could not remove what it extracted — 66k leaked
-/// `cleave-archive-*` dirs exhausted the tmpfs's inodes and turned every new
-/// extraction into "No space left on device".
+/// limit is 524288), and unlike Go, Rust's runtime never lifts it. A busy
+/// process holds several descriptors per in-flight analysis — the sample, its
+/// extracted members, rizin's pipes — so 1024 is a ceiling on concurrency that
+/// nothing reports. At that ceiling every symptom shows up somewhere else: each
+/// file the process tries to open fails, so `traits_repo::version()` reads no
+/// sidecar (reports go out without `rev` and hopper cannot skip re-posts),
+/// `/proc/self` is unreadable (no RSS), and `TempDir`'s drop, which ignores
+/// errors, cannot remove what it extracted — leaked `cleave-archive-*` dirs
+/// then exhaust the tmpfs's inodes and turn every new extraction into "No
+/// space left on device".
 ///
 /// Tries the hard limit first; where the kernel refuses it (Linux caps at
 /// `fs.nr_open` even when the hard limit is unlimited, macOS at
 /// `kern.maxfilesperproc`) it falls back to smaller ceilings. Never lowers the
-/// limit. Children inherit it, which is what covers the server's idle worker.
+/// limit. Children inherit it.
 fn raise_open_file_limit() {
     #[cfg(unix)]
     // SAFETY: getrlimit/setrlimit read and write only the struct passed in.
@@ -153,7 +134,6 @@ pub unsafe fn install() {
     block_sigusr1();
     raise_open_file_limit();
     propagate_no_analysis_cache();
-    propagate_follow_aliases();
 }
 
 /// Install the crash dump, the thread dump and the heap profiler, and start
@@ -171,8 +151,8 @@ pub fn install_diagnostics() {
 }
 
 /// Serve `SIGUSR1` (the Linux stand-in for BSD's `SIGINFO`): an all-thread
-/// backtrace and, when enabled, a heap profile — captured in-process, so it
-/// works in jails where no debugger can attach.
+/// backtrace, captured in-process, so it works in jails where no debugger can
+/// attach.
 ///
 /// The thread lives as long as the process. It parks in `sigwait`, so there is
 /// nothing to join, and process exit ends it.
@@ -201,7 +181,6 @@ fn spawn_sigusr1_thread() {
                     continue;
                 }
                 crate::thread_dump::dump_all_threads();
-                crate::heap_profile::dump_on_signal();
             }
         });
     if let Err(error) = spawned {
@@ -212,17 +191,15 @@ fn spawn_sigusr1_thread() {
 /// Build the process-wide Rayon pool cleave's analysis fans out on, and say
 /// how it was sized.
 ///
-/// Every binary running this stack needs the same pool: the width the fleet
-/// was measured at, stacks deep enough for nested archive analysis, and each
-/// worker registered for the thread dump and demoted one scheduling notch. A
-/// pool built any other way fails quietly, under load.
+/// Every binary running this stack needs the same pool: the width
+/// `pool_cores` picks, stacks deep enough for nested archive analysis, and
+/// each worker thread registered for the thread dump and demoted one
+/// scheduling notch. A pool built any other way fails quietly, under load.
 ///
 /// `CLEAVE_RAYON_THREADS` overrides the width.
 pub fn install_rayon_pool() {
-    let override_threads = std::env::var("CLEAVE_RAYON_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0);
+    let override_threads =
+        crate::env::number::<usize>(crate::env::CLEAVE_RAYON_THREADS).filter(|&n| n > 0);
     let physical = cleave::memory_tracker::physical_cpu_count();
     let logical = cleave::memory_tracker::cpu_count();
     let detected_cores = pool_cores(physical, logical, smt_pool_vendor());
@@ -291,12 +268,11 @@ const SMALL_HOST_CORES: usize = 8;
 /// The pool width for this host's shape, before any override.
 ///
 /// On a wide host, physical cores win: logical SMT siblings (32 on a 16-core
-/// host) oversubscribe archive-member analysis, and S2 dropped 56.6 s → 51.8 s
-/// at 16 threads. On a small SMT host the opposite holds: the pool is the only
+/// host) oversubscribe archive-member analysis and run it slower than one
+/// thread per core. On a small SMT host the opposite holds: the pool is the only
 /// parallelism there is, and it idles whenever the one admitted archive is in a
-/// serial phase (tar/gzip read). Measured 2026-08-30 on a 4c/8t AMD Ryzen 3400G
-/// over the 121-job poppy worker benchmark: 4 threads 34:13, 5 → 32:47,
-/// 6 → 31:15, 8 → 27:43 (−19%), peak RSS flat (4.3–4.6 GB), outputs identical.
+/// serial phase (tar/gzip read), so taking every logical CPU on a 4c/8t host
+/// finishes a batch about a fifth sooner at flat peak RSS with identical output.
 /// The wider pool is taken only where that class of sibling exists (see
 /// [`smt_pool_vendor`]).
 fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool) -> Option<usize> {
@@ -308,10 +284,9 @@ fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool)
 }
 
 /// Whether this host's SMT siblings are the kind the small-host pool policy
-/// was measured on: x86 hyperthreads from AMD (measured) or Intel (same
-/// design). Apple silicon never qualifies — its extra "logical" capacity is
-/// efficiency cores, certified not to help this workload — and neither does
-/// an unknown vendor.
+/// holds for: x86 hyperthreads from AMD or Intel (the same design). Apple
+/// silicon never qualifies — its extra "logical" capacity is efficiency cores,
+/// which do not help this workload — and neither does an unknown vendor.
 fn smt_pool_vendor() -> bool {
     if cfg!(target_vendor = "apple") || !cfg!(target_arch = "x86_64") {
         return false;

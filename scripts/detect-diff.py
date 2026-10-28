@@ -88,7 +88,7 @@ def main():
         # Fetch-derived member risks are compared only for drift accounting;
         # corpus members and record verdicts remain the hard gate. (A record
         # verdict CAN legitimately move if fetched content changes it — that is
-        # exactly what --fetch is for — so verdict changes are still reported
+        # exactly what --follow is for — so verdict changes are still reported
         # and still fail: a tuning change should alter cost, not conclusions,
         # between two runs made minutes apart.)
         af = {k: v for k, v in ar.items() if is_fetch_derived(k[2])}

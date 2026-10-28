@@ -113,9 +113,6 @@ pub struct ServerConfig {
     pub hopper: Option<String>,
     /// Passwords to try against encrypted archives.
     pub zip_passwords: crate::ArchivePasswords,
-    /// Class-aware admission (`SCAN_SLOT_LANES=1`): payloads at or below this
-    /// many bytes take the small lane. `None` keeps flat admission.
-    pub slot_lanes: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -139,7 +136,6 @@ impl Default for ServerConfig {
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
             zip_passwords: crate::ArchivePasswords::default(),
-            slot_lanes: None,
         }
     }
 }
@@ -194,7 +190,8 @@ pub struct Startup {
     /// Directories `POST /v1/analyze?path=` may read files from. Empty, the
     /// default, refuses every `path=` request.
     pub allow_local_paths: Vec<PathBuf>,
-    /// Concurrent request slots. `None` takes the worker default.
+    /// Concurrent request slots. `None` sizes them from the core count; see
+    /// [`crate::rules::default_workers`].
     pub workers: Option<NonZeroUsize>,
     /// Comma-separated CIDRs allowed to reach non-loopback routes.
     pub allow_cidr: Option<String>,
@@ -204,7 +201,7 @@ pub struct Startup {
     pub hopper: Option<String>,
     /// Per-request analysis timeout in seconds. Zero disables.
     pub analysis_timeout_secs: u64,
-    /// Rules, model and analysis settings, shared with the pull worker.
+    /// Rules, model and analysis settings.
     /// Fetching is off by default: a server driving outbound fetches is an
     /// SSRF-shaped exposure, so turning it on is an operator decision.
     pub rules: crate::rules::RulesStartup,
@@ -292,8 +289,6 @@ impl Startup {
             fetch: rules.fetch,
             hopper,
             zip_passwords: rules.zip_passwords,
-            slot_lanes: (std::env::var("SCAN_SLOT_LANES").as_deref() == Ok("1"))
-                .then(crate::analysis::small_job_max_bytes),
         };
         config.validate()?;
         Ok(config)
@@ -401,7 +396,7 @@ struct InFlightRequest {
     started_at: Instant,
     /// Shared with the blocking task; set to true to request cooperative cancellation.
     cancellation: Arc<AtomicBool>,
-    /// Tracks the current analysis phase inside cleave/litmus. Updated at each
+    /// Tracks the current analysis phase inside cleave and scan. Updated at each
     /// major stage so `/_/requests` can report what a stuck request is doing.
     phase: RequestPhase,
     /// OS thread ID of the blocking thread servicing this request (0 until started).
@@ -430,9 +425,9 @@ impl InFlightRequest {
 ///
 /// Slots are sized for a request's whole life, most of which is waiting on
 /// the network; cores are sized to the rayon pool, the only capacity an
-/// analysis really contends for. Reporting slots alone told the router
-/// `slots_free=48` on a box whose 16 cores were all busy (2026-09-04), and
-/// the analysis it sent there waited five minutes to start.
+/// analysis really contends for. Reporting slots alone can tell a router
+/// `slots_free=48` on a box whose 16 cores are all busy, and an analysis sent
+/// there waits minutes to start.
 pub(super) struct AnalysisPermit {
     _slot: tokio::sync::OwnedSemaphorePermit,
     _cpu: tokio::sync::OwnedSemaphorePermit,
@@ -635,7 +630,7 @@ impl JobBucket {
 
 /// PURL types tracked separately on `/_/stats`, plus a catch-all.
 ///
-/// A PURL carries no size, so a router choosing a worker for one has nothing to
+/// A PURL carries no size, so a router choosing a server for one has nothing to
 /// look up in [`SIZE_BUCKET_NAMES`] until the artifact has already been fetched
 /// — by which point the choice is made. The type is the next best predictor and
 /// is known up front: a golang pseudo-version resolves to a repository clone, an
@@ -679,8 +674,8 @@ pub(super) struct Jobs {
     micros_total: AtomicU64,
     /// Per-size-bucket completion totals, for the size-aware half of routing.
     ///
-    /// One scalar average is not enough to choose a server. The 12.5s-vs-90s
-    /// spread measured across two scanners on the same artifact was a large
+    /// One scalar average is not enough to choose a server. A wide spread
+    /// between two scanners on the same artifact is typically a large
     /// archive's member analysis, not a constant handicap — a single number
     /// would brand a box "slow" when it is only slow at big inputs, and send
     /// every small package somewhere worse. A caller usually knows the size
@@ -698,7 +693,7 @@ pub(super) struct Jobs {
     /// Kept apart from the fresh numbers because mixing them makes every
     /// average bimodal and therefore useless for prediction: the same artifact
     /// is milliseconds on a hit and minutes on a miss. A router choosing a
-    /// worker for work it has not done wants the fresh figure; blending in
+    /// server for work it has not done wants the fresh figure; blending in
     /// cache hits only tells it how lucky this server has been.
     cached: JobBucket,
     /// `/lookup` service time. Near-constant — an index probe, not an analysis
@@ -718,11 +713,10 @@ impl Jobs {
             .fetch_add(elapsed_ms.saturating_mul(1_000), Ordering::Relaxed);
         // What the router averages is this server's own service time: the LLM
         // phase is left out, because the endpoint is shared by the whole fleet
-        // and a contended one made every worker that asked it look slow.
-        // Measured 2026-09-06: a 128-core box restarted, its first twenty
-        // samples were probes that each waited on the endpoint, its p80 read
-        // 82s, and it took 2 of the next 128 dispatches while a 4-core box
-        // took 52.
+        // and a contended one makes every server that asks it look slow. A
+        // freshly restarted large box whose first samples all waited on the
+        // endpoint would otherwise read as the slowest in the fleet and be
+        // starved of dispatches.
         let micros = elapsed_ms
             .saturating_sub(result.interpret_ms)
             .saturating_mul(1_000);
@@ -741,50 +735,6 @@ impl Jobs {
         if let Some(purl) = purl {
             self.by_type[purl_type_bucket(purl)].record(micros);
         }
-    }
-}
-
-/// Class-aware admission, when `SCAN_SLOT_LANES=1`.
-///
-/// The flat slot semaphore treats every analysis as equal, but a large archive
-/// fans out across the whole shared rayon pool while a small file uses roughly
-/// one thread — so `--workers` flat slots either under-admit smalls or
-/// co-schedule whales that then fight for the pool (measured +55% wall on
-/// whale co-residency). The lanes mirror the worker's cleave gate at the front
-/// door: smalls get most permits, whales get few, and a full lane answers 429
-/// with Retry-After instead of queueing — a whale's queue wait is minutes, so
-/// the fleet routes it to an idle server; a small's wait is seconds, so callers
-/// just retry.
-#[derive(Debug)]
-pub(super) struct SlotLanes {
-    pub(super) whale: Arc<Semaphore>,
-    pub(super) small: Arc<Semaphore>,
-    /// Jobs at or below this size take the small lane (`SCAN_SMALL_JOB_MB`).
-    /// Unknown size — a PURL or URL analysis whose payload has not been
-    /// fetched yet — is a whale: those are almost always packages, and
-    /// mis-classing a whale as small is the expensive direction.
-    pub(super) small_max_bytes: u64,
-}
-
-impl SlotLanes {
-    fn new(max_concurrent: usize, small_max_bytes: u64) -> Self {
-        let whale_permits = (1 + max_concurrent / 8).min(max_concurrent);
-        let small_permits = max_concurrent.saturating_sub(whale_permits).max(1);
-        tracing::info!(
-            whale_permits,
-            small_permits,
-            small_max_mb = small_max_bytes / (1024 * 1024),
-            "slot lanes enabled: class-aware admission (SCAN_SLOT_LANES)"
-        );
-        Self {
-            whale: Arc::new(Semaphore::new(whale_permits)),
-            small: Arc::new(Semaphore::new(small_permits)),
-            small_max_bytes,
-        }
-    }
-
-    pub(super) fn available(&self) -> usize {
-        self.whale.available_permits() + self.small.available_permits()
     }
 }
 
@@ -834,7 +784,6 @@ struct AppState {
     /// One permit per rayon thread: every analysis in this process runs on the
     /// same pool.
     cpu: Arc<Semaphore>,
-    lanes: Option<SlotLanes>,
     /// Tasks stuck past the timeout — still occupying a slot until the
     /// blocking thread finally returns. Tracked for observability only.
     stuck_orphans: AtomicUsize,
@@ -859,7 +808,7 @@ struct AppState {
     buffered: Arc<Semaphore>,
     /// Background hopper uploader (`--hopper`); `None` disables result renewal.
     uploader: Option<Arc<crate::upload::Uploader>>,
-    /// The corpus behind this worker's index. `None` when no hopper is
+    /// The corpus behind this server's index. `None` when no hopper is
     /// configured, which leaves a lookup answering from local knowledge alone.
     corpus: Option<Arc<corpus::Corpus>>,
 }
@@ -873,11 +822,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl AppState {
     /// Analyses this server can start right now: a slot and a core for each.
     pub(super) fn available_analysis_permits(&self) -> usize {
-        let slots = match &self.lanes {
-            Some(lanes) => lanes.available(),
-            None => self.slots.available_permits(),
-        };
-        slots.min(self.cpu.available_permits())
+        self.slots
+            .available_permits()
+            .min(self.cpu.available_permits())
     }
 
     /// Analyses running now.
@@ -998,9 +945,9 @@ impl AppState {
             rss_mb = rss / 1024 / 1024,
             "memory pressure detected, clearing thread-local caches"
         );
-        // Awaited before re-reading RSS: a fire-and-forget clear let the
-        // re-read run first, logged memory freed that was not, and admitted
-        // requests an overloaded worker could not service.
+        // Awaited before re-reading RSS: a fire-and-forget clear would let the
+        // re-read run first, log memory freed that was not, and admit
+        // requests an overloaded server cannot service.
         if let Err(e) = tokio::task::spawn_blocking(cleave::clear_all_thread_caches).await {
             tracing::warn!(error = %e, "cache-clear task failed");
         }
@@ -1216,7 +1163,7 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
     let corpus = corpus::Corpus::new(config.hopper());
     match &corpus {
         Some(c) => tracing::info!(addresses = %c.addresses(), "lookups defer to the corpus"),
-        // Not a warning: a worker with no corpus behind it answers from its
+        // Not a warning: a server with no corpus behind it answers from its
         // own index, which is a whole deployment rather than a broken one.
         None => tracing::info!("no hopper configured: lookups answer from the local index alone"),
     }
@@ -1226,9 +1173,6 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
         readiness: RwLock::new(Readiness::Starting),
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(Semaphore::new(max_concurrent)),
-        lanes: config
-            .slot_lanes
-            .map(|small_max_bytes| SlotLanes::new(max_concurrent, small_max_bytes)),
         cpu: Arc::new(Semaphore::new(cores)),
         cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),

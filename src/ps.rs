@@ -1,5 +1,5 @@
 //! Process scanning: enumerate running processes, deduplicate by SHA256, and
-//! scan each unique executable through the litmus model.
+//! scan each unique executable through the model.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+use anyhow::Result;
 
 use crate::OutputFormat;
 use crate::engine::{Progress, ScanConfig, ScanResult, ScanSummary};
@@ -39,13 +38,93 @@ struct ProcessGroup {
 /// a universal binary's non-host slice, which never runs here.
 const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
 
-/// Compute SHA256 of a file, reading from the given path.
-fn sha256_file(path: &std::path::Path) -> Result<String> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+/// One group per distinct running binary: processes sharing an executable
+/// path are merged, then paths sharing a sha256. Also returns how many
+/// binaries could not be hashed, which are left out.
+fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u32) {
+    // Group by exe_path → (pids, deleted).
+    let mut by_path: HashMap<PathBuf, (Vec<u32>, bool)> = HashMap::new();
+    for entry in entries {
+        let (pids, deleted) = by_path
+            .entry(entry.exe_path.clone())
+            .or_insert_with(|| (Vec::new(), entry.deleted));
+        pids.push(entry.pid);
+        // If any entry says deleted, mark it.
+        if entry.deleted {
+            *deleted = true;
+        }
+    }
+
+    // Deduplicate by SHA256.
+    let mut by_sha: HashMap<String, ProcessGroup> = HashMap::new();
+    let mut hash_errors = 0u32;
+
+    for (path, (pids, deleted)) in by_path {
+        let hash = if deleted && !path.exists() {
+            // Try reading via /proc on Linux.
+            #[cfg(target_os = "linux")]
+            {
+                match crate::digest::sha256_file(std::path::Path::new(&format!(
+                    "/proc/{}/exe",
+                    pids[0]
+                ))) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(
+                            "cannot hash deleted binary {} (pid {}): {e}",
+                            path.display(),
+                            pids[0],
+                        );
+                        hash_errors += 1;
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::warn!("cannot hash deleted binary: {}", path.display());
+                hash_errors += 1;
+                continue;
+            }
+        } else {
+            match crate::digest::sha256_file(&path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("cannot hash {}: {e}", path.display());
+                    hash_errors += 1;
+                    continue;
+                }
+            }
+        };
+
+        let group = by_sha.entry(hash.clone()).or_insert_with(|| ProcessGroup {
+            path,
+            pids: Vec::new(),
+            deleted: false,
+            sha256: hash,
+        });
+        group.pids.extend(pids);
+        group.deleted |= deleted;
+    }
+
+    (by_sha.into_values().collect(), hash_errors)
+}
+
+/// Where to read `group`'s binary: its path, or for a deleted one the
+/// running image under `/proc` on Linux. `None`, logged, when it cannot be read.
+fn scan_path(group: &ProcessGroup) -> Option<PathBuf> {
+    if !group.deleted || group.path.exists() {
+        return Some(group.path.clone());
+    }
+    if cfg!(target_os = "linux") {
+        return Some(PathBuf::from(format!("/proc/{}/exe", group.pids[0])));
+    }
+    tracing::warn!(
+        "deleted binary not scannable: {} (pids: {:?})",
+        group.path.display(),
+        group.pids
+    );
+    None
 }
 
 /// Run a process scan: enumerate, deduplicate, classify.
@@ -76,14 +155,8 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     if proc_result.entries.is_empty() {
         let summary = ScanSummary {
-            total_files: 0,
-            hostile: 0,
-            suspicious: 0,
-            benign: 0,
-            errors: 0,
-            dependency_attention: Default::default(),
-            static_flags: 0,
             duration_ms: crate::duration_ms(scan_start.elapsed()),
+            ..ScanSummary::default()
         };
         if is_terminal {
             output::print_summary(&summary);
@@ -91,86 +164,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         return Ok(summary);
     }
 
-    // Group by exe_path → (pids, deleted).
-    let mut by_path: HashMap<PathBuf, (Vec<u32>, bool)> = HashMap::new();
-    for entry in &proc_result.entries {
-        let (pids, deleted) = by_path
-            .entry(entry.exe_path.clone())
-            .or_insert_with(|| (Vec::new(), entry.deleted));
-        pids.push(entry.pid);
-        // If any entry says deleted, mark it.
-        if entry.deleted {
-            *deleted = true;
-        }
-    }
-
-    // Deduplicate by SHA256.
-    let mut by_sha: HashMap<String, ProcessGroup> = HashMap::new();
-    let mut hash_errors = 0u32;
-
-    for (path, (pids, deleted)) in by_path {
-        let hash = if deleted && !path.exists() {
-            // Try reading via /proc on Linux.
-            #[cfg(target_os = "linux")]
-            {
-                match sha256_file(std::path::Path::new(&format!("/proc/{}/exe", pids[0]))) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!(
-                            "cannot hash deleted binary {} (pid {}): {e}",
-                            path.display(),
-                            pids[0],
-                        );
-                        hash_errors += 1;
-                        continue;
-                    }
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                tracing::warn!("cannot hash deleted binary: {}", path.display());
-                hash_errors += 1;
-                continue;
-            }
-        } else {
-            match sha256_file(&path) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("cannot hash {}: {e}", path.display());
-                    hash_errors += 1;
-                    continue;
-                }
-            }
-        };
-
-        let group = by_sha.entry(hash.clone()).or_insert_with(|| ProcessGroup {
-            path,
-            pids: Vec::new(),
-            deleted: false,
-            sha256: hash,
-        });
-        group.pids.extend(pids);
-        group.deleted |= deleted;
-    }
-
-    let mut groups: Vec<ProcessGroup> = by_sha.into_values().collect();
-    // Optional cap for fast iteration / benchmarking: `SCAN_PS_LIMIT=N` scans
-    // only the first N unique binaries. Sorted by path first so the chosen
-    // subset is stable across runs (modulo which processes are alive at the
-    // time), which keeps before/after timings comparable. Unset = scan all.
-    if let Some(limit) = std::env::var("SCAN_PS_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        groups.sort_by(|a, b| a.path.cmp(&b.path));
-        groups.truncate(limit);
-        tracing::info!(
-            limit,
-            kept = groups.len(),
-            "SCAN_PS_LIMIT active — scanning first {limit} unique binaries (path-sorted)"
-        );
-    }
-    let groups = groups;
+    let (groups, hash_errors) = group_by_binary(&proc_result.entries);
     let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
 
     if is_terminal {
@@ -232,24 +226,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
             continue;
         }
 
-        let scan_path = if group.deleted && !group.path.exists() {
-            // On Linux, try scanning via /proc/pid/exe.
-            #[cfg(target_os = "linux")]
-            {
-                PathBuf::from(format!("/proc/{}/exe", group.pids[0]))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                tracing::warn!(
-                    "deleted binary not scannable: {} (pids: {:?})",
-                    group.path.display(),
-                    group.pids
-                );
-                errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        } else {
-            group.path.clone()
+        let Some(scan_path) = scan_path(group) else {
+            errors.fetch_add(1, Ordering::Relaxed);
+            continue;
         };
         by_scan_path.insert(scan_path.clone(), group);
         scan_paths.push(scan_path);
@@ -258,10 +237,11 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Analyze the unique binaries through cleave's batch API: it loads the
     // CapabilityMapper + YARA engine once and fans the files out across a single
     // rayon pass. A hand-rolled `par_iter` over the single-file `analyze_file`
-    // instead nests rayon inside rayon — each file's inner parallelism multiplied
-    // by the outer fan-out oversubscribed the pool and ran *slower* than serial
-    // (measured: 2.8× util, 3× the CPU). Verdict order in the output stream is
-    // now completion order, which JSON/terminal consumers already tolerate.
+    // would nest rayon inside rayon — each file's inner parallelism multiplied
+    // by the outer fan-out oversubscribes the pool and runs *slower* than
+    // serial, at about three times the CPU. Verdict order in the output stream
+    // is completion order, which JSON/terminal consumers tolerate.
+
     let analyze = |scan_path: &std::path::Path, result: Result<cleave::AnalysisReport>| {
         let Some(group) = by_scan_path.get(scan_path) else {
             return;
@@ -305,14 +285,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 ) || config.filter().shows(&result.classification)
                 {
                     let print = || {
-                        emit_result(
-                            &result,
-                            config,
-                            &group.pids,
-                            group.deleted,
-                            progress.is_some(),
-                            &stdout,
-                        );
+                        emit_result(&result, config, progress.is_some(), &stdout);
                     };
                     if let Some(p) = &progress {
                         p.around_result(print);
@@ -437,14 +410,12 @@ fn build_result(
 fn emit_result(
     r: &ScanResult,
     config: &ScanConfig,
-    pids: &[u32],
-    deleted: bool,
     has_progress: bool,
     stdout: &Mutex<std::io::Stdout>,
 ) {
     match config.format() {
         OutputFormat::Terminal => {
-            output::print_ps_result(r, pids, deleted, has_progress, config.extra());
+            output::print_ps_result(r, has_progress, config.extra());
         }
         OutputFormat::Json => {
             let envelope = r.envelope_ref();

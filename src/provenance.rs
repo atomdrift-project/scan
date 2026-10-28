@@ -2,8 +2,8 @@
 //!
 //! A collector (forager) runs `fletch registry <purl>` at fetch time and stores
 //! its `{record, sources}` envelope in the sample's sidecar under `registry`.
-//! Both the worker (over HTTP, from `/api/provenance/{sha256}`) and the CLI
-//! (`--registry-map <file>`) read that sidecar to recover the normalized
+//! Both postdoc's worker (over HTTP, from `/api/provenance/{sha256}`) and the
+//! CLI (`--registry-map <file>`) read that sidecar to recover the normalized
 //! [`fletch::Registry`] a scan reasons over, so a hopper-sourced scan sees the
 //! same registry facts a live `pkg`/`url` scan fetches — without a refetch.
 
@@ -342,7 +342,7 @@ mod collector_sidecar_tests {
 /// The two documents describe different things, so a scan handed both keeps
 /// both. The capture record says where these exact bytes came from — a CDN
 /// reconstruction, a mirror, an archive replay — and is the only account of it
-/// once the package is gone; `--registry-map` (or a worker's hopper lookup) says
+/// once the package is gone; `--registry-map` (or postdoc's hopper lookup) says
 /// what the registry knew about the package. Identity, origin, and collector
 /// therefore stay as captured, and only the registry block, plus a package slot
 /// the collector did not record, are taken from `supplied`.
@@ -436,7 +436,7 @@ impl Upload<'_> {
         })
     }
 
-    /// A sidecar that preserves provenance supplied by a worker, a
+    /// A sidecar that preserves provenance supplied by postdoc's worker, a
     /// `--registry-map`, or a live lookup.
     ///
     /// A complete hopper sidecar is reused as-is, rebound to these bytes. Bare
@@ -985,7 +985,7 @@ fn parse_registry_record(json: &[u8]) -> Option<Registry> {
 /// Preserve a provenance document and recover its normalized registry record.
 /// Accepts
 /// any of three shapes:
-/// - a hopper sidecar (record nested under `registry`, as the worker receives
+/// - a hopper sidecar (record nested under `registry`, as postdoc's worker receives
 ///   from `/api/provenance/{sha256}`),
 /// - a bare `fletch registry` envelope (`{record, sources}`, straight from
 ///   fletch's stdout), or
@@ -1022,7 +1022,7 @@ mod tests {
     use super::{registry_map, registry_provenance};
 
     // A minimal normalized record — the shape `fletch registry` emits under
-    // `record`. Only the few fields the worker logs are asserted.
+    // `record`. Only a few identifying fields are asserted.
     const RECORD: &str = r#"{"ecosystem":"npm","name":"left-pad","version":"1.3.0"}"#;
 
     fn registry_record(json: &[u8]) -> Option<fletch::Registry> {
@@ -1266,7 +1266,7 @@ mod tests {
 
     #[test]
     fn reads_bare_record() {
-        // A bare normalized record — the per-sha value gauntlet puts in a
+        // A bare normalized record — the per-sha value a batch caller puts in a
         // `--registry-map` after extracting just `registry.record`.
         let rec = registry_record(RECORD.as_bytes()).expect("record present");
         assert_eq!(rec.name, "left-pad");
@@ -1323,7 +1323,7 @@ mod tests {
         .sidecar(Some(&reg), &sources)
         .unwrap();
 
-        // What scan writes, scan (and a worker) reads back as the same record.
+        // What scan writes, scan (and postdoc's worker) reads back as the same record.
         let rec = registry_record(&json).expect("registry record present");
         assert_eq!(rec.ecosystem, "npm");
         assert_eq!(rec.name, "left-pad");
@@ -1377,7 +1377,7 @@ mod tests {
             filename: "socket-1.1.137.tgz",
             sha256: &"a".repeat(64),
             size_bytes: 5083868,
-            collector: "scan+galadriel",
+            collector: "scan+host",
             at: "2026-07-03T16:34:16Z",
             url: "https://registry.npmjs.org/socket/-/socket-1.1.137.tgz",
             purl: Some("pkg:npm/socket@1.1.137"),

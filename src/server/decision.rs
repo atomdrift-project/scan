@@ -218,3 +218,348 @@ mod tests {
         }
     }
 }
+
+/// One decision, as it goes on the wire.
+///
+/// Every field but `url` is always present. A key that is unknown is `null`
+/// and a list that is empty is `[]`, never absent — a caller writes one code path against
+/// a shape that does not move, and a generated type has no optionals to unwrap
+/// that are really just "we had nothing to say".
+#[derive(serde::Serialize)]
+pub(super) struct V1Decision {
+    pub(super) decision: Decision,
+    pub(super) purl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) url: Option<String>,
+    pub(super) sha256: Option<String>,
+    pub(super) severity: Option<Severity>,
+    /// The tightest false-positive budget per 100 million benign files at which
+    /// this artifact grades hostile — lower being worse, and `-1` meaning it
+    /// fires at none. A property of the file and the model: measured, never
+    /// chosen, which is what separates it from the caller's own
+    /// `false_positive_budget` that it is compared against. Present so a caller
+    /// can tune that budget against real numbers; `null` when there is none.
+    pub(super) fires_at: Level,
+    pub(super) reason: Option<String>,
+    pub(super) findings: Vec<V1Finding>,
+    pub(super) engine_version: Option<String>,
+    pub(super) analyzed_at: Option<String>,
+}
+
+impl V1Decision {
+    /// Nobody has analyzed this artifact. Nothing is wrong; there is simply no
+    /// answer, and what a caller does about that is their policy to set.
+    pub(super) fn unanalyzed(sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self::empty(Decision::Unanalyzed, sha, purl)
+    }
+
+    /// We could not answer. Deliberately carries no severity, no level and no
+    /// findings: this decision is about us, not about the artifact, and a
+    /// caller must not be able to read anything into it.
+    pub(super) fn unavailable(sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self::empty(Decision::Unavailable, sha, purl)
+    }
+
+    /// What the filters alone justify, for an artifact no stored verdict and no
+    /// corpus record covers. `None` when the filters had no opinion.
+    ///
+    /// `engine_version` and `analyzed_at` stay `None`, which is the whole
+    /// contract: an engine is what separates a measurement from a citation, so
+    /// a caller (and beamline's cache) can tell this from a scan we ran, and
+    /// `/v1/analyze` is free to replace it with a real one.
+    ///
+    /// Levels come from [`crate::lookup::bloom_claim`] — the loosest each tier
+    /// can justify, since a filter carries membership and not a measurement.
+    pub(super) fn bloom(
+        d: crate::bloom_repo::Decision,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        budget: u16,
+    ) -> Option<Self> {
+        let claim = crate::lookup::bloom_claim(d)?;
+        let fires_at = claim.lvl;
+        let (decided, severity) = decide(fires_at, budget);
+        Some(Self {
+            decision: decided,
+            purl: purl.map(str::to_owned),
+            url: None,
+            sha256: sha.map(str::to_owned),
+            severity: Some(severity),
+            fires_at,
+            reason: claim.finding.as_ref().map(|f| f.desc.to_owned()),
+            findings: claim
+                .finding
+                .as_ref()
+                .map(|f| V1Finding::from_bloom(f, purl))
+                .into_iter()
+                .collect(),
+            engine_version: None,
+            analyzed_at: None,
+        })
+    }
+
+    pub(super) fn empty(decided: Decision, sha: Option<&str>, purl: Option<&str>) -> Self {
+        Self {
+            decision: decided,
+            purl: purl.map(str::to_owned),
+            url: None,
+            sha256: sha.map(str::to_owned),
+            severity: None,
+            fires_at: Level::Manual,
+            reason: None,
+            findings: Vec::new(),
+            engine_version: None,
+            analyzed_at: None,
+        }
+    }
+
+    /// Whether this says something about the artifact rather than about us,
+    /// and says it because an engine of ours measured it.
+    ///
+    /// `unanalyzed` reports that nobody has analyzed it, which is precisely what
+    /// `/v1/analyze` exists to fix, and `unavailable` reports that we could not
+    /// find out. Neither may stand in for a run.
+    ///
+    /// Nor may a level derived from threat-feed citations, and that one is the
+    /// easy miss: it carries a real `decision`, so it reads as a verdict at
+    /// every glance. Standing in for the run would mean an artifact nobody has
+    /// analyzed never gets analyzed — the caller is told `block`, the corpus
+    /// learns nothing, and the gap the derived level papers over stays open for
+    /// good. An engine is exactly what separates a measurement from a citation,
+    /// so an engine is what is asked for.
+    pub(super) fn is_verdict(&self) -> bool {
+        !matches!(self.decision, Decision::Unanalyzed | Decision::Unavailable)
+            && self.engine_version.is_some()
+    }
+
+    /// Anything that answers the caller's question, measured or not.
+    ///
+    /// Wider than [`Self::is_verdict`] on purpose, and the difference is a
+    /// policy choice rather than an oversight. `is_verdict` remains the strict
+    /// question — is this a measurement of ours — and downstream still asks it
+    /// by looking for an engine. This one governs whether `/v1/analyze` may
+    /// answer at all, where the operator's judgement is that a fast answer from
+    /// what we already know beats spending a slot to rediscover it.
+    ///
+    /// The cost is real and worth naming: for an artifact nobody has analyzed
+    /// and a feed has cited, this answers from the citation and the analysis
+    /// never happens, so the corpus does not learn. `?fresh=1` is the escape
+    /// hatch for a caller who needs the measurement, and the derived answer
+    /// still carries no `engine_version`, so nothing downstream mistakes it for
+    /// one.
+    ///
+    /// `unanalyzed` and `unavailable` are excluded exactly as before: the first is
+    /// what `/v1/analyze` exists to fix, the second is a statement about us.
+    pub(super) fn is_answerable(&self) -> bool {
+        !matches!(self.decision, Decision::Unanalyzed | Decision::Unavailable)
+            && !self.fires_at.is_manual()
+    }
+
+    /// A verdict this server holds in its own index.
+    ///
+    /// Takes no digest: a stored verdict always carries its own, and it is the
+    /// artifact's identity rather than whatever the caller happened to type.
+    pub(super) fn stored(v: &crate::lookup::Verdict, purl: Option<&str>, budget: u16) -> Self {
+        let (decided, severity) = decide(v.lvl, budget);
+        Self {
+            decision: decided,
+            // The verdict names the artifact it is about; the caller's spelling
+            // only fills in what it could not.
+            purl: v.purl.clone().or_else(|| purl.map(str::to_owned)),
+            url: None,
+            sha256: Some(v.sha256.clone()),
+            severity: Some(severity),
+            fires_at: v.lvl,
+            reason: v.why.clone(),
+            findings: V1Finding::worth_reporting(v.hits.iter().map(V1Finding::from_hit)),
+            engine_version: Some(v.eng.clone()),
+            analyzed_at: Some(v.at.clone()),
+        }
+    }
+
+    /// A record the corpus holds. Decided here rather than there: hopper stores
+    /// what an artifact is, and turning that into allow or block is policy this
+    /// server owns, so the same budget produces the same answer whichever side
+    /// of the index the record came from.
+    pub(super) fn corpus(
+        r: &crate::hopper::Record,
+        sha: Option<&str>,
+        purl: Option<&str>,
+        budget: u16,
+    ) -> Self {
+        let (decided, severity) = decide(r.fires_at, budget);
+        Self {
+            decision: decided,
+            purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
+            url: None,
+            // Empty is absent. A record standing on threat-feed citations for a
+            // package nobody has analyzed names no bytes, and the corpus sends
+            // the field as "" rather than omitting it — which would put an
+            // empty string where the wire contract says string|null, and where
+            // a caller comparing digests to prove two spellings are one thing
+            // would find them equal.
+            sha256: r
+                .sha256
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| sha.map(str::to_owned)),
+            severity: Some(severity),
+            fires_at: r.fires_at,
+            reason: r.reason.clone(),
+            findings: V1Finding::worth_reporting(r.findings.iter().map(V1Finding::from_corpus)),
+            engine_version: r.engine_version.clone(),
+            analyzed_at: r.analyzed_at.clone(),
+        }
+    }
+
+    /// Attach the reason an `unavailable` came about. `None` leaves the
+    /// decision exactly as it was, so the common outage keeps its bare shape.
+    pub(super) fn because(mut self, reason: Option<&'static str>) -> Self {
+        if let Some(reason) = reason {
+            self.reason = Some(reason.to_owned());
+        }
+        self
+    }
+
+    /// Answer about the coordinate the caller named, in the spelling they
+    /// named it.
+    ///
+    /// Every key is normalized before it is looked up — PyPI folds `.` and `_`
+    /// to `-` per PEP 503, npm scopes are unwrapped, a bare `npm/left-pad` gets
+    /// its `pkg:` — and echoing the normalized form back is how
+    /// `pkg:pypi/info.gianlucacosta.eos.core@2.0.2` came home answered about
+    /// `pkg:pypi/info-gianlucacosta-eos-core@2.0.2`. The same package, and a
+    /// caller has no way to know that without implementing PEP 503 themselves.
+    ///
+    /// That matters most where it is least visible: a lookup may name fifty
+    /// packages and the reply is a list, so `purl` is what a caller matches
+    /// response to request by. Rewriting the spelling breaks that silently, and
+    /// only for the names that happen to contain a `.` or a `_`.
+    ///
+    /// So the field answers "the package you asked about" and the caller's
+    /// bytes are returned unaltered. `sha256` remains the identity, and it is
+    /// the field to compare when two spellings must be proven to be one thing.
+    pub(super) fn asked_about(mut self, asked: Option<&str>) -> Self {
+        if let Some(asked) = asked {
+            self.purl = Some(asked.to_owned());
+        }
+        self
+    }
+
+    pub(super) fn asked_about_url(mut self, asked: Option<&str>) -> Self {
+        if let Some(asked) = asked {
+            self.url = Some(asked.to_owned());
+        }
+        self
+    }
+
+    pub(super) fn with_url(mut self, url: Option<&str>) -> Self {
+        if let Some(url) = url {
+            self.url = Some(url.to_owned());
+        }
+        self
+    }
+}
+
+/// One finding on the wire.
+///
+/// Fed from this server's index or from the corpus, which know different
+/// amounts about the same thing: a stored hit carries the file and offset it
+/// fired on, while the corpus keeps only the trait and its criticality — those
+/// details live in the one column a lookup must not read.
+///
+/// `id` and `crit` are therefore the only fields always present, and the rest
+/// are omitted when there is nothing to say rather than sent as null. That is
+/// the opposite of the rule the enclosing decision object follows, and the two
+/// differ because the questions do. A decision has a FIXED set of things it
+/// answers, so a caller writes one code path against nine keys that never move
+/// and `"engine_version": null` is itself the answer to "which engine". A
+/// finding has no such set: how much is known about one varies by where it came
+/// from, four nulls per corpus finding is most of the object, and a reader
+/// checking `desc` has to handle absence anyway.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct V1Finding {
+    pub(super) id: String,
+    pub(super) crit: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pkg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) desc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) off: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) line: Option<u64>,
+}
+
+impl V1Finding {
+    pub(super) fn from_hit(h: &crate::lookup::Hit) -> Self {
+        let some = |s: &String| (!s.is_empty()).then(|| s.clone());
+        Self {
+            id: h.id.clone(),
+            crit: h.crit,
+            file: some(&h.file),
+            pkg: some(&h.pkg),
+            desc: some(&h.desc),
+            off: h.off,
+            line: h.line,
+        }
+    }
+
+    /// A finding synthesized from a filter hit. Carries no `file`, `off` or
+    /// `line` — a filter knows membership and nothing about where anything
+    /// fired — which is the same shape the corpus sends for a citation.
+    pub(super) fn from_bloom(c: &crate::lookup::BloomFinding, purl: Option<&str>) -> Self {
+        Self {
+            id: c.id.to_owned(),
+            crit: c.crit,
+            file: None,
+            pkg: purl.map(str::to_owned),
+            desc: Some(c.desc.to_owned()),
+            off: None,
+            line: None,
+        }
+    }
+
+    pub(super) fn from_corpus(f: &crate::hopper::Finding) -> Self {
+        Self {
+            id: f.id.clone(),
+            crit: f.crit,
+            file: None,
+            pkg: None,
+            desc: f.desc.clone(),
+            off: None,
+            line: None,
+        }
+    }
+
+    /// The findings worth putting on the wire: the strongest few, worst first.
+    ///
+    /// The corpus already decides this in a trigger — `crit >= 4`, ordered by
+    /// criticality, at most three — and a decision answered from this server's
+    /// own index has to land on the same set, or one artifact reads differently
+    /// depending on which side of the index happened to answer. Applying it
+    /// here rather than trusting each source keeps the two in step by
+    /// construction; on corpus records it is a no-op.
+    ///
+    /// A benign artifact clears the bar with nothing, and that is the intended
+    /// answer rather than a gap to fill: ten "Rust test marker" hits explain
+    /// nothing about an allow, and listing them invites a caller to read
+    /// significance into noise.
+    pub(super) fn worth_reporting(all: impl Iterator<Item = Self>) -> Vec<Self> {
+        let mut kept: Vec<Self> = all.filter(|f| f.crit >= REPORT_MIN_CRIT).collect();
+        // Stable, so equal criticalities keep the order their source listed
+        // them in — the same tiebreak as the trigger's `ORDER BY crit DESC,
+        // ord`.
+        kept.sort_by_key(|f| std::cmp::Reverse(f.crit));
+        kept.truncate(REPORT_LIMIT);
+        kept
+    }
+}
+
+/// Suspicious and above. Below this a trait is an observation, not a reason.
+const REPORT_MIN_CRIT: u8 = 4;
+
+/// Enough to show why, few enough to read. Matches the corpus's `LIMIT 3`.
+const REPORT_LIMIT: usize = 3;

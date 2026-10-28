@@ -9,7 +9,7 @@
 //! `general/` ensemble subdirectory. No git.
 //!
 //! On-disk layout under `dirs::data_dir()/atomdrift/scan/models/<bundle>` where
-//! `<bundle>` comes from the last path segment of `SCAN_MODELS_REPO`
+//! `<bundle>` is the last path segment of the models repository
 //! (`.../azoth.git` → `azoth`), so a per-filetype variant lands at a sibling dir.
 //!
 //! Resolution order:
@@ -27,7 +27,7 @@ const DEFAULT_MODELS_REPO_URL: &str = "https://github.com/atomdrift-project/azot
 /// Files that must be present in a complete bundle. The model file is checked
 /// separately because it may live at the top level or under `models/`.
 const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
-/// litmus is ONNX-only — the native LightGBM/XGBoost loaders were retired.
+/// Scan loads ONNX models only; there is no native LightGBM/XGBoost loader.
 const MODEL_FILES: &[&str] = &["model.onnx"];
 
 /// Resolve the models bundle directory, bootstrap-installing (a download) if
@@ -39,18 +39,17 @@ const MODEL_FILES: &[&str] = &["model.onnx"];
 /// Returns an error if `SCAN_MODELS_DIR` names a missing directory, or the
 /// first-run install fails.
 pub fn ensure_model_dir() -> Result<PathBuf> {
-    if let Ok(explicit) = std::env::var("SCAN_MODELS_DIR") {
-        let p = PathBuf::from(&explicit);
-        if p.is_dir() {
-            tracing::debug!("Using models from SCAN_MODELS_DIR={}", p.display());
-            return Ok(p);
+    if let Some(explicit) = crate::env::path(crate::env::SCAN_MODELS_DIR) {
+        if explicit.is_dir() {
+            tracing::debug!("Using models from SCAN_MODELS_DIR={}", explicit.display());
+            return Ok(explicit);
         }
-        anyhow::bail!("SCAN_MODELS_DIR={explicit} does not exist");
+        anyhow::bail!("SCAN_MODELS_DIR={} does not exist", explicit.display());
     }
 
     let data_dir = default_models_dir()?;
     // `settle`: an update between its swap's two renames is not a first run.
-    if has_models(&data_dir) || (crate::model_update::settle(&data_dir) && has_models(&data_dir)) {
+    if has_models(&data_dir) || (crate::bundle::settle(&data_dir) && has_models(&data_dir)) {
         tracing::debug!("Using models from {}", data_dir.display());
         return Ok(data_dir);
     }
@@ -75,8 +74,7 @@ pub fn version() -> Option<String> {
 /// # Errors
 /// When there is no override and no data directory; see [`crate::data_dir`].
 pub fn install_target() -> Result<PathBuf> {
-    std::env::var_os("SCAN_MODELS_DIR")
-        .map_or_else(default_models_dir, |dir| Ok(PathBuf::from(dir)))
+    crate::env::path(crate::env::SCAN_MODELS_DIR).map_or_else(default_models_dir, Ok)
 }
 
 /// Feature dimensionality of the installed model: the number of inputs each
@@ -120,11 +118,9 @@ pub fn model_count() -> Option<usize> {
     (n > 0).then_some(n)
 }
 
-/// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`,
-/// where `<bundle>` is named by `SCAN_MODELS_REPO` (see [`bundle_name`]).
+/// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/<bundle>`.
 fn default_models_dir() -> Result<PathBuf> {
-    let repo = std::env::var("SCAN_MODELS_REPO");
-    let bundle = bundle_name(repo.as_deref().unwrap_or(DEFAULT_MODELS_REPO_URL));
+    let bundle = bundle_name(DEFAULT_MODELS_REPO_URL);
     Ok(crate::data_dir()?
         .join("models")
         .join(bundle.unwrap_or("azoth")))
@@ -141,7 +137,7 @@ fn bundle_name(url: &str) -> Option<&str> {
     stripped.rsplit(['/', ':']).next().filter(|s| !s.is_empty())
 }
 
-/// True if the directory looks like a complete bundle litmus can load.
+/// True if the directory looks like a complete bundle scan can load.
 ///
 /// Two layouts are accepted: an ensemble bundle (`general/` subdirectory
 /// containing the required artifacts) or a legacy single-bundle (artifacts

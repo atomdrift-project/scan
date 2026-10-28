@@ -1,5 +1,5 @@
 //! One analysis of a file or byte buffer against a loaded model bundle: the
-//! pipeline the server and the pull worker share.
+//! pipeline `atomscan serve` and postdoc's worker share.
 //!
 //! [`classify_file`] and [`classify_bytes`] run cleave and then the model, and
 //! return the wire [`ScanResult`]. [`ModelResources`] is the loaded bundle,
@@ -29,7 +29,7 @@ pub struct Analysis<'a> {
     pub slow_rule_ms: u64,
     pub cancellation: Option<&'a Arc<AtomicBool>>,
     pub phase: Option<&'a RequestPhase>,
-    /// Registry facts collected at fetch time (worker provenance or a
+    /// Registry facts collected at fetch time (a queue job's provenance or a
     /// caller's registry map), so the scan reasons over them without refetching.
     pub root_registry: Option<&'a RegistryProvenance>,
     /// Reference-following policy; [`Analysis::new`] takes the bundle's.
@@ -50,6 +50,7 @@ impl std::fmt::Debug for Analysis<'_> {
 }
 
 impl<'a> Analysis<'a> {
+    #[must_use]
     pub fn new(label: &'a str, resources: &'a ModelResources, slow_rule_ms: u64) -> Self {
         Self {
             label,
@@ -266,7 +267,7 @@ impl RequestPhase {
 /// The loaded model bundle an analysis runs against: thresholds, the ML
 /// ensemble, and the optional LLM and fetch policies attached to it.
 ///
-/// Shared by the server and the pull worker, each of which holds one behind an
+/// Shared by the server and postdoc's worker, each of which holds one behind an
 /// `Arc` and swaps it on reload.
 pub struct ModelResources {
     pub model: Model,
@@ -279,16 +280,9 @@ pub struct ModelResources {
     pub zip_passwords: crate::ArchivePasswords,
 }
 
-/// Payloads at or below this many bytes count as small — for the slot lanes
-/// and for [`whale_lane_for`] alike. `SCAN_SMALL_JOB_MB`, the same knob the
-/// worker's cleave gate reads; 1 MiB unless set.
-#[must_use]
-pub fn small_job_max_bytes() -> u64 {
-    std::env::var("SCAN_SMALL_JOB_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
-}
+/// Payloads at or below this many bytes count as small, for
+/// [`whale_lane_for`] and for the daemons' admission lanes alike.
+pub const SMALL_JOB_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Threads for one whale's private pool on a host with this many physical
 /// cores: a quarter of them, never fewer than two (one thread cannot pipeline
@@ -302,9 +296,8 @@ pub fn whale_pool_threads(physical_cores: usize) -> usize {
 
 /// Threads for a small payload's private pool on a host with this many
 /// physical cores: an eighth of them, 2–8. 4 cores → 2, 64 → 8, 128 → 8. A
-/// package under the small cap has few members, so a wider pool mostly idles;
-/// eight is where its p50 was best (0.29 s vs 0.44 s on 16, measured
-/// 2026-09-05 at concurrency 8 over 256 PURLs).
+/// package under the small cap has few members, so a wider pool mostly idles,
+/// and eight threads give a lower p50 than sixteen.
 #[must_use]
 pub fn small_pool_threads(physical_cores: usize) -> usize {
     (physical_cores / 8).clamp(2, 8)
@@ -322,21 +315,14 @@ pub fn whale_slots(physical_cores: usize) -> usize {
 }
 
 /// Payloads above this many bytes are *big* whales, the ones that take a
-/// slot from [`whale_slots`]. `SCAN_BIG_JOB_MB`; 8 MiB unless set. Between
-/// `SCAN_SMALL_JOB_MB` and this a payload still gets a private pool, but
-/// never waits: a 2 MiB package finishes in seconds, and making it queue
-/// behind a 250 MiB one is the starvation this whole arrangement exists to
-/// prevent.
-fn big_job_min_bytes() -> u64 {
-    std::env::var("SCAN_BIG_JOB_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or(8 * 1024 * 1024, |mb| mb.saturating_mul(1024 * 1024))
-}
+/// slot from [`whale_slots`]. Between [`SMALL_JOB_MAX_BYTES`] and this a
+/// payload still gets a private pool, but never waits: a 2 MiB package
+/// finishes in seconds, and making it queue behind a 250 MiB one is the
+/// starvation this whole arrangement exists to prevent.
+const BIG_JOB_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Whale-lane sizing, read once from the environment.
 /// Analyses admitted and not yet finished, process-wide — what a new lane
-/// shares the cores with. Kept by [`RequestGuard`].
+/// shares the cores with. The server counts each request in and out.
 pub static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Threads a private lane of tier minimum `floor` gets when `active`
@@ -345,13 +331,11 @@ pub static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 /// above the cores. Alone (`active <= 1`) the answer is `None`: the global
 /// pool, every thread of it.
 ///
-/// The tier floors (8 for small, 16 for whales) were chosen at concurrency 8
-/// and are right there — 8 for small beat 16 on p50 — but they are the whole
-/// story only when the box is full. At concurrency 1 the same 8-thread pool
-/// left 120 threads idle: purls-128 measured p90 1.63 s on the fixed widths
-/// against 1.12 s on the global pool, wall 164 → 111 s (2026-09-06). The
-/// share reproduces both ends: 64 physical cores / 8 in flight = 8 (the
-/// small floor), / 4 = 16, / 2 = 32, alone = everything.
+/// The tier floors (8 for small, 16 for whales) suit a full box, where 8
+/// threads beat 16 for small payloads on p50. On a quiet box a fixed width
+/// leaves most cores idle and the global pool finishes sooner. The share
+/// covers both ends: 64 physical cores / 8 in flight = 8 (the small floor),
+/// / 4 = 16, / 2 = 32, alone = everything.
 #[must_use]
 pub fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
     if active <= 1 {
@@ -361,20 +345,14 @@ pub fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usiz
 }
 
 struct WhaleConfig {
-    /// Threads per whale pool; `0` sends whales to the global pool instead.
+    /// Threads per whale pool.
     threads: usize,
-    /// Threads per small payload's pool; `0` keeps small payloads on the
-    /// global pool.
+    /// Threads per small payload's pool.
     small_threads: usize,
     /// Physical cores, the numerator of the per-request share.
     physical: usize,
-    /// `SCAN_LANE_SHARE=0` pins every lane at its tier floor (the widths
-    /// measured at concurrency 8) instead of sharing the cores by load.
-    share: bool,
     /// Big whales in flight at once.
     slots: usize,
-    small_max_bytes: u64,
-    big_min_bytes: u64,
 }
 
 static WHALE_CONFIG: OnceLock<WhaleConfig> = OnceLock::new();
@@ -388,43 +366,19 @@ fn whale_config() -> &'static WhaleConfig {
                     .map(|n| n.get() / 2)
             })
             .unwrap_or(4);
-        let env_usize = |key: &str| {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        };
-        let threads =
-            env_usize("SCAN_WHALE_POOL_THREADS").unwrap_or_else(|| whale_pool_threads(physical));
-        let small_threads =
-            env_usize("SCAN_SMALL_POOL_THREADS").unwrap_or_else(|| small_pool_threads(physical));
-        let slots = env_usize("SCAN_WHALE_SLOTS")
-            .unwrap_or_else(|| whale_slots(physical))
-            .max(1);
-        let small_max_bytes = small_job_max_bytes();
-        let big_min_bytes = big_job_min_bytes().max(small_max_bytes);
-        let share = std::env::var("SCAN_LANE_SHARE").as_deref() != Ok("0");
-        if threads == 0 {
-            tracing::info!("whale analysis pools disabled (SCAN_WHALE_POOL_THREADS=0)");
-        } else {
-            tracing::info!(
-                threads_per_whale = threads,
-                threads_per_small = small_threads,
-                big_whale_slots = slots,
-                whale_over_mb = small_max_bytes / (1024 * 1024),
-                big_over_mb = big_min_bytes / (1024 * 1024),
-                share,
-                "analysis lanes ready: every payload runs on a private rayon pool sized to it"
-            );
-        }
-        WhaleConfig {
-            threads,
-            small_threads,
+        let config = WhaleConfig {
+            threads: whale_pool_threads(physical),
+            small_threads: small_pool_threads(physical),
             physical,
-            share,
-            slots,
-            small_max_bytes,
-            big_min_bytes,
-        }
+            slots: whale_slots(physical),
+        };
+        tracing::info!(
+            threads_per_whale = config.threads,
+            threads_per_small = config.small_threads,
+            big_whale_slots = config.slots,
+            "analysis lanes ready: every payload runs on a private rayon pool sized to it"
+        );
+        config
     })
 }
 
@@ -436,7 +390,7 @@ static WHALE_SLOTS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 struct WhaleSlot;
 
 /// Every big-whale slot is taken. Surfaced as 429 so the router places the
-/// analysis on a worker with a free slot instead of queueing it here.
+/// analysis on a host with a free slot instead of queueing it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WhaleSlotBusy {
     slots: usize,
@@ -458,10 +412,9 @@ impl WhaleSlot {
     /// Take a slot now or refuse. This never waits: a request that reaches
     /// here is already streaming, so a queue is invisible to the router and
     /// the request sits behind whatever holds the slot for that whale's
-    /// whole run (three wheels of 17–78 MB on 4-core scan-pdx, 2026-09-06:
-    /// one held the only slot for 34 minutes and the other two timed out
-    /// behind it while three other workers had room). A refusal ends the
-    /// stream in milliseconds and the router tries the next worker.
+    /// whole run, which on a small host can outlast the request's budget
+    /// while other hosts have room. A refusal ends the stream in
+    /// milliseconds and the router tries the next host.
     fn try_acquire(slots: usize) -> Result<Self, WhaleSlotBusy> {
         WHALE_SLOTS_IN_USE
             .try_update(Ordering::AcqRel, Ordering::Acquire, |in_use| {
@@ -491,25 +444,20 @@ impl Drop for WhaleSlot {
 /// `par_iter` it issues — string extraction in stng, a member-window flush in
 /// cleave — is *injected* into a rayon pool from outside, and rayon workers
 /// take injected work only once their own deques are empty. While a whale's
-/// thousands of member tasks sit in those deques they never are. Measured
-/// 2026-09-05 at concurrency 8 over 128 real PURLs: a package that analyzes
-/// in 0.3s alone waited 16.8s in `Registry::in_worker_cold` for a global-pool
-/// worker, and the p90 sat at 5.2–6.9s whether or not the LLM pass ran.
+/// thousands of member tasks sit in those deques they never are, so a
+/// package that analyzes in a fraction of a second alone can wait many
+/// seconds in `Registry::in_worker_cold` for a global-pool thread.
 ///
-/// A single *shared* whale pool was the first cut and fixed the small side
-/// (p90 4.1s), but moved the starvation into the whale pool: three 36–254 MB
-/// wheels in flight kept a 1.3 MB package waiting the whole 200s sweep, and
-/// held each other to 170s+ where alone they take 25–40s. So each whale gets
+/// A single pool *shared* by all whales would only move that starvation into
+/// the whale pool, where several large wheels hold a mid-sized package and
+/// each other far past their solo times. So each whale gets
 /// its own pool ([`whale_pool_threads`] wide, dropped when the analysis
 /// returns); nothing shares an injector with a whale. Big ones
-/// (`SCAN_BIG_JOB_MB`) also take one of [`whale_slots`]; a burst of them is
+/// (over `BIG_JOB_MIN_BYTES`) also take one of [`whale_slots`]; a burst of them is
 /// refused past that count ([`WhaleSlotBusy`]) so the router spreads it over
 /// the fleet instead of oversubscribing this host; the threads are cheap, the
 /// cores are the budget.
 ///
-/// `SCAN_WHALE_POOL_THREADS` sets the per-whale width (0 sends whales to the
-/// global pool); `SCAN_WHALE_SLOTS` the big-whale concurrency;
-/// `SCAN_SMALL_JOB_MB` (shared with the slot lanes) says where whale starts.
 #[derive(Debug)]
 pub struct WhaleLane {
     pool: rayon::ThreadPool,
@@ -537,46 +485,34 @@ pub fn whale_slot_usage() -> (usize, usize) {
 /// build. The wait is the caller's phase to report.
 ///
 /// Built per analysis and dropped after it: parking idle pools for reuse
-/// (warm thread-local caches) measured as a wash, within noise on p50, p90
-/// and throughput over 256 PURLs, so the simpler form stays.
+/// (warm thread-local caches) gains nothing measurable on latency or
+/// throughput, so the simpler form stays.
 ///
-/// Small payloads got private pools too once the whales had them: on the
-/// global pool they compete for cleave's bounded inner-parallel owner slots
-/// and half of them analyze serially at concurrency 8; on a pool of their
-/// own each is parallel and exempt (`dedicated_pool`). Measured 2026-09-05
-/// over 256 PURLs: throughput 203 → 230/min, mean 1.65 → 1.35 s.
+/// Small payloads get private pools too: on the global pool they compete for
+/// cleave's bounded inner-parallel owner slots and many analyze serially
+/// under load; on a pool of their own each is parallel and exempt
+/// (`dedicated_pool`).
 ///
-/// Never for pull work. The idle worker's analyses already run on a pool of
-/// their own — bounded, scheduled below the server's, and drawing on their
-/// own parallelism slots — and a lane would undo all three: a lane pool's
-/// threads are unmarked and at normal priority, and a big idle archive would
-/// take one of the few whale slots and hold it for its whole slow run.
-/// Measured 2026-09-06 on scan-lax: two of the two whale slots held by pull
-/// work, and two interactive analyses waited in `whale:lane` until their
-/// 30-minute budget ran out.
+/// Background queue work should not take a lane. It belongs on a bounded,
+/// lower-priority pool of its own, and a big background archive would hold
+/// one of the few whale slots for its whole slow run, turning interactive
+/// whales away.
 ///
 /// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
 /// than queued; the handler turns that into a retry-later response.
 pub fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
     let cfg = whale_config();
-    let floor = if bytes <= cfg.small_max_bytes {
+    let floor = if bytes <= SMALL_JOB_MAX_BYTES {
         cfg.small_threads
     } else {
         cfg.threads
     };
-    if floor == 0 {
+    // Alone on the box, the global pool is the widest lane there is.
+    let Some(threads) = lane_threads(floor, cfg.physical, ACTIVE_REQUESTS.load(Ordering::Acquire))
+    else {
         return Ok(None);
-    }
-    let threads = if cfg.share {
-        // Alone on the box, the global pool is the widest lane there is.
-        match lane_threads(floor, cfg.physical, ACTIVE_REQUESTS.load(Ordering::Acquire)) {
-            Some(threads) => threads,
-            None => return Ok(None),
-        }
-    } else {
-        floor
     };
-    let slot = if bytes > cfg.big_min_bytes {
+    let slot = if bytes > BIG_JOB_MIN_BYTES {
         Some(WhaleSlot::try_acquire(cfg.slots)?)
     } else {
         None

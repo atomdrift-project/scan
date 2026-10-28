@@ -27,14 +27,18 @@ pub mod auto_update;
 pub mod bloom_build;
 pub mod bloom_repo;
 pub mod bloom_update;
+pub(crate) mod bundle;
 pub mod cache_cleanup;
 mod civil;
 pub mod cli;
 pub(crate) mod deptree;
+mod digest;
 pub mod engine;
+pub mod env;
 pub mod features;
 pub mod fetch;
 pub mod heap_profile;
+pub mod hopper;
 pub(crate) mod hosts;
 pub mod interpret;
 mod interrupt;
@@ -80,6 +84,7 @@ pub use analyzer::Analyzer;
 pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};
 pub use model::Classification;
 pub use model::Thresholds;
+pub use rules::refresh_rules_at_startup;
 
 /// Archive passwords kept unique and redacted from debug output.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -165,7 +170,7 @@ pub enum OutputFormat {
     Terminal,
     /// Newline-delimited JSON, one object per file.
     Json,
-    /// Compact, context-centric text for feeding a local LLM: a litmus verdict
+    /// Compact, context-centric text for feeding a local LLM: a scan verdict
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See `crate::engine::write_tiny`.
     Tiny,
@@ -209,58 +214,33 @@ pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
         .context("this user has no data directory (is HOME set?)")
 }
 
+/// `<platform cache directory>/atomdrift/scan`, where scan's verdict index and
+/// analysis caches live; `None` when the platform has none, and every cache
+/// then stays off.
+///
+/// A unit-test build gets a private temporary directory instead: its tests
+/// write verdicts, and must never write them into a developer's real index.
+#[must_use]
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        Some(
+            DIR.get_or_init(|| tempfile::tempdir().expect("tempdir").keep())
+                .clone(),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        Some(dirs::cache_dir()?.join("atomdrift").join("scan"))
+    }
+}
+
 /// Stack size for every analysis thread pool, in MiB. cleave's archive
 /// analysis is nested-parallel and deep; 256 MB is what the global rayon pool
 /// has always used, and every analysis pool must match it or a member that
 /// recurses fine on one pool overflows on another.
 pub const RAYON_STACK_MB: usize = 256;
-
-/// Refresh the model and traits bundles before a daemon starts serving.
-///
-/// Long-lived daemons pick up new rules on restart, so this runs once at
-/// startup rather than on a timer. Failures are warned about and not fatal: a
-/// daemon in a disconnected environment must still start with whatever is on
-/// disk. `force` updates even when the local copy looks current; `no_update`
-/// skips the step entirely.
-///
-/// This is also the step that populates a `--traits-dir` pointing at an empty
-/// state directory on a fresh deploy. Without it a server starts, reports
-/// healthy, and fails every analysis on a traits path that was never created.
-///
-/// # Errors
-/// The one failure that is fatal: `--enriched` was asked for and the token is
-/// missing or refused. A daemon that came up anyway would serve rules nobody
-/// deployed it with.
-pub fn refresh_rules_at_startup(force: bool, no_update: bool) -> anyhow::Result<()> {
-    if no_update {
-        tracing::warn!("--no-update: skipping startup model/traits refresh");
-        return Ok(());
-    }
-    let traits = std::thread::scope(|s| {
-        s.spawn(|| {
-            if let Err(e) = models_repo::install_target()
-                .and_then(|dir| model_update::update(&dir, force, false))
-            {
-                tracing::warn!(error = format!("{e:#}"), "model update failed");
-            }
-        });
-        s.spawn(|| traits_repo::update(force, false))
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("traits update panicked")))
-    });
-    match traits {
-        Ok(_) => Ok(()),
-        Err(e) if traits_repo::enriched_refusal(&e).is_some() => Err(e),
-        Err(e) => {
-            tracing::warn!(
-                dir = %cleave::traits_repo::install_target().display(),
-                error = format!("{e:#}"),
-                "traits update failed",
-            );
-            Ok(())
-        }
-    }
-}
 
 #[cfg(test)]
 mod archive_password_tests {

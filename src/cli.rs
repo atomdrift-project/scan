@@ -3,7 +3,7 @@
 //! [`GlobalArgs`] holds the `global = true` options of the `atomscan` binary —
 //! the LLM, follow/fetch, threshold, display and model-refresh knobs that apply
 //! to every subcommand. It lives in the library, not in `src/main.rs`, so a
-//! second binary that re-exposes `serve`/`worker` can `#[command(flatten)]` the
+//! second binary that re-exposes `serve` can `#[command(flatten)]` the
 //! same declarations instead of restating them. Restating them is how two
 //! front-ends silently acquire different defaults; there is exactly one copy of
 //! each flag, here.
@@ -82,21 +82,25 @@ impl LlmEnv {
     ///
     /// Returns an error when a concurrency variable is set but not a number.
     pub fn from_process() -> Result<Self> {
-        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        use crate::env;
         // 0 keeps its old meaning: the default.
-        let count = |key: &str| -> Result<Option<NonZeroUsize>> {
-            var(key)
-                .map(|raw| raw.trim().parse().with_context(|| format!("{key}={raw:?}")))
+        let count = |var: env::Var| -> Result<Option<NonZeroUsize>> {
+            env::text(var)
+                .map(|raw| {
+                    raw.trim()
+                        .parse()
+                        .with_context(|| format!("{}={raw:?}", var.name))
+                })
                 .transpose()
                 .map(|n| n.and_then(NonZeroUsize::new))
         };
         Ok(Self {
-            target: var("SCAN_LLM"),
-            model: var("SCAN_LLM_MODEL"),
-            key: var("SCAN_LLM_KEY"),
-            concurrency: count("SCAN_LLM_CONCURRENCY")?,
-            background_concurrency: count("SCAN_LLM_BACKGROUND_CONCURRENCY")?,
-            system_prompt_file: var("SCAN_LLM_SYSTEM_PROMPT_FILE").map(PathBuf::from),
+            target: env::text(env::SCAN_LLM),
+            model: env::text(env::SCAN_LLM_MODEL),
+            key: env::text(env::SCAN_LLM_KEY),
+            concurrency: count(env::SCAN_LLM_CONCURRENCY)?,
+            background_concurrency: count(env::SCAN_LLM_BACKGROUND_CONCURRENCY)?,
+            system_prompt_file: env::path(env::SCAN_LLM_SYSTEM_PROMPT_FILE),
             llm_token_file: crate::interpret::llm_token_path(),
             openrouter_token_file: crate::interpret::openrouter_token_path(),
         })
@@ -193,7 +197,7 @@ pub struct GlobalArgs {
     /// Disable the automatic rules/models refresh (on by default when the local
     /// ruleset is over 24h stale). Use when the local traits/models are
     /// intentionally ahead of (or diverged from) the remote, e.g. local edits
-    /// that would block the pull. Also settable via `SCAN_NO_UPDATE`.
+    /// that would block the pull.
     #[arg(long, global = true)]
     pub no_update: bool,
 
@@ -215,14 +219,8 @@ pub struct GlobalArgs {
     /// token, or `--enriched`), and without it is the same as `local`.
     /// `local` never asks, and is the reproducible mode. `remote` sends
     /// everything to isotope13 for analysis, uploading local files' contents,
-    /// and needs isotope13 Enriched. Also settable via `SCAN_ANALYZE`.
-    #[arg(
-        long,
-        global = true,
-        value_enum,
-        default_value = "auto",
-        env = "SCAN_ANALYZE"
-    )]
+    /// and needs isotope13 Enriched.
+    #[arg(long, global = true, value_enum, default_value = "auto")]
     pub analyze: crate::remote::Analyze,
 
     /// Force light-background color theme
@@ -238,13 +236,7 @@ pub struct GlobalArgs {
     pub model_dir: Option<PathBuf>,
 
     /// Output format
-    #[arg(
-        short,
-        long,
-        global = true,
-        env = "SCAN_FORMAT",
-        default_value = "terminal"
-    )]
+    #[arg(short, long, global = true, default_value = "terminal")]
     pub format: OutputFormat,
 
     /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
@@ -255,13 +247,11 @@ pub struct GlobalArgs {
 
     /// Hard wall-clock limit for each Rizin subprocess, in seconds. On expiry
     /// Atomscan kills and reaps Rizin before releasing the analysis worker; on
-    /// Unix it also kills the complete process group. Also settable via
-    /// `SCAN_RIZIN_TIMEOUT_SECS`.
+    /// Unix it also kills the complete process group.
     #[arg(
         long,
         global = true,
         value_name = "SECS",
-        env = "SCAN_RIZIN_TIMEOUT_SECS",
         default_value_t = DEFAULT_RIZIN_TIMEOUT_SECS,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -299,8 +289,8 @@ pub struct GlobalArgs {
     pub extra: bool,
 
     /// [deprecated] Legacy on-switch for LLM interpretation; superseded by
-    /// `--llm`. Kept for compatibility (env: SCAN_INTERPRET).
-    #[arg(long, global = true, env = "SCAN_INTERPRET", hide = true)]
+    /// `--llm`.
+    #[arg(long, global = true, hide = true)]
     pub interpret: bool,
 
     /// [optional] Enable additional LLM interpretation of analyzed samples: a
@@ -355,7 +345,7 @@ pub struct GlobalArgs {
     /// the calibrated level grid and cleave findings say.
     ///
     /// One of several independent admissions, so it can only send more, never
-    /// block. The default sits on a measured elbow: malicious admission is flat
+    /// block. The default sits on an elbow: malicious admission is flat
     /// across 0.46..0.57 while benign admission keeps falling through it.
     /// Lowering it buys the overlap region at roughly 50 benign samples per
     /// malicious one; raising it sheds about four benign per malicious.
@@ -372,8 +362,8 @@ pub struct GlobalArgs {
     /// and more than this many notable-or-above findings is not sent to the
     /// LLM, unless it carries a strong gate trait or ML placed it on the level
     /// grid. Big legitimate packages accumulate notable findings until some
-    /// admission fires, and the reader then moves nothing; on the measured
-    /// corpus the veto at 300 halved benign calls and kept every correct
+    /// admission fires, and the reader then moves nothing; on the benchmark
+    /// corpus a veto at 300 halves benign calls and keeps every correct
     /// shift. `0` disables it.
     #[arg(
         long,
@@ -408,14 +398,12 @@ pub struct GlobalArgs {
     ///   `ci-actions`   — third-party actions referenced by CI configuration.
     /// `all` selects every category; `none` analyzes only the requested artifact.
     /// A bare `--follow` follows dependencies and references but not CI actions,
-    /// and so does an absent one for an interactive scan. `serve` and `worker`
-    /// default to `all` instead: they populate the shared corpus, where a
-    /// category nobody followed is one nobody ever learns. The old `--fetch` flag and `deps`, `packages`, `urls`, and
-    /// `ci` values remain accepted as aliases. Also settable via `SCAN_FOLLOW`;
-    /// `SCAN_FETCH` remains a compatibility alias.
+    /// and so does an absent one for an interactive scan. `serve`
+    /// defaults to `all` instead: it answers for other hosts, where a category
+    /// nobody followed is one nobody ever learns. Also settable via
+    /// `SCAN_FOLLOW`.
     #[arg(
         long = "follow",
-        visible_alias = "fetch",
         global = true,
         value_name = "TARGETS",
         num_args = 0..=1,
@@ -433,84 +421,55 @@ pub struct GlobalArgs {
     /// [EXPERIMENTAL] How many hops of references to follow when `--follow` is on:
     /// `1` fetches only what the scanned files reference, `2` also follows
     /// references found inside those payloads (reaching a stage-3 `curl | bash`
-    /// dropper), and so on. Also settable via `SCAN_FOLLOW_DEPTH`; the old
-    /// `--fetch-depth` and `SCAN_FETCH_DEPTH` names remain aliases.
+    /// dropper), and so on.
     #[arg(
         long = "follow-depth",
-        visible_alias = "fetch-depth",
         global = true,
         value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_FETCH_DEPTH,
-        env = "SCAN_FOLLOW_DEPTH"
+        default_value_t = crate::fetch::DEFAULT_FETCH_DEPTH
     )]
-    pub fetch_depth: u8,
+    pub follow_depth: u8,
 
     /// [EXPERIMENTAL] Skip fetching a declared dependency whose registry publish
     /// date is older than this many days — the cheap provenance lookup runs
     /// first, and only recent (freshest-risk) releases are pulled and scanned.
     /// Applies to declared dependencies only; URLs are never age-gated. `0`
     /// disables the gate (fetch every resolvable dependency). A dependency whose
-    /// age can't be determined is always fetched. Also settable via
-    /// `SCAN_FETCH_MAX_AGE`.
+    /// age can't be determined is always fetched.
     ///
-    /// Unset, the ceiling depends on the mode: an interactive scan wants a
-    /// fresh-risk window ([`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`]), while a
-    /// worker is a cache-population role and takes every resolvable dependency
-    /// ([`WORKER_MAX_DEP_AGE_DAYS`]). Optional rather than defaulted so an
-    /// explicit `--fetch-max-age` still wins in both.
-    #[arg(long, global = true, value_name = "DAYS", env = "SCAN_FETCH_MAX_AGE")]
+    /// Unset, the ceiling is a fresh-risk window
+    /// ([`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`]). Optional rather than
+    /// defaulted so each front-end supplies its own fallback.
+    #[arg(long, global = true, value_name = "DAYS")]
     pub fetch_max_age: Option<u32>,
 
     /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
-    /// platform, not just the host's. This is automatic in `serve` and
-    /// `worker`, which scan on behalf of other machines; interactive scans
-    /// stay host-only for latency unless this flag is passed. Also settable via
-    /// `SCAN_FETCH_ALL_PLATFORMS`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_ALL_PLATFORMS",
-        conflicts_with = "fetch_host_platform_only"
-    )]
+    /// platform, not just the host's. This is automatic in `serve`, which
+    /// scans on behalf of other machines; interactive scans
+    /// stay host-only for latency unless this flag is passed.
+    #[arg(long, global = true, conflicts_with = "fetch_host_platform_only")]
     pub fetch_all_platforms: bool,
 
     /// [EXPERIMENTAL] Fetch only native-binary dependencies matching this
     /// host's OS and architecture. This is the interactive default and an
-    /// explicit completeness opt-out for `serve` / `worker`. Also settable
-    /// via `SCAN_FETCH_HOST_PLATFORM_ONLY`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_HOST_PLATFORM_ONLY",
-        conflicts_with = "fetch_all_platforms"
-    )]
+    /// explicit completeness opt-out for `serve`.
+    #[arg(long, global = true, conflicts_with = "fetch_all_platforms")]
     pub fetch_host_platform_only: bool,
 
     /// [EXPERIMENTAL] Follow declared dependencies past the first hop — the
-    /// dependencies of a fetched dependency, out to `--fetch-depth`. This is
-    /// automatic in `serve` and `worker`, which populate the shared corpus;
+    /// dependencies of a fetched dependency, out to `--follow-depth`. This is
+    /// automatic in `serve`, which answers for other hosts;
     /// an interactive scan stops declared dependencies at the first hop, since
     /// the transitive tail costs a registry lookup each and is almost entirely
     /// old releases the age gate then discards. URLs and command-mentioned
     /// packages — the dropper chain — are followed at every hop either way.
-    /// Also settable via `SCAN_FETCH_TRANSITIVE_DEPS`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_TRANSITIVE_DEPS",
-        conflicts_with = "fetch_direct_deps_only"
-    )]
+    ///
+    #[arg(long, global = true, conflicts_with = "fetch_direct_deps_only")]
     pub fetch_transitive_deps: bool,
 
     /// [EXPERIMENTAL] Follow declared dependencies for one hop only. This is the
-    /// interactive default and an explicit completeness opt-out for `serve` /
-    /// `worker`. Also settable via `SCAN_FETCH_DIRECT_DEPS_ONLY`.
-    #[arg(
-        long,
-        global = true,
-        env = "SCAN_FETCH_DIRECT_DEPS_ONLY",
-        conflicts_with = "fetch_transitive_deps"
-    )]
+    /// interactive default and an explicit completeness opt-out for `serve`.
+    #[arg(long, global = true, conflicts_with = "fetch_transitive_deps")]
     pub fetch_direct_deps_only: bool,
 
     /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
@@ -519,34 +478,30 @@ pub struct GlobalArgs {
     /// bounds the two mutable tiers: a pinned version's packument (whose yank
     /// status can change after publish) and a `latest`/versionless lookup.
     /// Unset keeps the defaults — 4h pinned, 1h unpinned. A released version's
-    /// immutable file list is never re-checked regardless. Also settable via
-    /// `SCAN_REGISTRY_TTL`.
+    /// immutable file list is never re-checked regardless.
     #[arg(
         long,
         global = true,
         value_name = "DUR",
-        value_parser = crate::fetch::parse_duration,
-        env = "SCAN_REGISTRY_TTL"
+        value_parser = crate::fetch::parse_duration
     )]
     pub registry_ttl: Option<std::time::Duration>,
 
     /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
     /// suffix (`256M`, `2G`, `512K`); a bare number is bytes. A response larger
-    /// than this is abandoned, so one artifact can't dominate a run. Also
-    /// settable via `SCAN_FETCH_MAX_SIZE`.
+    /// than this is abandoned, so one artifact can't dominate a run.
     #[arg(
         long,
         global = true,
         value_name = "SIZE",
         default_value = "256M",
-        value_parser = crate::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_SIZE"
+        value_parser = crate::fetch::parse_bytes
     )]
     pub fetch_max_size: u64,
 
     /// Persist unfinished fetches and resume them when scanning the same content.
     /// Increasing --follow-depth resumes saved deeper references.
-    #[arg(long, global = true, value_name = "PATH", env = "SCAN_FETCH_PENDING")]
+    #[arg(long, global = true, value_name = "PATH")]
     pub fetch_pending: Option<std::path::PathBuf>,
 
     /// Include lockfile dependencies used exclusively for development or tests.
@@ -566,40 +521,35 @@ pub struct GlobalArgs {
     /// triggered by a single scanned file. This is 100 by default. Cache hits
     /// are always served and never counted, so a warm re-run is never throttled.
     /// References past the cap are recorded as budget-exceeded, never silently
-    /// dropped. Also settable via `SCAN_FETCH_MAX_FILE_FETCHES`.
+    /// dropped.
     #[arg(
         long,
         global = true,
         value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_FILE_FETCHES,
-        env = "SCAN_FETCH_MAX_FILE_FETCHES"
+        default_value_t = crate::fetch::DEFAULT_MAX_FILE_FETCHES
     )]
     pub fetch_max_file_fetches: usize,
 
     /// [EXPERIMENTAL] Maximum number of *live* opportunistic raw-URL fetches
     /// triggered by a single scanned file. This is 4 by default. URL references
     /// declared as dependencies or command-mentioned packages use the larger
-    /// `--fetch-max-file-fetches` cap instead. Also settable via
-    /// `SCAN_FETCH_MAX_URLS`.
+    /// `--fetch-max-file-fetches` cap instead.
     #[arg(
         long,
         global = true,
         value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_URL_FETCHES,
-        env = "SCAN_FETCH_MAX_URLS"
+        default_value_t = crate::fetch::DEFAULT_MAX_URL_FETCHES
     )]
     pub fetch_max_urls: usize,
 
     /// [EXPERIMENTAL] Maximum total bytes fetched on behalf of a single scanned
-    /// file. Accepts a unit suffix (`2G`); a bare number is bytes. Also settable
-    /// via `SCAN_FETCH_MAX_FILE_SIZE`.
+    /// file. Accepts a unit suffix (`2G`); a bare number is bytes.
     #[arg(
         long,
         global = true,
         value_name = "SIZE",
         default_value = "2G",
-        value_parser = crate::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_FILE_SIZE"
+        value_parser = crate::fetch::parse_bytes
     )]
     pub fetch_max_file_size: u64,
 
@@ -610,41 +560,37 @@ pub struct GlobalArgs {
     /// how long fetching takes — a wide tree of slow registries can hold a scan
     /// open with every count budget still unspent. References not reached
     /// before the cap are left unfollowed; whatever was already fetched is
-    /// analyzed and graded as usual. Also settable via `SCAN_FETCH_TIMEOUT`.
+    /// analyzed and graded as usual.
     #[arg(
         long,
         global = true,
         value_name = "DUR",
         default_value = "5m",
-        value_parser = crate::fetch::parse_duration,
-        env = "SCAN_FETCH_TIMEOUT"
+        value_parser = crate::fetch::parse_duration
     )]
     pub fetch_timeout: std::time::Duration,
 
     /// [EXPERIMENTAL] Maximum number of *live* fetches across the whole
     /// execution — a hard ceiling over every scanned file combined. Lifted in
-    /// long-lived server modes (`serve`/`worker`), where the per-file caps bound
-    /// each job instead. Also settable via `SCAN_FETCH_MAX_TOTAL_FETCHES`.
+    /// the long-lived `serve` mode, where the per-file caps bound
+    /// each job instead.
     #[arg(
         long,
         global = true,
         value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_TOTAL_FETCHES,
-        env = "SCAN_FETCH_MAX_TOTAL_FETCHES"
+        default_value_t = crate::fetch::DEFAULT_MAX_TOTAL_FETCHES
     )]
     pub fetch_max_total_fetches: usize,
 
     /// [EXPERIMENTAL] Maximum total bytes fetched across the whole execution.
     /// Accepts a unit suffix (`10G`); a bare number is bytes. Lifted in
-    /// long-lived server modes (`serve`/`worker`). Also settable via
-    /// `SCAN_FETCH_MAX_TOTAL_SIZE`.
+    /// the long-lived `serve` mode.
     #[arg(
         long,
         global = true,
         value_name = "SIZE",
         default_value = "10G",
-        value_parser = crate::fetch::parse_bytes,
-        env = "SCAN_FETCH_MAX_TOTAL_SIZE"
+        value_parser = crate::fetch::parse_bytes
     )]
     pub fetch_max_total_size: u64,
 }
@@ -828,8 +774,8 @@ impl GlobalArgs {
 
     /// Whether native-binary dependencies are fetched for this host only.
     ///
-    /// `scans_for_other_hosts` is true for the corpus-facing roles (`serve`,
-    /// `worker`), which scan on behalf of other machines and so take every
+    /// `scans_for_other_hosts` is true for the corpus-facing role (`serve`),
+    /// which scans on behalf of other machines and so takes every
     /// platform by default. The two flags conflict, so at most one arm can fire.
     #[must_use]
     pub fn host_platform_only(&self, scans_for_other_hosts: bool) -> bool {
@@ -850,8 +796,7 @@ impl GlobalArgs {
     /// The selection comes from `--follow`; the hop count from `--follow-depth`,
     /// the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
     /// from `--fetch-max-file-*` (each its own flag/env). `default_max_age` is the
-    /// ceiling used when `--fetch-max-age` is unset — an interactive scan wants a
-    /// fresh-risk window, a worker takes every resolvable dependency. An explicit
+    /// ceiling used when `--fetch-max-age` is unset. An explicit
     /// selection is honored verbatim; the knobs always apply.
     #[must_use]
     pub fn fetch_policy(
@@ -860,7 +805,7 @@ impl GlobalArgs {
         default_max_age: u32,
         scans_for_other_hosts: bool,
     ) -> crate::fetch::FetchPolicy {
-        policy.depth = self.fetch_depth;
+        policy.depth = self.follow_depth;
         policy.include_dev_dependencies = self.fetch_dev_deps;
         policy.all_versions = self.fetch_all_versions;
         policy.max_dep_age_days = self.fetch_max_age.unwrap_or(default_max_age);

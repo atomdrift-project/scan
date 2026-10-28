@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Validate / tune the `--interpret` render template on a labelled corpus.
 
-One command: capture every file's LLM render from a single scan (via the
-`SCAN_INTERPRET_DUMP_DIR` dump hook — no `--interpret`, no LLM calls needed for
-capture), then sweep the render templates offline against the LLM endpoint and
-score each against hand-labelled ground truth.
+One command: capture every file's LLM render (`atomscan -f interpret`, one
+scan per file — no `--interpret`, no LLM calls needed for capture), then sweep
+the render templates offline against the LLM endpoint and score each against
+hand-labelled ground truth.
+
+The captured render is the one production sends, annotations already
+recategorized, so only arms that start from it apply: `described`,
+`categorized`, and the size arms. The letter-based arms (`lettered`, `full`,
+`pointer`, `elevated`, `raw`) need the severity letters, which no longer
+leave the scanner.
 
     hacks/interpret-tune/tune.py --corpus /var/tmp/hopper-triage.last \
                                  --labels hacks/interpret-tune/labels/hopper-triage.tsv
@@ -204,7 +210,7 @@ def system_prompt(template):
             "pointer": POINTER_PROMPT, "elevated": POINTER_PROMPT, "raw": RAW_PROMPT,
             "categorized": CATEGORIZED_PROMPT}[template]
 
-TEMPLATES = ["described", "lettered", "categorized", "full", "pointer", "elevated", "raw"]
+TEMPLATES = ["described", "categorized", "noraw", "nohex", "slim"]
 
 # ── corpus / labels / capture ──────────────────────────────────────────────────
 def sha256(path):
@@ -264,38 +270,34 @@ def load_renders(dump_dir, corpus):
     return renders
 
 def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
+    """Render every corpus file the way a live `--interpret` query would, caching
+    each under its content hash. `--follow=none`: a fetched dependency is network
+    state, so its render differs run to run — the exact thing an A/B must hold
+    fixed. Registry provenance (`--registry-map`) changes the render materially —
+    package age, publish cadence, name/repository agreement — so supply-chain
+    rules cannot be scored without it. A per-file timeout keeps one pathological
+    sample from wedging the run."""
     os.makedirs(dump_dir, exist_ok=True)
-    # `--follow=none`: a fetched dependency is network state, so the render it
-    # produces differs run to run — the exact thing an A/B must hold fixed. It is
-    # also how gauntlet scans, so these renders match what production grades.
-    env = dict(os.environ, SCAN_NO_UPDATE="1", SCAN_INTERPRET_DUMP_DIR=dump_dir,
-               SCAN_FOLLOW="none")
-    if registry_map:
-        # The env var, not `--registry-map`: the flag lives on the `path`
-        # subcommand, and capture runs the bare `scan <path>` form.
-        env["SCAN_REGISTRY_MAP"] = os.path.abspath(registry_map)
-    # Registry provenance materially changes the render — package age, publish
-    # cadence, name/repository agreement. Without it every registry-dependent
-    # trait is invisible to scoring and supply-chain rules cannot be validated at
-    # all: a clone-and-rename package reads as a faithful copy of something
-    # legitimate, because that is exactly what its bytes are.
-    # No --interpret needed: the dump hook fires whenever SCAN_INTERPRET_DUMP_DIR
-    # is set, so capture makes zero LLM calls. A per-scan timeout guards against a
-    # pathological sample wedging the whole run — renders dumped before the kill
-    # are still usable, and the missing ones are reported.
-    proc = subprocess.Popen([bin_path, "-f", "json", corpus], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        print(f"# WARNING: capture scan exceeded {timeout}s and was killed; "
-              f"proceeding with renders dumped so far", file=sys.stderr)
-    renders = load_renders(dump_dir, corpus)
-    if not renders:
-        print("# WARNING: capture produced no renders — check the scan binary, the corpus "
-              "path, and --capture-timeout", file=sys.stderr)
+    renders, failed = {}, 0
+    for rel, path in corpus_files(corpus):
+        cmd = [bin_path, "--no-update", "--follow=none", "-f", "interpret", "path"]
+        if registry_map:
+            cmd += ["--registry-map", os.path.abspath(registry_map)]
+        try:
+            out = subprocess.run(cmd + [path], capture_output=True, timeout=timeout,
+                                 text=True, errors="replace").stdout.rstrip("\n")
+        except subprocess.TimeoutExpired:
+            failed += 1
+            continue
+        if not out:
+            failed += 1
+            continue
+        with open(os.path.join(dump_dir, sha256(path) + ".render"), "w", encoding="utf-8") as f:
+            f.write(out + "\n")
+        renders[rel] = out
+    if failed:
+        print(f"# WARNING: {failed} files produced no render (timeout or scan error)",
+              file=sys.stderr)
     return renders
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
@@ -356,7 +358,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--bin", default=None, help="scan binary (default: out/atomscan)")
     ap.add_argument("--capture-timeout", type=int, default=1800,
-                    help="seconds before the capture scan is killed (a bad sample can't wedge the run)")
+                    help="seconds before one file's capture scan is killed")
     ap.add_argument("--registry-map", default=None, help="registry provenance map passed to the capture scan")
     ap.add_argument("--reuse-renders", action="store_true",
                     help="grade the renders already in --dump-dir instead of rescanning the corpus")
@@ -382,7 +384,7 @@ def main():
         print(f"# reusing {len(cached)} renders from {dump_dir}", file=sys.stderr)
         renders = cached
     else:
-        print(f"# capturing renders via {bin_path} (SCAN_INTERPRET_DUMP_DIR) …", file=sys.stderr)
+        print(f"# capturing renders via {bin_path} -f interpret …", file=sys.stderr)
         renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
         print(f"# captured {len(renders)} renders", file=sys.stderr)
 

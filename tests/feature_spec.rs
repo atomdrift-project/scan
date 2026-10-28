@@ -1,4 +1,4 @@
-//! Verify the feature spec version matches what litmus was compiled against.
+//! Verify the feature spec version matches what atomscan was compiled against.
 //!
 //! Catches model/code version drift at CI time rather than in production.
 
@@ -6,8 +6,7 @@ use anyhow::{Context, Result};
 use scan::features::{EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION, FeatureSpec};
 
 fn model_dir() -> Result<std::path::PathBuf> {
-    std::env::var("SCAN_MODELS_DIR")
-        .map(std::path::PathBuf::from)
+    scan::env::path(scan::env::SCAN_MODELS_DIR)
         .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
 }
 
@@ -33,14 +32,14 @@ fn spec_version_matches_expected() -> Result<()> {
     assert_eq!(
         spec.version(),
         EXPECTED_SPEC_VERSION,
-        "feature_spec.json is v{} but litmus expects v{EXPECTED_SPEC_VERSION} — \
-         update litmus feature extraction or retrain the model",
+        "feature_spec.json is v{} but atomscan expects v{EXPECTED_SPEC_VERSION} — \
+         update atomscan feature extraction or retrain the model",
         spec.version(),
     );
     assert_eq!(
         spec.abi_version(),
         EXPECTED_MODEL_ABI_VERSION,
-        "feature_spec.json ABI is v{} but litmus expects ABI v{EXPECTED_MODEL_ABI_VERSION}",
+        "feature_spec.json ABI is v{} but atomscan expects ABI v{EXPECTED_MODEL_ABI_VERSION}",
         spec.abi_version(),
     );
     assert!(

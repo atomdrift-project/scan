@@ -1,9 +1,8 @@
 //! `POST /v1/analyze` asks before it works.
 //!
-//! The route used to analyze unconditionally. Measured against production, three
-//! consecutive analyses of `pkg:cargo/tokio@1.40.0` ran 291s, 161s and 116s while
-//! `GET /v1/lookup` answered the same question from the corpus in one hop — so
-//! every one of them re-derived a verdict the fleet already held.
+//! Analyzing unconditionally would spend minutes per request re-deriving a
+//! verdict the fleet already holds, while `GET /v1/lookup` answers the same
+//! question from the corpus in one hop.
 //!
 //! These run against an empty model directory, which is what makes the assertions
 //! sharp: an analysis that actually runs cannot succeed and answers non-200 (see

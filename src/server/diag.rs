@@ -353,7 +353,7 @@ pub(super) struct Stats<'a> {
     in_flight: usize,
     /// The basis `slots` was sized on, so a caller can read `load1` against
     /// the right denominator. Worth reporting because `in_flight` is this
-    /// process's own count and nothing else's: measured on a 64-core node,
+    /// process's own count and nothing else's: a 64-core node can report
     /// `slots_free=64 in_flight=0` alongside `load1=50`.
     physical_cpus: Option<usize>,
     /// Logical cores the whole machine kept busy since the previous poll, from
@@ -362,8 +362,7 @@ pub(super) struct Stats<'a> {
     /// platform has no counters.
     cpu_busy_cores: Option<f64>,
     /// Big-whale slots: the one wait on the interactive path that is not a
-    /// core or a slot, and the one that held two requests for their whole
-    /// budget on 2026-09-06.
+    /// core or a slot, and one that can hold a request for its whole budget.
     whale_slots: WhaleSlots,
     overloaded: bool,
     stuck_orphans: usize,
@@ -508,7 +507,7 @@ impl<'a> Stats<'a> {
 /// reports what this build *is* and barely changes, while everything here moves
 /// every second and must not be cached.
 ///
-/// The vocabulary deliberately matches what the pull worker already advertises
+/// The vocabulary deliberately matches what postdoc's worker advertises
 /// to hopper on `/api/next` — slots, rss, load, max_bytes, traits, tools — so a
 /// caller reasoning about which scanner to use is reading the same facts hopper
 /// uses to ration work, rather than a second dialect of the same idea.

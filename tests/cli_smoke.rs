@@ -79,6 +79,10 @@ impl Fixture {
             "no_proxy",
             "all_proxy",
         ] {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "passing the OS's own variables through"
+            )]
             if let Some(value) = std::env::var_os(name) {
                 cmd.env(name, value);
             }
@@ -88,13 +92,13 @@ impl Fixture {
             .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_CACHE_HOME", self.root.path().join("cache"))
             .env("SCAN_MODELS_DIR", &self.models)
-            .env("SCAN_BLOOM_DIR", self.root.path().join("bloom"))
             .env("CLEAVE_TRAITS_DIR", &self.traits)
             .env("CLEAVE_CACHE_DIR", self.root.path().join("cleave-cache"))
-            .env("SCAN_NO_UPDATE", "1")
             .env("SCAN_NO_UPDATE_CHECK", "1")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
+            // Never refresh rules in the background; `update-rules` still does.
+            .arg("--no-update")
             .args(args);
         cmd
     }

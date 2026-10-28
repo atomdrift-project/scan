@@ -40,7 +40,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         );
     }
     let fs_summary = if targets.is_empty() {
-        zero_summary()
+        ScanSummary::default()
     } else {
         crate::engine::run_paths(&targets, config, None)?
     };
@@ -55,7 +55,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 /// directories are valid targets — `run_paths` walks each accordingly.
 fn curated_targets() -> Vec<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = dirs::home_dir();
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // Common across unix: staging/temp plus a frequent drop target on PATH.
@@ -95,9 +95,7 @@ fn curated_targets() -> Vec<PathBuf> {
         ] {
             candidates.push(PathBuf::from(p));
         }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            candidates.push(PathBuf::from(tmpdir));
-        }
+        candidates.push(std::env::temp_dir());
         if let Some(home) = &home {
             candidates.push(home.join("Library/LaunchAgents"));
         }
@@ -122,19 +120,5 @@ fn merge(a: &ScanSummary, b: &ScanSummary, start: Instant) -> ScanSummary {
         dependency_attention,
         static_flags: a.static_flags.saturating_add(b.static_flags),
         duration_ms: crate::duration_ms(start.elapsed()),
-    }
-}
-
-/// A zero-count summary for when no curated targets exist on this host.
-fn zero_summary() -> ScanSummary {
-    ScanSummary {
-        total_files: 0,
-        hostile: 0,
-        suspicious: 0,
-        benign: 0,
-        errors: 0,
-        dependency_attention: Default::default(),
-        static_flags: 0,
-        duration_ms: 0,
     }
 }

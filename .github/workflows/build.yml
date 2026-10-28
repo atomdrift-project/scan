@@ -85,7 +85,6 @@ env:
   # The exact rustc every release binary is built with. Bump deliberately.
   RUST_TOOLCHAIN: "1.99.1"
   RUST_BACKTRACE: "1"
-  SCAN_NO_UPDATE: "1"
 
 jobs:
   native:
@@ -513,7 +512,7 @@ jobs:
           # step for a binary this size is the memory high-water mark.
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           # cmake is for aws-lc-sys, which has no prebuilt path off the tier-1
           # platforms and falls back to a CMake build.
           prepare: |
@@ -594,7 +593,7 @@ jobs:
           arch: aarch64
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             pkg install -y rust cmake pkgconf git
           run: |
@@ -663,7 +662,7 @@ jobs:
           release: "7.9"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             pkg_add -I rust cmake git
           run: |
@@ -694,7 +693,7 @@ jobs:
             "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
             cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
             # This is the W^X canary — see the note above the job.
-            cargo test --locked --lib || echo "::warning::OpenBSD unit tests failed"
+            cargo test --locked --lib
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -733,7 +732,7 @@ jobs:
           release: "11.0"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           # -u: the image's preinstalled packages trail the live pkgsrc
           # branch, and plain pkg_add refuses to upgrade a dependency in place.
           prepare: |
@@ -745,7 +744,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
             "/tmp/target/$BUILD_PROFILE/atomscan" --version
             cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
-            cargo test --locked --lib || echo "::warning::NetBSD unit tests failed"
+            cargo test --locked --lib
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -789,7 +788,7 @@ jobs:
           release: "6.4.2"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             pkg install -y rust cmake pkgconf git
           run: |
@@ -801,7 +800,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
             "/tmp/target/$BUILD_PROFILE/atomscan" --version
             cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
-            cargo test --locked --lib || echo "::warning::DragonFlyBSD unit tests failed"
+            cargo test --locked --lib
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -841,7 +840,7 @@ jobs:
           cpu: "4"
           mem: "12288"
           usesh: true
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             # R1/beta5 ships OpenSSL 3.0, while Cargo in rust_bin 1.94.1 was
             # linked against SSL_get0_group_name@OPENSSL_3.2.0. rust_bin's
@@ -896,7 +895,7 @@ jobs:
           # Keep Cargo's registry and fat-LTO output on the host-backed mount;
           # the Hurd guest image does not have enough disk for both.
           sync: nfs
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -957,7 +956,7 @@ jobs:
           release: "11.4-gcc"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             set -eux
             # Confirmed by the enumeration in run 30598384692: Oracle's IPS
@@ -1040,7 +1039,7 @@ jobs:
           release: "r151058"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
           prepare: |
             pkg publisher
             # Names resolved against r151058: rust and cmake live under the
@@ -1093,7 +1092,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
             "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
             cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
-            cargo test --locked --lib || echo "::warning::OmniOS unit tests failed"
+            cargo test --locked --lib
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 

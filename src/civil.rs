@@ -41,6 +41,35 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Seconds since the Unix epoch, `0` for a clock set before it.
+#[must_use]
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Unix seconds for a UTC civil time, or `None` for a field out of range or a
+/// time before 1970.
+#[must_use]
+pub(crate) fn utc_epoch(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = to_days(i64::from(year), month, day)?;
+    u64::try_from(
+        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second),
+    )
+    .ok()
+}
+
 /// `secs` after the Unix epoch as RFC 3339 in UTC (`2026-10-01T13:02:22Z`).
 pub(crate) fn rfc3339(secs: u64) -> String {
     let (y, mo, d) = from_days(i64::try_from(secs / 86_400).unwrap_or(i64::MAX));

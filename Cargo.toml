@@ -47,6 +47,7 @@ large_futures = "warn"
 map_err_ignore = "warn"
 significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
+too_many_lines = "warn"
 
 [package]
 name = "atomdrift-scan"

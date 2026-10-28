@@ -17,7 +17,7 @@ use std::path::Path;
 /// still selects a development tree. With nothing installed and no `traits/`
 /// here, cleave is left to bootstrap-install into the data directory.
 pub fn prepare_runtime_env() {
-    let env_set = std::env::var_os("CLEAVE_TRAITS_DIR").is_some_and(|v| !v.is_empty());
+    let env_set = crate::env::text(crate::env::CLEAVE_TRAITS_DIR).is_some();
     if env_set || cleave::traits_repo::override_dir().is_some() {
         return;
     }

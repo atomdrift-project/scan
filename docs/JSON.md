@@ -295,7 +295,7 @@ diff -u before.txt after.txt
 ```
 
 Rendered output goes to stdout, and warnings go to stderr. Run both inputs with the
-same renderer build and `SCAN_INTERPRET_BUDGET_BYTES` setting.
+same renderer build.
 
 The reader accepts compact v9 or v8 reports and cleave's raw v3 snapshots
 (`cleave --format snapshot SAMPLE -o before.json`); unknown schemas fail.

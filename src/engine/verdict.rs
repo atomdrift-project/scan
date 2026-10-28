@@ -199,7 +199,7 @@ pub(super) fn interpreted_level(
 
 /// The worst (highest-outranking) member evaluation, or `None` when no member
 /// was evaluated. Iteration is id order == report entry order, so ties keep
-/// the earliest member exactly as the old in-loop fold did.
+/// the earliest member.
 pub(super) fn worst_member(evals: &MemberEvals) -> Option<Decision> {
     evals.values().map(EmbeddedFile::decision).reduce(graver)
 }
@@ -230,22 +230,18 @@ pub(super) fn worst_member_floor(evals: &MemberEvals) -> Option<FloorDecision> {
 /// Confident crit-5 findings the hostile arm needs — the anchor the rest of the
 /// arm corroborates.
 ///
-/// Was `1`, on the reasoning that one suffices *because* it is corroborated:
-/// real malware routinely carries a single hostile trait beside supporting
-/// crit-4s (`rex-powershell`, `openclaude`, and a rhadamanthys coinminer all
-/// have exactly one), and an earlier attempt at two lost all three.
+/// One anchor is not enough. A single crit-5 is one witness however many
+/// crit-4s sit beside it, and a single-anchor arm marks model-clean legitimate
+/// packages hostile on one trait that describes the package's own function:
+/// `ansible-core` on a PowerShell base64-exec trait — which is how its Windows
+/// connection plugin works — with `confident_hostile=1, severe=3, families=3`,
+/// and Cherry Studio (`v2.0.9.tar.gz`) at `1/4/4`. In both, the crit-4s describe
+/// the same legitimate behavior from other angles.
 ///
-/// Raised to `2` (2026-08-27) after the single-anchor arm was observed marking
-/// model-clean legitimate packages hostile on one trait that describes the
-/// package's own function: `ansible-core` on a PowerShell base64-exec trait —
-/// which is how its Windows connection plugin works — with `confident_hostile=1,
-/// severe=3, families=3`, and Cherry Studio (`v2.0.9.tar.gz`) at `1/4/4`. Both
-/// fired the arm at its exact minimum. A single crit-5 is one witness however
-/// many crit-4s sit beside it, and the crit-4s in both cases were describing the
-/// same legitimate behavior from other angles.
-///
-/// The named regressions above are the known cost; re-measure them alongside the
-/// gauntlet missed-sample pool before relaxing this again.
+/// The cost is real malware that carries a single hostile trait beside
+/// supporting crit-4s (`rex-powershell`, `openclaude`, and a rhadamanthys
+/// coinminer each have exactly one). Re-check those alongside the missed-sample
+/// pool before relaxing this.
 const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 2;
 
 /// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
@@ -266,21 +262,14 @@ const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
 /// Counted over both severe tiers, so crit-5 and crit-4 families together have
 /// to reach it — the same set the arm's `severe()` total draws from.
 ///
-/// Was two. The argument for two was that every observed false positive was a
-/// *single*-family cluster, already rejected, while three would have discarded
-/// `darkglitch` — a Python RAT whose hostile traits span only `backdoor/rat` and
-/// `backdoor/tasking`. That argument was made against a four-deep family, and
-/// [`TRAIT_FLOOR_FAMILY_DEPTH`] is now two: `darkglitch`'s pair collapses to one
-/// family at this depth regardless, so three no longer costs what it did.
-///
-/// Raised to three (2026-08-27) because two families is a materially weaker claim
-/// once a family is a *kind* of behavior rather than a technique. `PyAutoIt` — a
-/// legitimate AutoIt wrapper — reached the hostile arm at `confident_hostile=4,
-/// severe=5, families=2`, on the input-synthesis and window-manipulation traits
-/// that are AutoIt's entire purpose. It also makes the two arms consistent: the
-/// suspicious arm has always required three (see
-/// [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`]), and the hostile arm demanding *less*
-/// diversity than the suspicious one had no principle behind it.
+/// Two families is a weak claim when a family is a *kind* of behavior rather
+/// than a technique (see [`TRAIT_FLOOR_FAMILY_DEPTH`]). `PyAutoIt` — a
+/// legitimate AutoIt wrapper — reaches `confident_hostile=4, severe=5,
+/// families=2` on the input-synthesis and window-manipulation traits that are
+/// AutoIt's entire purpose. Three also keeps the arms consistent: the
+/// suspicious arm requires three (see [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`]), and
+/// the hostile arm demanding *less* diversity than the suspicious one would
+/// have no principle behind it.
 const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 3;
 
 /// Distinct trait families the suspicious arm's crit-4 findings must span.
@@ -296,22 +285,19 @@ const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
 /// than a leaf path or the finer `objectives/anti-static/obfuscation/string`.
 /// One definition, used by both arms.
 ///
-/// Was four (`objectives/evasion/process/hook`), chosen as the shallowest depth
-/// that gave nothing up: at three, the static-keys cluster correctly collapsed to
-/// one family, but so did `darkglitch` — a Python RAT whose three hostile traits
-/// are genuinely distinct capabilities under `command-and-control/backdoor`
-/// (`rat/multi` and `tasking/filesystem`) — and it lost its verdict entirely.
+/// Two makes a family a *kind* of behavior rather than a technique, so
+/// restating one behavior at different depths cannot corroborate itself. A
+/// deeper family is too fine to be corroboration: at four
+/// (`objectives/evasion/process/hook`), `ansible-core` reaches the hostile arm
+/// with three "independent" families that are all one idea — a PowerShell
+/// base64 decode-and-execute, which is how its Windows connection plugin works,
+/// counted once per subdirectory it is spelled in.
 ///
-/// Shallowed to two (2026-08-27). Four proved too fine to be corroboration on the
-/// gauntlet false-positive pool: `ansible-core` reached the hostile arm with
-/// three "independent" families that are all one idea — a PowerShell base64
-/// decode-and-execute, which is how its Windows connection plugin works, counted
-/// once per subdirectory it was spelled in. Two makes a family a *kind* of
-/// behavior rather than a technique, so restating one behavior at different
-/// depths can no longer corroborate itself.
-///
-/// The darkglitch class of verdict is the known cost, and it is the thing to
-/// re-measure first if the missed-sample pool regresses.
+/// The cost is the `darkglitch` class of verdict: a Python RAT whose hostile
+/// traits are genuinely distinct capabilities under
+/// `command-and-control/backdoor` (`rat/multi` and `tasking/filesystem`)
+/// collapses to one family here. It is the thing to re-check first if the
+/// missed-sample pool regresses.
 const TRAIT_FLOOR_FAMILY_DEPTH: usize = 2;
 
 /// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
@@ -320,7 +306,7 @@ const TRAIT_FLOOR_FAMILY_DEPTH: usize = 2;
 /// carrying no path, or a shorter one, is its own family rather than joining a
 /// catch-all bucket that would let unrelated traits corroborate each other.
 pub(super) fn trait_family(id: &str) -> &str {
-    let path = id.split("::").next().unwrap_or(id);
+    let path = crate::features::trait_path(id);
     path.match_indices('/')
         .nth(TRAIT_FLOOR_FAMILY_DEPTH - 1)
         // `cut` indexes an ASCII '/', so it is a char boundary by construction;
@@ -332,9 +318,9 @@ pub(super) fn trait_family(id: &str) -> &str {
 /// Minimum cleave confidence (`c`) for a finding to count toward the trait floor.
 /// Low-confidence high-crit findings are exactly the incidental ones that fire on
 /// busy benign binaries (e.g. a couple of speculative crit-4s among hundreds of
-/// findings), so the floor only acts on evidence cleave is sure about. Measured:
-/// at 0.76 the dropper keeps all 4 crit-4s and the PE keeps all 3 crit-5s, while
-/// no /usr/bin benign trips the crit-5 arm.
+/// findings), so the floor only acts on evidence cleave is sure about. At 0.76
+/// the dropper keeps all 4 crit-4s and the PE keeps all 3 crit-5s, while no
+/// /usr/bin benign trips the crit-5 arm.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
 /// Confidence-filtered crit-5/crit-4 tallies, with the trait families each tier
@@ -526,7 +512,7 @@ pub fn trait_floor(
     // Recognized software has to clear a higher anchor before the floor will
     // *block* it. Not an exemption — one extra confident crit-5, which a genuine
     // compromise adding its own hostile behavior still reaches, while a lone
-    // trait describing the program's own advertised function no longer promotes
+    // trait describing the program's own advertised function cannot promote
     // a model-clean sample straight past review. Falling short here drops
     // through to the suspicious arm below, which is where "a human should look"
     // belongs.
@@ -576,7 +562,7 @@ pub fn trait_floor(
 ///
 /// The model graded these benign yet cleave is confident they carry severe
 /// traits — a model gap worth investigating. INFO keeps it visible in
-/// serve/worker mode (`scan=info`) without spamming default CLI runs
+/// serve mode (`scan=info`) without spamming default CLI runs
 /// (`scan=warn`).
 ///
 /// Returns what the floor did, so a caller reporting the model and the floor
@@ -704,8 +690,8 @@ mod tests {
             trait_family("objectives/supply-chain/install-hook/npm::b"),
         );
         // The accepted cost: `darkglitch`'s two genuinely distinct backdoor
-        // capabilities now share a family, so a verdict resting on that pair
-        // alone no longer clears the diversity test. See
+        // capabilities share a family, so a verdict resting on that pair
+        // alone does not clear the diversity test. See
         // [`TRAIT_FLOOR_FAMILY_DEPTH`].
         assert_eq!(
             trait_family("objectives/command-and-control/backdoor/rat/multi::a"),
@@ -1134,7 +1120,7 @@ mod tests {
             );
 
             // Suspicious lands *within* the band, not on its weakest rung, so two
-            // interpreted verdicts of differing strength no longer collapse onto
+            // interpreted verdicts of differing strength do not collapse onto
             // one number.
             let alone = at(interpreted_level(Some(deploy), grid_max, Suspicious, false));
             let corroborated = at(interpreted_level(Some(deploy), grid_max, Suspicious, true));

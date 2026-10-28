@@ -58,9 +58,8 @@ mod jemalloc {
     /// Route tree-sitter's C-core allocations through jemalloc. Its parse
     /// trees otherwise go to the system malloc — outside every jemalloc
     /// budget, decay policy, and heap profile this codebase relies on, and
-    /// on macOS the default small-object zone retains freed pages
-    /// (measured: ~0.8 GB of empty retained MALLOC_SMALL at the gauntlet
-    /// peak).
+    /// on macOS the default small-object zone retains freed pages (on the
+    /// order of a gigabyte of empty MALLOC_SMALL at a large batch's peak).
     ///
     /// Installs via the tree-sitter crate's [`tree_sitter::set_allocator`]
     /// rather than raw `ts_set_allocator`: the crate keeps an internal free-fn
@@ -347,7 +346,8 @@ fn default_cli_follow_policy() -> scan::fetch::FetchPolicy {
 /// `--mode slow` means "consult no filters", so it publishes nothing. Note this
 /// reads the operator's `--mode` rather than the effective mode: `serve` forces
 /// itself slow so a submitted job is always analyzed on its own merits, and
-/// that internal choice must not also switch off its dependency skip — only an explicit `--mode slow` does.
+/// that internal choice must not also switch off its dependency skip — only an
+/// explicit `--mode slow` does.
 ///
 /// Returns the loaded filters so `fs`/`ps` can hand the same copy to
 /// `ScanConfig::with_bloom` instead of loading a second one.
@@ -430,9 +430,9 @@ where
 /// subcommands let clap populate their local `hopper` field from the
 /// environment, but bare-path shorthand bypasses subcommand parsing.
 fn resolve_hopper(hopper: Option<String>) -> Option<String> {
-    let hopper = resolve_hopper_value(hopper, std::env::var("SCAN_HOPPER").ok());
+    let hopper = resolve_hopper_value(hopper, scan::env::text(scan::env::SCAN_HOPPER));
     if let Some(raw) = hopper.as_deref() {
-        scan::upload::warn_if_cleartext(raw);
+        scan::hopper::warn_if_cleartext(raw);
     }
     hopper
 }
@@ -465,8 +465,8 @@ enum Commands {
         /// dropped as an unknown-SHA no-op. Upload failures are reported as
         /// errors, but never make the scan fatal. Also settable via the
         /// `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
-        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
+        /// Authenticates with `~/.tok/hopper`; hopper rejects an
+        /// unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -482,8 +482,8 @@ enum Commands {
         /// sidecar, a `{record,sources}` fletch envelope, or a legacy bare
         /// registry record. Complete inputs retain their raw provider data.
         /// A file absent from the map scans normally.
-        /// Also settable via the `SCAN_REGISTRY_MAP` env var.
-        #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
+        ///
+        #[arg(long, value_name = "FILE")]
         registry_map: Option<PathBuf>,
     },
 
@@ -505,8 +505,8 @@ enum Commands {
         /// fetched URL is exactly the never-before-seen case, so this is the
         /// flag that gets a freshly-discovered sample into the corpus.
         /// Also settable via the `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
-        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
+        /// Authenticates with `~/.tok/hopper`; hopper rejects an
+        /// unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -530,8 +530,8 @@ enum Commands {
         /// sidecar's `registry` node, so the uploaded sample carries the same
         /// provenance a forager-collected one would.
         /// Also settable via the `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper` (or `$HOPPER_TOKEN_FILE` /
-        /// `$HOPPER_TOKEN`); hopper rejects an unauthenticated request with 401.
+        /// Authenticates with `~/.tok/hopper`; hopper rejects an
+        /// unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
@@ -636,9 +636,8 @@ struct ServeArgs {
     ///
     /// Upload failures are reported as errors, but never make the scan
     /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
-    /// with `~/.tok/hopper` (or
-    /// `$HOPPER_TOKEN_FILE` / `$HOPPER_TOKEN`); hopper rejects an
-    /// unauthenticated request with 401.
+    /// with `~/.tok/hopper`; hopper rejects an unauthenticated request with
+    /// 401.
     #[arg(
         long,
         visible_alias = "upload",
@@ -648,12 +647,11 @@ struct ServeArgs {
     hopper: Option<String>,
 
     /// Per-request analysis timeout in seconds; 0 disables. Raise when
-    /// `--fetch` is on and dependency analysis can exceed the default.
+    /// `--follow` is on and dependency analysis can exceed the default.
     #[arg(
         long,
         default_value_t = scan::server::DEFAULT_ANALYSIS_TIMEOUT_SECS,
-        value_name = "SECS",
-        env = "SCAN_ANALYSIS_TIMEOUT"
+        value_name = "SECS"
     )]
     analysis_timeout: u64,
 }
@@ -694,12 +692,12 @@ impl Commands {
 ///
 /// Warn rather than fail: the setting is harmless (merely ignored) on the
 /// platforms that link the bundled jemalloc, and an operator override should
-/// never be able to refuse to boot a worker.
+/// never be able to refuse to boot a server.
 fn warn_on_broken_freebsd_malloc_conf() {
     if !cfg!(target_os = "freebsd") {
         return;
     }
-    let conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    let conf = scan::env::text(scan::env::MALLOC_CONF).unwrap_or_default();
     // Only `background_thread:true` breaks init; an explicit `:false` is fine.
     if !conf.contains("background_thread:true") {
         return;
@@ -765,6 +763,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 
 /// Set up the process for `command`, then run it.
 fn run(cli: Cli) -> Result<ExitCode> {
+    scan::env::check()?;
     let Cli { global, command } = cli;
     // Bare paths already became `fs` in `with_default_subcommand`, so a missing
     // subcommand here means an empty command line: print the help and stop.
@@ -819,7 +818,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     cleave::enriched::resolve(global.enriched).map_err(anyhow::Error::msg)?;
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
-    // default traits checkout was installed by cleave or another litmus run.
+    // default traits checkout was installed by cleave or another scan run.
     scan::traits_repo::prepare_runtime_env();
 
     warn_on_broken_freebsd_malloc_conf();
@@ -845,7 +844,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
     // Default-on refresh: bring rules + models (+ bloom) current when the local
     // ruleset is over 24h stale — or immediately with `-u/--update` — unless
-    // `--no-update`/`SCAN_NO_UPDATE` disables it. Scanning commands only: the
+    // `--no-update` disables it. Scanning commands only: the
     // daemons refresh on restart, and `version`/`update-rules` manage updates
     // themselves.
     if command.is_scan() {
@@ -939,17 +938,17 @@ fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
         scan::fetch::configure_pending(path)?;
     }
     // Before any analysis can start: every analysis's options read it.
-    scan::engine::set_rizin_timeout(std::time::Duration::from_secs(global.rizin_timeout_secs));
+    scan::engine::set_rizin_timeout(std::time::Duration::from_secs(global.rizin_timeout_secs))?;
     if let Some(seconds) = global.rizin_retry_timeout_secs {
-        scan::engine::set_rizin_retry_timeout(std::time::Duration::from_secs(seconds));
+        scan::engine::set_rizin_retry_timeout(std::time::Duration::from_secs(seconds))?;
     }
     // The fetch client and blob cache are built once per process, on first use,
-    // so their settings are fixed here: every mode (interactive scan and worker
+    // so their settings are fixed here: every mode (interactive scan and server
     // alike) honors `--fetch-max-size` and `--registry-ttl`.
     scan::fetch::configure(scan::fetch::Settings {
         max_fetch_bytes: global.fetch_max_size,
         registry_ttl: global.registry_ttl,
-    });
+    })?;
     // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
     // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
     // loop for the never-exiting daemons. Non-blocking either way.
@@ -971,7 +970,7 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
     // `atomscan` is this binary's own target: startup diagnostics logged from
     // main.rs (rule refresh, authentication, LLM configuration) are not in the
     // `scan` library and were being filtered out of the daemons' logs.
-    let explicit = global.verbose || std::env::var_os("RUST_LOG").is_some();
+    let explicit = global.verbose || scan::env::text(scan::env::RUST_LOG).is_some();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if global.verbose {
             tracing_subscriber::EnvFilter::new("atomscan=debug,scan=debug,cleave=debug")
@@ -1010,10 +1009,10 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
     //
     // That is not a rounding error on hostile input. goblin's permissive PE
     // import walker emits one `warn!` per bad-RVA lookup-table entry, and a
-    // forged import directory drives that loop into the millions: on the worker
-    // wedged 2026-09-04, 40% of the only running Rayon thread's samples were in
-    // the bridge rather than in the parse. `set_max_level(Off)` makes those call
-    // sites no-ops at the macro, which is what the dependency comment intends.
+    // forged import directory drives that loop into the millions, until the
+    // analysis spends a large share of its time in the bridge rather than the
+    // parse. `set_max_level(Off)` makes those call sites no-ops at the macro,
+    // which is what the dependency comment intends.
     //
     // An operator who asked for logs still gets them: `--verbose` or an explicit
     // `RUST_LOG` leaves the bridge at its default level, so a dependency's `log`
@@ -1026,7 +1025,7 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
 /// Pick the terminal color theme. Detection is only for an interactive scan
 /// drawing to a terminal: the OSC color-scheme query blocks on a TTY response
 /// and hangs in any environment that doesn't reply (SSH, some tmux configs,
-/// worker daemons).
+/// daemons).
 fn set_theme(global: &GlobalArgs, command: &Commands) {
     if global.light {
         scan::output::set_theme(scan::output::Theme::Light);
@@ -1107,7 +1106,7 @@ fn scan_paths(
     }
     // `--registry-map <file>`: a JSON object {sha256: provenance}. Preserve each
     // complete value and derive the normalized record beside it, so map-backed
-    // scans have the same provider data as live and worker scans. Entries
+    // scans have the same provider data as live and hopper-backed scans. Entries
     // without a record are skipped — registry provenance is best-effort, never
     // required.
     let registry_map = match registry_map {
@@ -1224,7 +1223,7 @@ fn serve(
         eprintln!("Deferring unknown lookups to the corpus at {url}");
     }
     // Serve never bloom-skips an /analyze job (Mode::Slow), but the membership
-    // endpoint and the --fetch dependency gate read the process-wide handle.
+    // endpoint and the --follow dependency gate read the process-wide handle.
     // Missing files fail closed (no skip).
     publish_bloom_filters(global.mode);
     eprintln!("Starting Atomdrift Scan server on http://{} ...", args.bind);
@@ -1238,76 +1237,65 @@ fn serve(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `atomscan update-rules`: check for, or apply, model, traits and bloom
-/// updates. Models and traits failing is an error; bloom filters are an
-/// optional fast path, so their failure is only a warning.
+/// `atomscan update-rules`: check for, or apply, rule updates. Traits and
+/// models failing is an error; the bloom and NSRL filters only let a scan skip
+/// work, so their failure is a warning.
 fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> ExitCode {
-    // R2-backed: model_update validates the staged bundle (Model::load) before
-    // swapping it in, so a broken bundle never goes live.
-    let dirs = model_dir
-        .map_or_else(scan::models_repo::install_target, |dir| {
-            Ok(dir.to_path_buf())
-        })
-        .and_then(|models| {
-            Ok((
-                models,
-                scan::bloom_repo::install_dir()?,
-                scan::nsrl_repo::install_dir()?,
-            ))
-        });
-    let (dir, bloom_dir, nsrl_dir) = match dirs {
-        Ok(dirs) => dirs,
-        Err(e) => {
-            eprintln!("Error: {e:#}");
-            return ExitCode::FAILURE;
-        }
+    use scan::rules::Source;
+    let sources: &[Source] = if models_only {
+        &[Source::Models]
+    } else {
+        &Source::ALL
     };
     if check {
-        if let Err(e) = scan::model_update::check(&dir) {
-            eprintln!("Error checking model updates: {e}");
-            return ExitCode::FAILURE;
-        }
-        if models_only {
-            return ExitCode::SUCCESS;
-        }
-        if let Err(e) = scan::traits_repo::check_updates() {
-            eprintln!("Error checking traits updates: {e}");
-            return ExitCode::FAILURE;
-        }
-        if let Err(e) = scan::bloom_update::check(&bloom_dir) {
-            eprintln!("Warning: bloom filter check failed: {e}");
-        }
-        if scan::nsrl_repo::enabled()
-            && let Err(e) = scan::nsrl_repo::check(&nsrl_dir)
-        {
-            eprintln!("Error checking NSRL updates: {e}");
-            return ExitCode::FAILURE;
-        }
-    } else {
-        if let Err(e) = scan::model_update::update(&dir, false, false) {
-            eprintln!("Error updating models: {e}");
-            return ExitCode::FAILURE;
-        }
-        if models_only {
-            return ExitCode::SUCCESS;
-        }
-        if let Err(e) = scan::traits_repo::update(false, false) {
-            eprintln!("Error updating traits: {e}");
-            return ExitCode::FAILURE;
-        }
-        // Without filters the scan simply runs without the known-good/known-bad
-        // short-circuit.
-        if let Err(e) = scan::bloom_update::update(&bloom_dir, false, false) {
-            eprintln!("Warning: bloom filter update failed (non-fatal): {e}");
-        }
-        if scan::nsrl_repo::enabled()
-            && let Err(e) = scan::nsrl_repo::update(&nsrl_dir, false)
-        {
-            eprintln!("Error updating NSRL: {e}");
-            return ExitCode::FAILURE;
+        return check_rules(sources, model_dir);
+    }
+    let mut code = ExitCode::SUCCESS;
+    for (source, e) in scan::rules::refresh(sources, model_dir, false, false).failures() {
+        if source.optional() {
+            eprintln!(
+                "Warning: {} update failed (non-fatal): {e:#}",
+                source.name()
+            );
+        } else {
+            eprintln!("Error updating {}: {e:#}", source.name());
+            code = ExitCode::FAILURE;
         }
     }
-    ExitCode::SUCCESS
+    code
+}
+
+/// `atomscan update-rules --check`: report what each source would install.
+fn check_rules(sources: &[scan::rules::Source], model_dir: Option<&Path>) -> ExitCode {
+    use scan::rules::Source;
+    let mut code = ExitCode::SUCCESS;
+    for &source in sources {
+        let checked = match source {
+            Source::Traits => scan::traits_repo::check_updates(),
+            Source::Models => model_dir
+                .map_or_else(scan::models_repo::install_target, |dir| {
+                    Ok(dir.to_path_buf())
+                })
+                .and_then(|dir| scan::model_update::check(&dir)),
+            Source::Bloom => {
+                scan::bloom_repo::install_dir().and_then(|dir| scan::bloom_update::check(&dir))
+            }
+            Source::Nsrl => {
+                scan::nsrl_repo::install_dir().and_then(|dir| scan::nsrl_repo::check(&dir))
+            }
+        };
+        match checked {
+            Ok(()) => {}
+            Err(e) if source.optional() => {
+                eprintln!("Warning: {} check failed: {e:#}", source.name());
+            }
+            Err(e) => {
+                eprintln!("Error checking {} updates: {e:#}", source.name());
+                code = ExitCode::FAILURE;
+            }
+        }
+    }
+    code
 }
 
 /// `atomscan version`: this build, and the identity and size of every rule
@@ -1494,938 +1482,9 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        Cli, Commands, MaxRssPolicy, default_cli_follow_policy, is_expected_yara_cache_mismatch,
-        resolve_hopper_value, with_default_subcommand,
-    };
-    use anyhow::{Context, Result};
-    use clap::Parser;
-    use scan::OutputFormat;
-    use scan::cli::{DEFAULT_RIZIN_TIMEOUT_SECS, LlmEnv};
-    use std::ffi::OsString;
-    use std::net::SocketAddr;
-    use std::num::NonZeroU64;
-    use std::path::PathBuf;
-
-    #[test]
-    fn nsrl_uses_the_normal_rules_update_without_an_extra_flag() {
-        let cli = Cli::try_parse_from(["atomscan", "update-rules"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::UpdateRules {
-                models_only: false,
-                check: false
-            })
-        ));
-        let cli = Cli::try_parse_from(["atomscan", "update-rules", "--check"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::UpdateRules {
-                models_only: false,
-                check: true
-            })
-        ));
-        assert!(Cli::try_parse_from(["atomscan", "update-rules", "--nsrl"]).is_err());
-    }
-
-    #[test]
-    fn a_closed_pipe_anywhere_in_the_chain_exits_quietly() {
-        let pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            .context("writing a result");
-        assert!(super::is_broken_pipe(&pipe));
-        let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert!(!super::is_broken_pipe(&other));
-    }
-
-    #[test]
-    fn only_expected_yara_cache_mismatch_is_quietable() {
-        let expected = "compiled YARA rules do not match the rule sources on disk; \
-                        ignoring them and recompiling";
-        assert!(is_expected_yara_cache_mismatch(
-            "cleave::yara_engine",
-            expected
-        ));
-        assert!(!is_expected_yara_cache_mismatch(
-            "cleave::yara_engine",
-            "YARA bucket scan failed, skipping bucket"
-        ));
-        assert!(!is_expected_yara_cache_mismatch("scan::engine", expected));
-    }
-
-    #[test]
-    fn follow_defaults_to_references_and_dependencies() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
-            .context("parse should work")?;
-        assert!(
-            cli.global.follow.is_none(),
-            "absence of --follow is resolved at startup"
-        );
-
-        let policy = default_cli_follow_policy();
-        assert!(policy.urls && policy.packages && policy.deps);
-        assert!(
-            !policy.ci,
-            "CI actions never reach an installed artifact; auditing them is opt-in"
-        );
-        // A bare `--follow` must select exactly what an absent one resolves to.
-        let bare = Cli::try_parse_from(with_default_subcommand(["scan", "--follow", "/tmp/a"]))
-            .context("bare --follow should parse")?
-            .global
-            .follow
-            .context("bare --follow has a default_missing_value")?;
-        assert_eq!(
-            (bare.urls, bare.packages, bare.deps, bare.ci),
-            (policy.urls, policy.packages, policy.deps, policy.ci),
-        );
-        assert_eq!(
-            policy.max_file_fetches,
-            scan::fetch::DEFAULT_MAX_FILE_FETCHES
-        );
-        assert_eq!(policy.max_file_fetches, 100);
-        assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
-        assert_eq!(policy.max_url_fetches, 4);
-        Ok(())
-    }
-
-    /// A service follows everything it can reach, because the corpus it fills
-    /// is asked about artifacts nobody has looked at yet: a category left
-    /// unfollowed is one nobody ever learns about.
-    #[test]
-    fn serve_follows_everything_by_default() {
-        let service = scan::fetch::default_service_follow_policy();
-        assert!(
-            service.urls && service.packages && service.deps && service.ci,
-            "a cache-population role must follow every category"
-        );
-
-        // The interactive default stays narrow: CI actions never reach an
-        // installed artifact, so one person's scan should not pay for them.
-        let interactive = default_cli_follow_policy();
-        assert!(
-            !interactive.ci,
-            "the interactive default must not widen with the service one"
-        );
-        assert_ne!(
-            (
-                interactive.urls,
-                interactive.packages,
-                interactive.deps,
-                interactive.ci
-            ),
-            (service.urls, service.packages, service.deps, service.ci),
-            "the two defaults are deliberately different; if they converge, say so on purpose"
-        );
-    }
-
-    /// The roles that get the wide default are exactly the ones that scan on
-    /// behalf of other hosts. Keeping the two in step is what stops a new
-    /// service subcommand from quietly populating the corpus with a narrow
-    /// verdict.
-    #[test]
-    fn the_wide_default_covers_every_service_role() {
-        let cli = Cli::try_parse_from(["scan", "serve"]).expect("serve should parse");
-        assert!(
-            cli.command.as_ref().is_some_and(Commands::is_daemon),
-            "serve scans for other hosts and must take the wide follow default"
-        );
-        let interactive = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
-            .expect("path scan should parse");
-        assert!(
-            !interactive
-                .command
-                .as_ref()
-                .is_some_and(Commands::is_daemon),
-            "an interactive path scan keeps the narrow default"
-        );
-    }
-
-    #[test]
-    fn old_fetch_flag_and_target_names_remain_aliases() -> Result<()> {
-        let old = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--fetch=deps,packages,urls,ci",
-            "/tmp/a",
-        ]))
-        .context("legacy --fetch vocabulary should parse")?
-        .global
-        .follow
-        .context("legacy --fetch should select a policy")?;
-        let new = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--follow=dependencies,references,ci-actions",
-            "/tmp/a",
-        ]))
-        .context("canonical --follow vocabulary should parse")?
-        .global
-        .follow
-        .context("canonical --follow should select a policy")?;
-        assert_eq!(old, new);
-        Ok(())
-    }
-
-    #[test]
-    fn rizin_timeout_defaults_to_ten_minutes_and_is_overridable() -> Result<()> {
-        let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
-            .context("default timeout should parse")?;
-        assert_eq!(
-            default.global.rizin_timeout_secs,
-            DEFAULT_RIZIN_TIMEOUT_SECS
-        );
-
-        let overridden = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--rizin-timeout-secs",
-            "42",
-            "/tmp/a",
-        ]))
-        .context("timeout override should parse")?;
-        assert_eq!(overridden.global.rizin_timeout_secs, 42);
-        assert!(
-            Cli::try_parse_from(with_default_subcommand([
-                "scan",
-                "--rizin-timeout-secs",
-                "0",
-                "/tmp/a"
-            ]))
-            .is_err(),
-            "zero would disable the hard deadline and must be rejected"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dependency_platform_scope_follows_scanner_role() -> Result<()> {
-        let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
-            .context("default should parse")?;
-        assert!(
-            default
-                .global
-                .host_platform_only(default.command.as_ref().is_some_and(Commands::is_daemon)),
-            "interactive scans optimize for the current host"
-        );
-        assert!(
-            scan::fetch::FetchPolicy::default().host_platform_only,
-            "library and CLI defaults must agree"
-        );
-        let compatible = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--fetch-all-platforms",
-            "/tmp/a",
-        ]))
-        .context("all-platforms opt-in should parse")?;
-        assert!(!compatible.global.host_platform_only(false));
-
-        let host_only = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--fetch-host-platform-only",
-            "/tmp/a",
-        ]))
-        .context("host-only opt-out should parse")?;
-        assert!(host_only.global.host_platform_only(true));
-
-        let daemon = Cli::try_parse_from(["scan", "serve"]).context("serve should parse")?;
-        let role = daemon.command.as_ref().is_some_and(Commands::is_daemon);
-        assert!(role);
-        assert!(
-            !daemon.global.host_platform_only(role),
-            "serve scans on behalf of other hosts"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bare_paths_default_to_scan_shorthand() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a", "/tmp/b"]))
-            .context("parse should work")?;
-        match cli.command.context("fs subcommand expected")? {
-            Commands::Path { paths, .. } => assert_eq!(
-                paths,
-                vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
-            ),
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    /// The shorthand is the form operators and agents actually type, and every
-    /// flag `fs` accepts has to survive it — `--upload` was rejected outright
-    /// before the line was rewritten into a real subcommand.
-    #[test]
-    fn shorthand_accepts_every_fs_flag() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--upload",
-            "http://hopper:8081",
-            "--registry-map",
-            "/tmp/map.json",
-            "--format",
-            "json",
-            "/tmp/a",
-        ]))
-        .context("parse should work")?;
-        assert_eq!(cli.global.format, OutputFormat::Json);
-        match cli.command.context("fs subcommand expected")? {
-            Commands::Path {
-                paths,
-                hopper,
-                registry_map,
-            } => {
-                assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
-                assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
-                assert_eq!(registry_map, Some(PathBuf::from("/tmp/map.json")));
-            }
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn default_subcommand_declines_lines_that_name_their_own() {
-        for line in [
-            vec!["scan", "fs", "/tmp/a"],
-            vec!["scan", "purl", "pkg:npm/left-pad@1.3.0"],
-            vec!["scan", "serve"],
-            vec!["scan", "help"],
-            vec!["scan", "--help"],
-            vec!["scan", "--version"],
-            vec!["scan"],
-            vec!["scan", "--verbose"],
-        ] {
-            assert_eq!(
-                with_default_subcommand(line.clone()),
-                line.iter().map(OsString::from).collect::<Vec<_>>(),
-                "{line:?} should reach the top-level parser as typed",
-            );
-        }
-    }
-
-    #[test]
-    fn default_subcommand_inserts_before_operands() {
-        assert_eq!(
-            with_default_subcommand(["scan", "-f", "json", "/tmp/a"]),
-            ["scan", "fs", "-f", "json", "/tmp/a"]
-                .iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>(),
-        );
-        // `--` marks the operand, so a path spelled like a flag still scans.
-        assert_eq!(
-            with_default_subcommand(["scan", "--", "-weird-name"]),
-            ["scan", "fs", "--", "-weird-name"]
-                .iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn hopper_environment_fills_missing_scan_destination() {
-        assert_eq!(
-            resolve_hopper_value(None, Some("http://hopper:8081/".to_string())).as_deref(),
-            Some("http://hopper:8081/")
-        );
-        assert_eq!(
-            resolve_hopper_value(
-                Some("http://flag:8081".to_string()),
-                Some("http://env".to_string())
-            )
-            .as_deref(),
-            Some("http://flag:8081")
-        );
-        assert!(resolve_hopper_value(None, Some("  ".to_string())).is_none());
-    }
-
-    #[test]
-    fn fs_subcommand_accepts_multiple_paths() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "fs", "/tmp/a", "/tmp/b"]))
-            .context("parse should work")?;
-        match cli.command.context("fs subcommand expected")? {
-            Commands::Path { paths, .. } => {
-                assert_eq!(
-                    paths,
-                    vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
-                );
-            }
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn fs_hopper_flag_and_upload_alias_parse() -> Result<()> {
-        for flag in ["--hopper", "--upload"] {
-            let cli = Cli::try_parse_from(with_default_subcommand([
-                "scan",
-                "fs",
-                flag,
-                "http://hopper:8081",
-                "/tmp/a",
-            ]))
-            .context("parse should work")?;
-            match cli.command.context("fs subcommand expected")? {
-                Commands::Path { paths, hopper, .. } => {
-                    assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
-                    assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
-                }
-                other => anyhow::bail!("unexpected command: {other:?}"),
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn url_and_purl_accept_hopper_flag() -> Result<()> {
-        let cli = Cli::try_parse_from([
-            "scan",
-            "url",
-            "https://h/f.tgz",
-            "--hopper",
-            "http://x:8081",
-        ])
-        .context("parse should work")?;
-        match cli.command.context("url subcommand expected")? {
-            Commands::Url { url, hopper } => {
-                assert_eq!(url, "https://h/f.tgz");
-                assert_eq!(hopper.as_deref(), Some("http://x:8081"));
-            }
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        let cli =
-            Cli::try_parse_from(["scan", "purl", "npm/left-pad", "--upload", "http://x:8081"])
-                .context("parse should work")?;
-        match cli.command.context("purl subcommand expected")? {
-            Commands::Purl { hopper, .. } => {
-                assert_eq!(hopper.as_deref(), Some("http://x:8081"));
-            }
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn fs_without_hopper_defaults_to_none() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "fs", "/tmp/a"]))
-            .context("parse should work")?;
-        match cli.command.context("fs subcommand expected")? {
-            Commands::Path { hopper, .. } => assert!(hopper.is_none()),
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn path_subcommand_and_its_aliases_resolve() -> Result<()> {
-        for name in ["path", "fs", "scan"] {
-            let cli = Cli::try_parse_from(with_default_subcommand(["scan", name, "/tmp/a"]))
-                .with_context(|| format!("parse of `{name}` should work"))?;
-            match cli
-                .command
-                .with_context(|| format!("path expected via `{name}`"))?
-            {
-                Commands::Path { paths, .. } => {
-                    assert_eq!(paths, vec![PathBuf::from("/tmp/a")])
-                }
-                other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn purl_subcommand_and_its_aliases_resolve() -> Result<()> {
-        for name in ["purl", "pkg", "package", "pkgs"] {
-            let cli = Cli::try_parse_from(["scan", name, "pkg:npm/left-pad@1.3.0"])
-                .with_context(|| format!("parse of `{name}` should work"))?;
-            match cli
-                .command
-                .with_context(|| format!("purl expected via `{name}`"))?
-            {
-                Commands::Purl { purl, .. } => assert_eq!(purl, "pkg:npm/left-pad@1.3.0"),
-                other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn serve_accepts_negative_max_rss_disable() -> Result<()> {
-        let cli = Cli::try_parse_from([
-            "scan",
-            "serve",
-            "--bind",
-            "127.0.0.1:49999",
-            "--max-rss-gb",
-            "-1",
-        ])
-        .context("serve -1 should parse")?;
-        match cli.command.context("serve subcommand expected")? {
-            Commands::Serve(args) => {
-                assert_eq!(args.bind, "127.0.0.1:49999".parse::<SocketAddr>()?);
-                assert_eq!(args.max_rss_gb, -1);
-            }
-            other => anyhow::bail!("unexpected command: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn max_rss_policy_classifies_cli_inputs() {
-        assert_eq!(MaxRssPolicy::from_cli(-1), MaxRssPolicy::Disabled);
-        assert_eq!(MaxRssPolicy::from_cli(i64::MIN), MaxRssPolicy::Disabled);
-        assert_eq!(MaxRssPolicy::from_cli(0), MaxRssPolicy::Auto);
-        assert_eq!(
-            MaxRssPolicy::from_cli(7),
-            MaxRssPolicy::Explicit(NonZeroU64::new(7).expect("non-zero"))
-        );
-    }
-
-    #[test]
-    fn level_flag_parses_and_shortcuts_removed() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "-l", "100", "/tmp/a"]))
-            .context("-l 100 should parse")?;
-        assert_eq!(cli.global.level, Some(100));
-
-        let cli = Cli::try_parse_from(with_default_subcommand(["scan", "--level", "12", "/tmp/a"]))
-            .context("--level 12 should parse")?;
-        assert_eq!(cli.global.level, Some(12));
-
-        // Out-of-range rejected (0..=25000, per-100M since the per-million migration).
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "-l", "25001", "/tmp/a"]))
-                .is_err()
-        );
-        // --level still conflicts with explicit thresholds.
-        assert!(
-            Cli::try_parse_from(with_default_subcommand([
-                "scan",
-                "-l",
-                "10",
-                "--threshold-hostile",
-                "0.5",
-                "/tmp/a"
-            ]))
-            .is_err()
-        );
-        // The numeric shortcuts and their aliases were removed.
-        assert!(Cli::try_parse_from(with_default_subcommand(["scan", "-5", "/tmp/a"])).is_err());
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "--loose", "/tmp/a"])).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "--paranoid", "/tmp/a"])).is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn gzip_long_aliases_are_not_accepted() {
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "--fast", "/tmp/a"])).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "--best", "/tmp/a"])).is_err()
-        );
-    }
-
-    #[test]
-    fn archive_password_flag_is_repeatable_and_global() -> Result<()> {
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "path",
-            "/tmp/a",
-            "--zip-password",
-            "one",
-            "--zip-password=two",
-        ]))?;
-
-        assert_eq!(cli.global.zip_passwords, ["one", "two"]);
-        Ok(())
-    }
-
-    #[test]
-    fn concurrency_flags_reject_zero() {
-        assert!(Cli::try_parse_from(["atomscan", "serve", "--workers", "0"]).is_err());
-    }
-
-    #[test]
-    fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
-        assert!(
-            Cli::try_parse_from(with_default_subcommand(["scan", "-1", "-9", "/tmp/a"])).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(with_default_subcommand([
-                "scan",
-                "-9",
-                "--threshold-hostile",
-                "0.90",
-                "/tmp/a"
-            ]))
-            .is_err()
-        );
-    }
-
-    /// The LLM environment as a test wants it: token files under `home`'s
-    /// `.tok`, or none, and no `SCAN_LLM*` variables — whatever the process
-    /// running the tests has set.
-    fn llm_env(home: Option<&std::path::Path>) -> LlmEnv {
-        LlmEnv {
-            llm_token_file: home.map(|h| h.join(".tok").join("llm")),
-            openrouter_token_file: home.map(|h| h.join(".tok").join("openrouter")),
-            ..LlmEnv::default()
-        }
-    }
-
-    #[test]
-    fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
-        let empty_home = tempfile::tempdir()?;
-        let env = llm_env(Some(empty_home.path()));
-        let missing_key = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "/tmp/a",
-        ]))?;
-        let err = missing_key
-            .global
-            .interpret_config_with(&env)
-            .expect_err("openrouter without a key must fail");
-        assert!(
-            err.to_string().contains("~/.tok/openrouter"),
-            "unexpected error: {err}"
-        );
-
-        let missing_model = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-key",
-            "sk-test",
-            "/tmp/a",
-        ]))?;
-        let cfg = missing_model
-            .global
-            .interpret_config_with(&env)?
-            .context("openrouter without a pinned model should default to auto")?;
-        assert_eq!(cfg.model, scan::interpret::OPENROUTER_DEFAULT_MODEL);
-
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "--llm-key",
-            "sk-test",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("openrouter with model+key should enable interpret")?;
-        assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
-        assert_eq!(cfg.model, "qwen/qwen3.8-27b");
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
-        Ok(())
-    }
-
-    #[test]
-    fn llm_flags_are_global_on_serve() -> Result<()> {
-        let env = llm_env(None);
-        let serve = Cli::try_parse_from([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "--llm-key",
-            "sk-test",
-            "serve",
-        ])?;
-        assert_eq!(serve.global.llm.as_deref(), Some("openrouter"));
-        let cfg = serve
-            .global
-            .interpret_config_with(&env)?
-            .context("serve inherits --llm")?;
-        assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
-        Ok(())
-    }
-
-    /// `~/.tok/llm` authenticates *our* endpoint. Handing it to OpenRouter
-    /// would send a live credential to a third party, and arrive there as an
-    /// ordinary 401 that says nothing about what leaked.
-    #[test]
-    fn the_vllm_token_is_never_sent_to_openrouter() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
-        let env = llm_env(Some(dir.path()));
-        // Alone, OpenRouter without its own key is the same hard error it
-        // has always been — not a silent borrow of the vLLM token.
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "/tmp/a",
-        ]))?;
-        let err = cli
-            .global
-            .interpret_config_with(&env)
-            .expect_err("~/.tok/llm must not satisfy OpenRouter");
-        assert!(err.to_string().contains("~/.tok/openrouter"), "{err}");
-        Ok(())
-    }
-
-    #[test]
-    fn llm_failover_chain_resolves_each_endpoint_separately() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
-        std::fs::write(tok.join("openrouter"), "sk-openrouter\n")?;
-        let env = llm_env(Some(dir.path()));
-        // The shape we deploy by default. Both models pinned so the test
-        // resolves without touching the network.
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "https://llm.isotope13.ai/v1,openrouter",
-            "--llm-model",
-            "Qwen/Qwen3.8-27B,qwen/qwen3.8-27b",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("chain should resolve")?;
-        assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
-        assert_eq!(cfg.model, "Qwen/Qwen3.8-27B");
-        // Each endpoint takes its own token file: the vLLM key must not be
-        // sent to OpenRouter, nor the reverse.
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm"));
-        assert_eq!(cfg.fallbacks.len(), 1);
-        assert_eq!(
-            cfg.fallbacks[0].base_url,
-            scan::interpret::OPENROUTER_BASE_URL
-        );
-        assert_eq!(cfg.fallbacks[0].model, "qwen/qwen3.8-27b");
-        assert_eq!(cfg.fallbacks[0].api_key.as_deref(), Some("sk-openrouter"));
-        Ok(())
-    }
-
-    /// A fallback that cannot be used is dropped, not fatal: the primary is
-    /// what the scan actually needs.
-    #[test]
-    fn an_unusable_fallback_is_dropped_but_the_primary_stands() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("llm"), "sk-vllm\n")?;
-        let env = llm_env(Some(dir.path()));
-        // No ~/.tok/openrouter, so the OpenRouter slot cannot be called
-        // (its model would default to `openrouter/auto`, but the missing
-        // key still drops it); the same config with OpenRouter *alone* is
-        // a hard error (see openrouter_alias_requires_key_and_defaults_model).
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "https://llm.isotope13.ai/v1,openrouter",
-            "--llm-model",
-            "Qwen/Qwen3.8-27B",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("primary should stand")?;
-        assert_eq!(cfg.base_url, "https://llm.isotope13.ai/v1");
-        assert!(
-            cfg.fallbacks.is_empty(),
-            "an OpenRouter slot with no key must not be kept: {:?}",
-            cfg.fallbacks
-        );
-        Ok(())
-    }
-
-    /// ...but losing every endpoint is fatal, and says why for each.
-    #[test]
-    fn a_chain_with_no_usable_endpoint_is_an_error() -> Result<()> {
-        let empty_home = tempfile::tempdir()?;
-        let env = llm_env(Some(empty_home.path()));
-        // Port 1 refuses immediately, so discovery fails without a wait;
-        // the OpenRouter slot has neither key nor model.
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "http://127.0.0.1:1/v1,openrouter",
-            "/tmp/a",
-        ]))?;
-        let err = cli
-            .global
-            .interpret_config_with(&env)
-            .expect_err("no endpoint is usable here");
-        let text = err.to_string();
-        assert!(text.contains("no usable LLM endpoint"), "{text}");
-        assert!(text.contains("127.0.0.1:1"), "{text}");
-        assert!(text.contains("OpenRouter"), "{text}");
-        Ok(())
-    }
-
-    #[test]
-    fn llm_key_falls_back_to_tok_llm_file() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("llm"), "sk-vllm-file\n")?;
-        let env = llm_env(Some(dir.path()));
-        // A pinned model keeps this off the network: an unpinned one would
-        // probe the endpoint for its catalog.
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "http://interpret:8000/v1",
-            "--llm-model",
-            "Qwen/Qwen3.8-27B",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("~/.tok/llm should supply the key")?;
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm-file"));
-
-        // An explicit key still wins over the file.
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "http://interpret:8000/v1",
-            "--llm-model",
-            "Qwen/Qwen3.8-27B",
-            "--llm-key",
-            "sk-flag",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("explicit key")?;
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-flag"));
-        Ok(())
-    }
-
-    #[test]
-    fn openrouter_prefers_its_own_tok_file_over_tok_llm() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("llm"), "sk-vllm-file\n")?;
-        std::fs::write(tok.join("openrouter"), "sk-openrouter-file\n")?;
-        let env = llm_env(Some(dir.path()));
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("openrouter key")?;
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-openrouter-file"));
-        Ok(())
-    }
-
-    #[test]
-    fn no_tok_llm_file_leaves_the_endpoint_unauthenticated() -> Result<()> {
-        let empty_home = tempfile::tempdir()?;
-        let env = llm_env(Some(empty_home.path()));
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "http://interpret:8000/v1",
-            "--llm-model",
-            "Qwen/Qwen3.8-27B",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("local target")?;
-        assert_eq!(cfg.api_key, None);
-        Ok(())
-    }
-
-    #[test]
-    fn openrouter_key_falls_back_to_tok_file() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let tok = dir.path().join(".tok");
-        std::fs::create_dir(&tok)?;
-        std::fs::write(tok.join("openrouter"), "sk-from-file\n")?;
-        let env = llm_env(Some(dir.path()));
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--llm",
-            "openrouter",
-            "--llm-model",
-            "qwen/qwen3.8-27b",
-            "/tmp/a",
-        ]))?;
-        let cfg = cli
-            .global
-            .interpret_config_with(&env)?
-            .context("tok file should supply key")?;
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));
-        Ok(())
-    }
-}
+#[path = "main/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod dependency_audit_cli_tests {
-    use super::*;
-    #[test]
-    fn resume_scope_and_native_retry_flags_parse_and_reject_invalid_values() {
-        let cli = Cli::try_parse_from(with_default_subcommand([
-            "atomscan",
-            "--follow=all",
-            "--fetch-pending=/tmp/backlog.json",
-            "--fetch-dev-deps=false",
-            "--fetch-all-versions",
-            "--rizin-timeout-secs=60",
-            "--rizin-retry-timeout-secs=120",
-            "/tmp/sample",
-        ]))
-        .unwrap();
-        assert_eq!(
-            cli.global.fetch_pending.as_deref(),
-            Some(std::path::Path::new("/tmp/backlog.json"))
-        );
-        assert_eq!(cli.global.rizin_retry_timeout_secs, Some(120));
-        let policy = cli
-            .global
-            .fetch_policy(cli.global.follow.unwrap(), 0, false);
-        assert!(!policy.include_dev_dependencies);
-        assert!(policy.all_versions);
-        for flag in ["--rizin-retry-timeout-secs=0", "--fetch-dev-deps=maybe"] {
-            assert!(
-                Cli::try_parse_from(with_default_subcommand(["atomscan", flag, "/tmp/sample"]))
-                    .is_err()
-            );
-        }
-    }
-    #[test]
-    fn audit_defaults_preserve_development_coverage_and_disable_extra_native_attempt() {
-        let cli =
-            Cli::try_parse_from(with_default_subcommand(["atomscan", "/tmp/sample"])).unwrap();
-        assert!(cli.global.fetch_dev_deps);
-        assert!(!cli.global.fetch_all_versions);
-        assert!(cli.global.fetch_pending.is_none());
-        assert!(cli.global.rizin_retry_timeout_secs.is_none());
-    }
-}
+#[path = "main/dependency_audit_cli_tests.rs"]
+mod dependency_audit_cli_tests;

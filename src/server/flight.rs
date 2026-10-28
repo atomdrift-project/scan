@@ -11,7 +11,7 @@
 //! The first request for a key *leads*: it runs the analysis in a server-owned
 //! task and publishes the outcome. Later requests *follow* — they take no slot
 //! and wait for that same outcome. Because the analysis outlives any one
-//! request, the leader hanging up no longer abandons the followers, and nobody
+//! request, the leader hanging up does not abandon the followers, and nobody
 //! hanging up cancels it: its verdict is filed either way (see
 //! [`Attachment`]'s `Drop`).
 
@@ -26,10 +26,10 @@ use super::error::ApiError;
 use crate::analysis::RequestPhase;
 use crate::engine::ScanResult;
 
-/// What makes two requests the same piece of work.
+/// What a flight analyzes.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) enum FlightKey {
-    /// Lowercase hex SHA-256 of the uploaded bytes — `POST /analyze`.
+pub(super) enum Artifact {
+    /// Lowercase hex SHA-256 of uploaded bytes.
     ///
     /// The bytes are the identity; the upload filename is not part of it, so
     /// concurrent requests for one artifact share a single analysis and the
@@ -38,54 +38,48 @@ pub(super) enum FlightKey {
     /// leader's framing of them — an acceptable trade for one analysis per
     /// artifact, since it takes a deliberate race to arrange.
     Sha(String),
-    /// Package URL — `POST /analyze-purl`.
+    /// A package URL, canonical.
     Purl(String),
-    /// Exact fetch URL — `POST /v1/analyze?url=…`.
+    /// An exact fetch URL.
     Url(String),
-    /// Uploaded bytes analyzed with a request-specific follow selection.
-    ShaFollow(String, u8),
-    /// PURL analyzed with a request-specific follow selection.
-    PurlFollow(String, u8),
-    /// URL analyzed with a request-specific follow selection.
-    UrlFollow(String, u8),
+}
+
+/// What makes two requests the same piece of work: the artifact, and the
+/// follow policy it is analyzed under.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct FlightKey {
+    pub(super) artifact: Artifact,
+    /// The request's follow selection, when it is not the server's own;
+    /// `None` keeps requests under the server's policy together.
+    pub(super) follow: Option<u8>,
 }
 
 impl FlightKey {
-    /// Scope a v1 upload by follow policy only when it differs from the
-    /// deployment default. The ordinary key remains compatible with legacy
-    /// routes and reconnect status checks.
-    pub(super) fn sha_follow(sha: String, requested: u8, configured: u8) -> Self {
-        if requested == configured {
-            Self::Sha(sha)
-        } else {
-            Self::ShaFollow(sha, requested)
-        }
-    }
-
-    /// PURL equivalent of [`Self::sha_follow`].
-    pub(super) fn purl_follow(purl: String, requested: u8, configured: u8) -> Self {
-        if requested == configured {
-            Self::Purl(purl)
-        } else {
-            Self::PurlFollow(purl, requested)
-        }
-    }
-
-    /// URL equivalent of [`Self::purl_follow`].
-    pub(super) fn url_follow(url: String, requested: u8, configured: u8) -> Self {
-        if requested == configured {
-            Self::Url(url)
-        } else {
-            Self::UrlFollow(url, requested)
+    /// The key for `artifact` analyzed under `requested`, scoped by policy only
+    /// when that differs from the server's `configured` one.
+    pub(super) fn new(artifact: Artifact, requested: u8, configured: u8) -> Self {
+        Self {
+            artifact,
+            follow: (requested != configured).then_some(requested),
         }
     }
 
     /// The package this analysis was requested by, when it was requested by
     /// one. Uploads carry a digest and a filename, never a locator.
     pub(super) fn purl(&self) -> Option<&str> {
-        match self {
-            Self::Purl(purl) | Self::PurlFollow(purl, _) => Some(purl),
-            Self::Sha(_) | Self::ShaFollow(_, _) | Self::Url(_) | Self::UrlFollow(_, _) => None,
+        match &self.artifact {
+            Artifact::Purl(purl) => Some(purl),
+            Artifact::Sha(_) | Artifact::Url(_) => None,
+        }
+    }
+}
+
+impl From<Artifact> for FlightKey {
+    /// `artifact` under the server's own policy.
+    fn from(artifact: Artifact) -> Self {
+        Self {
+            artifact,
+            follow: None,
         }
     }
 }
@@ -95,23 +89,24 @@ impl From<&FlightKey> for super::access::Subject {
     /// were about, so the access line takes it verbatim: uploads are named by
     /// the digest of their bytes, PURL analyses by the canonical locator.
     fn from(key: &FlightKey) -> Self {
-        match key {
-            FlightKey::Sha(sha) | FlightKey::ShaFollow(sha, _) => Self::sha256(sha),
-            FlightKey::Purl(purl) | FlightKey::PurlFollow(purl, _) => Self::purl(purl, None),
-            FlightKey::Url(url) | FlightKey::UrlFollow(url, _) => Self::url(url, None),
+        match &key.artifact {
+            Artifact::Sha(sha) => Self::sha256(sha),
+            Artifact::Purl(purl) => Self::purl(purl, None),
+            Artifact::Url(url) => Self::url(url, None),
         }
     }
 }
 
 impl fmt::Display for FlightKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sha(sha) => write!(f, "sha:{sha}"),
-            Self::Purl(purl) => write!(f, "purl:{purl}"),
-            Self::ShaFollow(sha, follow) => write!(f, "sha:{sha} follow:{follow:04b}"),
-            Self::PurlFollow(purl, follow) => write!(f, "purl:{purl} follow:{follow:04b}"),
-            Self::Url(url) => write!(f, "url:{url}"),
-            Self::UrlFollow(url, follow) => write!(f, "url:{url} follow:{follow:04b}"),
+        match &self.artifact {
+            Artifact::Sha(sha) => write!(f, "sha:{sha}")?,
+            Artifact::Purl(purl) => write!(f, "purl:{purl}")?,
+            Artifact::Url(url) => write!(f, "url:{url}")?,
+        }
+        match self.follow {
+            Some(follow) => write!(f, " follow:{follow:04b}"),
+            None => Ok(()),
         }
     }
 }
@@ -391,7 +386,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn key() -> FlightKey {
-        FlightKey::Sha("a".repeat(64))
+        FlightKey::from(Artifact::Sha("a".repeat(64)))
     }
 
     use axum::http::StatusCode;
@@ -425,7 +420,7 @@ mod tests {
     fn the_same_bytes_under_another_name_share_one_analysis() {
         let flights = Arc::new(Flights::default());
         let zip = flights.join(key());
-        let txt = flights.join(FlightKey::Sha("a".repeat(64)));
+        let txt = flights.join(FlightKey::from(Artifact::Sha("a".repeat(64))));
         assert!(zip.leads());
         assert!(!txt.leads(), "the same bytes follow the run already going");
         assert_eq!(flights.census().analyses, 1);
@@ -435,7 +430,9 @@ mod tests {
     fn a_different_key_is_a_different_flight() {
         let flights = Arc::new(Flights::default());
         let a = flights.join(key());
-        let b = flights.join(FlightKey::Purl("pkg:npm/left-pad@1.3.0".into()));
+        let b = flights.join(FlightKey::from(Artifact::Purl(
+            "pkg:npm/left-pad@1.3.0".into(),
+        )));
         assert!(a.leads());
         assert!(b.leads());
         assert_eq!(flights.census().analyses, 2);
@@ -445,8 +442,14 @@ mod tests {
     fn different_follow_policies_do_not_share_an_analysis() {
         let flights = Arc::new(Flights::default());
         let sha = "a".repeat(64);
-        let dependencies = flights.join(FlightKey::ShaFollow(sha.clone(), 0b0100));
-        let none = flights.join(FlightKey::ShaFollow(sha, 0));
+        let dependencies = flights.join(FlightKey {
+            artifact: Artifact::Sha(sha.clone()),
+            follow: Some(0b0100),
+        });
+        let none = flights.join(FlightKey {
+            artifact: Artifact::Sha(sha),
+            follow: Some(0),
+        });
         assert!(dependencies.leads());
         assert!(none.leads());
         assert_eq!(flights.census().analyses, 2);
@@ -577,10 +580,10 @@ mod tests {
     }
 
     /// A follower streaming progress reads the leader's phase through the
-    /// flight. It used to search `/_/requests` for an entry named like the
-    /// flight's subject — but an upload's entry is named by its filename and
-    /// its subject is the digest, so every streamed upload reported a null
-    /// phase.
+    /// flight, not by searching `/_/requests` for an entry named like the
+    /// flight's subject: an upload's entry is named by its filename and its
+    /// subject is the digest, so that search finds nothing for an upload.
+
     #[test]
     fn a_follower_reads_the_phase_of_the_run_it_rides() {
         let flights = Arc::new(Flights::default());

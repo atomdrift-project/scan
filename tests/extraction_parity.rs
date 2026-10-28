@@ -1,4 +1,4 @@
-//! End-to-end parity tests between litmus (Rust) and collimator (Python).
+//! End-to-end parity tests between scan (Rust) and collimator (Python).
 //!
 //! Tests the full pipeline: cleave JSON → feature extraction → standardization
 //! → model prediction → threshold classification. Catches any divergence in
@@ -15,11 +15,9 @@ use scan::model::Model;
 /// Resolve the model directory: SCAN_MODELS_DIR env var, or fallback to
 /// ../collimator/out (co-located development layout).
 fn model_dir() -> std::path::PathBuf {
-    std::env::var("SCAN_MODELS_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../collimator/out"))
-        })
+    scan::env::path(scan::env::SCAN_MODELS_DIR).unwrap_or_else(|| {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../collimator/out"))
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -86,9 +84,9 @@ fn feature_extraction_matches_collimator() {
         fixture.n_features,
     );
 
-    // Verify feature name ordering matches between litmus and Python.
+    // Verify feature name ordering matches between Rust and Python.
     // This catches offset bugs (e.g., adding features to agg without
-    // updating litmus offsets) with a clear error message.
+    // updating the Rust offsets) with a clear error message.
     if !fixture.feature_names.is_empty() {
         let rust_names = spec.feature_names();
         for (j, (rust_name, python_name)) in rust_names
@@ -99,7 +97,7 @@ fn feature_extraction_matches_collimator() {
             assert_eq!(
                 rust_name, python_name,
                 "feature name mismatch at index {j}: \
-                 rust={rust_name:?} python={python_name:?} — likely an offset bug in litmus",
+                 rust={rust_name:?} python={python_name:?} — likely an offset bug in atomscan",
             );
         }
     }

@@ -1,15 +1,15 @@
 //! Deferring a lookup to hopper when the local index has nothing.
 //!
-//! A scan worker holds a verdict index and a set of filters; hopper holds the
+//! A scan server holds a verdict index and a set of filters; hopper holds the
 //! corpus behind them. Asking one question and getting one answer is the point:
 //! a caller should not have to know that two services exist, nor which of them
-//! to reconcile against the other, so a worker that does not know finds out
+//! to reconcile against the other, so a server that does not know finds out
 //! rather than reporting absence.
 //!
 //! `--hopper` may name several addresses for the same corpus, in preference
 //! order: put the replica first and the primary behind it. Reads and writes
 //! take the same list, because routing them separately is a topology this
-//! worker would have to know and hopper's write relay exists so that it does
+//! server would have to know and hopper's write relay exists so that it does
 //! not — a replica answers lookups locally and forwards the renewals.
 //!
 //! A head that fails is rested rather than retried on the next request: the
@@ -19,6 +19,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+use crate::hopper::Record;
 
 /// How long a hopper read may take before the endpoint counts as unreachable.
 ///
@@ -66,7 +68,7 @@ const REST: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Reached {
     /// The corpus holds a record for it.
-    Record(Box<CorpusRecord>),
+    Record(Box<Record>),
     /// The corpus answered and holds nothing, or holds bytes nobody has
     /// analyzed. Either way there is no verdict — and nothing is wrong.
     Nothing,
@@ -82,44 +84,6 @@ pub(crate) enum Reached {
 pub(crate) enum CorpusSource {
     Replica,
     Primary,
-}
-
-/// One artifact as hopper's `/v1/lookup` reports it.
-///
-/// Every field is optional because the corpus spans several eras of stored
-/// record: `fires_at` in particular is absent for rows written before levels
-/// existed, and a missing level must stay missing rather than become a zero.
-#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
-pub(crate) struct CorpusRecord {
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub purl: Option<String>,
-    #[serde(default)]
-    pub fires_at: crate::model::Level,
-    #[serde(default)]
-    pub engine_version: Option<String>,
-    #[serde(default)]
-    pub traits_version: Option<String>,
-    #[serde(default)]
-    pub analyzed_at: Option<String>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub findings: Vec<CorpusFinding>,
-}
-
-/// One of the artifact's strongest traits, as the corpus stores them.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-pub(crate) struct CorpusFinding {
-    pub id: String,
-    #[serde(default)]
-    pub crit: u8,
-    /// A sentence for a person, present only on findings the analyzer did not
-    /// produce. A trait id describes itself; a citation does not, and the
-    /// record's `reason` is already taken when the verdict was also measured.
-    #[serde(default)]
-    pub desc: Option<String>,
 }
 
 /// Sample bytes hopper served, and their digest.
@@ -152,7 +116,7 @@ struct AddressStats {
     failed: u64,
 }
 
-/// The corpus behind this worker's index.
+/// The corpus behind this server's index.
 #[derive(Debug)]
 pub(crate) struct Corpus {
     /// Every address the corpus can be reached at, in preference order.
@@ -191,9 +155,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Corpus {
     /// A corpus reader, or `None` when `--hopper` named nothing and there is
-    /// nothing behind this worker to defer to.
+    /// nothing behind this server to defer to.
     pub(crate) fn new(hopper: Option<&str>) -> Option<Arc<Self>> {
-        let bases = crate::upload::endpoints(hopper.unwrap_or(""));
+        let bases = crate::hopper::endpoints(hopper.unwrap_or(""));
         if bases.is_empty() {
             return None;
         }
@@ -241,7 +205,7 @@ impl Corpus {
                 .client
                 .get(format!("{base}{path}"))
                 .timeout(Duration::from_secs(5 * 60));
-            if let Some(token) = crate::upload::hopper_token() {
+            if let Some(token) = crate::hopper::token() {
                 request = request.bearer_auth(token);
             }
             let mut response = match request.send().await {
@@ -486,7 +450,7 @@ impl Corpus {
             lag_seconds: Option<i64>,
         }
         let mut request = self.client.get(format!("{base}/_/replica"));
-        if let Some(token) = crate::upload::hopper_token() {
+        if let Some(token) = crate::hopper::token() {
             request = request.bearer_auth(token);
         }
         let response = request.send().await.ok()?;
@@ -534,7 +498,7 @@ impl Corpus {
         for attempt in 0..=READ_RETRIES {
             self.count(base, |a| &a.asked);
             let mut request = self.client.get(format!("{base}{path}"));
-            if let Some(token) = crate::upload::hopper_token() {
+            if let Some(token) = crate::hopper::token() {
                 request = request.bearer_auth(token);
             }
             let response = match request.send().await {
@@ -571,7 +535,7 @@ impl Corpus {
                 continue;
             }
             return match status {
-                200 => match response.json::<CorpusRecord>().await {
+                200 => match response.json::<Record>().await {
                     Ok(record) => Some((Reached::Record(Box::new(record)), source)),
                     // Reachable, but not speaking our protocol. Not a reason to try
                     // the other endpoint, which is running the same build.
@@ -661,7 +625,7 @@ mod tests {
 
     #[test]
     fn lookup_records_retain_the_traits_version() {
-        let record: CorpusRecord = serde_json::from_str(
+        let record: Record = serde_json::from_str(
             r#"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","traits_version":"abc12"}"#,
         )
         .expect("corpus record");
@@ -929,9 +893,9 @@ mod tests {
     ///
     /// The bargain is that a replica's 404 is taken as the answer so the miss
     /// load stays off the primary. It holds only while the replica is current.
-    /// Measured at 27 minutes behind in production, during which a verdict the
-    /// primary already held read as `unknown` — analyze a package, get a
-    /// decision, look it up a minute later and be told nobody has seen it.
+    /// A replica that lags by minutes reads a verdict the primary already holds
+    /// as `unknown` — analyze a package, get a decision, look it up a minute
+    /// later and be told nobody has seen it.
     #[tokio::test]
     async fn a_replica_that_is_behind_has_its_reads_relayed() {
         let behind = endpoint("200 OK", r#"{"replica":true,"lag_seconds":14401}"#);

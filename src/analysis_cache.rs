@@ -17,7 +17,7 @@
 //! different namespace, so a stale result can never mask a detection a newer
 //! ruleset adds — a version bump simply misses and re-analyzes.
 //! A hit is only ever a result the *current* detector already produced. Set
-//! `SCAN_ANALYSIS_CACHE=0` to disable it entirely.
+//! `SCAN_NO_ANALYSIS_CACHE=1` to disable it entirely.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -55,21 +55,16 @@ pub(crate) struct AnalysisCache {
 /// Used by [`crate::cache_cleanup`] to reclaim the store; entries live at
 /// `analysis/<version>/<key>.zst` (two levels below this root).
 pub(crate) fn cache_base() -> Option<PathBuf> {
-    Some(
-        dirs::cache_dir()?
-            .join("atomdrift")
-            .join("scan")
-            .join("analysis"),
-    )
+    Some(crate::cache_dir()?.join("analysis"))
 }
 
 impl AnalysisCache {
     /// Open (creating on first use) the cache directory for the active ruleset
-    /// version. `None` when disabled via `SCAN_ANALYSIS_CACHE=0`, when the OS
+    /// version. `None` when disabled via `SCAN_NO_ANALYSIS_CACHE`, when the OS
     /// has no cache directory, or when the directory can't be created — every
     /// such case degrades to "always analyze", never an error.
     pub(crate) fn open() -> Option<Self> {
-        if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
+        if crate::env::flag(crate::env::SCAN_NO_ANALYSIS_CACHE) {
             return None;
         }
         let base = cache_base()?;
@@ -168,8 +163,8 @@ fn incomplete(report: &AnalysisReport) -> bool {
 
 /// A token identifying the analysis-producing detector, so a rules, model, or
 /// engine update invalidates cached results. Folds in the scan release, the
-/// rule contents and analyzer build, the installed bloom set (which the
-/// dependency skip-predicate consults), and the installed model bundle.
+/// rule contents and analyzer build, the installed bloom and NSRL sets (which
+/// the dependency skip-predicate consults), and the installed model bundle.
 ///
 /// Reuse Cleave's content fingerprint, shared with rule loading and memoized
 /// until reload. It does not compile rules or read their sources a second
@@ -177,26 +172,22 @@ fn incomplete(report: &AnalysisReport) -> bool {
 /// Git metadata would all share a single namespace.
 ///
 /// cleave's compact schema version belongs here too: a cached entry holds a
-/// report in that format, and a format change must not replay the old one.
+/// report in that format, and a format change must not replay entries written
+/// in the previous one.
 ///
 /// The model belongs here for the same reason the rules do: a cached entry
-/// holds the *verdict*, and the verdict is the model's output. Until
-/// 2026-08-07 it was absent, so a model auto-update reused the previous
-/// bundle's namespace and every already-seen file kept the verdict the old
-/// bundle gave it. That is how the 2026-08-04 route-policy defect (benign
-/// OpenDocument files graded hostile at every deploy level) would have
-/// outlived the corrected bundle that fixed it.
+/// holds the *verdict*, and the verdict is the model's output. Without it a
+/// model auto-update would reuse the previous bundle's namespace, and every
+/// already-seen file would keep the verdict that bundle gave it, so a defect
+/// in one bundle would outlive the corrected bundle that fixes it.
 pub(crate) fn ruleset_version() -> String {
     let traits = cleave::cache::traits_revision_fingerprint();
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
-    let nsrl = crate::nsrl_repo::enabled()
-        .then(crate::nsrl_repo::installed_manifest)
-        .flatten()
-        .map_or_else(
-            || "nonsrl".to_string(),
-            |m| format!("nsrl-{}", bloom_token(&m)),
-        );
+    let nsrl = crate::nsrl_repo::installed_manifest().map_or_else(
+        || "nonsrl".to_string(),
+        |m| format!("nsrl-{}", bloom_token(&m)),
+    );
     format!(
         "{}-c{}-r{traits:016x}-{bloom}-{nsrl}-m{}",
         env!("CARGO_PKG_VERSION"),
@@ -299,7 +290,12 @@ mod tests {
     #[test]
     fn local_trait_edits_invalidate_cached_results() {
         const PROBE: &str = "SCAN_TEST_LOCAL_TRAITS_CACHE";
-        if std::env::var_os(PROBE).is_none() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "this test's own child-process marker"
+        )]
+        let child = std::env::var_os(PROBE).is_some();
+        if !child {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

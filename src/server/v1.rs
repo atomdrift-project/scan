@@ -16,12 +16,11 @@ use super::AppState;
 use super::access::{RequestId, Subject, with_subject};
 use super::analyze::{self, Job, RequestFollow, index_query};
 use super::corpus::{self, Reached};
-use super::decision;
+use super::decision::{self, V1Decision};
 use super::error::ApiError;
-use super::flight::{Attachment, FlightKey, Outcome};
+use super::flight::{Artifact, Attachment, FlightKey, Outcome};
 use super::input::{normalize_pkg_purl, sanitize_upload_filename, valid_http_url};
 use crate::lookup::pick_verdict;
-use crate::model::Level;
 
 /// Query for `GET /v1/lookup` and `POST /v1/analyze`. `purl`, `url` and
 /// `sha256` repeat; one `sha256` names one artifact, and only a lookup takes
@@ -31,7 +30,7 @@ use crate::model::Level;
 /// a sequence, and `serde_urlencoded` — what axum's `Query` is built on —
 /// cannot deserialize one. It silently rejects the whole request instead, which
 /// would make `?purl=a&purl=b` a 400 with no explanation.
-pub(super) struct V1LookupQuery {
+pub(super) struct V1Query {
     purl: Vec<String>,
     url: Vec<String>,
     sha256: Vec<String>,
@@ -65,7 +64,7 @@ pub(super) struct V1LookupQuery {
     /// means the same thing at both hops.
     fresh: bool,
     /// Bypass outer verdict caches and reconcile a SHA with Hopper. Hopper's
-    /// result is reusable only when it was produced by this worker's traits;
+    /// result is reusable only when it was produced by this server's traits;
     /// otherwise the immutable sample bytes are fetched and analyzed here.
     refresh: bool,
     /// A file on this host to analyze (`/v1/analyze` only, and only when the
@@ -104,7 +103,7 @@ fn header_wants_fresh(headers: &HeaderMap) -> bool {
         .is_some_and(affirmative)
 }
 
-impl V1LookupQuery {
+impl V1Query {
     /// Fold the header alias into the parsed query. Either spelling opts in;
     /// neither can opt back out, so a proxy that adds the header cannot be
     /// defeated by a stale `fresh=0` further down the chain.
@@ -176,7 +175,7 @@ impl V1LookupQuery {
 /// asking for more is refused rather than quietly trimmed, so a caller never
 /// mistakes a shallower answer for the one it asked for.
 fn v1_follow_policy(
-    q: &V1LookupQuery,
+    q: &V1Query,
     configured: crate::fetch::FetchPolicy,
 ) -> Result<crate::fetch::FetchPolicy, ApiError> {
     if q.follow.is_empty() {
@@ -227,7 +226,7 @@ const V1_PROGRESS_EVERY: Duration = Duration::from_secs(5);
 struct V1Analyze {
     request_id: u64,
     started: Instant,
-    q: V1LookupQuery,
+    q: V1Query,
     budget: u16,
     follow: RequestFollow,
     /// The package as the caller spelled it, and its normalized key.
@@ -242,7 +241,7 @@ struct V1Analyze {
 impl V1Analyze {
     /// Validate everything the query says. A refusal is a finished response:
     /// an unparseable PURL names what the caller sent on the access line.
-    fn parse(state: &AppState, request_id: u64, q: V1LookupQuery) -> Result<Self, Box<Response>> {
+    fn parse(state: &AppState, request_id: u64, q: V1Query) -> Result<Self, Box<Response>> {
         let started = Instant::now();
         let reject =
             |code, message: &'static str| Box::new(ApiError::bad_request(code, message).response());
@@ -380,8 +379,8 @@ impl V1Analyze {
 ///
 /// The whole point of this route over `/analyze-purl` is that it survives being
 /// slow. A proxy between us and the caller gives up on a silent connection —
-/// measured at 125 seconds in front of this fleet — and tears it down, which
-/// costs the caller an analysis that in fact completed: the worker finishes,
+/// after as little as 125 seconds — and tears it down, which costs the
+/// caller an analysis that in fact completed: the server finishes,
 /// files its verdict, and answers the next asker in milliseconds, but the reply
 /// to *this* request had nowhere to go.
 ///
@@ -406,7 +405,7 @@ pub(super) async fn v1_analyze(
     body: axum::body::Body,
 ) -> Response {
     let request_id = request_id.get();
-    let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
+    let q = V1Query::parse(raw.0.as_deref()).with_fresh_header(&headers);
     let req = match V1Analyze::parse(&state, request_id, q) {
         Ok(req) => req,
         Err(rejected) => return *rejected,
@@ -541,17 +540,17 @@ async fn analyze_bytes(
 
     // Already answered? The digest is in hand before any temp file exists, so
     // this costs one index probe against the very artifact the caller sent;
-    // without it, re-uploading something this worker has already analyzed
+    // without it, re-uploading something this server has already analyzed
     // pays for the whole analysis again.
     //
     // Resolved by digest and by digest ALONE. The PURL must not reach the
-    // resolver here, and this is not a style preference — passing it was a
-    // false negative with a CVE's shape. Hopper answers a `?sha256=…&purl=…`
+    // resolver here, and this is not a style preference — passing it would be
+    // a false negative with a CVE's shape. Hopper answers a `?sha256=…&purl=…`
     // query on either key, so an upload of arbitrary bytes carrying `?purl=` of
-    // a package the corpus knows came back with *that package's* verdict:
-    // measured against production, 25 bytes of text sent as
-    // `?purl=pkg:npm/chalk@5.3.0` were answered `allow` under chalk's digest,
-    // and the bytes were never looked at. Anything can be laundered through a
+    // a package the corpus knows would come back with *that package's*
+    // verdict: 25 bytes of text sent as `?purl=pkg:npm/chalk@5.3.0` would be
+    // answered `allow` under chalk's digest without the bytes ever being
+    // looked at. Anything can be laundered through a
     // reputable coordinate that way, which is precisely the attack this route
     // exists to catch. What is asked about is the digest, which is the only
     // thing an upload actually names; the caller's PURL is grafted back on
@@ -600,8 +599,8 @@ async fn analyze_bytes(
         return refused(req, &refusal);
     }
 
-    let attachment = state.flights.join(FlightKey::sha_follow(
-        sha.clone(),
+    let attachment = state.flights.join(FlightKey::new(
+        Artifact::Sha(sha.clone()),
         req.follow.policy.selection_bits(),
         state.config.fetch.selection_bits(),
     ));
@@ -802,8 +801,8 @@ async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Res
     if let Err(refusal) = state.admit_request(request_id).await {
         return refusal.response();
     }
-    let attachment = state.flights.join(FlightKey::url_follow(
-        url.clone(),
+    let attachment = state.flights.join(FlightKey::new(
+        Artifact::Url(url.clone()),
         req.follow.policy.selection_bits(),
         state.config.fetch.selection_bits(),
     ));
@@ -839,11 +838,10 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     // Already answered?
     //
     // This is the expensive door into the question `/v1/lookup` answers
-    // cheaply, and until it asked, every caller paid a full download-and-
-    // classify for an artifact this worker already held a verdict for.
-    // Measured against production, three consecutive analyses of
-    // pkg:cargo/tokio@1.40.0 ran 291s, 161s and 116s while `/v1/lookup`
-    // answered the same question from the index in a single hop.
+    // cheaply. Without asking first, every caller would pay a full download-
+    // and-classify — minutes for a large crate — for an artifact this server
+    // already holds a verdict for, while `/v1/lookup` answers the same
+    // question from the index in a single hop.
     //
     // Resolved exactly the way the lookup resolves it — same normalization,
     // same index-then-corpus order, same budget — because two routes answering
@@ -880,8 +878,8 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
         return refused(req, &refusal);
     }
 
-    let attachment = state.flights.join(FlightKey::purl_follow(
-        purl.clone(),
+    let attachment = state.flights.join(FlightKey::new(
+        Artifact::Purl(purl.clone()),
         req.follow.policy.selection_bits(),
         state.config.fetch.selection_bits(),
     ));
@@ -1090,9 +1088,9 @@ fn outcome_response(
 /// 422 is what [`ApiError::from_analysis`] renders for
 /// [`crate::fetch::Unretrievable`]; 413 is an artifact past the size limit.
 /// Both are facts about the package that will not change if the caller retries
-/// against a healthier worker, and both are what poppy files under download
+/// against a healthier server, and both are what poppy files under download
 /// failures rather than its error rate. Every other status — 500, 504, 429, a
-/// worker starting up — is about us, and stays an unqualified outage.
+/// server starting up — is about us, and stays an unqualified outage.
 fn unretrievable_reason(status: StatusCode) -> Option<&'static str> {
     match status {
         StatusCode::UNPROCESSABLE_ENTITY => Some("unretrievable"),
@@ -1175,7 +1173,7 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
             Outcome::Failed(refusal) if refusal.status == StatusCode::TOO_MANY_REQUESTS => {
                 // Refused after the stream began (a big whale found every slot
                 // taken). Not a decision: the stream ends without one, which a
-                // router reads as "hand this to a worker with room". A decision
+                // router reads as "hand this to a server with room". A decision
                 // here would be final and wrong — the package was never looked
                 // at.
                 tracing::warn!(id = request_id, subject = %named.subject, elapsed_ms = elapsed, "streamed analysis refused; ending without a decision");
@@ -1198,13 +1196,12 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
                 // An artifact nobody can download is not an outage, and the
                 // difference is already drawn on the unstreamed path, where an
                 // unretrievable package is a 422. Collapsing every failure into
-                // a bare `unavailable` put that back for every streamed caller,
+                // a bare `unavailable` would erase it for every streamed caller,
                 // which is all of them: poppy asks with `Accept:
-                // application/x-ndjson`, so it never saw the 422 and scored a
-                // dead package as a beamline outage. On 2026-09-17 one deleted
-                // GitHub repo — whose twelve versions proxy.golang.org still
-                // lists from cache and can no longer serve — paged the fleet
-                // that way.
+                // application/x-ndjson`, so it never sees the 422 and would
+                // score a dead package — say, a deleted GitHub repo whose
+                // versions proxy.golang.org still lists but cannot serve — as a
+                // beamline outage.
                 //
                 // The decision stays `unavailable`: we still did not answer,
                 // and a caller must not read an assessment into it. What
@@ -1298,7 +1295,7 @@ pub(super) async fn v1_lookup(
     headers: HeaderMap,
 ) -> Response {
     let started = Instant::now();
-    let q = V1LookupQuery::parse(raw.0.as_deref()).with_fresh_header(&headers);
+    let q = V1Query::parse(raw.0.as_deref()).with_fresh_header(&headers);
     let response = v1_lookup_inner(&state, &q)
         .await
         .unwrap_or_else(|refusal| refusal.response());
@@ -1309,7 +1306,7 @@ pub(super) async fn v1_lookup(
     response
 }
 
-async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1LookupQuery) -> Result<Response, ApiError> {
+async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1Query) -> Result<Response, ApiError> {
     let budget = q.budget(state.config.level)?;
     let shas: Vec<&str> = q
         .sha256
@@ -1487,16 +1484,16 @@ impl Key {
     fn stored(&self, verdict: &crate::lookup::Verdict, budget: u16) -> (V1Decision, &'static str) {
         (
             V1Decision::stored(verdict, self.purl.as_deref(), budget).with_url(self.url.as_deref()),
-            // Held, not produced. This used to report `scan:analysis` — the
-            // same value a fresh run reports — which made an instant index hit
-            // and a ninety-second analysis indistinguishable to anything
-            // counting cache layers.
+            // Held, not produced. Reporting `scan:analysis` — the value a
+            // fresh run reports — would make an instant index hit and a
+            // ninety-second analysis indistinguishable to anything counting
+            // cache layers.
             "scan:index",
         )
     }
 }
 
-/// The verdict this worker holds for `key`. The digest is the identity: a
+/// The verdict this server holds for `key`. The digest is the identity: a
 /// PURL's verdict is accepted only when it describes the same bytes, because a
 /// release whose digest has moved is an answer about a different artifact than
 /// the one asked about. Blocking: the index is files.
@@ -1511,7 +1508,7 @@ fn held(index: &crate::lookup::Index, key: &Key, corpus: bool) -> Option<crate::
     }
 }
 
-/// The decision for one artifact, in this worker's own vocabulary.
+/// The decision for one artifact, in this server's own vocabulary.
 ///
 /// A missing index is not an empty one. Reporting `unanalyzed` then would tell
 /// the caller nobody has analyzed this package, when what is true is that we
@@ -1609,7 +1606,7 @@ fn corpus_source(source: Option<corpus::CorpusSource>) -> &'static str {
     }
 }
 
-/// The decision for an artifact this worker's index does not hold: the
+/// The decision for an artifact this server's index does not hold: the
 /// filters, then the corpus.
 async fn decide_unheld(
     state: &AppState,
@@ -1652,7 +1649,7 @@ async fn decide_unheld(
             .with_url(url)
     };
 
-    // Not in this worker's index. The corpus behind it may still know, and a
+    // Not in this server's index. The corpus behind it may still know, and a
     // caller should not have to learn that two services exist in order to get
     // one answer — so ask, rather than reporting an absence that is only ours.
     //
@@ -1678,1111 +1675,5 @@ async fn decide_unheld(
     (decided, corpus_source(source))
 }
 
-/// One decision, as it goes on the wire.
-///
-/// Every field is always present. A key that is unknown is `null` and a list
-/// that is empty is `[]`, never absent — a caller writes one code path against
-/// a shape that does not move, and a generated type has no optionals to unwrap
-/// that are really just "we had nothing to say".
-#[derive(serde::Serialize)]
-pub(super) struct V1Decision {
-    decision: decision::Decision,
-    purl: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    sha256: Option<String>,
-    severity: Option<decision::Severity>,
-    /// The tightest false-positive budget per 100 million benign files at which
-    /// this artifact grades hostile — lower being worse, and `-1` meaning it
-    /// fires at none. A property of the file and the model: measured, never
-    /// chosen, which is what separates it from the caller's own
-    /// `false_positive_budget` that it is compared against. Present so a caller
-    /// can tune that budget against real numbers; `null` when there is none.
-    fires_at: Level,
-    reason: Option<String>,
-    findings: Vec<V1Finding>,
-    engine_version: Option<String>,
-    analyzed_at: Option<String>,
-}
-
-impl V1Decision {
-    /// Nobody has analyzed this artifact. Nothing is wrong; there is simply no
-    /// answer, and what a caller does about that is their policy to set.
-    fn unanalyzed(sha: Option<&str>, purl: Option<&str>) -> Self {
-        Self::empty(decision::Decision::Unanalyzed, sha, purl)
-    }
-
-    /// We could not answer. Deliberately carries no severity, no level and no
-    /// findings: this decision is about us, not about the artifact, and a
-    /// caller must not be able to read anything into it.
-    fn unavailable(sha: Option<&str>, purl: Option<&str>) -> Self {
-        Self::empty(decision::Decision::Unavailable, sha, purl)
-    }
-
-    /// What the filters alone justify, for an artifact no stored verdict and no
-    /// corpus record covers. `None` when the filters had no opinion.
-    ///
-    /// `engine_version` and `analyzed_at` stay `None`, which is the whole
-    /// contract: an engine is what separates a measurement from a citation, so
-    /// a caller (and beamline's cache) can tell this from a scan we ran, and
-    /// `/v1/analyze` is free to replace it with a real one.
-    ///
-    /// Levels come from [`crate::lookup::bloom_claim`] — the loosest each tier
-    /// can justify, since a filter carries membership and not a measurement.
-    fn bloom(
-        d: crate::bloom_repo::Decision,
-        sha: Option<&str>,
-        purl: Option<&str>,
-        budget: u16,
-    ) -> Option<Self> {
-        let claim = crate::lookup::bloom_claim(d)?;
-        let fires_at = claim.lvl;
-        let (decided, severity) = decision::decide(fires_at, budget);
-        Some(Self {
-            decision: decided,
-            purl: purl.map(str::to_owned),
-            url: None,
-            sha256: sha.map(str::to_owned),
-            severity: Some(severity),
-            fires_at,
-            reason: claim.finding.as_ref().map(|f| f.desc.to_owned()),
-            findings: claim
-                .finding
-                .as_ref()
-                .map(|f| V1Finding::from_bloom(f, purl))
-                .into_iter()
-                .collect(),
-            engine_version: None,
-            analyzed_at: None,
-        })
-    }
-
-    fn empty(decided: decision::Decision, sha: Option<&str>, purl: Option<&str>) -> Self {
-        Self {
-            decision: decided,
-            purl: purl.map(str::to_owned),
-            url: None,
-            sha256: sha.map(str::to_owned),
-            severity: None,
-            fires_at: Level::Manual,
-            reason: None,
-            findings: Vec::new(),
-            engine_version: None,
-            analyzed_at: None,
-        }
-    }
-
-    /// Whether this says something about the artifact rather than about us,
-    /// and says it because an engine of ours measured it.
-    ///
-    /// `unanalyzed` reports that nobody has analyzed it, which is precisely what
-    /// `/v1/analyze` exists to fix, and `unavailable` reports that we could not
-    /// find out. Neither may stand in for a run.
-    ///
-    /// Nor may a level derived from threat-feed citations, and that one is the
-    /// easy miss: it carries a real `decision`, so it reads as a verdict at
-    /// every glance. Standing in for the run would mean an artifact nobody has
-    /// analyzed never gets analyzed — the caller is told `block`, the corpus
-    /// learns nothing, and the gap the derived level papers over stays open for
-    /// good. An engine is exactly what separates a measurement from a citation,
-    /// so an engine is what is asked for.
-    fn is_verdict(&self) -> bool {
-        !matches!(
-            self.decision,
-            decision::Decision::Unanalyzed | decision::Decision::Unavailable
-        ) && self.engine_version.is_some()
-    }
-
-    /// Anything that answers the caller's question, measured or not.
-    ///
-    /// Wider than [`Self::is_verdict`] on purpose, and the difference is a
-    /// policy choice rather than an oversight. `is_verdict` remains the strict
-    /// question — is this a measurement of ours — and downstream still asks it
-    /// by looking for an engine. This one governs whether `/v1/analyze` may
-    /// answer at all, where the operator's judgement is that a fast answer from
-    /// what we already know beats spending a slot to rediscover it.
-    ///
-    /// The cost is real and worth naming: for an artifact nobody has analyzed
-    /// and a feed has cited, this answers from the citation and the analysis
-    /// never happens, so the corpus does not learn. `?fresh=1` is the escape
-    /// hatch for a caller who needs the measurement, and the derived answer
-    /// still carries no `engine_version`, so nothing downstream mistakes it for
-    /// one.
-    ///
-    /// `unanalyzed` and `unavailable` are excluded exactly as before: the first is
-    /// what `/v1/analyze` exists to fix, the second is a statement about us.
-    fn is_answerable(&self) -> bool {
-        !matches!(
-            self.decision,
-            decision::Decision::Unanalyzed | decision::Decision::Unavailable
-        ) && !self.fires_at.is_manual()
-    }
-
-    /// A verdict this worker holds in its own index.
-    ///
-    /// Takes no digest: a stored verdict always carries its own, and it is the
-    /// artifact's identity rather than whatever the caller happened to type.
-    fn stored(v: &crate::lookup::Verdict, purl: Option<&str>, budget: u16) -> Self {
-        let (decided, severity) = decision::decide(v.lvl, budget);
-        Self {
-            decision: decided,
-            // The verdict names the artifact it is about; the caller's spelling
-            // only fills in what it could not.
-            purl: v.purl.clone().or_else(|| purl.map(str::to_owned)),
-            url: None,
-            sha256: Some(v.sha256.clone()),
-            severity: Some(severity),
-            fires_at: v.lvl,
-            reason: v.why.clone(),
-            findings: V1Finding::worth_reporting(v.hits.iter().map(V1Finding::from_hit)),
-            engine_version: Some(v.eng.clone()),
-            analyzed_at: Some(v.at.clone()),
-        }
-    }
-
-    /// A record the corpus holds. Decided here rather than there: hopper stores
-    /// what an artifact is, and turning that into allow or block is policy this
-    /// worker owns, so the same budget produces the same answer whichever side
-    /// of the index the record came from.
-    fn corpus(
-        r: &corpus::CorpusRecord,
-        sha: Option<&str>,
-        purl: Option<&str>,
-        budget: u16,
-    ) -> Self {
-        let (decided, severity) = decision::decide(r.fires_at, budget);
-        Self {
-            decision: decided,
-            purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
-            url: None,
-            // Empty is absent. A record standing on threat-feed citations for a
-            // package nobody has analyzed names no bytes, and the corpus sends
-            // the field as "" rather than omitting it — which would put an
-            // empty string where the wire contract says string|null, and where
-            // a caller comparing digests to prove two spellings are one thing
-            // would find them equal.
-            sha256: r
-                .sha256
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| sha.map(str::to_owned)),
-            severity: Some(severity),
-            fires_at: r.fires_at,
-            reason: r.reason.clone(),
-            findings: V1Finding::worth_reporting(r.findings.iter().map(V1Finding::from_corpus)),
-            engine_version: r.engine_version.clone(),
-            analyzed_at: r.analyzed_at.clone(),
-        }
-    }
-
-    /// Attach the reason an `unavailable` came about. `None` leaves the
-    /// decision exactly as it was, so the common outage keeps its bare shape.
-    fn because(mut self, reason: Option<&'static str>) -> Self {
-        if let Some(reason) = reason {
-            self.reason = Some(reason.to_owned());
-        }
-        self
-    }
-
-    /// Answer about the coordinate the caller named, in the spelling they
-    /// named it.
-    ///
-    /// Every key is normalized before it is looked up — PyPI folds `.` and `_`
-    /// to `-` per PEP 503, npm scopes are unwrapped, a bare `npm/left-pad` gets
-    /// its `pkg:` — and echoing the normalized form back is how
-    /// `pkg:pypi/info.gianlucacosta.eos.core@2.0.2` came home answered about
-    /// `pkg:pypi/info-gianlucacosta-eos-core@2.0.2`. The same package, and a
-    /// caller has no way to know that without implementing PEP 503 themselves.
-    ///
-    /// That matters most where it is least visible: a lookup may name fifty
-    /// packages and the reply is a list, so `purl` is what a caller matches
-    /// response to request by. Rewriting the spelling breaks that silently, and
-    /// only for the names that happen to contain a `.` or a `_`.
-    ///
-    /// So the field answers "the package you asked about" and the caller's
-    /// bytes are returned unaltered. `sha256` remains the identity, and it is
-    /// the field to compare when two spellings must be proven to be one thing.
-    fn asked_about(mut self, asked: Option<&str>) -> Self {
-        if let Some(asked) = asked {
-            self.purl = Some(asked.to_owned());
-        }
-        self
-    }
-
-    fn asked_about_url(mut self, asked: Option<&str>) -> Self {
-        if let Some(asked) = asked {
-            self.url = Some(asked.to_owned());
-        }
-        self
-    }
-
-    fn with_url(mut self, url: Option<&str>) -> Self {
-        if let Some(url) = url {
-            self.url = Some(url.to_owned());
-        }
-        self
-    }
-}
-
-/// One finding on the wire.
-///
-/// Fed from this worker's index or from the corpus, which know different
-/// amounts about the same thing: a stored hit carries the file and offset it
-/// fired on, while the corpus keeps only the trait and its criticality — those
-/// details live in the one column a lookup must not read.
-///
-/// `id` and `crit` are therefore the only fields always present, and the rest
-/// are omitted when there is nothing to say rather than sent as null. That is
-/// the opposite of the rule the enclosing decision object follows, and the two
-/// differ because the questions do. A decision has a FIXED set of things it
-/// answers, so a caller writes one code path against nine keys that never move
-/// and `"engine_version": null` is itself the answer to "which engine". A
-/// finding has no such set: how much is known about one varies by where it came
-/// from, four nulls per corpus finding is most of the object, and a reader
-/// checking `desc` has to handle absence anyway.
-#[derive(Clone, Debug, serde::Serialize)]
-pub(super) struct V1Finding {
-    id: String,
-    crit: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pkg: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    desc: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    off: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line: Option<u64>,
-}
-
-impl V1Finding {
-    fn from_hit(h: &crate::lookup::Hit) -> Self {
-        let some = |s: &String| (!s.is_empty()).then(|| s.clone());
-        Self {
-            id: h.id.clone(),
-            crit: h.crit,
-            file: some(&h.file),
-            pkg: some(&h.pkg),
-            desc: some(&h.desc),
-            off: h.off,
-            line: h.line,
-        }
-    }
-
-    /// A finding synthesized from a filter hit. Carries no `file`, `off` or
-    /// `line` — a filter knows membership and nothing about where anything
-    /// fired — which is the same shape the corpus sends for a citation.
-    fn from_bloom(c: &crate::lookup::BloomFinding, purl: Option<&str>) -> Self {
-        Self {
-            id: c.id.to_owned(),
-            crit: c.crit,
-            file: None,
-            pkg: purl.map(str::to_owned),
-            desc: Some(c.desc.to_owned()),
-            off: None,
-            line: None,
-        }
-    }
-
-    fn from_corpus(f: &corpus::CorpusFinding) -> Self {
-        Self {
-            id: f.id.clone(),
-            crit: f.crit,
-            file: None,
-            pkg: None,
-            desc: f.desc.clone(),
-            off: None,
-            line: None,
-        }
-    }
-
-    /// The findings worth putting on the wire: the strongest few, worst first.
-    ///
-    /// The corpus already decides this in a trigger — `crit >= 4`, ordered by
-    /// criticality, at most three — and a decision answered from this worker's
-    /// own index has to land on the same set, or one artifact reads differently
-    /// depending on which side of the index happened to answer. Applying it
-    /// here rather than trusting each source keeps the two in step by
-    /// construction; on corpus records it is a no-op.
-    ///
-    /// A benign artifact clears the bar with nothing, and that is the intended
-    /// answer rather than a gap to fill: ten "Rust test marker" hits explain
-    /// nothing about an allow, and listing them invites a caller to read
-    /// significance into noise.
-    fn worth_reporting(all: impl Iterator<Item = Self>) -> Vec<Self> {
-        let mut kept: Vec<Self> = all.filter(|f| f.crit >= REPORT_MIN_CRIT).collect();
-        // Stable, so equal criticalities keep the order their source listed
-        // them in — the same tiebreak as the trigger's `ORDER BY crit DESC,
-        // ord`.
-        kept.sort_by_key(|f| std::cmp::Reverse(f.crit));
-        kept.truncate(REPORT_LIMIT);
-        kept
-    }
-}
-
-/// Suspicious and above. Below this a trait is an observation, not a reason.
-const REPORT_MIN_CRIT: u8 = 4;
-
-/// Enough to show why, few enough to read. Matches the corpus's `LIMIT 3`.
-const REPORT_LIMIT: usize = 3;
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn versioned_purl_uses_corpus_even_with_a_clean_local_alias() -> anyhow::Result<()> {
-        use super::super::ServerConfig;
-        use crate::lookup::Verdict;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let purl = "pkg:pypi/critical-release-choice@1.0.0";
-        let clean_sha = "c1".repeat(32);
-        let critical_sha = "d2".repeat(32);
-        let index = crate::lookup::global().expect("verdict index enabled");
-        index.replace(&Verdict {
-            sha256: clean_sha.clone(),
-            lvl: Level::Clean,
-            eng: "local".into(),
-            at: "2026-01-02T00:00:00Z".into(),
-            purl: Some(purl.into()),
-            why: None,
-            hits: Vec::new(),
-        });
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let payload = serde_json::json!({
-            "sha256": critical_sha, "purl": purl, "fires_at": 0,
-            "engine_version": "corpus", "analyzed_at": "2026-01-01T00:00:00Z", "findings": []
-        });
-        let corpus = axum::Router::new().route(
-            "/v1/lookup",
-            axum::routing::get(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                let payload = payload.clone();
-                async move { axum::Json(payload) }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let task = tokio::spawn(async move { axum::serve(listener, corpus).await });
-        let (_router, state) = super::super::assemble(ServerConfig {
-            hopper: Some(format!("http://{address}")),
-            ..ServerConfig::default()
-        })?;
-        let key = Key::parse(None, Some(purl), None).expect("valid purl");
-        assert!(
-            held(index, &key, true).is_none(),
-            "one payload cannot stand for its release"
-        );
-        assert!(
-            held(index, &key, false).is_some(),
-            "standalone workers retain local lookups"
-        );
-        let (single, _) = decide(&state, &key, 25, false).await;
-        assert_eq!(single.fires_at, Level::At(0));
-        assert_eq!(single.sha256.as_deref(), Some(critical_sha.as_str()));
-        let batch = decide_many(&state, vec![key.clone(), key], 25, false).await;
-        for (decision, _) in batch {
-            assert_eq!(decision.fires_at, Level::At(0));
-            assert_eq!(decision.sha256.as_deref(), Some(critical_sha.as_str()));
-        }
-        let before = calls.load(Ordering::SeqCst);
-        assert!(
-            before >= 3,
-            "single and batch lookups must reach the corpus"
-        );
-        let exact = Key::parse(Some(&clean_sha), Some(purl), None).expect("valid keys");
-        let (decision, _) = decide(&state, &exact, 25, false).await;
-        assert_eq!(decision.fires_at, Level::Clean);
-        assert_eq!(decision.sha256.as_deref(), Some(clean_sha.as_str()));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            before,
-            "digest hits stay artifact-specific"
-        );
-        task.abort();
-        Ok(())
-    }
-
-    #[test]
-    fn only_versioned_purl_only_keys_require_corpus_selection() {
-        for (sha, purl, expected) in [
-            (None, Some("pkg:pypi/litellm@1.107.0"), true),
-            (None, Some("pkg:npm/%40scope/name@1.0"), true),
-            (None, Some("pkg:pypi/litellm"), false),
-            (None, Some("pkg:npm/%40scope/name"), false),
-            (
-                Some("a".repeat(64)),
-                Some("pkg:pypi/litellm@1.107.0"),
-                false,
-            ),
-        ] {
-            let key = Key::parse(sha.as_deref(), purl, None).expect("valid keys");
-            assert_eq!(key.needs_corpus(true), expected, "{key:?}");
-            assert!(!key.needs_corpus(false));
-        }
-    }
-
-    /// A pending analysis must send progress before it has an outcome. Use a
-    /// paused clock and an unpublished flight so neither a fast refusal nor
-    /// an installed verdict can stand in for the streaming path.
-    #[tokio::test]
-    async fn a_pending_analysis_streams_progress_before_its_decision() -> anyhow::Result<()> {
-        use anyhow::Context as _;
-        use futures_core::Stream as _;
-        use std::future::poll_fn;
-        use std::pin::Pin;
-
-        let purl = "pkg:npm/stream-fixture@1.0.0";
-        let flights = Arc::new(super::super::flight::Flights::default());
-        let attachment = flights.join(FlightKey::Purl(purl.into()));
-        let publisher = flights.publisher(attachment.flight());
-        let request = V1Analyze {
-            request_id: 1,
-            started: Instant::now(),
-            q: V1LookupQuery::parse(None),
-            budget: 25,
-            follow: RequestFollow {
-                policy: crate::fetch::FetchPolicy::default(),
-                refresh: false,
-            },
-            purl: Some((purl.into(), purl.into())),
-            url: None,
-            path: None,
-        };
-        let named = Named {
-            key: Some(purl.into()),
-            asked: Some(purl.into()),
-            subject: purl.into(),
-            is_url: false,
-        };
-        let response =
-            tokio::time::timeout(Duration::from_secs(1), answer(&request, attachment, named))
-                .await
-                .context("a pending analysis did not send headers within one second")?;
-        assert_eq!(response.headers()["content-type"], "application/x-ndjson");
-        assert_eq!(response.headers()["X-Scan-Follow"], "none");
-
-        let mut body = response.into_body().into_data_stream();
-        let progress = tokio::time::timeout(
-            Duration::from_secs(5),
-            poll_fn(|cx| Pin::new(&mut body).poll_next(cx)),
-        )
-        .await
-        .context("a pending analysis did not send its first progress frame")?
-        .context("stream ended before its first progress frame")??;
-        let progress: serde_json::Value = serde_json::from_slice(&progress)?;
-        assert_eq!(progress["state"], "analyzing");
-        assert_eq!(progress["purl"], purl);
-        assert!(progress.get("decision").is_none());
-
-        publisher.publish(Outcome::Failed(ApiError::init_failed()));
-        let decision = tokio::time::timeout(
-            Duration::from_secs(1),
-            poll_fn(|cx| Pin::new(&mut body).poll_next(cx)),
-        )
-        .await
-        .context("stream did not send the completed decision")?
-        .context("stream ended without a decision")??;
-        let decision: serde_json::Value = serde_json::from_slice(&decision)?;
-        assert_eq!(decision["decision"], "unavailable");
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                poll_fn(|cx| Pin::new(&mut body).poll_next(cx)),
-            )
-            .await
-            .context("stream did not end after its decision")?
-            .is_none()
-        );
-        Ok(())
-    }
-
-    /// A finding says only what is known about it.
-    ///
-    /// The decision object around it keeps every key at all times; a finding
-    /// does not, because how much is known about one varies by where it came
-    /// from. A corpus finding knows the trait and its criticality and nothing
-    /// else — sending four nulls to say so is most of the object.
-    #[test]
-    fn a_finding_omits_what_it_does_not_know() {
-        use super::corpus::CorpusFinding;
-        let corpus = V1Finding::from_corpus(&CorpusFinding {
-            id: "intel/feed/malicious".into(),
-            crit: 5,
-            desc: Some("Cited as malicious by 3 independent sources.".into()),
-        });
-        let json = serde_json::to_value(&corpus).expect("serialize");
-        let obj = json.as_object().expect("object");
-        assert!(obj.contains_key("id"), "id is the finding's identity");
-        assert!(obj.contains_key("crit"), "crit is always known");
-        assert!(obj.contains_key("desc"), "a desc that exists must be sent");
-        for absent in ["file", "pkg", "off", "line"] {
-            assert!(
-                !obj.contains_key(absent),
-                "{absent} is unknown here and must be omitted, not null"
-            );
-        }
-        // Never null: absent is how "nothing to say" is spelled in a finding.
-        assert!(
-            obj.values().all(|v| !v.is_null()),
-            "a null survived into a finding: {json}"
-        );
-    }
-
-    /// What may answer `/v1/analyze` without spending a slot.
-    ///
-    /// The rule is "anything that actually answers the question", which is
-    /// wider than "a measurement of ours" — an operator's call, made because a
-    /// fast answer from what we already know beats rediscovering it. What stays
-    /// excluded is what was always excluded: `unanalyzed`, which is the very thing
-    /// the route exists to fix, and `unavailable`, which is a statement about us
-    /// rather than about the artifact.
-    #[test]
-    fn only_a_real_answer_may_replace_an_analysis() {
-        use super::decision::Decision;
-        let purl = Some("pkg:npm/left-pad@1.3.0");
-        assert!(!V1Decision::unanalyzed(None, purl).is_answerable());
-        assert!(!V1Decision::unavailable(None, purl).is_answerable());
-
-        // A decision with no level answers nothing, whatever it is labelled.
-        assert!(!V1Decision::empty(Decision::Block, None, purl).is_answerable());
-
-        let measured = |d| {
-            let mut v = V1Decision::empty(d, None, purl);
-            v.engine_version = Some("2.8.0".into());
-            v.fires_at = Level::At(10);
-            v
-        };
-        assert!(measured(Decision::Allow).is_answerable());
-        assert!(measured(Decision::Block).is_answerable());
-    }
-
-    /// A derived answer may answer, but must never claim to be a measurement:
-    /// the absent engine is what stops it being cached as one downstream, and
-    /// what `?fresh=1` exists to get past.
-    #[test]
-    fn a_derived_answer_answers_without_claiming_an_engine() {
-        let purl = Some("pkg:npm/left-pad@1.3.0");
-        for d in [
-            crate::bloom_repo::Decision::Skip,
-            crate::bloom_repo::Decision::SightedHostile,
-            crate::bloom_repo::Decision::SightedSuspicious,
-            crate::bloom_repo::Decision::KnownBad,
-        ] {
-            let derived = V1Decision::bloom(d, None, purl, 25).expect("answerable");
-            assert!(derived.is_answerable(), "{d:?}");
-            assert!(!derived.is_verdict(), "{d:?} is not a measurement");
-            assert!(derived.engine_version.is_none(), "{d:?}");
-            assert!(derived.analyzed_at.is_none(), "{d:?}");
-        }
-        // No filter had an opinion: nothing to answer with.
-        assert!(V1Decision::bloom(crate::bloom_repo::Decision::Unknown, None, purl, 25).is_none());
-    }
-
-    /// `fresh` is opt-in on the same affirmative-only terms as `force`, and is
-    /// a separate question from it: `force` spends a slot, `fresh` chooses
-    /// which layer may answer. A caller can want either without the other.
-    #[test]
-    fn only_an_affirmative_fresh_bypasses_the_filters() {
-        let q = |raw| V1LookupQuery::parse(Some(raw));
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=1").fresh);
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=true").fresh);
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=yes").fresh);
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0&fresh=0").fresh);
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0&fresh=").fresh);
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0").fresh);
-
-        // Independent of `force`, in both directions.
-        let both = q("purl=pkg:npm/left-pad@1.3.0&fresh=1&force=0");
-        assert!(both.fresh && !both.force);
-        let other = q("purl=pkg:npm/left-pad@1.3.0&fresh=0&force=1");
-        assert!(!other.fresh && other.force);
-    }
-
-    /// The header spelling is an alias, not an override: either opts in, and a
-    /// proxy that adds the header cannot be defeated by a stale `fresh=0`
-    /// further down the chain.
-    #[test]
-    fn the_fresh_header_is_an_alias_that_only_opts_in() {
-        let headers = |value: Option<&str>| {
-            let mut h = HeaderMap::new();
-            if let Some(v) = value {
-                h.insert(
-                    "x-hopper-fresh",
-                    HeaderValue::from_str(v).expect("header value"),
-                );
-            }
-            h
-        };
-        let q = |raw, header| {
-            V1LookupQuery::parse(Some(raw))
-                .with_fresh_header(&headers(header))
-                .fresh
-        };
-        let base = "purl=pkg:npm/left-pad@1.3.0";
-        assert!(q(base, Some("1")), "the header alone opts in");
-        assert!(q(base, Some("true")));
-        assert!(!q(base, Some("0")), "a negative header is not an opt-in");
-        assert!(!q(base, None));
-        // Neither spelling can opt back out of the other.
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=1", Some("0")));
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&fresh=0", Some("1")));
-    }
-
-    /// Forcing a fresh run is opt-in, and only an affirmative spelling opts in.
-    /// The expensive reading of an ambiguous value is the one that burns an
-    /// analysis slot, so anything else leaves the cheap path in place.
-    #[test]
-    fn only_an_affirmative_force_spends_a_slot() {
-        let q = |raw| V1LookupQuery::parse(Some(raw)).force;
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=1"));
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=true"));
-        assert!(q("purl=pkg:npm/left-pad@1.3.0&force=yes"));
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force=0"));
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force=false"));
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0&force="));
-        assert!(!q("purl=pkg:npm/left-pad@1.3.0"));
-    }
-
-    #[test]
-    fn refresh_has_one_unambiguous_wire_spelling() {
-        let q = |raw: &str| -> bool { V1LookupQuery::parse(Some(raw)).refresh };
-        assert!(q(
-            "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&refresh=1"
-        ));
-        for value in ["", "0", "true", "yes", "2"] {
-            let raw = format!(
-                "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&refresh={value}"
-            );
-            assert!(!q(&raw));
-        }
-    }
-
-    #[test]
-    fn refresh_reuses_only_an_explicit_matching_traits_version() {
-        assert!(matching_traits_version(Some("abc12"), Some("abc12")));
-        assert!(!matching_traits_version(Some("old00"), Some("abc12")));
-        assert!(!matching_traits_version(None, Some("abc12")));
-        assert!(!matching_traits_version(Some("abc12"), None));
-        assert!(!matching_traits_version(None, None));
-    }
-
-    #[test]
-    fn follow_policy_repeats_union_and_only_narrows_the_server_default() {
-        use crate::fetch::FetchPolicy;
-
-        let configured: FetchPolicy = "all".parse().unwrap();
-        let query = V1LookupQuery::parse(Some(
-            "purl=pkg:npm/app@1.0.0&follow=references&follow=ci-actions",
-        ));
-        assert_eq!(query.follow, ["references", "ci-actions"]);
-        let effective = v1_follow_policy(&query, configured).expect("valid selection");
-        assert!(effective.urls && effective.packages && effective.deps && effective.ci);
-
-        // A server configured not to follow references must not be talked into
-        // it, and must say so rather than answer a shallower question.
-        let dependencies_only: FetchPolicy = "dependencies".parse().unwrap();
-        let widen = V1LookupQuery::parse(Some("follow=references,dependencies"));
-        let refused = v1_follow_policy(&widen, dependencies_only).expect_err("widening refused");
-        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
-        assert_eq!(refused.code, "follow_not_allowed");
-        let within = V1LookupQuery::parse(Some("follow=dependencies"));
-        let effective = v1_follow_policy(&within, dependencies_only).expect("same policy");
-        assert!(effective.deps && !effective.urls && !effective.packages && !effective.ci);
-
-        let narrow = V1LookupQuery::parse(Some("follow=none"));
-        let effective = v1_follow_policy(&narrow, configured).expect("valid selection");
-        assert!(!effective.urls && !effective.packages && !effective.deps && !effective.ci);
-
-        let legacy = V1LookupQuery::parse(Some("follow=deps"));
-        assert!(v1_follow_policy(&legacy, configured).is_err());
-    }
-
-    /// One shape, whichever route answered and whatever it found.
-    ///
-    /// A caller writes one parser against nine keys and reads `decision` to
-    /// know what happened. That only holds if every way of producing a decision
-    /// produces the same keys — a field present on a lookup and absent on an
-    /// analysis is a field nobody can rely on, and the difference would show up
-    /// as an intermittent null rather than as an error.
-    #[test]
-    fn every_decision_has_the_same_shape() {
-        use super::corpus::{CorpusFinding, CorpusRecord};
-        use crate::lookup::{Hit, Verdict};
-
-        let stored = Verdict {
-            sha256: "a".repeat(64),
-            lvl: Level::At(3),
-            eng: "2.8.0".into(),
-            at: "2026-08-01T00:00:00Z".into(),
-            purl: Some("pkg:npm/evil@1.0.0".into()),
-            why: Some("Reverse shell in postinstall.".into()),
-            hits: vec![Hit {
-                id: "objectives/c2/backdoor".into(),
-                crit: 5,
-                file: "lib/install.js".into(),
-                pkg: String::new(),
-                desc: "Spawns bash".into(),
-                off: Some(109),
-                line: Some(12),
-            }],
-        };
-        let from_corpus = CorpusRecord {
-            sha256: Some("a".repeat(64)),
-            purl: Some("pkg:npm/evil@1.0.0".into()),
-            fires_at: Level::At(3),
-            engine_version: Some("2.8.0".into()),
-            traits_version: None,
-            analyzed_at: Some("2026-08-01T00:00:00Z".into()),
-            reason: Some("Reverse shell in postinstall.".into()),
-            findings: vec![CorpusFinding {
-                id: "objectives/c2/backdoor".into(),
-                crit: 5,
-                desc: None,
-            }],
-        };
-
-        let shapes = [
-            // What /v1/lookup and /v1/analyze both answer with on a hit.
-            V1Decision::stored(&stored, Some("pkg:npm/evil@1.0.0"), 25),
-            // What a lookup answers with when the corpus knew instead.
-            V1Decision::corpus(&from_corpus, None, Some("pkg:npm/evil@1.0.0"), 25),
-            V1Decision::unanalyzed(None, Some("pkg:npm/evil@1.0.0")),
-            V1Decision::unavailable(None, Some("pkg:npm/evil@1.0.0")),
-        ];
-
-        let keys = |d: &V1Decision| -> Vec<String> {
-            let v = serde_json::to_value(d).expect("serializes");
-            let mut k: Vec<String> = v
-                .as_object()
-                .expect("an object")
-                .keys()
-                .map(String::clone)
-                .collect();
-            k.sort();
-            k
-        };
-        let expected = keys(&shapes[0]);
-        assert_eq!(expected.len(), 9, "the shape changed: {expected:?}");
-        for shape in &shapes[1..] {
-            assert_eq!(
-                keys(shape),
-                expected,
-                "a decision answered with different keys"
-            );
-        }
-
-        // A finding, by contrast, does NOT keep one shape across the two
-        // sources, and that is deliberate. The decision object answers a fixed
-        // set of questions, so its keys never move; a finding's content depends
-        // on where it came from, and the corpus holds no file or offset at all.
-        // Sending four nulls to say so is most of the object, so absence is how
-        // "nothing to say" is spelled here.
-        let finding_keys = |d: &V1Decision| -> Vec<String> {
-            let v = serde_json::to_value(d).expect("serializes");
-            let mut k: Vec<String> = v["findings"][0]
-                .as_object()
-                .expect("a finding")
-                .keys()
-                .map(String::clone)
-                .collect();
-            k.sort();
-            k
-        };
-        let stored_finding = finding_keys(&shapes[0]);
-        let corpus_finding = finding_keys(&shapes[1]);
-        assert_eq!(
-            corpus_finding,
-            ["crit", "id"],
-            "a corpus finding must carry only what it knows",
-        );
-        // Whatever a finding does carry, it is never a null.
-        for shape in &shapes[..2] {
-            let v = serde_json::to_value(shape).expect("serializes");
-            assert!(
-                v["findings"][0]
-                    .as_object()
-                    .expect("a finding")
-                    .values()
-                    .all(|x| !x.is_null()),
-                "a null survived into a finding: {}",
-                v["findings"][0]
-            );
-        }
-        // The identity and severity are the two a caller may always rely on,
-        // whichever side of the index answered.
-        for id_or_crit in ["id", "crit"] {
-            assert!(
-                stored_finding.iter().any(|k| k == id_or_crit)
-                    && corpus_finding.iter().any(|k| k == id_or_crit),
-                "{id_or_crit} must be present on every finding",
-            );
-        }
-    }
-
-    /// A caller gets an answer about the package they named, spelled the way
-    /// they named it.
-    ///
-    /// Found in production: `pkg:pypi/info.gianlucacosta.eos.core@2.0.2` came
-    /// back answered about `pkg:pypi/info-gianlucacosta-eos-core@2.0.2`. Both
-    /// name the same project — PEP 503 folds `.` and `_` to `-` — but a caller
-    /// cannot know that without implementing PEP 503, and a lookup that names
-    /// fifty packages is matched to its request by this field. Rewriting it
-    /// breaks that correlation silently, and only for names with a `.` or `_`
-    /// in them.
-    #[test]
-    fn a_decision_is_spelled_the_way_the_caller_asked() {
-        use crate::lookup::Verdict;
-
-        let asked = "pkg:pypi/info.gianlucacosta.eos.core@2.0.2";
-        let normalized = "pkg:pypi/info-gianlucacosta-eos-core@2.0.2";
-        assert_eq!(
-            normalize_pkg_purl(asked).as_deref(),
-            Ok(normalized),
-            "the premise: these two spellings are one package",
-        );
-
-        // PEP 503 lowercases as well as folding separators, and that half was
-        // sighted separately in production: `pkg:pypi/ImportanceScore@1.2` came
-        // back answered about `pkg:pypi/importancescore@1.2`. Same cause, and a
-        // caller whose package name has no `.` or `_` in it at all.
-        let mixed = "pkg:pypi/ImportanceScore@1.2";
-        assert_eq!(
-            normalize_pkg_purl(mixed).as_deref(),
-            Ok("pkg:pypi/importancescore@1.2"),
-            "the premise: case folds too",
-        );
-        let cased = V1Decision::unanalyzed(None, Some("pkg:pypi/importancescore@1.2"))
-            .asked_about(Some(mixed));
-        assert_eq!(
-            serde_json::to_value(&cased).expect("serializes")["purl"],
-            mixed,
-            "the caller's capitalization was rewritten",
-        );
-
-        let stored = Verdict {
-            sha256: "a".repeat(64),
-            lvl: Level::Clean,
-            eng: "2.8.0".into(),
-            at: "2026-08-01T00:00:00Z".into(),
-            // What the index holds, which is always the normalized key.
-            purl: Some(normalized.to_string()),
-            why: None,
-            hits: Vec::new(),
-        };
-
-        // Every kind of decision, since a caller correlating a list of fifty
-        // gets whichever kind we happen to have.
-        let decisions = [
-            V1Decision::stored(&stored, Some(normalized), 25).asked_about(Some(asked)),
-            V1Decision::unanalyzed(None, Some(normalized)).asked_about(Some(asked)),
-            V1Decision::unavailable(None, Some(normalized)).asked_about(Some(asked)),
-        ];
-        for d in &decisions {
-            let v = serde_json::to_value(d).expect("serializes");
-            assert_eq!(
-                v["purl"], asked,
-                "answered about a different spelling than was asked about",
-            );
-        }
-
-        // The digest still names the artifact, and is what proves two
-        // spellings are one thing.
-        let v = serde_json::to_value(&decisions[0]).expect("serializes");
-        assert_eq!(v["sha256"], "a".repeat(64));
-
-        // A lookup by digest alone has no spelling to echo, so the stored one
-        // stands rather than becoming null.
-        let by_sha = V1Decision::stored(&stored, None, 25).asked_about(None);
-        let v = serde_json::to_value(&by_sha).expect("serializes");
-        assert_eq!(v["purl"], normalized);
-    }
-
-    /// Findings are evidence for the decision, not a dump of everything the
-    /// scanner noticed. A benign crate matched ten "Rust test marker" traits at
-    /// `crit: 3`; answering an `allow` with all ten invites a caller to read
-    /// significance into noise, and it disagreed with the same artifact looked
-    /// up from the corpus, where the trigger had already cut them.
-    #[test]
-    fn only_the_strongest_few_findings_reach_the_wire() {
-        use super::corpus::{CorpusFinding, CorpusRecord};
-        use crate::lookup::{Hit, Verdict};
-
-        let hit = |id: &str, crit: u8| Hit {
-            id: id.into(),
-            crit,
-            file: "lib/install.js".into(),
-            pkg: String::new(),
-            desc: String::new(),
-            off: None,
-            line: None,
-        };
-        let ids =
-            |d: &V1Decision| -> Vec<String> { d.findings.iter().map(|f| f.id.clone()).collect() };
-
-        let benign = Verdict {
-            sha256: "a".repeat(64),
-            lvl: Level::Clean,
-            eng: "2.8.0".into(),
-            at: "2026-08-01T00:00:00Z".into(),
-            purl: Some("pkg:cargo/tokio@1.40.0".into()),
-            why: None,
-            hits: (0..10)
-                .map(|i| hit(&format!("testing/harness::{i}"), 3))
-                .collect(),
-        };
-        let d = V1Decision::stored(&benign, None, 25);
-        assert_eq!(d.decision, super::decision::Decision::Allow);
-        assert!(
-            ids(&d).is_empty(),
-            "sub-threshold traits were reported as evidence: {:?}",
-            ids(&d),
-        );
-
-        // Worst first, capped at three, and equal criticalities keep the order
-        // their source listed them in.
-        let noisy = Verdict {
-            hits: vec![
-                hit("weak", 4),
-                hit("worst", 6),
-                hit("dropped", 3),
-                hit("strong-a", 5),
-                hit("strong-b", 5),
-                hit("cut", 4),
-            ],
-            ..benign
-        };
-        assert_eq!(
-            ids(&V1Decision::stored(&noisy, None, 25)),
-            ["worst", "strong-a", "strong-b"],
-        );
-
-        // The corpus applies the same rule in a trigger, so passing it through
-        // here changes nothing — which is the point: one artifact reads the
-        // same whichever side of the index answered.
-        let record = CorpusRecord {
-            sha256: Some("a".repeat(64)),
-            purl: Some("pkg:cargo/tokio@1.40.0".into()),
-            fires_at: Level::Clean,
-            engine_version: Some("2.8.0".into()),
-            traits_version: None,
-            analyzed_at: Some("2026-08-01T00:00:00Z".into()),
-            reason: None,
-            findings: (0..10)
-                .map(|i| CorpusFinding {
-                    id: format!("testing/harness::{i}"),
-                    crit: 3,
-                    desc: None,
-                })
-                .collect(),
-        };
-        assert!(
-            ids(&V1Decision::corpus(&record, None, None, 25)).is_empty(),
-            "a corpus record reported findings a stored verdict would have cut",
-        );
-    }
-
-    /// `unavailable` is a statement about us, not about the artifact, so nothing
-    /// about the artifact may ride along on one. A caller that could read a
-    /// severity or a budget out of a failed lookup would eventually branch on
-    /// it, and would then be treating our outage as evidence.
-    #[test]
-    fn an_unavailable_decision_carries_nothing_about_the_package() {
-        let d = V1Decision::unavailable(Some("a"), Some("pkg:npm/x@1.0.0"));
-        let v = serde_json::to_value(&d).expect("serializes");
-        assert_eq!(v["decision"], "unavailable");
-        assert_eq!(v["purl"], "pkg:npm/x@1.0.0");
-        for empty in [
-            "severity",
-            "fires_at",
-            "reason",
-            "engine_version",
-            "analyzed_at",
-        ] {
-            assert!(
-                v[empty].is_null(),
-                "{empty} leaked into an unavailable decision"
-            );
-        }
-        assert_eq!(v["findings"].as_array().map(Vec::len), Some(0));
-    }
-
-    /// The line this draws is the one [`ApiError::from_analysis`] already
-    /// draws for unstreamed callers: an artifact nobody can download is the
-    /// package's failure, and everything else is ours. Poppy only ever reads
-    /// the stream, so until this existed a dead package reached it as an
-    /// outage and went into the fleet error rate — which is how one deleted Go
-    /// repo paged the fleet on 2026-09-17.
-    #[test]
-    fn only_the_artifacts_own_failures_are_named() {
-        assert_eq!(
-            unretrievable_reason(StatusCode::UNPROCESSABLE_ENTITY),
-            Some("unretrievable"),
-        );
-        assert_eq!(
-            unretrievable_reason(StatusCode::PAYLOAD_TOO_LARGE),
-            Some("too_large"),
-        );
-
-        // Ours. These stay an unqualified outage, because retrying them against
-        // a healthier worker is exactly the right thing for a caller to do.
-        for status in [
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::GATEWAY_TIMEOUT,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::NOT_FOUND,
-        ] {
-            assert_eq!(unretrievable_reason(status), None, "status {status}");
-        }
-    }
-
-    /// `because` qualifies an unavailable without promoting it: the decision is
-    /// still that we did not answer, so nothing may read an assessment from it.
-    #[test]
-    fn a_reason_qualifies_but_does_not_become_a_verdict() {
-        let bare = V1Decision::unavailable(None, Some("pkg:golang/example.com/x@v1.0.0"));
-        assert_eq!(bare.reason, None);
-
-        let named = V1Decision::unavailable(None, Some("pkg:golang/example.com/x@v1.0.0"))
-            .because(unretrievable_reason(StatusCode::UNPROCESSABLE_ENTITY));
-        assert_eq!(named.reason.as_deref(), Some("unretrievable"));
-        assert_eq!(named.decision, super::decision::Decision::Unavailable);
-        assert_eq!(named.severity, None);
-        assert_eq!(named.fires_at, Level::Manual);
-        assert!(named.findings.is_empty());
-
-        // No reason leaves the decision byte-for-byte what it was.
-        let untouched = V1Decision::unavailable(None, None).because(None);
-        assert_eq!(untouched.reason, None);
-    }
-
-    /// A streamed upload's progress names the phase of the run it rides. The
-    /// upload's `/_/requests` entry is named by its filename while its subject
-    /// is the digest, so the old by-name search reported `phase: null` for
-    /// every streamed upload.
-    #[test]
-    fn a_streamed_uploads_progress_carries_its_phase() {
-        let flights = Arc::new(super::super::flight::Flights::default());
-        let sha = "c".repeat(64);
-        let leader = flights.join(FlightKey::Sha(sha.clone()));
-        let follower = flights.join(FlightKey::Sha(sha.clone()));
-        let phase = crate::analysis::RequestPhase::with_label("req#3 upload-3");
-        leader.flight().set_phase(phase.clone());
-        phase.set("cleave:analyze");
-
-        let named = Named {
-            key: None,
-            asked: None,
-            subject: sha.clone(),
-            is_url: false,
-        };
-        let frame = progress_frame(&follower, &named, Instant::now());
-        assert_eq!(frame["state"], "analyzing");
-        assert_eq!(frame["phase"], "cleave:analyze");
-        assert_eq!(frame["sha256"], sha, "an upload is named by its digest");
-    }
-}
+mod tests;

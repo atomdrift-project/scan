@@ -5,7 +5,7 @@
 //!
 //!   - **CLI `--format=json`** streams the borrowed [`ScanResult::envelope_ref`]
 //!     (`ScanResultEnvelopeRef` / `MlSectionRef`) straight to stdout.
-//!   - **Server `/analyze` and the hopper worker upload** serialize the owned
+//!   - **Server `/analyze` and postdoc's worker upload** serialize the owned
 //!     [`ScanResult::into_envelope`] (`ScanResultEnvelope` / `MlSection`); the
 //!     worker flattens that owned envelope into its `/api/result` body via
 //!     `#[serde(flatten)]`, so the bytes hopper stores are exactly these
@@ -15,7 +15,7 @@
 //! attributes (e.g. the borrowed `mods`/`skip` fields skip on
 //! `route_scores_empty`/`skipped_routes_empty` while the owned ones skip on
 //! `Vec::is_empty`). If they ever drift, the JSON a human sees via the CLI would
-//! differ from what every server and worker sends to hopper for the same file.
+//! differ from what servers and postdoc's workers send to hopper for the same file.
 //! This test pins them together: the same `ScanResult`, serialized every way,
 //! must produce identical bytes.
 
@@ -28,15 +28,16 @@ use scan::model::{Classification, Level, RouteScore, SkippedRoute};
 /// Serialize a `ScanResult` through all three envelope builders and assert the
 /// resulting JSON is byte-for-byte identical. `to_writer`/`to_vec` share
 /// serde_json's compact formatter (as does axum's `Json` responder), so equal
-/// bytes here means the CLI, server, and worker emit the same envelope.
+/// bytes here means the CLI, the server, and postdoc's worker emit the same envelope.
 fn assert_envelopes_identical(result: ScanResult, case: &str) {
     // CLI path: exactly what `emit_result` writes (`serde_json::to_vec` over
     // the borrowed view). Borrow first so the owned conversions can consume.
     let cli = serde_json::to_vec(&result.envelope_ref()).unwrap();
     // Clone-based owned builder (used where the caller keeps the result).
     let owned_clone = serde_json::to_vec(&result.to_envelope()).unwrap();
-    // Move-based owned builder: the server `/analyze` response and the hopper
+    // Move-based owned builder: the server `/analyze` response and postdoc's
     // worker upload both serialize this exact value. Consumes `result`, so last.
+
     let owned_move = serde_json::to_vec(&result.into_envelope()).unwrap();
 
     let cli = String::from_utf8(cli).unwrap();

@@ -56,8 +56,8 @@ pub fn missing() -> Vec<MissingTool> {
 
 /// Returns the canonical names of available external analysis tools.
 ///
-/// This is intentionally compact because workers send it on every `/api/next`
-/// poll. The names are part of Hopper's scheduling contract.
+/// Compact, because postdoc's worker sends it on every `/api/next` poll. The
+/// names are part of hopper's scheduling contract.
 #[must_use]
 pub fn available_names() -> Vec<&'static str> {
     let mut available: Vec<&'static str> = TOOLS

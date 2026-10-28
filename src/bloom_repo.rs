@@ -6,13 +6,12 @@
 //! routes.
 //!
 //! Filters live as `<kind>-<tier>.adbl` files, with a `bloom.toml` manifest, in
-//! `SCAN_BLOOM_DIR` if set, else `<data_dir>/atomdrift/scan/bloom` (what the
-//! updater fills). Never the working directory: a `bloom/` there could bless
+//! `<data_dir>/atomdrift/scan/bloom`, which the updater fills. Never the working directory: a `bloom/` there could bless
 //! the very files being scanned.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 mod decision_cache;
 use decision_cache::DecisionCache;
@@ -36,20 +35,33 @@ pub fn purl_key(purl: &str) -> Option<String> {
     fletch::purl::identity(purl)
 }
 
-/// Process-wide handle to the loaded bundle, published once at startup by the
+/// Process-wide handle to the loaded bundle, published at startup by the
 /// binary so decoupled subsystems (the dependency-fetch age gate and reporter,
 /// the server's lookup routes) consult the same verdicts.
-static GLOBAL: OnceLock<Arc<Lookup>> = OnceLock::new();
+static GLOBAL: RwLock<Option<Arc<Lookup>>> = RwLock::new(None);
 
-/// Publish the loaded bundle process-wide. The first call wins.
+/// Publish the loaded bundle process-wide, replacing any published before.
 pub fn set_global(lookup: Arc<Lookup>) {
-    let _ = GLOBAL.set(lookup);
+    *GLOBAL.write().unwrap_or_else(PoisonError::into_inner) = Some(lookup);
 }
 
 /// The process-wide bundle, if bloom was enabled this run.
 #[must_use]
 pub fn global() -> Option<Arc<Lookup>> {
-    GLOBAL.get().cloned()
+    GLOBAL
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Reload the installed bundle, if one was published: a long-lived process
+/// picks up refreshed filters without a restart. A probe already holding the
+/// old bundle finishes with it.
+pub fn reload() {
+    if global().is_some() {
+        set_global(Arc::new(Lookup::load()));
+        tracing::info!("bloom filters reloaded");
+    }
 }
 
 /// Scan's view of a [`burton::Lookup`]: the bundle, plus a bounded memo for the
@@ -101,11 +113,9 @@ impl Lookup {
             }
         };
         let mut lookup = Self::load_from(&primary);
-        if crate::nsrl_repo::enabled() {
-            match crate::nsrl_repo::install_dir() {
-                Ok(nsrl) => lookup.attach_nsrl(&primary, &nsrl),
-                Err(error) => tracing::warn!(error = format!("{error:#}"), "no NSRL filter"),
-            }
+        match crate::nsrl_repo::install_dir() {
+            Ok(nsrl) => lookup.attach_nsrl(&primary, &nsrl),
+            Err(error) => tracing::warn!(error = format!("{error:#}"), "no NSRL filter"),
         }
         lookup
     }
@@ -135,7 +145,7 @@ impl Lookup {
         // renames: let it finish and look again rather than run without filters.
         if let Err(Manifest(_, e) | Missing(_, e)) = &opened
             && e.kind() == NotFound
-            && crate::model_update::settle(dir)
+            && crate::bundle::settle(dir)
         {
             opened = burton::Lookup::open(dir, KEY_SCHEME);
         }
@@ -347,16 +357,12 @@ pub fn installed_manifest() -> Option<burton::Manifest> {
     burton::build::read_manifest(&install_dir().ok()?)
 }
 
-/// Where filters are read from: `SCAN_BLOOM_DIR` if set (which the updater
-/// then leaves alone), else the canonical data path the updater fills.
+/// Where filters are read from: the data path the updater fills.
 ///
 /// # Errors
 /// When there is no override and no data directory; see [`crate::data_dir`].
 pub fn install_dir() -> anyhow::Result<PathBuf> {
-    match std::env::var_os("SCAN_BLOOM_DIR") {
-        Some(dir) => Ok(PathBuf::from(dir)),
-        None => Ok(crate::data_dir()?.join("bloom")),
-    }
+    Ok(crate::data_dir()?.join("bloom"))
 }
 
 #[cfg(test)]

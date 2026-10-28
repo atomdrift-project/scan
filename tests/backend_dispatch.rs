@@ -1,7 +1,7 @@
 //! Integration test for the model-backend dispatch in `scan::model::Model`.
 //!
-//! litmus is ONNX-only: the native LightGBM (`.txt`) and XGBoost (`.json`)
-//! loaders were retired. These tests verify that:
+//! Scan loads ONNX models only; a native LightGBM (`.txt`) or XGBoost (`.json`)
+//! bundle is refused. These tests verify that:
 //!   * a directory containing `model.onnx` loads via the ONNX backend.
 //!   * multi-seed `models/seed_*.onnx` load and average correctly.
 //!   * a directory with both `model.onnx` and `models/` is ambiguous.
@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use scan::model::Model;
 
+#[expect(clippy::disallowed_methods, reason = "a test-only fixture location")]
 fn onnx_bundle() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
@@ -123,9 +124,9 @@ fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
 
 #[test]
 fn native_txt_model_is_rejected() {
-    // The LightGBM/XGBoost loaders are gone: a `.txt`/`.json`-only bundle is
-    // no longer loadable. (Resolution happens before the model is parsed, so
-    // stub contents are fine.)
+    // There is no LightGBM/XGBoost loader: a `.txt`/`.json`-only bundle is
+    // not loadable. (Resolution happens before the model is parsed, so stub
+    // contents are fine.)
     for native in ["model.txt", "model.json"] {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();

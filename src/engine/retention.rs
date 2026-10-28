@@ -35,7 +35,7 @@ const MAX_IDENTITY_ONLY_NODES: usize = 4096;
 /// output bounded, and mark any elision on the root explicitly.
 const MAX_DIAGNOSTIC_ONLY_NODES: usize = 4096;
 
-/// Post-classification retention rubric (operator policy, 2026-08-01): a
+/// Post-classification retention rubric (operator policy): a
 /// stored report keeps a member node only when someone will plausibly read it
 /// again. A node survives when it is
 ///
@@ -60,8 +60,7 @@ const MAX_DIAGNOSTIC_ONLY_NODES: usize = 4096;
 /// corpus that is ~77% of nodes and ~56% of stored report bytes, almost all
 /// of it `facts`/`ctx` that only trait evaluation and featurization (both
 /// already complete) ever consume. Collimator's retraining featurizer reads
-/// `facts` from the nodes that remain. `SCAN_KEEP_ALL_MEMBERS=1` makes the
-/// caller skip the rubric, for debugging or corpus captures.
+/// `facts` from the nodes that remain.
 pub(crate) fn apply_report_retention(report: &mut CompactReport) {
     let notable = |f: &CompactFile| {
         f.findings

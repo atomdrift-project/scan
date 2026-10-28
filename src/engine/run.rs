@@ -202,28 +202,54 @@ fn scan_partitioned(
     Ok(())
 }
 
-/// Analyze in-memory bytes — a fetched artifact — exactly as a single local
-/// file: classify, render, and tally. `label` is the display path (the URL or
-/// PURL); `name` drives cleave's extension-based type detection. Powers the
-/// `pkg`/`url` subcommands. Honors `config`'s fetch policy, so the fetched
-/// package's own declared references are followed when `--fetch` is set.
-///
-/// `registry_fallback_purl` is `Some(purl)` when `bytes` is a registry-metadata
-/// document standing in for a package that couldn't be fetched — never a real
-/// artifact. Its bytes hash differently on every fetch, so its verdict is
-/// routed by [`super::HopperRoute`] rather than posted under its own sha256.
+/// Bytes fetched for `scan url` or `scan purl`, and where they came from.
+#[derive(Debug)]
+pub struct Fetched<'a> {
+    /// The display path: the URL, or the PURL.
+    pub label: &'a str,
+    /// The file name, which drives cleave's extension-based type detection.
+    pub name: &'a str,
+    /// The bytes themselves.
+    pub bytes: Vec<u8>,
+    /// What the registry says about the package, when one was asked.
+    pub registry: Option<&'a RegistryProvenance>,
+    /// What the bytes are.
+    pub kind: FetchedKind<'a>,
+}
+
+/// What a [`Fetched`]'s bytes are.
+#[derive(Debug, Clone, Copy)]
+pub enum FetchedKind<'a> {
+    /// The artifact itself, as fetched.
+    Artifact(&'a fletch::fetch::FetchRecord),
+    /// The registry's record of the package at `purl`, standing in for a
+    /// release with no bytes left to fetch. It hashes differently on every
+    /// fetch, so its verdict is routed by [`super::HopperRoute`] rather than
+    /// filed under its own sha256.
+    RegistryRecord {
+        /// The package the record describes.
+        purl: &'a str,
+    },
+}
+
+/// Analyze fetched bytes exactly as a single local file: classify, render,
+/// and tally. Honors `config`'s fetch policy, so the package's own declared
+/// references are followed when `--follow` is set.
 ///
 /// # Errors
 /// As [`run_paths`].
-pub fn run_bytes(
-    label: &str,
-    name: &str,
-    bytes: Vec<u8>,
-    config: &ScanConfig,
-    root_registry: Option<&RegistryProvenance>,
-    root_fetch: Option<&fletch::fetch::FetchRecord>,
-    registry_fallback_purl: Option<&str>,
-) -> Result<ScanSummary> {
+pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummary> {
+    let Fetched {
+        label,
+        name,
+        bytes,
+        registry,
+        kind,
+    } = fetched;
+    let (fetch, fallback_purl) = match kind {
+        FetchedKind::Artifact(record) => (Some(record), None),
+        FetchedKind::RegistryRecord { purl } => (None, Some(purl)),
+    };
     // Deliberately no `prefetch_cleave_resources()` here. This one-shot single-
     // artifact path (`pkg:`/`url`) never fans out across rayon, and its analyses
     // usually hit cleave's report cache — so the capability mapper's match
@@ -236,7 +262,7 @@ pub fn run_bytes(
     // isotope13 first, under `--enriched`: by digest in `auto`, by upload in
     // `remote`. A registry document standing in for an unfetchable package is
     // never asked about — its bytes differ on every fetch.
-    if registry_fallback_purl.is_none() {
+    if fallback_purl.is_none() {
         match crate::remote::mode() {
             Analyze::Auto => {
                 if let Some((sha, verdict)) = crate::remote::known_bytes(&bytes) {
@@ -263,13 +289,13 @@ pub fn run_bytes(
         .with_context(|| format!("cleave analysis of {label}"));
     let origin = Origin {
         path: Path::new(label),
-        registry: root_registry,
-        fetch: root_fetch,
+        registry,
+        fetch,
     };
     // The url/purl the operator named — the fetched artifact itself, not a
     // dependency of it.
     let target = Target {
-        fallback_purl: registry_fallback_purl,
+        fallback_purl,
         ..Target::new(origin, true)
     };
     session.record_input(&target, analyzed, Some(bytes));
@@ -610,8 +636,8 @@ impl<'a> Session<'a> {
             result.dependency_attention.flagged_candidates,
             Ordering::Relaxed,
         );
-        // An adversely bloom-marked file is always surfaced — its flag replaces
-        // the old unconditional banner, so the benign filter must not swallow a
+        // An adversely bloom-marked file is always surfaced — its inline flag is
+        // the only notice it gets, so the benign filter must not swallow a
         // known-bad file the model happens to rate benign. JSON, tiny, and
         // interpret are machine/LLM payload formats: they emit every scanned
         // file. Severe static findings also admit a terminal result, even when
@@ -727,7 +753,8 @@ fn findings_match_filter(
     root.iter()
         .chain(members.values().flat_map(|member| &member.top_findings))
         .any(|finding| {
-            (filter.hostile && finding.crit >= 5) || (filter.suspicious && finding.crit == 4)
+            (filter.hostile && finding.crit >= crate::features::CRIT_HOSTILE)
+                || (filter.suspicious && finding.crit == crate::features::CRIT_SUSPICIOUS)
         })
 }
 

@@ -98,9 +98,10 @@ Exit codes make CI integration trivial:
 
 ### Networking and privacy
 
-atomscan will never send telemetry data. It will however reach out to the Internet for 2 reasons:
+atomscan will never send telemetry data. It will however reach out to the Internet for 3 reasons:
 
-- **rule updates**: every 24h, can be disabled using `--no-update` or `SCAN_NO_UPDATE_CHECK=1`
+- **rule updates**: every 24h; disable with `--no-update`
+- **release check**: once a day, to say a newer atomscan exists; disable with `SCAN_NO_UPDATE_CHECK=1`
 - **following discovered references**: to detect if a benign package depends on or downloads a compromised payload. Set `--follow=none` to analyze only the requested artifact.
 
 Downloaded dependencies are analyzed under the current rules unless a local
@@ -196,8 +197,8 @@ helpers use those CPUs; the scanner excludes their SMT siblings. The scheduling
 settings in the script can each be overridden through the environment.
 
 The preset uses 96 scan workers, 32 workers per large-file pool, a 4 GiB
-analysis memo, and delayed jemalloc page purging. On the measured 64-core
-Threadripper host, give the private large-file pools the faster CPU groups:
+analysis memo, and delayed jemalloc page purging. On a 64-core Threadripper,
+for example, give the private large-file pools the faster CPU groups:
 
 ```sh
 CLEAVE_LEAF_CPUS=2-7,24-39,56-63,66-71,88-103,120-127 \
@@ -227,6 +228,8 @@ replace installed tools.
   and deployment choices
 - [JSON report schema](docs/JSON.md) — machine-readable output fields
 - [Server API](docs/SERVER_API.md) — long-running HTTP service
+- [Environment variables](docs/ENVIRONMENT.md) — the few settings read from the
+  environment
 - [Dependency behavior](docs/DEPENDENCIES.md) — fetched dependency graph and
   provenance
 
@@ -261,7 +264,4 @@ precedence. The primary SHA-256 revocation filter must be loaded before NSRL
 can permit skipping. When both PURL and digest are supplied, each key still
 needs a good match. Slow mode continues to analyze all inputs.
 
-`SCAN_NSRL=0` disables this source. `SCAN_NSRL_DIR` selects an operator-maintained
-bundle, which the updater leaves alone. `SCAN_NSRL_URL` overrides the update
-base URL (the updater appends `nsrl/modern/v1/`). `atomscan version` reports
-NSRL separately, and NSRL content changes invalidate cached analysis verdicts.
+`atomscan version` reports NSRL separately, and NSRL content changes invalidate cached analysis verdicts.
