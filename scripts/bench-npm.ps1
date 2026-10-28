@@ -20,7 +20,7 @@ foreach ($pair in $EnvPairs -split ',') {
 $out = "C:\src\scan\out\$Id.json"
 $err = "C:\src\scan\out\$Id.err"
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$p = Start-Process -FilePath $Exe -ArgumentList @('-f','json','--mode',$Mode,'--no-update','--fetch=none',$Data) -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
+$p = Start-Process -FilePath $Exe -ArgumentList @('-f','json','--mode',$Mode,'--no-update','--follow=none',$Data) -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
 # Sample the live working set at 100 ms and keep the maximum. `PeakWorkingSet64`
 # is not usable here: it reads 0 after exit, and while running it silently
 # stops updating once the handle can no longer be refreshed, which under-read

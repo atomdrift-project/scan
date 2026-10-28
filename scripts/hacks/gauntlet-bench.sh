@@ -18,7 +18,6 @@ LIST=${4:-}
 export CLEAVE_TRAITS_DIR
 export SCAN_NO_ANALYSIS_CACHE=1
 export SCAN_FOLLOW=none
-export SCAN_NO_UPDATE=1
 export RUST_LOG=scan=info,cleave=error
 
 mkdir -p "$OUT/json" "$OUT/err"
@@ -35,7 +34,7 @@ echo "$FILES" | while IFS= read -r f; do
     [ -f "$DATASET/$f" ] || continue
     safe=$(printf '%s' "$f" | tr '/ ' '__')
     status=0
-    /usr/bin/time -l "$BIN" --format json --show all fs "$DATASET/$f" \
+    /usr/bin/time -l "$BIN" --no-update --format json --show all fs "$DATASET/$f" \
         > "$OUT/json/$safe.json" 2> "$OUT/err/$safe.err" || status=$?
     wall=$(awk '/ real /{print $1; exit}' "$OUT/err/$safe.err")
     rss=$(awk '/maximum resident set size/{printf "%.1f", $1/1048576; exit}' "$OUT/err/$safe.err")

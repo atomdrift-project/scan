@@ -21,9 +21,8 @@
 #     build, and Cargo.lock is the only thing pinning cleave/fletch/filefacts/
 #     stng/proclist to reviewed revisions.
 #
-# Smoke tests are deliberately `--version`/`--help` only: a real scan
-# bootstraps the model bundle over the network on first run (see
-# src/models_repo.rs), which we don't want CI depending on.
+# `guard` and `test` run the same `make lint` and `make test` a contributor
+# runs, on the toolchain build.yml pins, so a clean local run is a clean CI run.
 
 name: ci
 
@@ -40,10 +39,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Keep in step with build.yml: clippy's lints change between releases.
+  RUST_TOOLCHAIN: "1.99.1"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  SCAN_NO_UPDATE: "1"
 
 jobs:
   # Cheapest job, highest value. This repo routinely carries temporary
@@ -77,15 +77,48 @@ jobs:
           key: cargo-home-guard-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-guard-${{ runner.os }}-
 
-      - run: cargo fmt --all --check
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --component clippy,rustfmt --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
 
-      # Matches `make lint` exactly, so a clean local run means a clean CI run.
-      - run: cargo clippy --locked -- -D warnings
+      - run: make lint LOCKED=--locked
 
       # A `--locked` build fails outright on a stale lockfile, but this catches
       # the subtler case of a lockfile that resolves but wasn't committed.
       - name: Cargo.lock unchanged
         run: git diff --exit-code Cargo.lock
+
+  # Every test, unit and integration. A few reach the update bucket over the
+  # network, as build.yml's CLI tests already do.
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo home
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-test-${{ runner.os }}-
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+
+      - run: make test LOCKED=--locked
 
   # Not gated on `guard`: a cold build is ~25-45 min per target and serializing
   # them behind clippy would double the wall clock for no safety gain.

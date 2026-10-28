@@ -1,18 +1,17 @@
-//! A worker's recent latency, summarised for a router.
+//! A server's recent latency, summarised for a router.
 //!
-//! Two properties this has to get right, both learned the hard way:
+//! Two properties this has to get right:
 //!
 //! **It forgets on a clock, not on traffic.** A running total that only ages by
-//! sample count kept describing a past incident: a hopper outage produced
-//! analyses of 8 to 55 minutes, and because nothing decayed, the resulting
-//! averages went on steering routing long after the outage was over. A quiet
-//! worker must not stay tarred by an hour it already recovered from.
+//! sample count keeps describing a past incident: a hopper outage can produce
+//! analyses of tens of minutes, and if nothing decays, the resulting averages
+//! go on steering routing long after the outage is over. A quiet server must
+//! not stay tarred by an hour it already recovered from.
 //!
 //! **It reports a percentile, not a mean.** Analysis time is strongly bimodal —
 //! seconds for a small package, minutes for a large archive — and a mean sits
-//! in the empty space between the two humps, describing almost no real job.
-//! Measured live, mean-based estimates were wrong by roughly an order of
-//! magnitude against observed medians.
+//! in the empty space between the two humps, describing almost no real job;
+//! against observed medians it is off by roughly an order of magnitude.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -60,7 +59,7 @@ struct Window {
     slots: [Slot; SLOTS],
     cur: usize,
     /// Start of the current slot. Advancing is lazy — done on the next read or
-    /// write — so an idle worker costs nothing and still reports an empty
+    /// write — so an idle server costs nothing and still reports an empty
     /// window rather than stale numbers.
     cur_start: Instant,
 }
@@ -68,7 +67,7 @@ struct Window {
 /// Recent completion latencies for one class of work.
 ///
 /// A `Mutex` rather than atomics on purpose. This is written once per completed
-/// analysis — a few times a minute on a busy worker, since the work itself
+/// analysis — a few times a minute on a busy server, since the work itself
 /// takes minutes — so contention is not a consideration, and a lock buys an
 /// invariant that matters: a reader sees one coherent window instead of a
 /// histogram from one instant and a total from another.
@@ -148,7 +147,7 @@ impl Latency {
         let Ok(mut w) = self.window.lock() else {
             return Summary::default();
         };
-        // Advance on read too, or a worker that stopped receiving work would
+        // Advance on read too, or a server that stopped receiving work would
         // keep reporting whatever it was doing when the traffic stopped.
         Self::advance(&mut w, now);
 
@@ -245,9 +244,9 @@ fn percentile_micros(hist: &[u64; BUCKETS], count: u64, p: f64) -> u64 {
 /// u64::MAX — but stating that in code beats asserting it in a comment.
 fn micros_from_ms(ms: f64) -> u64 {
     // A nonsense duration must never read as a fast one. Returning 0 for NaN or
-    // infinity would make a broken worker the most attractive in the fleet —
-    // the same shape as the bug where an unpollable worker outranked a measured
-    // one. Zero is reserved for the legitimate case: bucket 0's lower bound.
+    // infinity would make a broken server the most attractive in the fleet,
+    // just as an unpollable server must never outrank a measured one. Zero is
+    // reserved for the legitimate case: bucket 0's lower bound.
     if ms.is_nan() || (ms.is_infinite() && ms.is_sign_positive()) {
         return u64::MAX;
     }

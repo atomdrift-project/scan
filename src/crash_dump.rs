@@ -1,7 +1,7 @@
 //! Crash-time dump of the analyses in flight when the process aborts.
 //!
 //! A stack overflow deep inside cleave's work-stealing analysis aborts the
-//! whole worker process (the Rust runtime prints `has overflowed its stack`
+//! whole process (the Rust runtime prints `has overflowed its stack`
 //! then `abort()`s → `SIGABRT`). The per-analysis lifecycle logs name every
 //! file that *started*, but not which of the in-flight set was on a CPU when
 //! the stack blew — so an operator is left diffing "analysis starting" against
@@ -24,7 +24,7 @@ pub use imp::register;
 mod imp {
     use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-    /// Maximum in-flight analyses we can record at once. Worker slots sit far
+    /// Maximum in-flight analyses we can record at once. Analysis slots sit far
     /// below this; the slack absorbs any transient over-subscription, and an
     /// overflow past it merely drops a line from the dump (best-effort).
     const SLOTS: usize = 512;

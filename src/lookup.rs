@@ -3,7 +3,7 @@
 //!
 //! The expensive artifact of an analysis is the cleave report, and that is
 //! already cached twice over: cleave memoizes the top-level report by content
-//! sha (`toplevel_report_cache`), and [`crate::analysis_cache`] memoizes the
+//! sha (`toplevel_report_cache`), and `crate::analysis_cache` memoizes the
 //! grafted sub-report of every fetched dependency. Neither can answer "what is
 //! the verdict for this sha" on its own — cleave's key folds in the file type
 //! and an options hash a caller holding only a digest cannot reconstruct, and
@@ -18,7 +18,7 @@
 //! Namespaced by the same ruleset-version token the analysis cache uses, so a
 //! rules, model, or engine change lands in a fresh namespace rather than
 //! serving a verdict the current detector would no longer give. Disabled by
-//! `SCAN_ANALYSIS_CACHE=0` (or the `SCAN_NO_ANALYSIS_CACHE=1` umbrella), which
+//! `SCAN_NO_ANALYSIS_CACHE=1`, which
 //! degrades every lookup to "unknown" rather than to an error.
 
 use std::num::NonZeroUsize;
@@ -405,12 +405,7 @@ pub struct Index {
 /// levels below this root — the shape [`crate::cache_cleanup`] reclaims.
 #[must_use]
 pub fn index_base() -> Option<PathBuf> {
-    Some(
-        dirs::cache_dir()?
-            .join("atomdrift")
-            .join("scan")
-            .join("lookup"),
-    )
+    Some(crate::cache_dir()?.join("lookup"))
 }
 
 /// The process-wide index, opened once. `None` when disabled or unusable, in
@@ -419,7 +414,7 @@ pub fn global() -> Option<&'static Index> {
     static GLOBAL: OnceLock<Option<Index>> = OnceLock::new();
     GLOBAL
         .get_or_init(|| {
-            if std::env::var("SCAN_ANALYSIS_CACHE").is_ok_and(|v| v == "0" || v == "false") {
+            if crate::env::flag(crate::env::SCAN_NO_ANALYSIS_CACHE) {
                 return None;
             }
             let base = index_base()?;

@@ -3,3 +3,14 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+
+# Every environment read goes through `crate::env`, where each variable is
+# declared and documented once.
+disallowed-methods = [
+    { path = "std::env::var", reason = "declare the variable in crate::env and read it there" },
+    { path = "std::env::var_os", reason = "declare the variable in crate::env and read it there" },
+]
+
+# A tripwire for functions that have grown several jobs, not a style rule:
+# a long single `match` or pipeline reads better whole.
+too-many-lines-threshold = 175

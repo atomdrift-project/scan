@@ -3,30 +3,28 @@
 //! Uses Burton's ADBL encoding in its own directory and key scheme. Scan's
 //! measured bad and outside-claim filters always veto this source. The bundle
 //! installs and refreshes with the other rules. An unchanged manifest costs
-//! only a small HTTP request. SCAN_NSRL=0 disables this source.
+//! only a small HTTP request.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use burton::{Filter, Manifest};
 use reqwest::blocking::Client;
 
-use crate::model_update::{Installer, hands_off};
+use crate::bundle::{self, Bundle};
 
 /// NSRL's digest-only identity; deliberately separate from Scan's PURL bundle.
 pub const KEY_SCHEME: &str = "nsrl/sha256/v1";
 const PREFIX: &str = "nsrl/modern/v1";
+/// The manifest, published and installed beside the filters.
+const SIDECAR: &str = "bloom.toml";
 
 /// Where the separately installed NSRL bundle lives.
 ///
 /// # Errors
 /// When there is no override and no data directory; see [`crate::data_dir`].
 pub fn install_dir() -> anyhow::Result<PathBuf> {
-    match std::env::var_os("SCAN_NSRL_DIR") {
-        Some(dir) => Ok(PathBuf::from(dir)),
-        None => Ok(crate::data_dir()?.join("nsrl-modern")),
-    }
+    Ok(crate::data_dir()?.join("nsrl-modern"))
 }
 
 /// The installed NSRL identity, without loading its large bit array.
@@ -40,7 +38,7 @@ pub fn installed_manifest() -> Option<Manifest> {
 /// Upstream NSRL release version, independent of Scan and the ADBL layout.
 #[must_use]
 pub fn installed_release() -> Option<String> {
-    let text = std::fs::read_to_string(install_dir().ok()?.join("bloom.toml")).ok()?;
+    let text = std::fs::read_to_string(install_dir().ok()?.join(SIDECAR)).ok()?;
     source_release(&text)
 }
 
@@ -62,12 +60,6 @@ fn release_key(version: &str) -> Option<[u32; 3]> {
         .ok()?;
     let parts: [u32; 3] = parts.try_into().ok()?;
     (parts[0] >= 2021 && (1..=12).contains(&parts[1]) && parts[2] > 0).then_some(parts)
-}
-
-/// Whether installed NSRL coverage participates in decisions.
-#[must_use]
-pub fn enabled() -> bool {
-    std::env::var("SCAN_NSRL").as_deref() != Ok("0")
 }
 
 /// Open an NSRL bundle, checking its explicit dataset identity.
@@ -98,139 +90,13 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn same_filters(a: &Manifest, b: &Manifest) -> bool {
-    a.key_scheme == b.key_scheme && a.filter == b.filter
-}
-
-fn client(quiet: bool) -> Result<Client> {
-    let mut client = Client::builder().timeout(Duration::from_secs(900));
-    if quiet {
-        client = client.connect_timeout(Duration::from_secs(4));
-    }
-    client.build().context("creating NSRL HTTP client")
-}
-
-fn base_url() -> String {
-    let base =
-        std::env::var("SCAN_NSRL_URL").unwrap_or_else(|_| crate::model_update::BASE_URL.to_owned());
-    format!("{}/{PREFIX}", base.trim_end_matches('/'))
-}
-
-fn remote_manifest(client: &Client, base: &str) -> Result<(Manifest, String)> {
-    let bytes = crate::model_update::get(client, &format!("{base}/bloom.toml"))?;
-    let text = String::from_utf8(bytes)?;
-    let manifest = toml::from_str(&text)?;
-    validate_manifest(&manifest)?;
-    source_release(&text).context("missing or invalid NSRL release version")?;
-    Ok((manifest, text))
-}
-
 /// Install or refresh NSRL independently of the daily Scan Bloom bundle.
-///
-/// A complete staged bundle is validated before replacing the installed copy.
-/// The normal rules updater includes first install as well as refreshes.
+/// Returns `true` when filters were installed.
 ///
 /// # Errors
 /// Returns download, integrity, format, or installation failures.
-pub fn update(dir: &Path, quiet: bool) -> Result<bool> {
-    if let Some(why) = hands_off("NSRL filters", dir, "SCAN_NSRL_DIR") {
-        if !quiet {
-            eprintln!("{why}");
-        }
-        return Ok(false);
-    }
-    let client = client(quiet)?;
-    let base = base_url();
-    let (manifest, text) = remote_manifest(&client, &base)?;
-    let current = || {
-        burton::build::read_manifest(dir).is_some_and(|have| {
-            same_filters(&have, &manifest)
-                && have
-                    .filter
-                    .values()
-                    .all(|entry| dir.join(&entry.file).is_file())
-        })
-    };
-    if current() {
-        if !quiet {
-            eprintln!("NSRL already up to date: {}", manifest.built);
-        }
-        return Ok(false);
-    }
-    let installer = Installer::lock(dir)?;
-    if current() {
-        return Ok(false);
-    }
-    if let Some(have) = burton::build::read_manifest(dir)
-        && have.built > manifest.built
-    {
-        bail!(
-            "refusing NSRL rollback from {} to {}",
-            have.built,
-            manifest.built
-        );
-    }
-    if let Some(previous) = std::fs::read_to_string(dir.join("bloom.toml"))
-        .ok()
-        .and_then(|text| source_release(&text))
-        .and_then(|version| release_key(&version))
-        && let Some(next) = source_release(&text).and_then(|version| release_key(&version))
-        && next < previous
-    {
-        bail!("refusing an older NSRL release, including same-month patch rollbacks");
-    }
-    installer.install(|staging| stage(staging, &client, &base, &manifest, &text))?;
-    if !quiet {
-        eprintln!("NSRL updated to {} at {}", manifest.built, dir.display());
-    }
-    Ok(true)
-}
-
-fn stage(
-    staging: &Path,
-    client: &Client,
-    base: &str,
-    manifest: &Manifest,
-    text: &str,
-) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Write};
-
-    validate_manifest(manifest)?;
-    for (stem, entry) in &manifest.filter {
-        // Stream to disk while hashing, avoiding a second 512 MiB HTTP buffer.
-        let path = staging.join(&entry.file);
-        let mut response = client
-            .get(format!("{base}/{}", entry.file))
-            .send()?
-            .error_for_status()?;
-        let mut output = std::fs::File::create(&path)?;
-        let mut digest = Sha256::new();
-        let mut buffer = vec![0; 1 << 20];
-        loop {
-            let n = response.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            output.write_all(&buffer[..n])?;
-            digest.update(&buffer[..n]);
-        }
-        drop(output);
-        if format!("{:x}", digest.finalize()) != entry.sha256 {
-            bail!("NSRL checksum mismatch for {}", entry.file);
-        }
-        let filter = Filter::load(std::fs::read(path)?).context("invalid NSRL filter")?;
-        if filter.stem() != *stem
-            || filter.version() != entry.format_version
-            || filter.len() != entry.n
-        {
-            bail!("NSRL filter header disagrees with manifest");
-        }
-    }
-    // Preserve release/provenance fields beyond Burton's shared filter schema.
-    std::fs::write(staging.join("bloom.toml"), text)?;
-    open(staging)?;
-    Ok(())
+pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
+    bundle::update::<Nsrl>(dir, force, quiet)
 }
 
 /// Check availability without downloading the filter bit arrays.
@@ -238,18 +104,118 @@ fn stage(
 /// # Errors
 /// Returns manifest download or validation errors.
 pub fn check(dir: &Path) -> Result<()> {
-    if let Some(why) = hands_off("NSRL filters", dir, "SCAN_NSRL_DIR") {
-        eprintln!("{why}");
-        return Ok(());
+    bundle::check::<Nsrl>(dir)
+}
+
+/// The NSRL filters, as [`bundle::update`] installs them.
+struct Nsrl;
+
+/// A validated manifest, with its text: the sidecar keeps the release and
+/// provenance fields beyond Burton's shared filter schema.
+struct Release {
+    manifest: Manifest,
+    text: String,
+    release: [u32; 3],
+}
+
+impl Release {
+    fn parse(text: String) -> Result<Self> {
+        let manifest: Manifest = toml::from_str(&text).context("parsing NSRL manifest")?;
+        validate_manifest(&manifest)?;
+        let release = source_release(&text)
+            .and_then(|version| release_key(&version))
+            .context("missing or invalid NSRL release version")?;
+        Ok(Self {
+            manifest,
+            text,
+            release,
+        })
     }
-    let (remote, _) = remote_manifest(&client(false)?, &base_url())?;
-    let current =
-        burton::build::read_manifest(dir).is_some_and(|have| same_filters(&have, &remote));
-    eprintln!(
-        "NSRL {}: {}",
-        if current { "up to date" } else { "available" },
-        remote.built
-    );
+}
+
+impl Bundle for Nsrl {
+    const NAME: &'static str = "NSRL filters";
+    type Installed = Release;
+    type Remote = Release;
+
+    fn installed(dir: &Path) -> Option<Release> {
+        Release::parse(std::fs::read_to_string(dir.join(SIDECAR)).ok()?).ok()
+    }
+
+    fn fetch(client: &Client) -> Result<Release> {
+        Release::parse(bundle::manifest(
+            client,
+            &bundle::url(&format!("{PREFIX}/{SIDECAR}")),
+        )?)
+    }
+
+    fn is_current(dir: &Path, have: &Release, remote: &Release) -> bool {
+        have.manifest.filter == remote.manifest.filter
+            && have
+                .manifest
+                .filter
+                .values()
+                .all(|entry| dir.join(&entry.file).is_file())
+    }
+
+    /// Both orders must hold: the build date, and the upstream release number,
+    /// which catches a same-month patch rollback the date alone would not.
+    fn rollback(have: &Release, remote: &Release) -> Option<String> {
+        let day = |m: &Manifest| crate::output::parse_ymd(&m.built);
+        if day(&remote.manifest) < day(&have.manifest) {
+            return Some(format!(
+                "the published filters (built {}) are older than the installed ones (built {})",
+                remote.manifest.built, have.manifest.built
+            ));
+        }
+        (remote.release < have.release).then(|| {
+            format!(
+                "the published release {} is older than the installed {}",
+                release_name(remote.release),
+                release_name(have.release)
+            )
+        })
+    }
+
+    fn stage(staging: &Path, client: &Client, remote: &Release) -> Result<()> {
+        stage(staging, client, &bundle::url(PREFIX), remote)
+    }
+
+    fn describe(remote: &Release) -> String {
+        format!(
+            "{} (built {})",
+            release_name(remote.release),
+            remote.manifest.built
+        )
+    }
+
+    fn describe_installed(have: &Release) -> String {
+        Self::describe(have)
+    }
+}
+
+fn release_name([year, month, patch]: [u32; 3]) -> String {
+    format!("{year}.{month:02}.{patch}")
+}
+
+/// Download, verify, and validate both filters into `staging` from `base`,
+/// then write the manifest beside them, and prove the whole bundle opens.
+fn stage(staging: &Path, client: &Client, base: &str, remote: &Release) -> Result<()> {
+    for (stem, entry) in &remote.manifest.filter {
+        // `validate_manifest` pinned the name to `<stem>-<sha256>.adbl`.
+        let path = staging.join(&entry.file);
+        let url = format!("{base}/{}", entry.file);
+        bundle::download_to(client, &url, &entry.sha256, &path)?;
+        let filter = Filter::load(std::fs::read(&path)?).context("invalid NSRL filter")?;
+        if filter.stem() != *stem
+            || filter.version() != entry.format_version
+            || filter.len() != entry.n
+        {
+            bail!("NSRL filter header disagrees with manifest");
+        }
+    }
+    std::fs::write(staging.join(SIDECAR), &remote.text).context("writing NSRL sidecar")?;
+    open(staging)?;
     Ok(())
 }
 
@@ -269,8 +235,32 @@ mod tests {
         );
     }
 
+    fn release(built: &str, version: &str) -> Release {
+        let entry = |stem: &str, n: u64| burton::build::Entry {
+            file: format!("{stem}-{}.adbl", "a".repeat(64)),
+            sha256: "a".repeat(64),
+            format_version: 1,
+            n,
+        };
+        let manifest = Manifest {
+            schema: 1,
+            built: built.to_owned(),
+            key_scheme: Some(KEY_SCHEME.to_owned()),
+            filter: [
+                ("sha256-good".to_owned(), entry("sha256-good", 100)),
+                ("sha256-bad".to_owned(), entry("sha256-bad", 0)),
+            ]
+            .into(),
+        };
+        let text = format!(
+            "release = \"{version}\"\n{}",
+            toml::to_string(&manifest).unwrap()
+        );
+        Release::parse(text).unwrap()
+    }
+
     #[test]
-    fn failed_filter_download_keeps_the_previous_installation() {
+    fn a_corrupt_filter_download_fails_staging() {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -285,41 +275,32 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
                 .unwrap();
         });
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("installed");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("previous"), "keep me").unwrap();
-        let entry = |stem: &str, n: u64| burton::build::Entry {
-            file: format!("{stem}-{}.adbl", "a".repeat(64)),
-            sha256: "a".repeat(64),
-            format_version: 1,
-            n,
-        };
-        let manifest = Manifest {
-            schema: 1,
-            built: "2026-09-01".to_owned(),
-            key_scheme: Some(KEY_SCHEME.to_owned()),
-            filter: [
-                ("sha256-good".to_owned(), entry("sha256-good", 100)),
-                ("sha256-bad".to_owned(), entry("sha256-bad", 0)),
-            ]
-            .into(),
-        };
-        let text = toml::to_string(&manifest).unwrap();
-        let result = Installer::lock(&target)
-            .unwrap()
-            .install(|staging| stage(staging, &client(false).unwrap(), &base, &manifest, &text));
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
+        let staging = tempfile::tempdir().unwrap();
+        let err = stage(
+            staging.path(),
+            &Client::new(),
+            &base,
+            &release("2026-09-01", "2026.09.1"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("sha256 mismatch"), "{err:#}");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn an_older_build_or_release_is_a_rollback() {
+        let have = release("2026-09-10", "2026.09.2");
         assert_eq!(
-            std::fs::read_to_string(target.join("previous")).unwrap(),
-            "keep me"
+            Nsrl::rollback(&have, &release("2026-09-10", "2026.09.2")),
+            None
         );
+        assert_eq!(
+            Nsrl::rollback(&have, &release("2026-10-01", "2026.10.1")),
+            None
+        );
+        assert!(Nsrl::rollback(&have, &release("2026-09-01", "2026.09.2")).is_some());
+        // A same-month patch rollback, rebuilt later.
+        assert!(Nsrl::rollback(&have, &release("2026-09-20", "2026.09.1")).is_some());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! The rules, model and concurrency a long-lived server runs with, settled once
-//! at startup so every binary serving the API resolves them the same way.
+//! at startup so every binary serving the API resolves them the same way; and
+//! the one refresh that keeps every rule source current.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -50,7 +51,7 @@ impl RulesStartup {
         if let Some(dir) = self.traits_dir.as_ref() {
             cleave::traits_repo::set_override_dir(Some(dir.into()));
         }
-        crate::refresh_rules_at_startup(
+        refresh_rules_at_startup(
             self.refresh == Refresh::Force,
             self.refresh == Refresh::Skip,
         )?;
@@ -89,6 +90,164 @@ pub struct Rules {
     pub zip_passwords: crate::ArchivePasswords,
 }
 
+/// One source of the rules a scan runs with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// cleave's trait definitions.
+    Traits,
+    /// The classifier bundle.
+    Models,
+    /// Scan's known-good and known-bad filters.
+    Bloom,
+    /// The NSRL allowlist.
+    Nsrl,
+}
+
+impl Source {
+    /// Every source, in the order a report lists them.
+    pub const ALL: [Self; 4] = [Self::Traits, Self::Models, Self::Bloom, Self::Nsrl];
+
+    /// The name logs and reports use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Traits => "traits",
+            Self::Models => "models",
+            Self::Bloom => "bloom",
+            Self::Nsrl => "nsrl",
+        }
+    }
+
+    /// Whether a scan can go on without this source. The filters only let a
+    /// scan skip work; without them every file is analyzed.
+    #[must_use]
+    pub const fn optional(self) -> bool {
+        matches!(self, Self::Bloom | Self::Nsrl)
+    }
+
+    fn update(self, models_dir: Option<&Path>, force: bool, quiet: bool) -> Result<bool> {
+        match self {
+            Self::Traits => crate::traits_repo::update(force, quiet),
+            Self::Models => match models_dir {
+                Some(dir) => crate::model_update::update(dir, force, quiet),
+                None => crate::model_update::update(
+                    &crate::models_repo::install_target()?,
+                    force,
+                    quiet,
+                ),
+            },
+            Self::Bloom => {
+                crate::bloom_update::update(&crate::bloom_repo::install_dir()?, force, quiet)
+            }
+            Self::Nsrl => crate::nsrl_repo::update(&crate::nsrl_repo::install_dir()?, force, quiet),
+        }
+    }
+}
+
+/// What one [`refresh`] did: per source, whether it installed anything.
+#[derive(Debug)]
+pub struct Refreshed(Vec<(Source, Result<bool>)>);
+
+impl Refreshed {
+    /// Whether any source installed something new.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.0.iter().any(|(_, result)| matches!(result, Ok(true)))
+    }
+
+    /// Whether `source` installed something new.
+    #[must_use]
+    pub fn changed_source(&self, source: Source) -> bool {
+        self.0
+            .iter()
+            .any(|(s, result)| *s == source && matches!(result, Ok(true)))
+    }
+
+    /// The sources that failed to update, with why.
+    pub fn failures(&self) -> impl Iterator<Item = (Source, &anyhow::Error)> {
+        self.0
+            .iter()
+            .filter_map(|(source, result)| result.as_ref().err().map(|e| (*source, e)))
+    }
+
+    /// Why `--enriched` cannot be honoured, when the traits refresh says so.
+    #[must_use]
+    pub fn enriched_refusal(&self) -> Option<&str> {
+        self.failures()
+            .find_map(|(_, e)| crate::traits_repo::enriched_refusal(e))
+    }
+}
+
+/// Bring `sources` up to date, concurrently: the slow path is one network
+/// round-trip, not four, and one source failing never blocks the others.
+/// `models_dir` overrides the installed model bundle's directory. `quiet` is
+/// a background refresh; see `crate::bundle::update`. What a failure
+/// means, and how loudly to say so, is the caller's to decide.
+#[must_use]
+pub fn refresh(
+    sources: &[Source],
+    models_dir: Option<&Path>,
+    force: bool,
+    quiet: bool,
+) -> Refreshed {
+    let results = std::thread::scope(|s| {
+        let running: Vec<_> = sources
+            .iter()
+            .map(|&source| {
+                (
+                    source,
+                    s.spawn(move || source.update(models_dir, force, quiet)),
+                )
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|(source, handle)| {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("{} update panicked", source.name())));
+                tracing::debug!(
+                    source = source.name(),
+                    ok = result.is_ok(),
+                    "rules refreshed"
+                );
+                (source, result)
+            })
+            .collect()
+    });
+    Refreshed(results)
+}
+
+/// Refresh every rule source as a long-lived process starts, unless
+/// `no_update`. Every failure but one is ridden out on the installed rules: a
+/// host in a disconnected environment must still start.
+///
+/// This is also what fills a `--traits-dir` naming an empty directory on a
+/// fresh deploy; without it a server comes up healthy and fails every analysis.
+///
+/// # Errors
+/// The one failure that is fatal: `--enriched` was asked for and the token is
+/// missing or refused. A daemon that came up anyway would serve rules nobody
+/// deployed it with.
+pub fn refresh_rules_at_startup(force: bool, no_update: bool) -> Result<()> {
+    if no_update {
+        tracing::warn!("--no-update: skipping the startup rules refresh");
+        return Ok(());
+    }
+    let refreshed = refresh(&Source::ALL, None, force, true);
+    for (source, e) in refreshed.failures() {
+        tracing::warn!(
+            source = source.name(),
+            error = format!("{e:#}"),
+            "startup rules refresh failed"
+        );
+    }
+    match refreshed.enriched_refusal() {
+        Some(why) => anyhow::bail!("enriched rules unavailable: {why}"),
+        None => Ok(()),
+    }
+}
+
 /// Default request slots: three per physical core.
 ///
 /// A slot spends much of its life on the network — dependency fetches and the
@@ -112,25 +271,18 @@ pub fn default_workers() -> NonZeroUsize {
 }
 
 /// How many top-level analyses may execute at once: the rayon pool (at least
-/// 2), never more than `slots`. `SCAN_CLEAVE_CONCURRENCY` overrides; 0 keeps
-/// the default.
+/// 2), never more than `slots`.
 ///
 /// Slots bound the requests in flight; this tighter gate bounds the
 /// memory-bandwidth-heavy cleave executions among them, held only around the
 /// blocking classify.
 pub(crate) fn cleave_concurrency(slots: usize) -> usize {
-    let override_value = std::env::var("SCAN_CLEAVE_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    cleave_concurrency_from(slots, rayon::current_num_threads(), override_value)
+    cleave_concurrency_from(slots, rayon::current_num_threads())
 }
 
-fn cleave_concurrency_from(slots: usize, pool: usize, override_value: Option<usize>) -> usize {
+fn cleave_concurrency_from(slots: usize, pool: usize) -> usize {
     let slots = slots.max(1);
-    override_value.filter(|&value| value > 0).map_or_else(
-        || pool.max(1).clamp(2.min(slots), slots),
-        |value| value.min(slots),
-    )
+    pool.max(1).clamp(2.min(slots), slots)
 }
 
 #[cfg(test)]
@@ -139,17 +291,10 @@ mod tests {
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
-        assert_eq!(cleave_concurrency_from(16, 32, None), 16);
-        assert_eq!(cleave_concurrency_from(16, 16, None), 16);
-        assert_eq!(cleave_concurrency_from(16, 8, None), 8);
-        assert_eq!(cleave_concurrency_from(2, 64, None), 2);
-        assert_eq!(cleave_concurrency_from(0, 32, None), 1);
-    }
-
-    #[test]
-    fn cleave_concurrency_override_caps_at_slots() {
-        assert_eq!(cleave_concurrency_from(4, 32, Some(64)), 4);
-        assert_eq!(cleave_concurrency_from(16, 32, Some(2)), 2);
-        assert_eq!(cleave_concurrency_from(16, 32, Some(0)), 16);
+        assert_eq!(cleave_concurrency_from(16, 32), 16);
+        assert_eq!(cleave_concurrency_from(16, 16), 16);
+        assert_eq!(cleave_concurrency_from(16, 8), 8);
+        assert_eq!(cleave_concurrency_from(2, 64), 2);
+        assert_eq!(cleave_concurrency_from(0, 32), 1);
     }
 }

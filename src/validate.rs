@@ -41,9 +41,9 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     if !degraded.is_empty() {
         let preview: Vec<&str> = degraded.iter().map(String::as_str).take(10).collect();
         anyhow::bail!(
-            "model degraded: feature_spec.json declares {} feature(s) this litmus build's \
+            "model degraded: feature_spec.json declares {} feature(s) this atomscan build's \
              extractor cannot produce, so they extract as zeros (e.g. {preview:?}); the model \
-             is out of sync with collimator — rebuild litmus with matching feature extraction \
+             is out of sync with collimator — rebuild atomscan with matching feature extraction \
              before deploying",
             degraded.len(),
         );
@@ -63,8 +63,8 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
             // this check compares against whichever traits revision happens to
             // be installed — which the traits auto-update can change under a
             // running fleet, with no scan release involved. Blocking on it
-            // meant a traits publish could stop every worker from booting,
-            // which is a far worse failure than the one being guarded against.
+            // would let a traits publish stop every node from booting, which
+            // is a far worse failure than the one being guarded against.
             // This command is the only place the installed tree is checked:
             // the test suite deliberately asserts nothing about it, since trait
             // definitions are validated in the traits repo, not here.
@@ -114,9 +114,8 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     crate::engine::add_zip_passwords(&mut options, config.zip_passwords());
     // The engine carries the rules and the compact member folding production
     // scans use, so each fixture's members are folded under the rules it is
-    // evaluated with. Folding used to consult a process-global mapper that
-    // validation never loads, and member features production keeps went
-    // missing here.
+    // evaluated with. A process-global mapper would not do: validation never
+    // loads one, and member features production keeps would go missing here.
     let engine = cleave::Engine::for_options(&options)?.with_compact_members(true);
 
     let total_targets = targets.len();
@@ -423,9 +422,9 @@ fn logit_margin(probability: f32, threshold: f32) -> f64 {
 mod logit_margin_tests {
     use super::logit_margin;
 
-    /// The 2026-08-04 OpenDocument misgrade. Under `{:.4}` the probability and
-    /// its threshold both printed as `0.0000`; the margin says it fired, and
-    /// by how little.
+    /// An OpenDocument decision at the bottom of the range. Under `{:.4}` the
+    /// probability and its threshold both print as `0.0000`; the margin says it
+    /// fired, and by how little.
     #[test]
     fn separates_a_decision_at_the_bottom_of_the_range() {
         let margin = logit_margin(1.031_160_4e-5, 8.072_087e-6);

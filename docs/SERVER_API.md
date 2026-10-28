@@ -188,8 +188,10 @@ recent latency by type and size, upload backlog.
 ### `POST /_/reload`, `POST /_/update`
 
 `/_/reload` reloads the model bundle and traits from disk and swaps them in;
-on failure the previous model stays. `/_/update` pulls the latest models and
-traits first. One at a time; a concurrent call gets `409`.
+on failure the previous model stays. `/_/update` first pulls the latest
+traits, models, bloom and NSRL filters; its `update_errors` names each source
+that failed to update and why, and is empty when none did. One at a time; a
+concurrent call gets `409`.
 
 ### `GET /_/memory`, `GET /_/requests`, `GET /_/threads`
 

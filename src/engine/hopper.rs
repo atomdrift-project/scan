@@ -128,9 +128,7 @@ fn registry_fallback_route(
     purl: &str,
     origin: Origin<'_>,
 ) -> HopperRoute {
-    let Some(real_sha) = crate::upload::hopper_http()
-        .and_then(|http| crate::upload::known_sha_for_purl(http, hopper_url, purl))
-    else {
+    let Some(real_sha) = crate::hopper::sha_for_purl(hopper_url, purl) else {
         return HopperRoute::Suppress;
     };
     let name = origin

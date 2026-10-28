@@ -32,7 +32,8 @@ pub use self::envelope::{
 };
 pub use self::pipeline::{PendingLlm, count_findings, extract_top_findings};
 pub use self::run::{
-    report_remote, run, run_bytes, run_paths, run_paths_with, run_with, scan_bytes, scan_file,
+    Fetched, FetchedKind, report_remote, run, run_bytes, run_paths, run_paths_with, run_with,
+    scan_bytes, scan_file,
 };
 pub use self::verdict::{
     FloorArm, FloorDecision, level_confidence, synthesized_level, trait_floor,
@@ -55,7 +56,6 @@ pub(crate) use self::run::{
     DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, tiny_opts_for,
 };
 
-use self::render_context::INTERPRET_PRIMARY_BUDGET_BYTES;
 use self::retention::UNANALYZED_MEMBER_RISK;
 
 /// Terminal display policy for scan verdicts and severe static findings.
@@ -142,18 +142,29 @@ pub struct ScanConfig {
 static RIZIN_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
 static RIZIN_RETRY_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-/// Configure one larger deadline for retrying timed-out native files.
-pub fn set_rizin_retry_timeout(timeout: Duration) {
-    let _ = RIZIN_RETRY_TIMEOUT.set(timeout);
+
+/// Fix the one larger deadline for retrying timed-out native files, once,
+/// before analysis.
+///
+/// # Errors
+/// When it was already fixed.
+pub fn set_rizin_retry_timeout(timeout: Duration) -> anyhow::Result<()> {
+    RIZIN_RETRY_TIMEOUT
+        .set(timeout)
+        .map_err(|_timeout| anyhow::anyhow!("rizin retry timeout already configured"))
 }
 pub(crate) fn rizin_retry_timeout() -> Option<Duration> {
     RIZIN_RETRY_TIMEOUT.get().copied()
 }
 
-/// Fix the wall-clock limit on each Rizin run. Call once before analysis;
-/// later calls are ignored.
-pub fn set_rizin_timeout(timeout: Duration) {
-    let _ = RIZIN_TIMEOUT.set(timeout);
+/// Fix the wall-clock limit on each Rizin run, once, before analysis.
+///
+/// # Errors
+/// When it was already fixed.
+pub fn set_rizin_timeout(timeout: Duration) -> anyhow::Result<()> {
+    RIZIN_TIMEOUT
+        .set(timeout)
+        .map_err(|_timeout| anyhow::anyhow!("rizin timeout already configured"))
 }
 
 /// The Rizin limit for an [`cleave::AnalysisOptions`]: the configured one, or
@@ -406,7 +417,7 @@ impl DependencyAttention {
 }
 
 /// Aggregate counters for a completed scan.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ScanSummary {
     /// Total number of files analyzed.
     pub total_files: u32,
@@ -445,13 +456,10 @@ pub struct FindingCounts {
 ///
 /// It never asks cleave for its regex prewarm. That compiles every pattern in
 /// cleave's warm memo, the union of everything any scan sharing the cache has
-/// ever compiled (~79k programs on 2026-09-25), when a scan only needs the few
-/// its file types reach, compiled lazily on first use. Measured that day on a
-/// quiet host: a one-shot 12-byte file went from 4.9 GiB peak and 44-48 s CPU
-/// to 0.8 GiB and 7-8 s, an 80 KB npm package from 4.9 GiB and ~50 s CPU to
-/// 1.5 GiB and 14 s, both faster in wall. A long-lived server answering 100
-/// mixed files, sequentially or four at a time, saw no first-request or
-/// throughput gain from it, only 2.6-2.8 GiB more peak RSS.
+/// ever compiled (tens of thousands of programs), when a scan only needs the
+/// few its file types reach, compiled lazily on first use. The prewarm costs a
+/// one-shot scan gigabytes of peak RSS and tens of seconds of CPU, and gives a
+/// long-lived server no first-request or throughput gain, only more peak RSS.
 pub fn prefetch_cleave_resources() {
     cleave::prefetch_shared_resources_with(true, false);
 }
@@ -507,50 +515,6 @@ fn archive_leaf(path: &str) -> &str {
 fn is_inside(path: &str, container: &str) -> bool {
     path.strip_prefix(container)
         .is_some_and(|rest| rest.starts_with(ARCHIVE_DELIMITER))
-}
-
-/// Engine settings an operator sets through the environment. They are
-/// deploy-time switches, not request input, so they are read once per process.
-#[derive(Debug, Clone)]
-pub(crate) struct Tuning {
-    /// `SCAN_INTERPRET_DUMP_DIR`: also write each LLM render to
-    /// `<dir>/<sha256>.render`, for offline prompt tuning (`hacks/interpret-tune`).
-    pub(crate) interpret_dump_dir: Option<PathBuf>,
-    /// `SCAN_KEEP_ALL_MEMBERS=1`: store whole reports, skipping retention.
-    pub(crate) keep_all_members: bool,
-    /// `SCAN_INTERPRET_BUDGET_BYTES`: the primary subject's render budget for
-    /// the LLM; `0` disables the cap.
-    pub(crate) interpret_budget_bytes: usize,
-}
-
-impl Default for Tuning {
-    fn default() -> Self {
-        Self {
-            interpret_dump_dir: None,
-            keep_all_members: false,
-            interpret_budget_bytes: INTERPRET_PRIMARY_BUDGET_BYTES,
-        }
-    }
-}
-
-impl Tuning {
-    fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            interpret_dump_dir: std::env::var_os("SCAN_INTERPRET_DUMP_DIR").map(PathBuf::from),
-            keep_all_members: std::env::var("SCAN_KEEP_ALL_MEMBERS").as_deref() == Ok("1"),
-            interpret_budget_bytes: std::env::var("SCAN_INTERPRET_BUDGET_BYTES")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(default.interpret_budget_bytes),
-        }
-    }
-
-    /// This process's settings, read from the environment on first use.
-    pub(crate) fn get() -> &'static Self {
-        static TUNING: OnceLock<Tuning> = OnceLock::new();
-        TUNING.get_or_init(Self::from_env)
-    }
 }
 
 /// Render a saved report through the live presentation functions without models.

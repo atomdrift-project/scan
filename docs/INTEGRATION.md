@@ -27,9 +27,8 @@ the whole interface.
 
 To refresh the models before a scan, add `-u` (a failed update is
 non-fatal); the models also auto-refresh when the local ruleset is over
-24h stale. Disable that automatic refresh with `--no-update` (or the
-`SCAN_NO_UPDATE` environment variable), and silence the once-a-day update
-notice with `SCAN_NO_UPDATE_CHECK`.
+24h stale. Disable that automatic refresh with `--no-update`, and silence the
+once-a-day update notice with `SCAN_NO_UPDATE_CHECK=1`.
 
 ## Choose a path
 
@@ -203,9 +202,7 @@ atomscan --follow=all --follow-depth 3 ./pkg/      # include CI actions too
 This is the only analysis phase that makes additional network requests. Use
 `--follow=none` for air-gapped or transparent-proxy gates that already know
 which artifacts will be requested. Set the default per
-deployment with `SCAN_FOLLOW` and `SCAN_FOLLOW_DEPTH` instead of flags if that
-suits you better. Existing `--fetch` and `SCAN_FETCH` configurations continue
-to work, as do the old `deps`, `packages`, `urls`, and `ci` value names.
+deployment with `SCAN_FOLLOW` instead of the flag if that suits you better.
 
 ## Library
 

@@ -16,7 +16,6 @@ OUT=$4
 export CLEAVE_TRAITS_DIR
 export SCAN_NO_ANALYSIS_CACHE=1
 export SCAN_FOLLOW=none
-export SCAN_NO_UPDATE=1
 export RUST_LOG=scan=warn,cleave=error
 
 mkdir -p "$OUT/jsonA" "$OUT/jsonB" "$OUT/err"
@@ -30,7 +29,7 @@ ls | LC_ALL=C sort | while IFS= read -r f; do
     safe=$(printf '%s' "$f" | tr '/ ' '__')
     run_leg() {
         leg=$1; bin=$2
-        /usr/bin/time -l "$bin" --format json --show all fs "$DATASET/$f" \
+        /usr/bin/time -l "$bin" --no-update --format json --show all fs "$DATASET/$f" \
             > "$OUT/json$leg/$safe.json" 2> "$OUT/err/$safe.$leg.err" || true
         awk -v w="" '/ real /{print $1; exit}' "$OUT/err/$safe.$leg.err"
     }

@@ -165,8 +165,7 @@ mod tests {
     }
 
     /// A finished scan must not stay in the registry, or `scan sys` would print
-    /// its notice for a Ctrl-C belonging to the phase after it — which is the
-    /// symptom the old per-entry-point handlers produced.
+    /// its notice for a Ctrl-C belonging to the phase after it.
     #[test]
     fn a_finished_scan_deregisters_itself() {
         const TAG: &str = "deregister-probe";

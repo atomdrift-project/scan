@@ -62,8 +62,7 @@ pub(crate) fn encoded_purl(purl: &str) -> String {
 /// ignored by default and run on purpose, so a missing bundle fails it rather
 /// than letting it pass without testing anything.
 pub(crate) fn model_dir() -> Result<std::path::PathBuf> {
-    std::env::var("SCAN_MODELS_DIR")
-        .map(std::path::PathBuf::from)
+    scan::env::path(scan::env::SCAN_MODELS_DIR)
         .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
 }
 

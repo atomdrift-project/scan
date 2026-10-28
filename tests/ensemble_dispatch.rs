@@ -21,12 +21,14 @@ use std::path::{Path, PathBuf};
 
 use scan::model::Model;
 
+#[expect(clippy::disallowed_methods, reason = "a test-only fixture location")]
 fn onnx_bundle() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
     (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
 }
 
 /// A full ensemble bundle (`general/` + `config.json` + `route_policies.json`).
+#[expect(clippy::disallowed_methods, reason = "a test-only fixture location")]
 fn ensemble_bundle() -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("AZOTH_DIR")?);
     p.join("general").is_dir().then_some(p)

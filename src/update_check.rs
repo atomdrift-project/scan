@@ -1,6 +1,6 @@
 //! Release-update notifier.
 //!
-//! On first run and at most once every 24 hours, litmus fetches a small static
+//! On first run and at most once every 24 hours, scan fetches a small static
 //! TOML manifest (`litmus.toml`) and prints a one-line notice when a newer
 //! release exists. The fetch is a plain GET of a static file; the only thing it
 //! says about this install is its User-Agent, `scan/<version>`. A fresh result
@@ -8,14 +8,13 @@
 //! network at all.
 //!
 //! The opt-out is honored everywhere: pass `--no-update-check` or set
-//! `SCAN_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
-//! via `SCAN_UPDATE_URL` (primarily for testing against a local server).
+//! `SCAN_NO_UPDATE_CHECK=1` to disable the notice.
 
 use crate::update_manifest::{self, Manifest};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Default location of the hosted manifests.
 const DEFAULT_BASE_URL: &str = "https://atomdrift.org/updates/";
@@ -72,14 +71,6 @@ fn cache_path() -> Option<PathBuf> {
     )
 }
 
-/// Current Unix time in seconds (0 if the clock predates the epoch).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Persist the notice cache (best-effort; failures are non-fatal).
 fn write_cache(cache: &Cache) {
     let Some(path) = cache_path() else { return };
@@ -115,7 +106,7 @@ fn notify(latest: &str, url: Option<&str>, installed: &str) {
 /// parse failure is logged at debug level and otherwise ignored — the check is
 /// strictly best-effort and never blocks or fails a command.
 pub fn maybe_notify(disabled_by_flag: bool) {
-    if disabled_by_flag || std::env::var_os("SCAN_NO_UPDATE_CHECK").is_some() {
+    if disabled_by_flag || crate::env::flag(crate::env::SCAN_NO_UPDATE_CHECK) {
         return;
     }
     let installed = env!("CARGO_PKG_VERSION");
@@ -127,16 +118,15 @@ pub fn maybe_notify(disabled_by_flag: bool) {
     // A fresh stamp (a recent success *or* a recent failed attempt) is used
     // without any network access.
     if let Some(cache) = &cached
-        && now_unix().saturating_sub(cache.checked_unix) < CHECK_INTERVAL_SECS
+        && crate::civil::now_secs().saturating_sub(cache.checked_unix) < CHECK_INTERVAL_SECS
     {
         notify(&cache.latest, cache.url.as_deref(), installed);
         return;
     }
 
-    let base = std::env::var("SCAN_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-    let cache = match fetch(&manifest_url(&base, "litmus.toml")) {
+    let cache = match fetch(&manifest_url(DEFAULT_BASE_URL, "litmus.toml")) {
         Ok(manifest) => Cache {
-            checked_unix: now_unix(),
+            checked_unix: crate::civil::now_secs(),
             latest: manifest.latest,
             url: manifest.url,
         },
@@ -146,7 +136,7 @@ pub fn maybe_notify(disabled_by_flag: bool) {
             // trigger a network call on every run. Preserve any previously
             // known `latest` so a transient failure still shows the last notice.
             Cache {
-                checked_unix: now_unix(),
+                checked_unix: crate::civil::now_secs(),
                 ..cached.unwrap_or_default()
             }
         }

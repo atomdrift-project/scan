@@ -1,8 +1,8 @@
 //! In-process all-thread backtraces for the `SIGUSR1` wedge dump.
 //!
-//! The previous `SIGUSR1` handler shelled out to `lldb`/`gdb` to attach to the
-//! worker — which fails exactly where it is needed: macOS SIP blocks self-attach,
-//! and the production FreeBSD bastille jails don't grant ptrace. This module
+//! Attaching `lldb`/`gdb` to the process fails exactly where it is needed:
+//! macOS SIP blocks self-attach, and the production FreeBSD bastille jails don't
+//! grant ptrace. This module
 //! captures the stacks of the analysis threads from *inside* the process, with no
 //! debugger and no ptrace, so a wedge can be diagnosed in the jail.
 //!
@@ -19,7 +19,7 @@
 //! atomics into preallocated memory, but the stack walk goes through the
 //! platform unwinder, which may take locks or allocate; a thread interrupted
 //! inside the allocator or the unwinder can deadlock or crash the process. On
-//! FreeBSD a `SIGUSR1` dump has aborted a worker. So the dump is only ever
+//! FreeBSD a `SIGUSR1` dump can abort the process. So the dump is only ever
 //! taken on a process that is already wedged or about to exit, never as
 //! routine telemetry.
 //!
@@ -45,7 +45,7 @@ static DUMPING: AtomicBool = AtomicBool::new(false);
 /// threads live for the process; tokio `spawn_blocking` threads are recycled
 /// after idle timeout, so each registration installs a thread-local guard that
 /// removes the id when its thread exits — otherwise dead tids would accumulate
-/// for the life of a long-running worker.
+/// for the life of a long-running process.
 fn registry() -> &'static Mutex<std::collections::BTreeSet<u64>> {
     static REGISTRY: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))

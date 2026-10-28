@@ -140,26 +140,30 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// Pull the latest models and traits. Both pulls are non-fatal: each failure
-/// is reported, and the reload that follows runs against whatever is on disk.
-/// `model_update` validates a bundle (`Model::load`) before swapping it in, so
-/// a broken bundle never lands and there is nothing to roll back. Blocking.
-fn pull_updates() -> (Option<String>, Option<String>) {
-    let models_err = crate::models_repo::install_target()
-        .and_then(|dir| crate::model_update::update(&dir, false, false))
-        .err()
-        .map(|e| {
-            tracing::warn!("models update failed: {e:#}");
-            e.to_string()
-        });
-    let traits_err = crate::traits_repo::update(false, false).err().map(|e| {
-        tracing::warn!("traits update failed: {e:#}");
-        e.to_string()
-    });
-    (models_err, traits_err)
+/// Pull every rule source, then reload the bloom filters if they changed.
+/// Every failure is reported and none is fatal: the model reload that follows
+/// runs against whatever is on disk, and a bundle that fails validation never
+/// lands there. Blocking.
+fn pull_updates() -> Vec<(crate::rules::Source, String)> {
+    use crate::rules::Source;
+    let refreshed = crate::rules::refresh(&Source::ALL, None, false, true);
+    if refreshed.changed_source(Source::Bloom) || refreshed.changed_source(Source::Nsrl) {
+        crate::bloom_repo::reload();
+    }
+    refreshed
+        .failures()
+        .map(|(source, e)| {
+            tracing::warn!(
+                source = source.name(),
+                error = format!("{e:#}"),
+                "update failed"
+            );
+            (source, format!("{e:#}"))
+        })
+        .collect()
 }
 
-/// POST /_/update — pull the latest models and traits, then reload.
+/// POST /_/update — pull every rule source, then reload.
 ///
 /// Shares the reload lock with `/_/reload`, so concurrent calls receive 409,
 /// and holds it across the pulls and the reload for as long as they run.
@@ -175,8 +179,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
         let pulled = pull_updates();
         (pulled, updating.reload_bundle())
     });
-    let ((models_err, traits_err), reloaded) = match tokio::time::timeout(UPDATE_TIMEOUT, job).await
-    {
+    let (failures, reloaded) = match tokio::time::timeout(UPDATE_TIMEOUT, job).await {
         Ok(Ok(done)) => done,
         Ok(Err(e)) => {
             tracing::warn!("update task join error: {e}");
@@ -195,15 +198,17 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
         }
     };
+    // Per source that failed to update, why; empty when all of them did.
+    let update_errors: serde_json::Map<String, serde_json::Value> = failures
+        .into_iter()
+        .map(|(source, why)| (source.name().to_owned(), why.into()))
+        .collect();
     match reloaded {
         Ok(reloaded) => {
             let mut body = serde_json::json!({
                 "status": "ok",
                 "elapsed_ms": reloaded.elapsed_ms,
-                "models_updated": models_err.is_none(),
-                "traits_updated": traits_err.is_none(),
-                "models_error": models_err,
-                "traits_error": traits_err,
+                "update_errors": update_errors,
                 "version": env!("CARGO_PKG_VERSION"),
                 "model_commit": crate::models_repo::version(),
                 "traits_commit": cleave::traits_repo::version(),
@@ -223,10 +228,7 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
                 Json(serde_json::json!({
                     "status": "reload_failed",
                     "error": "Failed to load model",
-                    "models_updated": models_err.is_none(),
-                    "traits_updated": traits_err.is_none(),
-                    "models_error": models_err,
-                    "traits_error": traits_err,
+                    "update_errors": update_errors,
                 })),
             )
                 .into_response()

@@ -64,7 +64,7 @@ pub(crate) fn write_extra_diagnostics(out: &mut dyn io::Write, r: &ScanResult) -
     Ok(())
 }
 
-/// Write litmus's `--format tiny` view (machine/LLM-facing, never colored): one
+/// Write the `--format tiny` view (machine/LLM-facing, never colored): one
 /// ML-verdict line — the gate, calibrated confidence, matched false-positive
 /// level — then cleave's annotated context.
 pub(crate) fn write_tiny(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<()> {
@@ -401,7 +401,7 @@ fn terminal_top_traits(files: &[&FileAnalysis]) -> Vec<TerminalTrait> {
                     continue;
                 }
                 let full_id = finding.id.as_str();
-                let base_id = full_id.split_once("::").map_or(full_id, |(base, _)| base);
+                let base_id = crate::features::trait_path(full_id);
                 if seen_ids.contains(base_id) {
                     continue;
                 }
@@ -553,6 +553,54 @@ fn top_package_id(file: &FileAnalysis, roots: &[(u32, &str)]) -> Option<u32> {
         .map(|(id, _)| *id)
 }
 
+/// One package inside a multi-package archive: its depth-1 root, the worst
+/// independent verdict among its files, and those files.
+struct Package {
+    id: u32,
+    decision: Decision,
+    members: Vec<u32>,
+}
+
+/// The archive layout when every notable member is a single ordinary file:
+/// their strongest findings in one aligned grid under `out`'s banner, then a
+/// line for what was left out. `total` counts every package, notable or not.
+fn member_grid(
+    mut out: String,
+    notable: &[&Package],
+    total: usize,
+    by_id: &HashMap<u32, &FileAnalysis>,
+) -> Option<String> {
+    let mut traits = Vec::new();
+    for pkg in notable.iter().take(3) {
+        let file = *by_id.get(&pkg.id)?;
+        if let Some(mut finding) = terminal_top_traits(&[file]).into_iter().next() {
+            let path = terminal_safe_text(&package_display_path(&file.path));
+            finding.location = finding
+                .location
+                .strip_prefix("line ")
+                .map_or_else(|| path.clone(), |line| format!("{path}:{line}"));
+            traits.push(finding);
+        }
+    }
+    out.push_str(&output::terminal_trait_rows(&traits, terminal_width()));
+    out.push('\n');
+    let additional = notable.len().saturating_sub(traits.len());
+    let clean = total.saturating_sub(notable.len());
+    let mut omitted = Vec::new();
+    if additional > 0 {
+        let noun = if additional == 1 { "file" } else { "files" };
+        omitted.push(format!("{additional} additional affected {noun}"));
+    }
+    if clean > 0 {
+        let noun = if clean == 1 { "file" } else { "files" };
+        omitted.push(format!("{clean} clean {noun} omitted"));
+    }
+    if !omitted.is_empty() {
+        let _ = write!(out, "\n {}\n", omitted.join(" · "));
+    }
+    Some(out)
+}
+
 /// Render a multi-package archive as a stack of independent verdict cards.
 ///
 /// A "grab-bag" archive — several unrelated packages zipped together — is badly
@@ -592,11 +640,6 @@ fn render_archive_cards(
 
     // Each package's verdict is the worst independent verdict among its files —
     // exactly how a first-hand scan of that package alone would resolve.
-    struct Package {
-        id: u32,
-        decision: Decision,
-        members: Vec<u32>,
-    }
     let mut packages: Vec<Package> = members_of
         .into_iter()
         .filter_map(|(pkg, package_members)| {
@@ -677,35 +720,7 @@ fn render_archive_cards(
                 .get(&pkg.id)
                 .is_some_and(|file| decoded_region_display_path(&file.path).is_none())
     }) {
-        let mut traits = Vec::new();
-        for pkg in notable.iter().take(3) {
-            let file = *by_id.get(&pkg.id)?;
-            if let Some(mut finding) = terminal_top_traits(&[file]).into_iter().next() {
-                let path = terminal_safe_text(&package_display_path(&file.path));
-                finding.location = finding
-                    .location
-                    .strip_prefix("line ")
-                    .map_or_else(|| path.clone(), |line| format!("{path}:{line}"));
-                traits.push(finding);
-            }
-        }
-        out.push_str(&output::terminal_trait_rows(&traits, terminal_width()));
-        out.push('\n');
-        let additional = notable.len().saturating_sub(traits.len());
-        let clean = packages.len().saturating_sub(notable.len());
-        let mut omitted = Vec::new();
-        if additional > 0 {
-            let noun = if additional == 1 { "file" } else { "files" };
-            omitted.push(format!("{additional} additional affected {noun}"));
-        }
-        if clean > 0 {
-            let noun = if clean == 1 { "file" } else { "files" };
-            omitted.push(format!("{clean} clean {noun} omitted"));
-        }
-        if !omitted.is_empty() {
-            let _ = write!(out, "\n {}\n", omitted.join(" · "));
-        }
-        return Some(out);
+        return member_grid(out, &notable, packages.len(), &by_id);
     }
 
     // Decoded regions are children of the named artifact, not sibling packages.
@@ -986,7 +1001,7 @@ pub(super) fn render_terminal_fetch_context(
         // A registry-only entry (no bytes fetched, so no verdict) is shown only
         // when the registry itself flags it hostile — a pulled version or a
         // security hold. "Older than fetch age limit" and other benign states are
-        // not findings; they were the bulk of the old noise.
+        // not findings, and showing them would bury the ones that are.
         let record = &registry.provenance.record;
         if record.version_removed != Some(true) && record.security_hold != Some(true) {
             continue;

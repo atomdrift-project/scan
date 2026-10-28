@@ -160,13 +160,11 @@ def main():
     env = dict(os.environ)
     env.update(
         SCAN_NO_ANALYSIS_CACHE="1",
-        SCAN_ANALYSIS_CACHE="0",
         FILEFACTS_CACHE="0",
         STNG_STRING_CACHE="0",
         CLEAVE_SKIP_CACHE="1",
         CLEAVE_SKIP_YARA_CACHE="0",
         SCAN_NO_UPDATE_CHECK="1",
-        SCAN_FOLLOW="none",
         SCAN_FOLLOW="none",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -247,7 +245,6 @@ def main():
         source_leaf_min_kb=env.get("CLEAVE_SOURCE_LEAF_MIN_KB", "4096"),
         source_flight_wait=env.get("CLEAVE_SOURCE_FLIGHT_WAIT", "0"),
         analysis_memo_mb=env.get("CLEAVE_ANALYSIS_MEMO_MB", "64"),
-        model_memo_mb=env.get("SCAN_MODEL_MEMO_MB", "0"),
         jemalloc_conf=env.get("_RJEM_MALLOC_CONF", "default"),
         cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         member_pressure_floor_mb=env.get("CLEAVE_MEMBER_PRESSURE_FLOOR_MB", "default"),

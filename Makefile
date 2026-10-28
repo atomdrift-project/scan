@@ -80,6 +80,10 @@ SCAN_THREADS ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
+# `make lint LOCKED=--locked` (CI) refuses a Cargo.lock that would change.
+# Empty by default so a local `[patch]` experiment still lints and tests.
+LOCKED ?=
+
 .PHONY: pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
@@ -445,7 +449,8 @@ tuna-once: ## One cleave-tuna cycle, then cherry-pick accepted experiments
 
 lint:
 	$(CARGO) fmt --all --check
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy $(LOCKED) --workspace --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc $(LOCKED) --no-deps --lib --quiet
 
 # Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
 # tidies any code clippy rewrote. Mirrors what `lint` checks.
@@ -456,12 +461,10 @@ fix:
 test:
 	@set -e; \
 	if command -v cargo-nextest >/dev/null 2>&1; then \
-		$(CARGO) nextest run --workspace; \
-		$(CARGO) test --doc --quiet; \
+		$(CARGO) nextest run $(LOCKED) --workspace; \
+		$(CARGO) test $(LOCKED) --doc --quiet; \
 	else \
-		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
-		$(CARGO) test --workspace -- \
-			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
+		$(CARGO) test $(LOCKED) --workspace; \
 	fi
 
 .PHONY: test-cli

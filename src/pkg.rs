@@ -9,7 +9,7 @@
 use anyhow::Result;
 use fletch::RefLocator;
 
-use crate::engine::ScanConfig;
+use crate::engine::{Fetched, FetchedKind, ScanConfig};
 use crate::{OutputFormat, ScanSummary};
 
 /// Fetch and scan a raw URL.
@@ -104,6 +104,21 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     // itself (when `derived_purl` is `None`), and `locator` moves into
     // `fetch_one` below before this is used again in the fetch-failure arm.
     let fallback_locator = crate::fetch::locator_str(registry_locator).to_owned();
+    // Scan the registry's record in place of a release that has no bytes.
+    let metadata_only = |name: &str, bytes| {
+        crate::engine::run_bytes(
+            Fetched {
+                label: name,
+                name,
+                bytes,
+                registry: registry_provenance.as_ref(),
+                kind: FetchedKind::RegistryRecord {
+                    purl: &fallback_locator,
+                },
+            },
+            config,
+        )
+    };
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
         // The registry lookup we just did (the packument we need for the record
@@ -117,15 +132,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             if progress {
                 warn_metadata_only("version unpublished");
             }
-            return crate::engine::run_bytes(
-                &name,
-                &name,
-                bytes,
-                config,
-                registry_provenance.as_ref(),
-                None,
-                Some(fallback_locator.as_str()),
-            );
+            return metadata_only(&name, bytes);
         }
     }
     // No known-good short-circuit here, by design. This function only ever runs
@@ -143,13 +150,14 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
             // its download URL); fall back to the locator itself.
             let label = crate::fetch::fetch_target(&rec).to_owned();
             crate::engine::run_bytes(
-                &label,
-                &name,
-                bytes,
+                Fetched {
+                    label: &label,
+                    name: &name,
+                    bytes,
+                    registry: registry_provenance.as_ref(),
+                    kind: FetchedKind::Artifact(&rec),
+                },
                 config,
-                registry_provenance.as_ref(),
-                Some(&rec),
-                None,
             )
         }
         // A release that is gone — unpublished or removed, while its metadata
@@ -172,15 +180,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 if progress {
                     warn_metadata_only("artifact unavailable");
                 }
-                crate::engine::run_bytes(
-                    &name,
-                    &name,
-                    bytes,
-                    config,
-                    registry_provenance.as_ref(),
-                    None,
-                    Some(fallback_locator.as_str()),
-                )
+                metadata_only(&name, bytes)
             }
             None => {
                 tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), "artifact could not be fetched");

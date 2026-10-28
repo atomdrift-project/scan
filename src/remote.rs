@@ -11,7 +11,7 @@
 //! What may leave the machine is decided here and nowhere else:
 //!
 //! - the SHA-256 of a local file of at least
-//!   [`crate::analysis::small_job_max_bytes`] (1 MiB) — below that, analyzing
+//!   [`crate::analysis::SMALL_JOB_MAX_BYTES`] (1 MiB) — below that, analyzing
 //!   is cheaper than asking, and such files are mostly source nobody else has;
 //! - the SHA-256 of a fetched artifact;
 //! - a PURL only when [`public_purl`] says it names a package on a mainstream
@@ -22,7 +22,7 @@
 //! record, the way a bloom decision is reported as `"source": "bloom"`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -201,12 +201,12 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
     let Some(precheck) = crate::corpus_precheck::armed().filter(|p| p.is_isotope13()) else {
         return (Vec::new(), paths);
     };
-    let floor = crate::analysis::small_job_max_bytes();
+    let floor = crate::analysis::SMALL_JOB_MAX_BYTES;
     let digests: Vec<Option<String>> = paths
         .par_iter()
         .map(|path| {
             let big = std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() >= floor);
-            big.then(|| sha256_file(path).ok()).flatten()
+            big.then(|| crate::digest::sha256_file(path).ok()).flatten()
         })
         .collect();
     let mut asked: Vec<String> = digests.iter().flatten().cloned().collect();
@@ -265,20 +265,6 @@ pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
         Standing::Adopt(verdict) => Some((hit.sha, verdict)),
         _ => None,
     }
-}
-
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// What to send `/v1/analyze` under `remote`.
@@ -437,7 +423,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tmp");
         std::fs::write(tmp.path(), b"abc").expect("write");
         assert_eq!(
-            sha256_file(tmp.path()).expect("hash"),
+            crate::digest::sha256_file(tmp.path()).expect("hash"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }

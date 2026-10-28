@@ -1,7 +1,7 @@
 //! Background reclamation of the on-disk caches a scan process populates.
 //!
 //! scan is the process that most heavily fills these caches, and its long-lived
-//! worker/server modes never exit — so a startup-only sweep would never fire
+//! server mode never exits — so a startup-only sweep would never fire
 //! again, and cleave only prunes the shared caches on a *directory* scan, not
 //! the per-payload analysis a daemon runs. [`start`] therefore picks a one-shot
 //! sweep for CLI runs and a recurring loop for daemons.
@@ -20,7 +20,7 @@ use filefacts::cache_sweep::{self, Budget, Root};
 /// single `stat`, so this only bounds how soon a newly-oversized cache is seen.
 const DAEMON_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Start cache reclamation for this process. `daemon` = a serve/worker mode that
+/// Start cache reclamation for this process. `daemon` = a long-running mode that
 /// never exits (sweep must recur); otherwise a one-shot CLI that sweeps once at
 /// startup, racing the real work.
 pub fn start(daemon: bool) {
@@ -61,9 +61,9 @@ fn budgets() -> Vec<Budget> {
     out.push(Budget {
         label: "scan",
         roots: scan_roots,
-        max_age: cache_sweep::max_age_from_env("SCAN_CACHE_TTL_DAYS"),
-        max_bytes: cache_sweep::max_bytes_from_env("SCAN_CACHE_MAX_BYTES"),
-        max_entries: cache_sweep::max_entries_from_env("SCAN_CACHE_MAX_ENTRIES"),
+        max_age: Duration::from_secs(30 * 24 * 60 * 60),
+        max_bytes: 2 * 1024 * 1024 * 1024,
+        max_entries: filefacts::cache::DEFAULT_MAX_ITEMS,
     });
 
     out

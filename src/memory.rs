@@ -3,22 +3,20 @@
 //!
 //! This lives in the library, not in a binary, because every process that drives
 //! analysis needs the same answer. Postdoc builds its own startup configuration
-//! and reuses this policy rather than passing a raw CLI value through. Otherwise
-//! the meanings of `0` can silently collide: an
-//! already-resolved ceiling uses `0` for *unlimited*, while every CLI spells
-//! `0` as *resolve one for me*. The two meanings collide on the default value,
-//! so the worker ran with memory admission disabled entirely. Which is why
-//! `Startup` now takes a [`MaxRssPolicy`] and resolves it itself: there is no
+//! and reuses this policy rather than passing a raw CLI value through, because
+//! the meanings of `0` collide: an already-resolved ceiling uses `0` for
+//! *unlimited*, while every CLI spells `0` as *resolve one for me*. Passed
+//! through raw, the default value would disable memory admission entirely.
+//! Callers hand over a [`MaxRssPolicy`] and it is resolved here, so there is no
 //! raw number left to pass through.
 //!
 //! **The basis must be cgroup-aware.** `cleave::memory_tracker::total_memory()`
 //! is the host's `MemTotal` and knows nothing about cgroups, so on a shared host
-//! it hands back a budget covering the whole machine. galadriel, 2026-09-17: a
-//! 251 GiB host resolved a 213 GiB ceiling for a worker sharing the box with a
-//! 32 GB `shared_buffers` PostgreSQL replica and vllm. The admission controller
-//! then did exactly what it was told and filled that budget — 576 concurrent
-//! analyses — until the cgroup OOM-killed the process every ~20 minutes. It was
-//! never a leak; memory was returned whenever work drained. The budget was a lie.
+//! it hands back a budget covering the whole machine: on a 251 GiB host shared
+//! with a database and an inference server, a 213 GiB ceiling. The admission
+//! controller then does exactly what it is told and fills that budget with
+//! hundreds of concurrent analyses until the cgroup OOM-kills the process. That
+//! is not a leak, since memory returns whenever work drains; the budget lies.
 //!
 //! The process ceiling is clamped to the memory available to its cgroup, with
 //! reserve for the operating system and other tenants.
@@ -66,7 +64,7 @@ impl MaxRssPolicy {
         }
     }
 
-    /// The worker's admission ceiling in bytes, resolved against this host;
+    /// The process's admission ceiling in bytes, resolved against this host;
     /// `None` when throttling is disabled. See [`resolve_worker_max_rss_gb`].
     #[must_use]
     pub fn worker_ceiling(self) -> Option<NonZeroU64> {
@@ -88,7 +86,7 @@ impl MaxRssPolicy {
     }
 }
 
-/// Memory a worker may size itself against, and where the number came from.
+/// Memory a process may size itself against, and where the number came from.
 ///
 /// `source` is logged as `auto_memory_basis_source`, which is how an operator
 /// confirms a cgroup limit was actually seen rather than assumed.
@@ -129,10 +127,9 @@ fn cgroup_limit_under(root: &Path, start: &Path) -> Option<u64> {
 /// Most restrictive memory limit that applies to this process.
 ///
 /// The limit that actually binds a process is the minimum over *every* ancestor
-/// cgroup, not the value on its own. That distinction is load-bearing: atomscan's
-/// server runs its companion worker in a delegated child cgroup
-/// (`scan.service/idle`) carrying no limit of its own, so reading only
-/// [`cgroup_v2_path`] finds nothing while the `MemoryMax=` on the parent unit is
+/// cgroup, not the value on its own. That distinction is load-bearing: a process
+/// in a delegated child cgroup that carries no limit of its own finds nothing by
+/// reading only [`cgroup_v2_path`], while the `MemoryMax=` on the parent unit is
 /// exactly what OOM-kills it.
 ///
 /// `memory.high` counts because a throttle the process can never outrun is a
@@ -177,7 +174,7 @@ pub fn worker_memory_basis() -> WorkerMemoryBasis {
     }
 }
 
-/// Resolve a raw `--max-rss-gb` into the worker's GiB ceiling; 0 means
+/// Resolve a raw `--max-rss-gb` into the process's GiB ceiling; 0 means
 /// throttling is disabled.
 #[must_use]
 pub fn resolve_worker_max_rss_gb(raw_max_rss_gb: i64) -> u64 {

@@ -97,7 +97,7 @@ impl ApiError {
     }
 
     /// A refusal for want of capacity: a router answers it by trying another
-    /// worker, which is why it is a fast 429 rather than a queue.
+    /// server, which is why it is a fast 429 rather than a queue.
     pub(super) fn at_capacity(
         message: impl Into<Cow<'static, str>>,
         lane: Option<&'static str>,
@@ -118,7 +118,7 @@ impl ApiError {
     pub(super) fn from_analysis(error: &anyhow::Error) -> Self {
         if let Some(busy) = error.downcast_ref::<crate::analysis::WhaleSlotBusy>() {
             // The same shape admission refuses with before the stream starts,
-            // so a router treats both as "full, try the next worker".
+            // so a router treats both as "full, try the next server".
             return Self::at_capacity(busy.to_string(), Some("whale"), Some(30));
         }
         // An artifact that could not be retrieved is answered from the type
@@ -319,10 +319,10 @@ mod tests {
     }
 
     /// An artifact the registry would not serve is a 422, not a 500. Beamline
-    /// reads a 5xx as a sick worker — it opens the breaker and retries the
+    /// reads a 5xx as a sick server — it opens the breaker and retries the
     /// fleet — so answering a plain 404 from a package host with a server
-    /// fault ejected healthy workers and reached poppy as an outage instead of
-    /// a download failure.
+    /// fault would eject healthy servers and reach poppy as an outage instead
+    /// of a download failure.
     #[test]
     fn unretrievable_artifact_is_422_not_500() {
         let error = anyhow::Error::new(crate::fetch::Unretrievable {

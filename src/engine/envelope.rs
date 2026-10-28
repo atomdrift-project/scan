@@ -88,8 +88,8 @@ pub struct ScanResult {
     pub analysis_cached: bool,
     /// Wall-clock the LLM second opinion took, in milliseconds; 0 when none
     /// ran. Not serialized. The server subtracts it from the latency it
-    /// reports to the router: the endpoint is shared by every worker, so its
-    /// slowness says nothing about which worker to pick.
+    /// reports to the router: the endpoint is shared by every server, so its
+    /// slowness says nothing about which server to pick.
     pub interpret_ms: u64,
     /// Fetched dependencies to mirror into hopper as their own samples. Empty
     /// unless the scan fetched dependencies; consumed by the upload paths and
@@ -345,7 +345,7 @@ pub struct EmbeddedFile {
     /// were not compiled against this field. It exists so a caller reporting
     /// the model and the floor as separate opinions can tell which of them
     /// convicted a member — `classification` above is the floored verdict and
-    /// no longer says which produced it.
+    /// does not say which produced it.
     #[serde(skip)]
     pub floor: Option<FloorDecision>,
 }
@@ -538,11 +538,16 @@ impl ScanResult {
     pub(crate) fn has_severe_findings(&self) -> bool {
         self.finding_counts.hostile > 0
             || self.finding_counts.suspicious > 0
-            || self.top_findings.iter().any(|finding| finding.crit >= 4)
             || self
-                .embedded_files
-                .values()
-                .any(|member| member.top_findings.iter().any(|finding| finding.crit >= 4))
+                .top_findings
+                .iter()
+                .any(|finding| finding.crit >= crate::features::CRIT_SUSPICIOUS)
+            || self.embedded_files.values().any(|member| {
+                member
+                    .top_findings
+                    .iter()
+                    .any(|finding| finding.crit >= crate::features::CRIT_SUSPICIOUS)
+            })
     }
 
     /// The `ml` section. Clones only the small fields; `files` is built here.
@@ -687,7 +692,7 @@ pub(super) mod tests {
         );
         assert_eq!(ml[1]["lvl"].as_i64(), Some(-1));
         // Same basename, different nodes: id keys the join, so each reports
-        // its own evaluation (the old path-suffix match returned the first).
+        // its own evaluation (a path-suffix match would return the first).
         assert!((ml[2]["prob"].as_f64().unwrap() - 0.00002).abs() < 1e-9);
         assert_eq!(ml[3]["lvl"].as_i64(), Some(3000));
         // Never evaluated: no verdict fields at all — absence, not inheritance.

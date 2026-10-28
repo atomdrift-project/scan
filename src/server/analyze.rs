@@ -1,11 +1,9 @@
 //! One analysis on behalf of a request: claiming capacity, running it on a
 //! blocking thread, and filing what it found.
 //!
-//! Every analyze route goes through here — the single-flight routes through
-//! [`lead`], `/analyze-path` through [`RequestGuard::run`] and [`record`]
-//! directly — so admission, the `/_/requests` entry, the timeout, the
-//! completion log and the `/_/stats` figures are one code path, not five
-//! copies that drift.
+//! Every analyze route goes through [`lead`], so admission, the `/_/requests`
+//! entry, the timeout, the completion log and the `/_/stats` figures are one
+//! code path.
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -92,60 +90,37 @@ impl Job {
 /// Refusing past full, rather than queueing. A queue here would hide the one
 /// fact the router most needs: a rejection is information, delivered in
 /// milliseconds, and beamline answers it by promoting the next arm onto a
-/// worker that has room. A queued request looks identical to a slow one from
-/// outside, so the router keeps choosing a saturated worker while an idle one
+/// backend that has room. A queued request looks identical to a slow one from
+/// outside, so the router keeps choosing a saturated backend while an idle one
 /// waits — and the queued analysis still runs after somebody else has already
 /// answered, which is the duplicate work single-flight exists to prevent.
 pub(super) fn admit(
     state: &AppState,
     request_id: u64,
     subject: &dyn Display,
-    size_hint: Option<u64>,
 ) -> Result<(Arc<ModelResources>, AnalysisPermit), ApiError> {
     let resources = state.resources().inspect_err(|_| {
         tracing::debug!(id = request_id, "rejected: resources not yet loaded");
     })?;
-    let permit = acquire(state, size_hint).inspect_err(|_| {
+    let permit = acquire(state).inspect_err(|_| {
         tracing::warn!(id = request_id, key = %subject, "rejecting: at capacity");
     })?;
     Ok((resources, permit))
 }
 
-/// One analysis permit under whichever admission scheme is active. With slot
-/// lanes on, a full lane is a fast 429 with a Retry-After hint rather than a
-/// queue; without them this is the flat try-acquire it always was.
-/// `size_hint` `None` (an unfetched PURL or URL) classes as a whale, the safe
-/// direction.
-fn acquire(state: &AppState, size_hint: Option<u64>) -> Result<AnalysisPermit, ApiError> {
-    let slot = match &state.lanes {
-        None => Arc::clone(&state.slots)
-            .try_acquire_owned()
-            .map_err(|_no_permit| {
-                let max = state.config.workers;
-                ApiError::at_capacity(
-                    format!("At capacity ({max}/{max} active analyses)"),
-                    None,
-                    None,
-                )
-            })?,
-        Some(lanes) => {
-            let small = size_hint.is_some_and(|size| size <= lanes.small_max_bytes);
-            // A small analysis is seconds, so its hint is "come right back"; a
-            // whale's is long enough for a router to prefer an idle server.
-            let (lane, label, retry_after_secs) = if small {
-                (&lanes.small, "small", 5)
-            } else {
-                (&lanes.whale, "whale", 30)
-            };
-            Arc::clone(lane).try_acquire_owned().map_err(|_no_permit| {
-                ApiError::at_capacity(
-                    format!("{label} lane at capacity"),
-                    Some(label),
-                    Some(retry_after_secs),
-                )
-            })?
-        }
-    };
+/// One analysis permit: a slot and a core, or a fast 429. A router answers
+/// the refusal by trying another server, which a queue would hide from it.
+fn acquire(state: &AppState) -> Result<AnalysisPermit, ApiError> {
+    let slot = Arc::clone(&state.slots)
+        .try_acquire_owned()
+        .map_err(|_no_permit| {
+            let max = state.config.workers;
+            ApiError::at_capacity(
+                format!("At capacity ({max}/{max} active analyses)"),
+                None,
+                None,
+            )
+        })?;
     // A slot without a core is a queue, and the router was promised a
     // refusal rather than a wait.
     let cpu = Arc::clone(&state.cpu)
@@ -169,7 +144,7 @@ pub(super) fn lead(
     follow: RequestFollow,
 ) {
     let publisher = state.flights.publisher(flight);
-    let (resources, permit) = match admit(state, request_id, flight.key(), job.size_hint()) {
+    let (resources, permit) = match admit(state, request_id, flight.key()) {
         Ok(admitted) => admitted,
         Err(refusal) => return publisher.publish(Outcome::Failed(refusal)),
     };
@@ -324,7 +299,7 @@ pub(super) struct Finished<'a> {
 /// Log a finished analysis and count it in the routing figures; turn a failure
 /// into its answer. Every analyze route reports here, so none of them can
 /// drift out of `/_/stats`.
-pub(super) fn record(
+fn record(
     state: &AppState,
     finished: &Finished<'_>,
     outcome: AnalysisOutcome,
@@ -590,11 +565,11 @@ fn classify_purl(
     )?;
 
     // Offer the artifact — bytes, registry record, and fetch provenance —
-    // before its verdict, exactly as the CLI (`scan purl --hopper`) and the
-    // pull worker do. Deliberately after analysis, not on fetch: hopper's
+    // before its verdict, exactly as the CLI (`scan purl --hopper`) and
+    // postdoc's worker do. Deliberately after analysis, not on fetch: hopper's
     // upload-tier claim query drains bytes-with-no-verdict rows first and
     // ahead of everything else, so offering them before this process has its
-    // own verdict in hand would race the sample onto the worker fleet's claim
+    // own verdict in hand would race the sample onto the fleet's claim
     // queue for a redundant analysis. Hopper drops a result for a SHA it
     // never ingested, so the verdict alone lands nowhere either — queuing
     // artifacts then result keeps the row unclaimable for only the width of
@@ -654,9 +629,8 @@ fn classify_url(
 /// registry's JSON record, not a real artifact, and it hashes differently
 /// every time it's built (`with_age()`-derived fields are relative to the
 /// call), so treating it as content-addressed mints hopper a fresh,
-/// never-deduplicating row on every single fetch — confirmed 2026-08-27
-/// against production (`lodash.once@4.1.1` and friends: 8-9 distinct shas for
-/// 8-9 fetches of the identical coordinate, in under two hours).
+/// never-deduplicating row on every single fetch: each fetch of the identical
+/// coordinate yields a distinct sha.
 ///
 /// Looks up whether hopper already holds *real* content for this purl (a
 /// prior successful fetch, by this process or another producer). If so,

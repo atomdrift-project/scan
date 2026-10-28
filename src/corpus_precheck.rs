@@ -1,16 +1,16 @@
 //! Fleet-shared skip for fetched-dependency analysis, backed by hopper's corpus.
 //!
-//! [`crate::analysis_cache`] already memoizes dependency analyses — but per
-//! worker, namespaced by ruleset version. A fleet release therefore invalidates
-//! every worker's cache at once, and each of a dozen workers rebuilds a private
-//! copy of the same shared dependency universe: measured 2026-08-23 as
-//! thousands of redundant re-scans per hour, every one stored by hopper with
-//! "result renewed with no analyzer change; the re-analysis learned nothing".
+//! `crate::analysis_cache` already memoizes dependency analyses — but per
+//! host, namespaced by ruleset version. A fleet release therefore invalidates
+//! every host's cache at once, and each host rebuilds a private copy of the
+//! same shared dependency universe: thousands of redundant re-scans per hour,
+//! every one stored by hopper with "result renewed with no analyzer change;
+//! the re-analysis learned nothing".
 //!
 //! This module asks the one cache the whole fleet shares — hopper — before
 //! analyzing a fetched payload or resolving a package coordinate:
 //!
-//!   1. TRAITS MATCH: the stored verdict was produced under this worker's own
+//!   1. TRAITS MATCH: the stored verdict was produced under this process's own
 //!      analyzer version (`traits_version` equals our 5-char traits commit,
 //!      the same truncation the /api/next heartbeat sends). Re-analysis by the
 //!      same analyzer learns nothing — hopper logs exactly that when it
@@ -34,7 +34,7 @@
 //! ask. (Hopper serves `/v1/lookup` from an in-memory pool on both the primary
 //! and the read replica, so whichever the process talks to answers cheaply.)
 //! No `--hopper`, no precheck. Auth reuses the process's hopper bearer token
-//! (see [`crate::upload::hopper_token`]).
+//! (see [`crate::hopper::token`]).
 //!
 //! # isotope13
 //!
@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
-use crate::fetch::unix_now;
+use crate::hopper::{Finding, Record, Status};
 use crate::model::Level;
 
 /// Lookups attempted (a hit or a miss, but the wire was asked).
@@ -76,7 +76,6 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const PURL_BATCH: usize = 50;
 
 /// How fresh a benign verdict must be to stand in for a re-analysis.
-/// `SCAN_CORPUS_MAX_AGE_DAYS` overrides.
 ///
 /// 30 rather than something tighter because this window is NOT the safety net
 /// against a benign verdict going bad — the threat-feed path is (a cited
@@ -87,7 +86,7 @@ const PURL_BATCH: usize = 50;
 /// left it alone; the residual exposure is a detector improvement on an
 /// uncited, never-requeued dep, which self-heals when the rescan tier reaches
 /// it. Known gap, deliberately not this module's job: nothing yet refreshes a
-/// package when its dependency RECORDS change (2026-08-24).
+/// package when its dependency RECORDS change.
 const DEFAULT_MAX_AGE_DAYS: u64 = 30;
 
 /// Consecutive transport failures, kept as a half-open circuit breaker. At
@@ -156,8 +155,6 @@ impl Breaker {
 pub struct Precheck {
     lookup_url: String,
     max_age: Duration,
-    /// `SCAN_PURL_PRECHECK=0` turns off only the batch PURL negotiation.
-    purls: bool,
     breaker: Breaker,
     backend: Backend,
 }
@@ -176,26 +173,14 @@ enum Backend {
 /// process was pointed at is the one it asks.
 static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 
-/// `SCAN_CORPUS_MAX_AGE_DAYS`, or the default.
-fn max_age_days() -> u64 {
-    match std::env::var("SCAN_CORPUS_MAX_AGE_DAYS") {
-        Ok(days) => days.trim().parse().unwrap_or_else(|_| {
-            tracing::warn!(value = %days, default = DEFAULT_MAX_AGE_DAYS, "SCAN_CORPUS_MAX_AGE_DAYS is not a number of days; using the default");
-            DEFAULT_MAX_AGE_DAYS
-        }),
-        Err(_) => DEFAULT_MAX_AGE_DAYS,
-    }
-}
-
 /// Arm the precheck against isotope13's API, for an `--enriched` scan in
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
 pub fn configure_isotope13(token: cleave::enriched::Token) {
-    let max_age_days = max_age_days();
+    let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck {
         lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
         max_age: Duration::from_secs(max_age_days.saturating_mul(86_400)),
-        purls: std::env::var("SCAN_PURL_PRECHECK").as_deref() != Ok("0"),
         breaker: Breaker::default(),
         backend: Backend::Isotope13(token),
     };
@@ -213,12 +198,10 @@ pub fn configure_isotope13(token: cleave::enriched::Token) {
 /// where the uploader is built — the one place every `--hopper` mode passes
 /// through — so enablement follows `--hopper` with no second setting.
 pub fn configure(hopper_base_url: &str) {
-    let max_age_days = max_age_days();
-    let purls = std::env::var("SCAN_PURL_PRECHECK").as_deref() != Ok("0");
+    let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck::new(
         hopper_base_url,
         Duration::from_secs(max_age_days.saturating_mul(86_400)),
-        purls,
     );
     let mut armed = ARMED.write().unwrap_or_else(PoisonError::into_inner);
     if let Some(p) = &precheck
@@ -240,54 +223,12 @@ pub fn armed() -> Option<Arc<Precheck>> {
     ARMED.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// The fields the policy reads, plus the verdict it may adopt. Everything else
-/// in the record is ignored, so the response shape may grow freely.
-///
-/// `fires_at` defaults because isotope13 omits a level that does not apply,
-/// where hopper writes `null`; both mean [`Level::Manual`].
-#[derive(Default, serde::Deserialize)]
-struct Record {
-    #[serde(default)]
-    fires_at: Level,
-    analyzed_at: Option<String>,
-    traits_version: Option<String>,
-    reason: Option<String>,
-    #[serde(default)]
-    findings: Vec<Finding>,
-    /// `analyzed`, `unanalyzed`, or `unavailable`. Hopper's answers carry none.
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    engine_version: Option<String>,
-}
-
 /// Downloaded bytes require current-analyzer coverage; package coordinates
 /// may use the bounded fresh-benign shortcut before any download takes place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lookup {
     DownloadedBytes,
     PackageCoordinate,
-}
-
-/// One answer of a batch PURL lookup: the record plus the two keys that pair
-/// it with its dependency.
-#[derive(serde::Deserialize)]
-struct PurlAnswer {
-    sha256: Option<String>,
-    purl: Option<String>,
-    #[serde(flatten)]
-    record: Record,
-}
-
-/// One of the corpus's strongest traits for an artifact, as `/v1/lookup`
-/// reports it: a stable id, its criticality (4 suspicious, 5 hostile), and a
-/// sentence for the findings that are not the analyzer's own.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Finding {
-    pub id: String,
-    #[serde(default)]
-    pub desc: String,
-    pub crit: u32,
 }
 
 /// A verdict this build may adopt as its own: the corpus produced it under the
@@ -340,7 +281,7 @@ pub struct PurlHit {
     pub standing: Standing,
 }
 
-/// This worker's 5-char traits commit prefix — the same value the /api/next
+/// This process's 5-char traits commit prefix — the same value the /api/next
 /// heartbeat sends, truncated the way hopper truncates, so string equality
 /// against a stored `traits_version` means "same analyzer".
 pub fn local_traits() -> Option<&'static str> {
@@ -353,17 +294,16 @@ pub fn local_traits() -> Option<&'static str> {
 impl Precheck {
     /// A precheck against the first hopper `hopper_base_url` names, or `None`
     /// when it names none.
-    fn new(hopper_base_url: &str, max_age: Duration, purls: bool) -> Option<Self> {
+    fn new(hopper_base_url: &str, max_age: Duration) -> Option<Self> {
         // HOPPER may be a comma list, replica first ("https://ro,…"): lookups
         // belong on the first entry — the replica when one is named, which is
         // exactly where a cheap read should land.
-        let base = crate::upload::endpoints(hopper_base_url)
+        let base = crate::hopper::endpoints(hopper_base_url)
             .into_iter()
             .next()?;
         Some(Self {
             lookup_url: format!("{base}/v1/lookup"),
             max_age,
-            purls,
             breaker: Breaker::default(),
             backend: Backend::Hopper,
         })
@@ -394,7 +334,7 @@ impl Precheck {
 
     fn http(&self) -> Option<&'static reqwest::blocking::Client> {
         match self.backend {
-            Backend::Hopper => crate::upload::hopper_http(),
+            Backend::Hopper => crate::hopper::http(),
             Backend::Isotope13(_) => crate::remote::http(),
         }
     }
@@ -404,7 +344,7 @@ impl Precheck {
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
         match &self.backend {
-            Backend::Hopper => match crate::upload::hopper_token() {
+            Backend::Hopper => match crate::hopper::token() {
                 Some(token) => request.bearer_auth(token),
                 None => request,
             },
@@ -428,7 +368,7 @@ impl Precheck {
             } else {
                 "token_refused"
             };
-            if self.breaker.trip(unix_now()) {
+            if self.breaker.trip(crate::civil::now_secs()) {
                 tracing::warn!(
                     event = "remote.disabled",
                     reason,
@@ -448,10 +388,12 @@ impl Precheck {
                 rec,
                 local_traits(),
                 self.max_age.as_secs(),
-                unix_now(),
+                crate::civil::now_secs(),
                 lookup,
             ),
-            Backend::Isotope13(_) => service_standing(rec, self.max_age.as_secs(), unix_now()),
+            Backend::Isotope13(_) => {
+                service_standing(rec, self.max_age.as_secs(), crate::civil::now_secs())
+            }
         }
     }
 
@@ -460,7 +402,7 @@ impl Precheck {
     /// verdict from another analyzer does not cover the current rules. Any
     /// failure — unreachable, non-200, unparseable — also means analyze.
     pub fn standing(&self, content_sha: &str) -> Standing {
-        if content_sha.len() != 64 || !self.breaker.allows(unix_now()) {
+        if content_sha.len() != 64 || !self.breaker.allows(crate::civil::now_secs()) {
             return Standing::Analyze;
         }
         let Some(http) = self.http() else {
@@ -477,7 +419,8 @@ impl Precheck {
                 r
             }
             Err(e) => {
-                self.breaker.failed(unix_now(), "corpus precheck", &e);
+                self.breaker
+                    .failed(crate::civil::now_secs(), "corpus precheck", &e);
                 return Standing::Analyze;
             }
         };
@@ -511,7 +454,7 @@ impl Precheck {
             return out;
         };
         for chunk in shas.chunks(PURL_BATCH) {
-            if !self.breaker.allows(unix_now()) {
+            if !self.breaker.allows(crate::civil::now_secs()) {
                 break;
             }
             CHECKS.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -526,7 +469,8 @@ impl Precheck {
                     r
                 }
                 Err(e) => {
-                    self.breaker.failed(unix_now(), "sha precheck", &e);
+                    self.breaker
+                        .failed(crate::civil::now_secs(), "sha precheck", &e);
                     continue;
                 }
             };
@@ -567,17 +511,17 @@ impl Precheck {
             return;
         };
         for item in items {
-            let Ok(answer) = serde_json::from_str::<PurlAnswer>(item.get()) else {
+            let Ok(mut answer) = serde_json::from_str::<Record>(item.get()) else {
                 continue;
             };
-            let Some(sha) = answer.sha256.map(|d| d.to_ascii_lowercase()) else {
+            let Some(sha) = answer.sha256.take().map(|d| d.to_ascii_lowercase()) else {
                 continue;
             };
             if !asked.iter().any(|a| a.eq_ignore_ascii_case(&sha)) {
                 tracing::warn!(event = "remote.lookup", mismatched = %sha, "answer names a digest that was not asked; ignored");
                 continue;
             }
-            let standing = self.judge(answer.record, Lookup::DownloadedBytes);
+            let standing = self.judge(answer, Lookup::DownloadedBytes);
             if standing.skips_analysis() {
                 out.insert(sha, standing);
             }
@@ -594,7 +538,7 @@ impl Precheck {
     /// Fail-open everywhere; an open breaker stops the batch.
     pub fn purls(&self, purls: &[String]) -> HashMap<String, PurlHit> {
         let mut out = HashMap::new();
-        if !self.purls || purls.is_empty() {
+        if purls.is_empty() {
             return out;
         }
         let Some(http) = self.http() else {
@@ -603,7 +547,7 @@ impl Precheck {
         for chunk in purls.chunks(PURL_BATCH) {
             // Re-checked per chunk: a trip here or on another thread stops the
             // rest, which would only time out too.
-            if !self.breaker.allows(unix_now()) {
+            if !self.breaker.allows(crate::civil::now_secs()) {
                 break;
             }
             PURL_CHECKS.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -617,7 +561,8 @@ impl Precheck {
                     r
                 }
                 Err(e) => {
-                    self.breaker.failed(unix_now(), "purl precheck", &e);
+                    self.breaker
+                        .failed(crate::civil::now_secs(), "purl precheck", &e);
                     continue;
                 }
             };
@@ -642,20 +587,20 @@ impl Precheck {
             return;
         };
         for (i, item) in items.iter().enumerate() {
-            let Ok(answer) = serde_json::from_str::<PurlAnswer>(item.get()) else {
+            let Ok(mut answer) = serde_json::from_str::<Record>(item.get()) else {
                 continue;
             };
-            let standing = self.judge(answer.record, Lookup::PackageCoordinate);
+            let (sha, purl) = (answer.sha256.take(), answer.purl.take());
+            let standing = self.judge(answer, Lookup::PackageCoordinate);
             if !standing.skips_analysis() {
                 continue;
             }
-            let Some(sha) = answer
-                .sha256
-                .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+            let Some(sha) =
+                sha.filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
             else {
                 continue;
             };
-            let Some(purl) = answer.purl.or_else(|| asked.get(i).cloned()) else {
+            let Some(purl) = purl.or_else(|| asked.get(i).cloned()) else {
                 continue;
             };
             PURL_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -679,22 +624,21 @@ impl Precheck {
 pub fn analyzed_verdict(line: &str) -> Result<(String, Verdict), String> {
     #[derive(serde::Deserialize)]
     struct Answer {
-        sha256: Option<String>,
         cause: Option<String>,
         #[serde(flatten)]
         record: Record,
     }
     let answer: Answer =
         serde_json::from_str(line).map_err(|e| format!("unreadable analysis answer: {e}"))?;
-    let status = answer.record.status.clone().unwrap_or_default();
-    if status != "analyzed" || answer.record.fires_at == Level::Manual {
+    let rec = answer.record;
+    if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Err(format!(
-            "isotope13 could not analyze it ({status}{})",
+            "isotope13 could not analyze it ({}{})",
+            rec.status.map_or("", Status::as_str),
             answer.cause.map(|c| format!(": {c}")).unwrap_or_default()
         ));
     }
-    let sha = answer.sha256.unwrap_or_default().to_ascii_lowercase();
-    let rec = answer.record;
+    let sha = rec.sha256.unwrap_or_default().to_ascii_lowercase();
     Ok((
         sha,
         Verdict {
@@ -723,7 +667,7 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
 /// analyzed again rather than trusted past its freshness. Anything not
 /// `analyzed`, or with no level, is analyzed here.
 fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
-    if rec.status.as_deref() != Some("analyzed") || rec.fires_at == Level::Manual {
+    if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Standing::Analyze;
     }
     if rec.fires_at == Level::Clean {
@@ -772,7 +716,7 @@ fn standing_of(
         });
     }
     // Downloaded bytes need current-analyzer coverage. Returning SkipBenign
-    // here used to discard the payload report, lose its next-hop references,
+    // here would discard the payload report, lose its next-hop references,
     // and make the caller report "analysis unavailable" for a successful fetch.
     if lookup == Lookup::DownloadedBytes {
         return Standing::Analyze;
@@ -794,7 +738,7 @@ fn standing_of(
     }
 }
 
-/// `(lookups attempted, analyses skipped)` since process start, for the worker
+/// `(lookups attempted, analyses skipped)` since process start, for a caller's
 /// summary line.
 pub fn counters() -> (u64, u64) {
     (
@@ -839,7 +783,7 @@ fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
         }
         field.parse().ok()
     };
-    crate::fetch::utc_epoch(
+    crate::civil::utc_epoch(
         num(0..4)?,
         num(5..7)?,
         num(8..10)?,
@@ -866,10 +810,10 @@ mod tests {
             assert_eq!(parse_rfc3339_epoch(s), Some(want), "{s}");
         }
         // The writer this parser inverts, not a copy of it.
-        let before = unix_now();
+        let before = crate::civil::now_secs();
         let parsed = parse_rfc3339_epoch(&crate::engine::now_rfc3339()).expect("parses");
         assert!(
-            (before..=unix_now()).contains(&parsed),
+            (before..=crate::civil::now_secs()).contains(&parsed),
             "{parsed} vs {before}"
         );
     }
@@ -925,11 +869,12 @@ mod tests {
         let precheck = Precheck::new(
             &format!("http://{}", listener.local_addr().expect("addr")),
             Duration::from_secs(86_400),
-            true,
         )
         .expect("a hopper");
         for _ in 0..BREAKER_LIMIT {
-            precheck.breaker.failed(unix_now(), "test", &"refused");
+            precheck
+                .breaker
+                .failed(crate::civil::now_secs(), "test", &"refused");
         }
         let purls: Vec<String> = (0..120).map(|i| format!("pkg:npm/p{i}@1")).collect();
         assert!(precheck.purls(&purls).is_empty());
@@ -942,7 +887,7 @@ mod tests {
     #[test]
     fn a_batch_answer_pairs_by_purl_and_drops_unusable_items() {
         let precheck =
-            Precheck::new("http://unused", Duration::from_secs(86_400), true).expect("a hopper");
+            Precheck::new("http://unused", Duration::from_secs(86_400)).expect("a hopper");
         let fresh = crate::engine::now_rfc3339();
         let sha = "AB".repeat(32);
         let body = format!(
@@ -1054,7 +999,7 @@ mod tests {
         assert_eq!(v.reason.as_deref(), Some("steals credentials"));
         assert_eq!(v.findings.len(), 2);
         assert_eq!(v.findings[0].crit, 5);
-        assert_eq!(v.findings[1].desc, "cited by OSV");
+        assert_eq!(v.findings[1].desc.as_deref(), Some("cited by OSV"));
     }
 
     #[test]
@@ -1106,7 +1051,6 @@ mod tests {
         Precheck {
             lookup_url: "https://unused.invalid/v1/lookup".into(),
             max_age: Duration::from_secs(30 * 86_400),
-            purls: true,
             breaker: Breaker::default(),
             backend: Backend::Isotope13(
                 cleave::enriched::Token::parse("i13_test_token").expect("a token"),
@@ -1124,7 +1068,7 @@ mod tests {
         let rec = |status: &str, fires: Level, at: &str| Record {
             fires_at: fires,
             analyzed_at: Some(at.to_string()),
-            status: Some(status.to_string()),
+            status: serde_json::from_value(status.into()).unwrap(),
             ..Record::default()
         };
         let fresh = "2026-10-21T00:00:00Z";
@@ -1182,22 +1126,22 @@ mod tests {
             let code = reqwest::StatusCode::from_u16(status).unwrap();
             assert!(!precheck.answered(code, "test"));
             assert!(
-                !precheck.breaker.allows(unix_now()),
+                !precheck.breaker.allows(crate::civil::now_secs()),
                 "{status} opens the breaker"
             );
         }
         let precheck = isotope13();
         assert!(!precheck.answered(reqwest::StatusCode::BAD_GATEWAY, "test"));
         assert!(
-            precheck.breaker.allows(unix_now()),
+            precheck.breaker.allows(crate::civil::now_secs()),
             "a 502 is one failed batch"
         );
         assert!(precheck.answered(reqwest::StatusCode::OK, "test"));
 
         // Hopper's refusals keep their old meaning: analyze, keep asking.
-        let hopper = Precheck::new("http://unused", Duration::from_secs(1), true).unwrap();
+        let hopper = Precheck::new("http://unused", Duration::from_secs(1)).unwrap();
         assert!(!hopper.answered(reqwest::StatusCode::UNAUTHORIZED, "test"));
-        assert!(hopper.breaker.allows(unix_now()));
+        assert!(hopper.breaker.allows(crate::civil::now_secs()));
     }
 
     #[test]

@@ -412,9 +412,8 @@ sidecars — identity comes from `--registry-map`, built with
 
 The harness is `hacks/interpret-tune/tune.py`; the workflow is:
 
-1. Capture the LLM render per file from a single scan via the
-   `SCAN_INTERPRET_DUMP_DIR` dump hook (no `--interpret` / LLM calls needed), or
-   let `tune.py` do it for you.
+1. Capture the LLM render per file with `atomscan -f interpret` (no
+   `--interpret` / LLM calls needed), or let `tune.py` do it for you.
 2. Hand-label each file's ideal grade (reverse-engineer binaries; be honest about
    files whose verdict lives in an unavailable payload — mark them borderline).
 3. Sweep the experiment arms offline against the LLM endpoint
