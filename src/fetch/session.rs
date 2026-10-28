@@ -287,7 +287,7 @@ impl FetchSession {
                 .unwrap_or_default(),
             current_hop: 0,
             pending_error: None,
-            pending: PENDING.get().cloned(),
+            pending: crate::settings::fetch_backlog().cloned(),
             local_coverage: HashMap::new(),
             unresolved_fetch_calls: HashSet::new(),
         }

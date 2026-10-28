@@ -431,17 +431,11 @@ pub(super) fn write_top_file_features(summaries: &[FileSummary], w: &mut Feature
         .iter()
         .map(|s| &s.risk)
         .min_by(|a, b| {
-            let ka = (
-                a.hostile_density + 0.25 * a.suspicious_density,
-                a.hostile_density,
-                a.suspicious_density,
-            );
-            let kb = (
-                b.hostile_density + 0.25 * b.suspicious_density,
-                b.hostile_density,
-                b.suspicious_density,
-            );
-            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+            let weighted = |s: &FileRiskStats| s.hostile_density + 0.25 * s.suspicious_density;
+            weighted(b)
+                .total_cmp(&weighted(a))
+                .then(b.hostile_density.total_cmp(&a.hostile_density))
+                .then(b.suspicious_density.total_cmp(&a.suspicious_density))
         })
         .map_or(0.0, |s| s.hostile_density + 0.25 * s.suspicious_density);
     w.set("agg:top1_file_hostile_weighted_density_sum", top_weighted);
@@ -690,35 +684,21 @@ pub(super) fn write_ngrams(
 }
 
 pub(super) fn topk_file_risk_features_from_summaries(summaries: &[FileSummary]) -> [f32; 8] {
+    // Descending, so `min_by` keeps the first of equals, as a stable sort and
+    // `take(1)` would.
     let top_susp = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
-        (
-            b.suspicious_ratio,
-            b.suspicious_findings,
-            b.hostile_ratio,
-            b.hostile_findings,
-        )
-            .partial_cmp(&(
-                a.suspicious_ratio,
-                a.suspicious_findings,
-                a.hostile_ratio,
-                a.hostile_findings,
-            ))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.suspicious_ratio
+            .total_cmp(&a.suspicious_ratio)
+            .then(b.suspicious_findings.cmp(&a.suspicious_findings))
+            .then(b.hostile_ratio.total_cmp(&a.hostile_ratio))
+            .then(b.hostile_findings.cmp(&a.hostile_findings))
     });
     let top_host = summaries.iter().map(|s| &s.risk).min_by(|a, b| {
-        (
-            b.hostile_ratio,
-            b.hostile_findings,
-            b.suspicious_ratio,
-            b.suspicious_findings,
-        )
-            .partial_cmp(&(
-                a.hostile_ratio,
-                a.hostile_findings,
-                a.suspicious_ratio,
-                a.suspicious_findings,
-            ))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.hostile_ratio
+            .total_cmp(&a.hostile_ratio)
+            .then(b.hostile_findings.cmp(&a.hostile_findings))
+            .then(b.suspicious_ratio.total_cmp(&a.suspicious_ratio))
+            .then(b.suspicious_findings.cmp(&a.suspicious_findings))
     });
 
     let (Some(top_susp), Some(top_host)) = (top_susp, top_host) else {

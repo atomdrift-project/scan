@@ -37,11 +37,11 @@ impl Default for State {
     }
 }
 
-pub(super) struct Store {
+pub(crate) struct Store {
     path: PathBuf,
 }
 impl Store {
-    pub(super) fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let store = Self {
             path: path.to_owned(),
         };

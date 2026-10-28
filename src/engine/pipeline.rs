@@ -523,9 +523,9 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
     let (label, model) = (req.label, req.model);
     let ctx = model.ctx();
     let compact = &prepared.compact;
-    // Parse the report once with every optional raw subtree any specialist may
-    // read, then share it across the root and embedded-file scoring passes.
-    let needs = ctx.raw_needs().union(RawNeeds::all());
+    // Parse the report once with every optional raw input any route scoring
+    // it reads, then share it across the root and embedded-file passes.
+    let needs = model.raw_needs(compact.files.iter().map(|f| f.file_type.as_str()));
     // The sample's own decision featurizes its own files only. With nothing
     // fetched this is the whole report; otherwise drop the grafted payloads so
     // they can't dilute the aggregate (they still classify individually via the
@@ -810,7 +810,7 @@ fn classify_dependency(
 ) -> Result<Option<(Decision, MemberEvals)>> {
     let model = req.model;
     let ctx = model.ctx();
-    let needs = ctx.raw_needs().union(RawNeeds::all());
+    let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
 
     // The container's own verdict. No own_shas filtering: this report is the one
     // cleave produced for the dependency's bytes alone, before anything was

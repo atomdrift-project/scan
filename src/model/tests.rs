@@ -894,3 +894,46 @@ fn ensemble_loader_rejects_unknown_required_route_name() -> Result<()> {
     let _ = err;
     Ok(())
 }
+
+/// A report is parsed for every route that will score it: a specialist that
+/// reads an optional input gets it even when the general route does not.
+#[test]
+fn raw_needs_cover_the_specialists_a_file_type_selects() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let route = |dir: &Path, feature: &str, kv_vocab: &[&str]| -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(
+            dir.join("model.onnx"),
+            include_bytes!("../../tests/fixtures/cli-model.onnx"),
+        )?;
+        let spec = serde_json::json!({
+            "version": crate::features::EXPECTED_SPEC_VERSION,
+            "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "presence_vocab": ["metadata"],
+            "kv_vocab": kv_vocab,
+            "feature_names": [feature],
+            "total_features": 1,
+            "standardized": false,
+            "metric_transforms": {}
+        });
+        std::fs::write(dir.join("feature_spec.json"), serde_json::to_vec(&spec)?)?;
+        Ok(())
+    };
+    route(&root.path().join("general"), "present:metadata", &[])?;
+    route(
+        &root.path().join("filetypes/elf"),
+        "kv:arch=x86",
+        &["arch=x86"],
+    )?;
+    std::fs::write(
+        root.path().join("config.json"),
+        r#"{"levels": [{"level": 25, "hostile": {"thresholds":
+            {"general": 0.99, "filetypes/elf": 0.99}}}]}"#,
+    )?;
+    let model = Model::load(root.path(), None, None)?;
+
+    let general_only = model.raw_needs(["python"]);
+    assert_eq!(general_only, crate::features::RawNeeds::default());
+    assert_ne!(model.raw_needs(["python", "elf"]), general_only);
+    Ok(())
+}

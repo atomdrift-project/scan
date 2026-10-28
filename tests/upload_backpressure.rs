@@ -43,6 +43,9 @@ fn envelope() -> ScanResultEnvelope {
 }
 
 fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    // On macOS and the BSDs an accepted socket inherits the listener's
+    // non-blocking mode; reads here must block, up to the timeout.
+    stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(DEADLINE)).unwrap();
     let mut bytes = Vec::new();
     let mut buf = [0u8; 8192];
@@ -184,8 +187,11 @@ fn slow_hopper_spools_overflow_then_flushes_every_verdict_in_order() {
     // Release even on regression, so the old bounded queue can drain and the
     // test reports a failure instead of leaving a blocked uploader behind.
     release_tx.send(()).unwrap();
-    producer.join().expect("producer");
+    // The server first: if it gave up, the uploader is still retrying toward
+    // its renewal budget, and waiting on the producer would hang the test
+    // instead of failing it.
     server.join().expect("server");
+    producer.join().expect("producer");
     let (pending, capacity) = queued.expect("analysis handoff blocked on Hopper");
     assert!(
         pending > capacity,

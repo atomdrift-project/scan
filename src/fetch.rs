@@ -72,17 +72,9 @@ pub use self::{age_gate::*, budget::*, merge::*, policy::*, registry::*, render:
 )]
 use self::{discover::*, imports::*, session::*, urls::*};
 
-static PENDING: OnceLock<Arc<pending::Store>> = OnceLock::new();
-
-/// Configure an opt-in durable fetch backlog, rejecting unreadable state.
-/// # Errors
-/// Returns an error for corrupt, unsupported, or unreadable backlog files.
-pub fn configure_pending(path: &Path) -> std::io::Result<()> {
-    let store = pending::Store::open(path)?;
-    PENDING
-        .set(Arc::new(store))
-        .map_err(|_store| std::io::Error::other("fetch backlog already configured"))
-}
+/// Unfinished fetch work kept for a later run; see
+/// [`crate::settings::Settings::fetch_backlog`].
+pub(crate) use pending::Store as Backlog;
 
 /// What the process's fetch client and blob cache are built with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,21 +97,8 @@ impl Default for Settings {
     }
 }
 
-static SETTINGS: OnceLock<Settings> = OnceLock::new();
-
-/// Fix the [`Settings`] for the process, once, before any fetch: the client
-/// and cache are built on first use and keep what they were built with.
-///
-/// # Errors
-/// When the settings were already fixed.
-pub fn configure(settings: Settings) -> anyhow::Result<()> {
-    SETTINGS
-        .set(settings)
-        .map_err(|_settings| anyhow::anyhow!("fetch settings already configured"))
-}
-
 fn settings() -> Settings {
-    SETTINGS.get().copied().unwrap_or_default()
+    crate::settings::get().fetch
 }
 
 /// fletch's blob cache under the configured [`Settings`]. Everything that reads

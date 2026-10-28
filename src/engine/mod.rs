@@ -3,7 +3,7 @@
 //! (`classify_report`), and the result and JSON envelope it produces.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -139,38 +139,15 @@ pub struct ScanConfig {
     bloom: Option<Arc<Lookup>>,
 }
 
-static RIZIN_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-
-static RIZIN_RETRY_TIMEOUT: OnceLock<Duration> = OnceLock::new();
-
-/// Fix the one larger deadline for retrying timed-out native files, once,
-/// before analysis.
-///
-/// # Errors
-/// When it was already fixed.
-pub fn set_rizin_retry_timeout(timeout: Duration) -> anyhow::Result<()> {
-    RIZIN_RETRY_TIMEOUT
-        .set(timeout)
-        .map_err(|_timeout| anyhow::anyhow!("rizin retry timeout already configured"))
-}
-pub(crate) fn rizin_retry_timeout() -> Option<Duration> {
-    RIZIN_RETRY_TIMEOUT.get().copied()
-}
-
-/// Fix the wall-clock limit on each Rizin run, once, before analysis.
-///
-/// # Errors
-/// When it was already fixed.
-pub fn set_rizin_timeout(timeout: Duration) -> anyhow::Result<()> {
-    RIZIN_TIMEOUT
-        .set(timeout)
-        .map_err(|_timeout| anyhow::anyhow!("rizin timeout already configured"))
-}
-
 /// The Rizin limit for an [`cleave::AnalysisOptions`]: the configured one, or
-/// `None` (cleave's default) when the process never set it.
+/// `None` (cleave's default); see [`crate::settings::Settings::rizin_timeout`].
 pub(crate) fn rizin_timeout() -> Option<Duration> {
-    RIZIN_TIMEOUT.get().copied()
+    crate::settings::get().rizin_timeout
+}
+
+/// The larger limit for retrying a native file whose Rizin run timed out.
+pub(crate) fn rizin_retry_timeout() -> Option<Duration> {
+    crate::settings::get().rizin_retry_timeout
 }
 
 pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords: &[String]) {

@@ -123,7 +123,7 @@ fn security_held_dependency_at_high_index_elevates_parent() {
             .expect("compact parent report");
 
     let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
-    let needs = ctx.raw_needs().union(crate::features::RawNeeds::all());
+    let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
     let evals: MemberEvals =
         score_embedded_files(&entries, "parent.tgz", needs, &ctx, &model, None)
             .expect("not cancelled")
@@ -184,7 +184,7 @@ fn cancellation_is_an_error_not_a_clean_member_table() {
     let ctx = ExtractContext::new(model.spec());
     let report: CompactReport = serde_json::from_str(&dep_report(3, "")).unwrap();
     let entries: Vec<&CompactFile> = embedded_entries(&report).collect();
-    let needs = ctx.raw_needs().union(RawNeeds::all());
+    let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
     let cancelled = AtomicBool::new(true);
     assert!(
         score_embedded_files(&entries, "d.tgz", needs, &ctx, &model, Some(&cancelled)).is_err()

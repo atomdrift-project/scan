@@ -77,9 +77,9 @@ impl TotalBudget {
     }
 }
 
-/// Set the process-wide per-execution fetch ceiling (`--fetch-max-total-*`),
-/// at startup, for one-shot scans; server modes leave it unlimited.
-pub fn set_total_budget(max_fetches: usize, max_bytes: u64) {
+/// Set the per-execution fetch ceiling; see
+/// [`crate::settings::Settings::fetch_total`].
+pub(crate) fn set_total_budget(max_fetches: usize, max_bytes: u64) {
     TOTAL_BUDGET.fetches.store(max_fetches, Ordering::Relaxed);
     TOTAL_BUDGET.bytes.store(max_bytes, Ordering::Relaxed);
 }

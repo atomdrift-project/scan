@@ -87,7 +87,7 @@ pub(super) struct FileSummary {
 
 /// Which optional feature families are active for this route, so
 /// [`FileSummary::from_compact`] only gathers the inputs they read.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RawNeeds {
     pub(super) kv: bool,
     pub(super) kv_shape: bool,
@@ -96,7 +96,8 @@ pub(crate) struct RawNeeds {
 }
 
 impl RawNeeds {
-    /// All optional inputs any specialist feature family may read.
+    /// Every optional input, for tests of the parse itself.
+    #[cfg(test)]
     pub(crate) const fn all() -> Self {
         Self {
             kv: true,
