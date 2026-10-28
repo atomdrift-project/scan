@@ -1,19 +1,13 @@
 //! Integration tests for ensemble routing in `scan::model::Model`.
 //!
 //! Builds a temporary ensemble bundle (general/ + filegroups/native/ +
-//! filetypes/elf/) from a real ONNX bundle and verifies:
+//! filetypes/elf/) from the one-feature fixture bundle and verifies:
 //!   * `predict_report` on a report of a given file type consults the right
 //!     specialists.
 //!   * Files whose type is unmapped route to general only.
 //!   * `required_routes` lists are enforced.
 //!
-//! Tests are `#[ignore]`d by default because they need a real bundle on
-//! disk. Run with:
-//!
-//! ```sh
-//! SCAN_ONNX_BUNDLE=/path/to/onnx-bundle \
-//!     cargo test --test ensemble_dispatch -- --ignored
-//! ```
+//! Only the real-bundle grid test needs an external bundle (`AZOTH_DIR`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -21,10 +15,13 @@ use std::path::{Path, PathBuf};
 
 use scan::model::Model;
 
-#[expect(clippy::disallowed_methods, reason = "a test-only fixture location")]
-fn onnx_bundle() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var_os("SCAN_ONNX_BUNDLE")?);
-    (p.join("model.onnx").is_file() && p.join("feature_spec.json").is_file()).then_some(p)
+mod bundle;
+
+/// A loadable single-model bundle to copy routes and seeds from.
+fn onnx_bundle() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    bundle::write(dir.path()).expect("write bundle");
+    dir
 }
 
 /// A full ensemble bundle (`general/` + `config.json` + `route_policies.json`).
@@ -120,12 +117,10 @@ const CALIBRATED: &str = r#"{
 }"#;
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filetype_specialist_when_present() {
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
-    let dir = stage_ensemble(&src, &["native"], &["elf"], CALIBRATED);
+    let src = onnx_bundle();
+    let src = src.path();
+    let dir = stage_ensemble(src, &["native"], &["elf"], CALIBRATED);
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     // Files of type elf consult: general + filegroup(native) + filetype(elf).
@@ -145,13 +140,11 @@ fn ensemble_routes_to_filetype_specialist_when_present() {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_routes_to_filegroup_when_filetype_absent() {
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
+    let src = onnx_bundle();
+    let src = src.path();
     // No filetypes/pe specialist; pe routes through filegroup(native) + general.
-    let dir = stage_ensemble(&src, &["native"], &[], CALIBRATED);
+    let dir = stage_ensemble(src, &["native"], &[], CALIBRATED);
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     let (prob, pe_routes) = routes(&model, "pe");
@@ -160,12 +153,10 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_with_only_general_falls_back_to_general() {
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
-    let dir = stage_ensemble(&src, &[], &[], "{}");
+    let src = onnx_bundle();
+    let src = src.path();
+    let dir = stage_ensemble(src, &[], &[], "{}");
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     // No specialists, so every file type scores on general alone.
@@ -177,15 +168,13 @@ fn ensemble_with_only_general_falls_back_to_general() {
 }
 
 #[test]
-#[ignore = "needs SCAN_ONNX_BUNDLE pointing at a real ONNX bundle"]
 fn ensemble_required_route_missing_is_fatal() {
-    let Some(src) = onnx_bundle() else {
-        panic!("SCAN_ONNX_BUNDLE not set or missing artifacts");
-    };
+    let src = onnx_bundle();
+    let src = src.path();
     let cfg = r#"{
       "required_routes": ["filetype:nonexistent"]
     }"#;
-    let dir = stage_ensemble(&src, &[], &[], cfg);
+    let dir = stage_ensemble(src, &[], &[], cfg);
     let err = Model::load(dir.path(), None, None).expect_err("missing required must fail");
     let msg = format!("{err:#}");
     assert!(

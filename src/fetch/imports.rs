@@ -173,19 +173,15 @@ pub(super) fn annotate_python_import_candidate(
     let verified = delivered_bytes(record)
         && report.is_some_and(|report| python_candidate_provides_namespace(reference, report));
     if verified {
-        let note = format!(
-            "Python import candidate; namespace present; {}",
-            note::VERSION_UNKNOWN
-        );
-        record.coverage_note = Some(match record.coverage_note.take() {
-            Some(existing) => format!("{existing}; {note}"),
-            None => note,
+        record.coverage.push(Coverage::Candidate {
+            source: CandidateSource::PythonImport,
         });
     } else {
-        let mut note = format!(
-            "{}: Python import provider unresolved; no candidate namespace verified",
-            note::UNAVAILABLE
-        );
+        record.coverage.push(Coverage::Unavailable {
+            reason: Some(
+                "Python import provider unresolved; no candidate namespace verified".into(),
+            ),
+        });
         // Keep severe observations about the rejected *candidate* reviewable
         // without turning them into findings about the importing artifact.
         let mut issues = report.map(candidate_static_issues).unwrap_or_default();
@@ -193,15 +189,10 @@ pub(super) fn annotate_python_import_candidate(
             issues.extend(registry_issues.iter().cloned());
         }
         if !issues.is_empty() {
-            let shown: Vec<_> = issues.iter().take(3).cloned().collect();
-            note.push_str(&format!(
-                "; {} {} unique severe findings ({})",
-                note::FLAGGED,
-                issues.len(),
-                shown.join(", ")
-            ));
+            record.coverage.push(Coverage::CandidateFlagged {
+                findings: issues.into_iter().collect(),
+            });
         }
-        record.coverage_note = Some(note);
     }
     verified
 }

@@ -317,27 +317,23 @@ fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() 
     report.files[1].path = "candidate.whl!!scapy/__init__.pyi".into();
     assert!(!python_candidate_provides_namespace(&reference, &report));
     report.files[1].path = "candidate.whl!!scapy/__init__.py".into();
-    record.coverage_note = Some("analysis incomplete".into());
+    record.coverage = vec![Coverage::Incomplete];
     assert!(annotate_python_import_candidate(
         &mut record,
         &reference,
         Some(&report),
         None
     ));
-    assert!(
-        record
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .starts_with("analysis incomplete; Python import candidate")
+    assert_eq!(
+        record.coverage,
+        [
+            Coverage::Incomplete,
+            Coverage::Candidate {
+                source: CandidateSource::PythonImport
+            }
+        ]
     );
-    assert!(
-        record
-            .coverage_note
-            .as_deref()
-            .unwrap()
-            .contains(note::VERSION_UNKNOWN)
-    );
+    assert!(coverage_text(&record).contains("installed distribution/version unknown"));
     report.files[0].path = "candidate.tar.gz".into();
     report.files[0].file_type = "tar".into();
     assert!(

@@ -214,26 +214,42 @@ pub fn data_dir() -> anyhow::Result<std::path::PathBuf> {
         .context("this user has no data directory (is HOME set?)")
 }
 
-/// `<platform cache directory>/atomdrift/scan`, where scan's verdict index and
-/// analysis caches live; `None` when the platform has none, and every cache
-/// then stays off.
+/// The root every scan cache lives under, settled once per process.
+static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Where scan's verdict index and analysis caches live:
+/// `<platform cache directory>/atomdrift/scan` unless [`set_cache_dir`] chose
+/// otherwise. `None` when the platform has none, and every cache then stays
+/// off.
 ///
 /// A unit-test build gets a private temporary directory instead: its tests
 /// write verdicts, and must never write them into a developer's real index.
 #[must_use]
 pub fn cache_dir() -> Option<std::path::PathBuf> {
-    #[cfg(test)]
-    {
-        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        Some(
-            DIR.get_or_init(|| tempfile::tempdir().expect("tempdir").keep())
-                .clone(),
-        )
-    }
-    #[cfg(not(test))]
-    {
-        Some(dirs::cache_dir()?.join("atomdrift").join("scan"))
-    }
+    CACHE_DIR
+        .get_or_init(|| {
+            #[cfg(test)]
+            {
+                Some(tempfile::tempdir().expect("tempdir").keep())
+            }
+            #[cfg(not(test))]
+            {
+                Some(dirs::cache_dir()?.join("atomdrift").join("scan"))
+            }
+        })
+        .clone()
+}
+
+/// Keep every scan cache under `dir` for the rest of the process. Opening the
+/// verdict index prunes the versions it does not use, so a test harness calls
+/// this before anything else: a test run must never touch a real index.
+///
+/// # Errors
+/// When the root is already settled, by an earlier call or an opened cache.
+pub fn set_cache_dir(dir: std::path::PathBuf) -> anyhow::Result<()> {
+    CACHE_DIR.set(Some(dir)).map_err(|rejected| {
+        anyhow::anyhow!("the cache directory is already settled; not {rejected:?}")
+    })
 }
 
 /// Stack size for every analysis thread pool, in MiB. cleave's archive

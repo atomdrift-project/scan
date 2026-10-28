@@ -175,13 +175,8 @@ pub(crate) fn classify_report(
     // and the potentially slow LLM round trip.
     drop(req.root_bytes.take());
     let index = ReportIndex::new(&prepared.typed);
-    let scored = score(&prepared, &req)?;
-    // After featurization, never before: a backref is a conclusion about
-    // *another* artifact, and fed as a feature of this one it would teach the
-    // model that declaring dependencies is itself malicious.
-    for backref in &scored.backrefs {
-        inject_dependency_backref(&mut prepared.compact, backref);
-    }
+    let mut scored = score(&prepared, &req)?;
+    scored.inject_backrefs(&mut prepared.compact);
     let top_findings =
         extract_top_findings(root_findings(&prepared.compact), &scored.decision.class);
     let dependency_results = grade_dependencies(
@@ -509,6 +504,19 @@ struct Scored {
     skipped_models: Vec<SkippedRoute>,
     finding_counts: FindingCounts,
     backrefs: Vec<DepBackref>,
+}
+
+impl Scored {
+    /// Pin the dependency verdicts onto `report` as synthetic findings. A
+    /// method on the scored result, so it can only run after featurization:
+    /// a backref is a conclusion about *another* artifact, and fed as a
+    /// feature of this one it would teach the model that declaring
+    /// dependencies is itself malicious.
+    fn inject_backrefs(&mut self, report: &mut CompactReport) {
+        for backref in std::mem::take(&mut self.backrefs) {
+            inject_dependency_backref(report, &backref);
+        }
+    }
 }
 
 fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {

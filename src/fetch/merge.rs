@@ -216,7 +216,7 @@ pub(super) fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> F
     FetchRecord {
         source_sha256: (!source_sha.is_empty()).then(|| source_sha.to_owned()),
         context: r.context.clone(),
-        coverage_note: None,
+        coverage: Vec::new(),
         source_offset: r.offset,
         kind: r.kind,
         locator: locator(r).to_owned(),

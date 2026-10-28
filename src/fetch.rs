@@ -39,8 +39,9 @@ use std::time::{Duration, Instant};
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
-    BlobCache, Fetch, FetchBudget, FetchError, FetchRecord, Fetched, HttpFetch, Method, Outcome,
-    RecordedSource, Request, Served, UrlFetches, fetch_ref, fetch_references_with,
+    BlobCache, CandidateSource, Coverage, Fetch, FetchBudget, FetchError, FetchRecord, Fetched,
+    HttpFetch, Method, Outcome, RecordedSource, Request, Served, UrlFetches, fetch_ref,
+    fetch_references_with,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
 use reqwest::Url;
@@ -358,17 +359,16 @@ pub(crate) fn orchestrate(
 #[cfg(test)]
 mod retrieval_failure_tests;
 
-/// The parts of a coverage note the code acts on. A note is prose on the wire;
-/// every writer starts it from here and every branch on one reads it through
-/// here, so rewording a message cannot silently change what happens to it.
-mod note {
-    pub(super) const UNAVAILABLE: &str = "analysis unavailable";
-    pub(super) const INCOMPLETE: &str = "analysis incomplete";
-    pub(super) const PENDING: &str = "pending:";
-    pub(super) const SUPPLIED: &str = "supplied code already analyzed";
-    pub(super) const DEVELOPMENT: &str = "development-only";
-    pub(super) const FLAGGED: &str = "candidate static issues:";
-    pub(super) const VERSION_UNKNOWN: &str = "installed distribution/version unknown";
+/// Whether `fact` says a reference's analysis is missing or has gaps: what a
+/// later run retries, and what a summary counts as incomplete.
+fn is_analysis_gap(fact: &Coverage) -> bool {
+    matches!(fact, Coverage::Unavailable { .. } | Coverage::Incomplete)
+}
+
+/// `rec`'s coverage facts as one line for people.
+fn coverage_text(rec: &FetchRecord) -> String {
+    let facts: Vec<String> = rec.coverage.iter().map(ToString::to_string).collect();
+    facts.join("; ")
 }
 
 fn fetch_work_key(reference: &Reference) -> String {

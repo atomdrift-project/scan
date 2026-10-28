@@ -7,25 +7,12 @@
 use anyhow::Result;
 use scan::{Analyzer, Thresholds};
 
+mod bundle;
+
 /// A one-feature model bundle that loads without any external artifacts.
 fn bundle() -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("model.onnx"),
-        include_bytes!("fixtures/cli-model.onnx"),
-    )?;
-    std::fs::write(
-        dir.path().join("feature_spec.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": scan::features::EXPECTED_SPEC_VERSION,
-            "abi_version": scan::features::EXPECTED_MODEL_ABI_VERSION,
-            "presence_vocab": ["metadata"],
-            "feature_names": ["present:metadata"],
-            "total_features": 1,
-            "standardized": false,
-            "metric_transforms": {}
-        }))?,
-    )?;
+    bundle::write(dir.path())?;
     std::fs::write(
         dir.path().join("config.json"),
         br#"{"suspicious":0.9,"hostile":0.99}"#,
