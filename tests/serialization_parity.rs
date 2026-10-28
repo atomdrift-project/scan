@@ -145,6 +145,7 @@ fn full_result_serializes_identically() {
         analysis_cached: false,
         interpret_ms: 0,
         dependency_results: vec![],
+        dependency_attention: Default::default(),
         bloom_mark: None,
         hopper_route: scan::engine::HopperRoute::Normal,
     };
@@ -193,6 +194,7 @@ fn minimal_result_serializes_identically() {
         analysis_cached: false,
         interpret_ms: 0,
         dependency_results: vec![],
+        dependency_attention: Default::default(),
         bloom_mark: None,
         hopper_route: scan::engine::HopperRoute::Normal,
     };

