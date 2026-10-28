@@ -1483,8 +1483,11 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
         );
     }
 
-    if summary.hostile == 0 && summary.suspicious == 0 && summary.errors == 0
-        && summary.dependency_attention.gaps == 0 && summary.dependency_attention.flagged_candidates == 0
+    if summary.hostile == 0
+        && summary.suspicious == 0
+        && summary.errors == 0
+        && summary.dependency_attention.gaps == 0
+        && summary.dependency_attention.flagged_candidates == 0
         && summary.static_flags == 0
     {
         return format!(
@@ -1514,14 +1517,23 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
     }
     if summary.dependency_attention.gaps > 0 {
         let n = summary.dependency_attention.gaps;
-        parts.push(fg(p.warning, &format!("{n} dependency gap{}", if n == 1 { "" } else { "s" })));
+        parts.push(fg(
+            p.warning,
+            &format!("{n} dependency gap{}", if n == 1 { "" } else { "s" }),
+        ));
     }
     if summary.static_flags > 0 {
-        parts.push(fg(p.warning, &format!("{} with severe static findings", summary.static_flags)));
+        parts.push(fg(
+            p.warning,
+            &format!("{} with severe static findings", summary.static_flags),
+        ));
     }
     if summary.dependency_attention.flagged_candidates > 0 {
         let n = summary.dependency_attention.flagged_candidates;
-        parts.push(fg(p.warning, &format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" })));
+        parts.push(fg(
+            p.warning,
+            &format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" }),
+        ));
     }
     parts.push(fg(p.very_dim, &format!("{} graded benign", summary.benign)));
     parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
@@ -1712,10 +1724,17 @@ mod tests {
     #[test]
     fn unresolved_dependencies_preclude_a_clean_summary() {
         let mut summary = ScanSummary {
-            total_files: 1, hostile: 0, suspicious: 0, benign: 1, errors: 0,
+            total_files: 1,
+            hostile: 0,
+            suspicious: 0,
+            benign: 1,
+            errors: 0,
             duration_ms: 1,
             static_flags: 0,
-            dependency_attention: crate::engine::DependencyAttention { gaps: 2, flagged_candidates: 1 },
+            dependency_attention: crate::engine::DependencyAttention {
+                gaps: 2,
+                flagged_candidates: 1,
+            },
         };
         let line = summary_status_line(&summary);
         assert!(line.contains("2 dependency gaps") && line.contains("1 flagged candidate"));

@@ -322,7 +322,10 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 }
                 dependency_gaps.fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
                 static_flags.fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
-                flagged_candidates.fetch_add(result.dependency_attention.flagged_candidates, Ordering::Relaxed);
+                flagged_candidates.fetch_add(
+                    result.dependency_attention.flagged_candidates,
+                    Ordering::Relaxed,
+                );
             }
             Err(e) => {
                 tracing::warn!("error processing {}: {e}", group.path.display());

@@ -536,9 +536,13 @@ pub struct MlSection {
 impl ScanResult {
     /// Static findings remain attention-worthy when the model grades benign.
     pub(crate) fn has_severe_findings(&self) -> bool {
-        self.finding_counts.hostile > 0 || self.finding_counts.suspicious > 0
+        self.finding_counts.hostile > 0
+            || self.finding_counts.suspicious > 0
             || self.top_findings.iter().any(|finding| finding.crit >= 4)
-            || self.embedded_files.values().any(|member| member.top_findings.iter().any(|finding| finding.crit >= 4))
+            || self
+                .embedded_files
+                .values()
+                .any(|member| member.top_findings.iter().any(|finding| finding.crit >= 4))
     }
 
     /// The `ml` section. Clones only the small fields; `files` is built here.
