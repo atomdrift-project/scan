@@ -41,7 +41,7 @@ use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
     BlobCache, CandidateSource, Coverage, Fetch, FetchBudget, FetchError, FetchRecord, Fetched,
     HttpFetch, Method, Outcome, RecordedSource, Request, Served, UrlFetches, fetch_ref,
-    fetch_references_with,
+    fetch_references,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
 use reqwest::Url;
@@ -240,10 +240,41 @@ fn default_source(parsed: &fletch::purl::Purl) -> bool {
 /// download — the [`fletch::fetch::ArtifactMatrix::preferred`] candidate the
 /// fetch itself picks. `None` when the registry lists no sha256 for it.
 fn registry_digest(purl: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<String> {
-    let matrix = fletch::fetch::resolve_artifacts(&RefLocator::Purl(purl.to_owned()), net, cache)?;
+    let matrix = fletch::fetch::resolve_artifacts(&RefLocator::Purl(purl.to_owned()), net, cache)
+        .inspect_err(|error| tracing::debug!(purl, %error, "registry lists no artifacts"))
+        .ok()?;
     let sha = matrix.preferred()?.checksums.get("sha256")?;
     (sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| sha.to_ascii_lowercase())
+}
+
+/// The filefacts type a report's `file_type` label names; `unknown` for a
+/// label this build does not know.
+fn report_file_type(label: &str) -> filefacts::FileType {
+    filefacts::FileType::from_label(label).unwrap_or(filefacts::FileType::Unknown)
+}
+
+/// The references `discovery` found in `source`, noting when a recognizer
+/// stopped at one of its budgets and the list may be incomplete.
+fn found(discovery: find::Discovery, source: &str) -> Vec<Reference> {
+    if discovery.truncated {
+        tracing::warn!(
+            source,
+            references = discovery.references.len(),
+            "reference discovery stopped at a budget; some references may be missing"
+        );
+    }
+    discovery.references
+}
+
+/// Whether `record`'s bytes matched `reference`'s declared pin; `None` when
+/// nothing was pinned or the pin's algorithm could not be checked.
+fn pin_verified(reference: &Reference, record: &FetchRecord) -> Option<bool> {
+    match record.outcome {
+        Outcome::PinMismatch => Some(false),
+        Outcome::Ok if reference.pinned_hash.is_some() => Some(true),
+        _ => None,
+    }
 }
 
 /// The root sample's imperative hunt re-reads it from disk and re-parses it.

@@ -314,8 +314,8 @@ pub fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> 
             FEED_TRAIT_ID,
             "Cited as malicious by one unadjudicated threat intelligence source.",
         ),
-        // No filter had an opinion.
-        Decision::Unknown => return None,
+        // No filter had an opinion, or one that might have could not be read.
+        Decision::Unknown | Decision::Unavailable => return None,
     })
 }
 

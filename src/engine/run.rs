@@ -1054,9 +1054,12 @@ fn bloom_gate(
         // A sighting is the same shape of answer as known-bad — a flag that
         // runs the full analysis — but says somebody else reported it rather
         // than that we measured it. The distinction rides the inline mark.
+        // An unreadable filter blesses nothing, so that artifact is analyzed
+        // too; `record` has already logged the broken bundle.
         BloomDecision::KnownBad
         | BloomDecision::SightedHostile
-        | BloomDecision::SightedSuspicious => None,
+        | BloomDecision::SightedSuspicious
+        | BloomDecision::Unavailable => None,
         BloomDecision::Conflicted => {
             // Build-time subtraction removes bad keys from good, so a conflict can
             // only mean filter version skew or a producer bug — it should never

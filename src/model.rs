@@ -32,7 +32,7 @@
 //!   general/                      always required
 //!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json
-//!   filegroups/<group>/           optional, e.g. native, scripts, archive
+//!   filegroups/<group>/           optional, a filefacts group: native, scripts, archives, …
 //!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json           may be absent → uses general's spec
 //!   filetypes/<type>/             optional, e.g. elf, pe

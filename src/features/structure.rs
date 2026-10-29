@@ -11,15 +11,11 @@
 )]
 use super::*;
 
-pub(super) fn format_groups_for_type(file_type: &str) -> Vec<&'static str> {
-    let normalized = file_type.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    FORMAT_GROUPS
-        .iter()
-        .filter_map(|&(group, types)| types.contains(&normalized.as_str()).then_some(group))
-        .collect()
+/// The format group of a cleave-reported file type; `None` for one filefacts
+/// does not identify.
+pub(super) fn format_group_for_type(file_type: &str) -> Option<filefacts::Group> {
+    let group = filefacts::FileType::from_label(&file_type.trim().to_ascii_lowercase())?.group();
+    (group != filefacts::Group::Unknown).then_some(group)
 }
 
 /// G6b: portable format-group hints derived only from cleave file types.
@@ -28,19 +24,19 @@ pub(super) fn write_format_hint_features(summaries: &[FileSummary], w: &mut Feat
     let mut known_files = 0usize;
     let mut present_groups = HashSet::new();
 
-    // Each file's format groups, resolved once — the loop below is O(groups × files).
-    let file_groups: Vec<Vec<&'static str>> = summaries
+    // Each file's format group, resolved once — the loop below is O(groups × files).
+    let file_groups: Vec<Option<filefacts::Group>> = summaries
         .iter()
-        .map(|s| format_groups_for_type(&s.file_type))
+        .map(|s| format_group_for_type(&s.file_type))
         .collect();
 
-    for (&(group, _), names) in FORMAT_GROUPS.iter().zip(FORMAT_FEATURE_NAMES.iter()) {
+    for (&group, names) in FORMAT_GROUPS.iter().zip(FORMAT_FEATURE_NAMES.iter()) {
         let mut group_count = 0usize;
         let mut suspicious_count = 0usize;
         let mut hostile_count = 0usize;
 
-        for (s, groups) in summaries.iter().zip(&file_groups) {
-            if groups.contains(&group) {
+        for (s, file_group) in summaries.iter().zip(&file_groups) {
+            if *file_group == Some(group) {
                 group_count += 1;
                 present_groups.insert(group);
                 if s.findings.suspicious_finding_count > 0 {
@@ -75,16 +71,23 @@ pub(super) fn write_format_hint_features(summaries: &[FileSummary], w: &mut Feat
     );
     w.set(
         "format:mixed_script_binary",
-        f32::from(present_groups.contains("script") && present_groups.contains("native_binary")),
+        f32::from(
+            present_groups.contains(&filefacts::Group::Scripts)
+                && present_groups.contains(&filefacts::Group::Native),
+        ),
     );
     w.set(
         "format:mixed_archive_script",
-        f32::from(present_groups.contains("archive_package") && present_groups.contains("script")),
+        f32::from(
+            present_groups.contains(&filefacts::Group::Archives)
+                && present_groups.contains(&filefacts::Group::Scripts),
+        ),
     );
     w.set(
         "format:mixed_archive_binary",
         f32::from(
-            present_groups.contains("archive_package") && present_groups.contains("native_binary"),
+            present_groups.contains(&filefacts::Group::Archives)
+                && present_groups.contains(&filefacts::Group::Native),
         ),
     );
     w.set(

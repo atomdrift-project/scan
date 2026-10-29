@@ -736,7 +736,9 @@ impl Hopper {
                 // slow older verdict must never overwrite its newer successor.
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 job.sha256.hash(&mut hash);
-                let lane = hash.finish() as usize % senders.len();
+                // The remainder is below `senders.len()`, so it fits a usize.
+                let lane =
+                    usize::try_from(hash.finish() % senders.len() as u64).unwrap_or_default();
                 if let Err((job, error)) = senders[lane].send(job) {
                     tracing::warn!(%error, "upload: renewal queue unavailable; sending inline");
                     self.renew_encoded(&job.sha256, job.purl.as_deref(), job.body);
@@ -1365,7 +1367,7 @@ mod tests {
         let lane = |sha: &str| {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             sha.hash(&mut hash);
-            hash.finish() as usize % RENEW_WORKERS
+            usize::try_from(hash.finish() % RENEW_WORKERS as u64).unwrap_or_default()
         };
         let slow = "a".repeat(64);
         let fast = (0..100)
@@ -1461,7 +1463,7 @@ mod tests {
             overlapped.load(Ordering::Relaxed),
             "one stalled digest blocked another lane"
         );
-        let completed = completed.lock().unwrap();
+        let completed = std::mem::take(&mut *completed.lock().unwrap());
         for (sha, count) in [(&slow, 3), (&fast, 2)] {
             let sequence: Vec<_> = completed
                 .iter()
@@ -1802,12 +1804,7 @@ mod tests {
             url: "https://example/x-1.tgz".to_string(),
             size: 99,
             provenance: Some(crate::provenance::RegistryProvenance::from_record_sources(
-                fletch::Registry {
-                    ecosystem: "bogus".to_string(),
-                    name: "x".to_string(),
-                    version: "1".to_string(),
-                    ..fletch::Registry::default()
-                },
+                crate::test_registry("bogus", "x", "1"),
                 &[fletch::fetch::RecordedSource {
                     url: "https://registry.example/x".to_string(),
                     status: 200,

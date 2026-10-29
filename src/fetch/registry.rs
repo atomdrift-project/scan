@@ -184,9 +184,11 @@ pub fn registry_with_sources(
     let Some(res) = shared_resources() else {
         return (None, Vec::new());
     };
-    let (record, sources) = fletch::registry_with_sources(locator, &*res.net, &res.cache);
+    let (record, sources) = fletch::registry::lookup_recorded(locator, &*res.net, &res.cache);
     (
-        record.map(|reg| reg.with_age(crate::civil::now_secs())),
+        record
+            .ok()
+            .map(|reg| reg.with_age(crate::civil::now_secs())),
         sources,
     )
 }
@@ -364,7 +366,7 @@ pub(super) fn lookup_registries(
             .par_iter()
             .map(|&i| {
                 let (record, sources) =
-                    fletch::try_registry_with_sources(&selected[i].locator, &*res.net, &res.cache);
+                    fletch::registry::lookup_recorded(&selected[i].locator, &*res.net, &res.cache);
                 let lookup = record.map(|record| Lookup {
                     record,
                     sources: Some(sources),

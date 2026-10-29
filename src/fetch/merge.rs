@@ -168,7 +168,7 @@ impl Payloads<'_> {
         // hunt, so a stage-2 script's `curl | bash` (or an encoded URL) is
         // followed.
         let mut next_from_bytes = Vec::new();
-        let mut payload_refs = find::references_in_bytes(&bytes, &name);
+        let mut payload_refs = found(find::references_in_bytes(&bytes, &name), &rec.locator);
         mark_redirect_destinations(&bytes, &mut payload_refs);
         if !payload_refs.is_empty() {
             next_from_bytes.push((content_sha.clone(), payload_refs));
@@ -229,7 +229,6 @@ pub(super) fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> F
         content_sha256: Some(sha.to_string()),
         size: None,
         served: Some(Served::Cache),
-        pin_verified: None,
         outcome: Outcome::Skipped,
     }
 }
@@ -446,11 +445,12 @@ pub(super) fn merge_payload(
         if !is_vendored_node_module(&file.path)
             && let Some(view) = &file.filefacts
         {
-            let refs: Vec<_> = static_es_module_refs(&file.path, &file.file_type, &view.values)
+            let file_type = report_file_type(&file.file_type);
+            let refs: Vec<_> = static_es_module_refs(&file.path, file_type, &view.values)
                 .into_iter()
-                .chain(find::python_imports(&file.file_type, &view.symbols))
+                .chain(find::python_imports(file_type, &view.symbols))
                 .chain(
-                    find::import_calls(&file.file_type, &view.symbols)
+                    find::import_calls(file_type, &view.symbols)
                         .into_iter()
                         .filter(is_python_import_candidate),
                 )
@@ -493,9 +493,15 @@ pub(super) fn merge_payload(
             continue;
         }
         if let Some(view) = &file.filefacts {
-            let mut refs = find::references_from_facts(&view.values, &view.references);
-            refs.extend(find::fetch_calls(&file.file_type, &view.symbols));
-            refs.extend(find::discover_batch_programs(&file.file_type, &view.values).references);
+            let mut refs = found(
+                find::references_from_facts(
+                    report_file_type(&file.file_type),
+                    &view.values,
+                    &view.symbols,
+                    &view.references,
+                ),
+                &file.path,
+            );
             mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
             if is_ci_context(file) {
                 mark_scope(&mut refs, filefacts::DependencyScope::Ci);

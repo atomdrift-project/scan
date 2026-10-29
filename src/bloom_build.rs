@@ -171,10 +171,12 @@ mod tests {
 
     #[test]
     fn keys_land_in_the_form_the_scanner_looks_them_up_by() {
-        let (sets, _) = read(&[r#"{"purl":"pkg:NPM/left-pad@1.3.0?arch=x86_64","label":"good"}"#]);
+        let (sets, _) = read(&[
+            r#"{"purl":"pkg:NPM/left-pad@1.3.0?file_name=left-pad-1.3.0.tgz","label":"good"}"#,
+        ]);
         let filters = sets.into_filters(1e-9);
         let dir = tempfile::tempdir().unwrap();
-        burton::build::write_bundle(
+        burton::write_bundle(
             dir.path(),
             &filters,
             "2026-08-31",

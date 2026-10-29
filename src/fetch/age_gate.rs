@@ -423,7 +423,14 @@ pub(super) fn age_gate(
         selected
             .into_par_iter()
             .map(|r| {
-                let exact = fletch::fetch::resolve_declared_reference(&r, &*res.net, &res.cache);
+                let exact = fletch::fetch::resolve_declared_reference(&r, &*res.net, &res.cache)
+                    .inspect_err(|error| match error {
+                        fletch::fetch::ResolveError::Failed(_) => {
+                            tracing::warn!(locator = locator(&r), %error, "registry unavailable; dependency range left unresolved");
+                        }
+                        _ => tracing::debug!(locator = locator(&r), %error, "dependency range not resolved"),
+                    })
+                    .ok();
                 (r, exact)
             })
             .collect()

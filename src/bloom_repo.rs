@@ -110,8 +110,10 @@ impl Lookup {
         // NSRL may bless only while our own SHA-256 revocation slot is loaded.
         // Losing the daily bundle must never leave a standalone stale allowlist.
         let revocations = self.inner.is_active()
-            && burton::build::read_manifest(primary)
-                .is_some_and(|m| m.filter.contains_key("sha256-bad"));
+            && matches!(
+                burton::read_manifest(primary),
+                Ok(Some(m)) if m.filter.contains_key("sha256-bad")
+            );
         if !revocations || !nsrl.join("bloom.toml").is_file() {
             return;
         }
@@ -124,13 +126,14 @@ impl Lookup {
     /// Open a bundle from a specific directory.
     #[must_use]
     pub fn load_from(dir: &Path) -> Self {
-        use burton::OpenError::{Manifest, Missing};
+        use burton::OpenError::Io;
         use std::io::ErrorKind::NotFound;
+        let manifest = dir.join(burton::MANIFEST_FILE);
         let mut opened = burton::Lookup::open(dir, KEY_SCHEME);
         // A file that isn't there may be an update between its swap's two
         // renames: let it finish and look again rather than run without filters.
-        if let Err(Manifest(_, e) | Missing(_, e)) = &opened
-            && e.kind() == NotFound
+        if let Err(Io { source, .. }) = &opened
+            && source.kind() == NotFound
             && crate::bundle::settle(dir)
         {
             opened = burton::Lookup::open(dir, KEY_SCHEME);
@@ -139,12 +142,12 @@ impl Lookup {
             Ok(inner) => {
                 tracing::debug!(
                     dir = %dir.display(),
-                    keys = inner.keys(),
+                    keys = inner.key_count(),
                     "opened bloom bundle"
                 );
                 Self::wrap(inner)
             }
-            Err(Manifest(_, e)) if e.kind() == NotFound => {
+            Err(Io { path, source }) if source.kind() == NotFound && path == manifest => {
                 tracing::debug!(dir = %dir.display(), "no bloom bundle installed");
                 Self::default()
             }
@@ -238,7 +241,7 @@ impl Lookup {
     /// rule tally.
     #[must_use]
     pub fn rule_count(&self) -> u64 {
-        self.inner.keys() + self.nsrl.as_ref().map_or(0, burton::Lookup::keys)
+        self.inner.key_count() + self.nsrl.as_ref().map_or(0, burton::Lookup::key_count)
     }
 }
 
@@ -250,6 +253,7 @@ struct BloomStats {
     sighted: AtomicU32,
     conflicted: AtomicU32,
     unscanned: AtomicU32,
+    unavailable: AtomicU32,
 }
 
 static STATS: BloomStats = BloomStats {
@@ -258,6 +262,7 @@ static STATS: BloomStats = BloomStats {
     sighted: AtomicU32::new(0),
     conflicted: AtomicU32::new(0),
     unscanned: AtomicU32::new(0),
+    unavailable: AtomicU32::new(0),
 };
 
 /// A point-in-time snapshot of the bloom decision tally.
@@ -275,6 +280,9 @@ pub struct BloomCounts {
     pub conflicted: u32,
     /// Artifacts left unscanned in fast mode (in neither set).
     pub unscanned: u32,
+    /// Artifacts analyzed because a filter could not be read when consulted,
+    /// so nothing could be blessed.
+    pub unavailable: u32,
 }
 
 impl BloomCounts {
@@ -286,6 +294,7 @@ impl BloomCounts {
             && self.sighted == 0
             && self.conflicted == 0
             && self.unscanned == 0
+            && self.unavailable == 0
     }
 }
 
@@ -301,6 +310,14 @@ pub(crate) fn record(decision: Decision, unscanned: bool) {
         Decision::Conflicted => &STATS.conflicted,
         Decision::Unknown if unscanned => &STATS.unscanned,
         Decision::Unknown => return,
+        Decision::Unavailable => {
+            if STATS.unavailable.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!(
+                    "a bloom filter could not be read; nothing it covers is skipped until the bundle is fixed"
+                );
+            }
+            return;
+        }
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -314,6 +331,7 @@ pub fn counts() -> BloomCounts {
         sighted: STATS.sighted.load(Ordering::Relaxed),
         conflicted: STATS.conflicted.load(Ordering::Relaxed),
         unscanned: STATS.unscanned.load(Ordering::Relaxed),
+        unavailable: STATS.unavailable.load(Ordering::Relaxed),
     }
 }
 
@@ -322,7 +340,10 @@ pub fn counts() -> BloomCounts {
 /// bundle is installed. Used by `scan version`.
 #[must_use]
 pub fn installed_manifest() -> Option<burton::Manifest> {
-    burton::build::read_manifest(&install_dir().ok()?)
+    burton::read_manifest(&install_dir().ok()?)
+        .inspect_err(|error| tracing::warn!(%error, "bloom manifest unreadable"))
+        .ok()
+        .flatten()
 }
 
 /// Where filters are read from: the data path the updater fills.
@@ -349,7 +370,7 @@ mod tests {
         for (tier, r) in rows {
             sets.insert(*tier, r.clone());
         }
-        burton::build::write_bundle(dir, &sets.into_filters(1e-9), "2026-08-31", KEY_SCHEME)
+        burton::write_bundle(dir, &sets.into_filters(1e-9), "2026-08-31", KEY_SCHEME)
             .expect("write bundle");
     }
 
@@ -367,11 +388,12 @@ mod tests {
         }
         let filters: Vec<_> = sets
             .into_filters_for(1, 1e-9)
+            .unwrap()
             .into_iter()
             .filter(|f| f.kind() == burton::Kind::Sha256)
             .collect();
         let mut manifest =
-            burton::build::write_bundle(dir, &filters, "2026-09-01", crate::nsrl_repo::KEY_SCHEME)
+            burton::write_bundle(dir, &filters, "2026-09-01", crate::nsrl_repo::KEY_SCHEME)
                 .unwrap();
         for (stem, entry) in &mut manifest.filter {
             let name = format!("{stem}-{}.adbl", entry.sha256);
@@ -463,7 +485,7 @@ mod tests {
         // Artifact-selection qualifiers are dropped by the identity form, so an
         // SBOM-stamped spelling collides with the bare coordinate.
         assert_eq!(
-            lk.decide_purl("pkg:npm/left-pad@1.3.0?arch=x86_64"),
+            lk.decide_purl("pkg:npm/left-pad@1.3.0?file_name=left-pad-1.3.0.tgz"),
             Decision::Skip
         );
         assert_eq!(lk.decide_purl("pkg:npm/evil@6.6.6"), Decision::KnownBad);
@@ -476,7 +498,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut sets = KeySets::new();
         sets.insert(Tier::Good, rec(None, Some(digest(2))));
-        burton::build::write_bundle(
+        burton::write_bundle(
             tmp.path(),
             &sets.into_filters(1e-9),
             "2026-08-31",
@@ -546,7 +568,7 @@ mod tests {
                 sha256: Some(bad_sha),
             },
         );
-        burton::build::write_bundle(
+        burton::write_bundle(
             tmp.path(),
             &sets.into_filters(1e-9),
             "2026-08-31",

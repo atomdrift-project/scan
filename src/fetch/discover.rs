@@ -142,7 +142,11 @@ pub(super) fn collect_references_from_input(
         // Declared references plus the value-driven hunt (npm lifecycle hooks),
         // both from facts the report already carries — so every archive member,
         // not just the root, contributes its references without re-extraction.
-        let mut refs = find::references_from_facts(&view.values, &view.references);
+        let file_type = report_file_type(&file.file_type);
+        let mut refs = found(
+            find::references_from_facts(file_type, &view.values, &view.symbols, &view.references),
+            &file.path,
+        );
         // A co-located lockfile is authoritative; do not borrow pins from
         // other bundled packages. Workspace-only locks remain explicit range
         // resolution until workspace ownership can be established.
@@ -171,14 +175,10 @@ pub(super) fn collect_references_from_input(
         // facts-only import vector, so `require("undeclared-pkg")` inside an
         // archive member is hunted without re-extracting its discarded bytes.
         refs.extend(
-            find::import_calls(&file.file_type, &view.symbols)
+            find::import_calls(file_type, &view.symbols)
                 .into_iter()
-                .chain(find::python_imports(&file.file_type, &view.symbols))
-                .chain(static_es_module_refs(
-                    &file.path,
-                    &file.file_type,
-                    &view.values,
-                ))
+                .chain(find::python_imports(file_type, &view.symbols))
+                .chain(static_es_module_refs(&file.path, file_type, &view.values))
                 .filter(|reference| {
                     if local.provides_python(file, reference) {
                         return false;
@@ -213,8 +213,6 @@ pub(super) fn collect_references_from_input(
                     !present
                 }),
         );
-        refs.extend(find::fetch_calls(&file.file_type, &view.symbols));
-        refs.extend(find::discover_batch_programs(&file.file_type, &view.values).references);
         if refs.is_empty() {
             continue;
         }
@@ -268,7 +266,7 @@ pub(super) fn collect_references_from_input(
             .flatten();
         let mut hunted = match subject {
             Some(subject) => vec![subject],
-            None => find::references_in_bytes(&bytes, &name),
+            None => found(find::references_in_bytes(&bytes, &*name), &root.path),
         };
         if is_ci_context(root) {
             mark_scope(&mut hunted, filefacts::DependencyScope::Ci);
@@ -284,15 +282,32 @@ pub(super) fn collect_references_from_input(
     for (sha, refs) in &groups {
         group_refs.entry(sha.as_str()).or_insert(refs.as_slice());
     }
-    let go_members: Vec<_> = report
-        .files
-        .iter()
-        .map(|file| filefacts::ReferenceMember {
-            path: &file.path,
-            references: group_refs.get(file.sha256.as_str()).copied().unwrap_or(&[]),
-        })
-        .collect();
-    let go_context = filefacts::go_dependency_context(&go_members);
+    // filefacts reads member paths as `/`-separated paths inside one
+    // artifact, so each archive's members go in a call of their own, named by
+    // the path after the archive's `!!`; results are keyed back by report path.
+    let mut by_archive: BTreeMap<&str, Vec<filefacts::ReferenceMember<'_>>> = BTreeMap::new();
+    for file in &report.files {
+        let (archive, path) = file.path.rsplit_once("!!").unwrap_or(("", &file.path));
+        by_archive
+            .entry(archive)
+            .or_default()
+            .push(filefacts::ReferenceMember {
+                path,
+                references: group_refs.get(file.sha256.as_str()).copied().unwrap_or(&[]),
+            });
+    }
+    let limits = filefacts::package_context::ContextLimits::default();
+    let mut go_context: HashMap<String, Vec<Reference>> = HashMap::new();
+    for (archive, members) in &by_archive {
+        for (path, resolved) in filefacts::go_dependency_context(members, &limits) {
+            let path = if archive.is_empty() {
+                path
+            } else {
+                format!("{archive}!!{path}")
+            };
+            go_context.insert(path, resolved);
+        }
+    }
     for (sha, refs) in &mut groups {
         let contexts: Vec<_> = by_sha
             .get(sha.as_str())
@@ -489,7 +504,7 @@ pub(super) fn hunt_download_members(
                 continue;
             }
         };
-        let mut hunted = find::references_in_bytes(&bytes, member);
+        let mut hunted = found(find::references_in_bytes(&bytes, member), member);
         if trigger == TRAIT_BROWSER_PAC_URL {
             // The lightweight trait only gates re-reading. Require the
             // API/mode/binding check before adding a PAC code dependency;

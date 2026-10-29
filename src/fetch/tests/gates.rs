@@ -106,10 +106,7 @@ fn resolved_purl_pairs_registry_version_onto_range_declarations() {
             "",
         )
     };
-    let at = |v: &str| Registry {
-        version: v.to_string(),
-        ..Registry::default()
-    };
+    let at = |v: &str| crate::test_registry("", "", v);
 
     // The npm case this exists for: a manifest range leaves the locator
     // version-less, so the bloom (keyed `name@version`) could never match it.
@@ -156,20 +153,16 @@ fn resolved_purl_pairs_registry_version_onto_range_declarations() {
 #[test]
 fn freshly_published_and_must_rescan_track_publish_age() {
     let now = 1_000_000_u64;
-    let fresh = Registry {
-        published_at: Some(now - 3_600), // 1h ago
-        ..Registry::default()
+    let published = |at: u64| {
+        let mut record = crate::test_registry("", "", "");
+        record.published_at = Some(at);
+        record
     };
+    let fresh = published(now - 3_600); // 1h ago
     // 30h ago: outside the 4h window, and the case that separates it from
     // the local-file window in `engine`, which is still measured in days.
-    let day_and_a_half = Registry {
-        published_at: Some(now - 30 * 3_600),
-        ..Registry::default()
-    };
-    let stale = Registry {
-        published_at: Some(now - 300_000), // ~3.5d ago
-        ..Registry::default()
-    };
+    let day_and_a_half = published(now - 30 * 3_600);
+    let stale = published(now - 300_000); // ~3.5d ago
     assert!(freshly_published(&fresh, now));
     assert!(!freshly_published(&day_and_a_half, now));
     assert!(!freshly_published(&stale, now));
@@ -180,30 +173,15 @@ fn freshly_published_and_must_rescan_track_publish_age() {
     assert!(must_rescan(&fresh, now));
     // A yank leaves the artifact downloadable, so re-scanning it is not a
     // doomed fetch — this is the arm that earns `dep_pulled` its keep.
-    assert!(must_rescan(
-        &Registry {
-            published_at: Some(now - 300_000),
-            deprecated: Some("yanked".to_string()),
-            ..Registry::default()
-        },
-        now
-    ));
-    assert!(must_rescan(
-        &Registry {
-            published_at: Some(now - 300_000),
-            security_hold: Some(true),
-            ..Registry::default()
-        },
-        now
-    ));
-    assert!(must_rescan(
-        &Registry {
-            published_at: Some(now - 300_000),
-            version_removed: Some(true),
-            ..Registry::default()
-        },
-        now
-    ));
+    let mut yanked = stale.clone();
+    yanked.deprecated = Some("yanked".to_string());
+    assert!(must_rescan(&yanked, now));
+    let mut held = stale.clone();
+    held.security_hold = Some(true);
+    assert!(must_rescan(&held, now));
+    let mut removed = stale;
+    removed.version_removed = Some(true);
+    assert!(must_rescan(&removed, now));
 }
 
 #[test]
