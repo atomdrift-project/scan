@@ -583,12 +583,6 @@ pub(super) fn crit_category_tokens(summary: &FindingSummary) -> Vec<String> {
     tokens
 }
 
-/// Sorted `tier:path` tokens from prefixes at the model's trait depth,
-/// shared by the tiered bigram and trigram feature builders.
-pub(super) fn tiered_path_tokens(summary: &FindingSummary) -> Vec<String> {
-    tiered_path_tokens_with_options(summary, 3, &HashMap::new())
-}
-
 pub(super) fn tiered_path_tokens_with_options(
     summary: &FindingSummary,
     minimum: u32,

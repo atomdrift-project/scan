@@ -360,12 +360,6 @@ pub(super) fn append_adopted_node(
     graft.push(report, node);
 }
 
-/// Fold an [`Analyzed`] payload into the report: append its file nodes nested
-/// under the file that declared the reference, and return the references the
-/// payload yields for the next hop. The fetch edge (`source_sha256 →
-/// content_sha256`) is the authoritative link; ids and depth are renumbered so
-/// the grafted nodes are a well-formed subtree that never collides with the main
-/// report's. Must run serially — it reads and extends `report.files`.
 /// Published npm packages' ordinary lockfiles describe the publisher's own
 /// development install. npm uses npm-shrinkwrap.json in consumed packages;
 /// retain it. Directly scanned workspaces retain their lockfiles as before.
@@ -384,22 +378,17 @@ pub(super) fn mark_published_npm_development_refs(
     path: &str,
     refs: &mut [Reference],
 ) {
-    if !is_published_npm_development_lock(locator, path) {
-        return;
-    }
-    for reference in refs {
-        let context = reference
-            .context
-            .get_or_insert(filefacts::DependencyContext {
-                scope: filefacts::DependencyScope::Development,
-                optional: false,
-                has_install_script: false,
-                installed_path: None,
-            });
-        context.scope = filefacts::DependencyScope::Development;
+    if is_published_npm_development_lock(locator, path) {
+        mark_scope(refs, filefacts::DependencyScope::Development);
     }
 }
 
+/// Fold an [`Analyzed`] payload into the report: append its file nodes nested
+/// under the file that declared the reference, and return the references the
+/// payload yields for the next hop. The fetch edge (`source_sha256 →
+/// content_sha256`) is the authoritative link; ids and depth are renumbered so
+/// the grafted nodes are a well-formed subtree that never collides with the main
+/// report's. Must run serially — it reads and extends `report.files`.
 pub(super) fn merge_payload(
     report: &mut AnalysisReport,
     graft: &mut Graft,
@@ -509,7 +498,7 @@ pub(super) fn merge_payload(
             refs.extend(find::discover_batch_programs(&file.file_type, &view.values).references);
             mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
             if is_ci_context(file) {
-                mark_ci_scope(&mut refs);
+                mark_scope(&mut refs, filefacts::DependencyScope::Ci);
             }
             if !refs.is_empty() {
                 next.push((file.sha256.clone(), refs));
@@ -554,16 +543,6 @@ pub(super) fn apply_package_composites(
     }
 }
 
-/// Enrich a fetched dependency's standalone report with package-scoped
-/// registry composites before it is captured or merged into its parent.
-pub(super) fn prepare_dependency_report(
-    payload: &mut Analyzed,
-    registry_findings: Option<&[Finding]>,
-    opts: &AnalysisOptions,
-) {
-    prepare_dependency_report_with(payload, registry_findings, opts, apply_package_composites);
-}
-
 /// Return the registry findings paired with the original declared reference.
 /// A fetch may canonicalize a versionless/ranged PURL to the concrete version
 /// it downloaded, so joining on `FetchRecord::locator` loses exactly the
@@ -575,24 +554,22 @@ pub(super) fn registry_findings_for_reference<'a>(
     findings.get(locator(reference)).map(Vec::as_slice)
 }
 
-/// Injectable core of [`prepare_dependency_report`]. Keeping the mutation in a
-/// small function makes the ordering contract testable without network access
-/// or depending on the machine's installed trait bundle.
+/// Enrich a fetched dependency's standalone report with package-scoped
+/// registry composites (`graft`, [`apply_package_composites`] in production)
+/// before it is captured or merged into its parent. Taking `graft` keeps the
+/// ordering contract testable without network access or depending on the
+/// machine's installed trait bundle.
 pub(super) fn prepare_dependency_report_with(
     payload: &mut Analyzed,
     registry_findings: Option<&[Finding]>,
     opts: &AnalysisOptions,
     graft: impl FnOnce(&mut AnalysisReport, &str, &[Finding], &[Finding], &AnalysisOptions),
 ) {
-    let Some(registry) = registry_findings else {
+    let (Some(registry), Some(sub)) = (registry_findings, payload.sub.as_mut()) else {
         return;
     };
-    let artifact = payload.sub.as_ref().map(sub_findings).unwrap_or_default();
-    let artifact_sha = payload.content_sha.clone();
-    let Some(sub) = payload.sub.as_mut() else {
-        return;
-    };
-    graft(sub, &artifact_sha, &artifact, registry, opts);
+    let artifact = sub_findings(sub);
+    graft(sub, &payload.content_sha, &artifact, registry, opts);
 }
 
 /// The URL a fetch's bytes came from: where the redirects ended, else where

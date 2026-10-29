@@ -95,18 +95,27 @@ fn raise_open_file_limit() {
 #[cfg(unix)]
 static SIGUSR1_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A signal set holding only `SIGUSR1`.
+#[cfg(unix)]
+fn sigusr1_mask() -> libc::sigset_t {
+    // SAFETY: `sigemptyset` initializes the zeroed set before `sigaddset`
+    // writes to it, and both touch only this local.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGUSR1);
+        mask
+    }
+}
+
 /// Block `SIGUSR1` in the calling thread, so every thread spawned after it
 /// inherits the mask and the dump thread can consume the signal by `sigwait`.
 #[cfg(unix)]
 fn block_sigusr1() {
-    // SAFETY: `sigemptyset`/`sigaddset` initialize the mask before
-    // `pthread_sigmask` reads it, and all three touch only that local.
-    let rc = unsafe {
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
-    };
+    let mask = sigusr1_mask();
+    // SAFETY: `mask` is initialized and `pthread_sigmask` only reads it; a
+    // null old-set pointer is allowed.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) };
     if rc == 0 {
         SIGUSR1_BLOCKED.store(true, std::sync::atomic::Ordering::Release);
     } else {
@@ -165,14 +174,7 @@ fn spawn_sigusr1_thread() {
     let spawned = std::thread::Builder::new()
         .name("sigusr1".into())
         .spawn(|| {
-            // SAFETY: as in `block_sigusr1`: the calls initialize and read
-            // only this local mask.
-            let mask = unsafe {
-                let mut mask: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut mask);
-                libc::sigaddset(&mut mask, libc::SIGUSR1);
-                mask
-            };
+            let mask = sigusr1_mask();
             loop {
                 let mut sig: libc::c_int = 0;
                 // SAFETY: `mask` is initialized and holds only a signal every

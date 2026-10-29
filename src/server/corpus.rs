@@ -17,9 +17,10 @@
 //! every lookup would be worse than the outage it is reacting to.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::lock;
 use crate::hopper::Record;
 
 /// How long a hopper read may take before the endpoint counts as unreachable.
@@ -147,10 +148,6 @@ struct Address {
     asked: AtomicU64,
     answered: AtomicU64,
     failed: AtomicU64,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Corpus {
@@ -292,26 +289,11 @@ impl Corpus {
     }
 
     /// Ask the corpus and retain the serving source for the HTTP response.
+    ///
+    /// `fresh` asks Hopper's authoritative side even when the preferred
+    /// endpoint is a replica: an explicit refresh is a read-after-write
+    /// request, which accepting replication lag would defeat.
     pub(crate) async fn known_with_source(
-        &self,
-        sha: Option<&str>,
-        purl: Option<&str>,
-    ) -> (Reached, Option<CorpusSource>) {
-        self.known_with_source_inner(sha, purl, false).await
-    }
-
-    /// Ask Hopper's authoritative side even when the preferred endpoint is a
-    /// replica. Used by an explicit refresh, where accepting replication lag
-    /// would defeat the caller's read-after-write request.
-    pub(crate) async fn known_fresh_with_source(
-        &self,
-        sha: Option<&str>,
-        purl: Option<&str>,
-    ) -> (Reached, Option<CorpusSource>) {
-        self.known_with_source_inner(sha, purl, true).await
-    }
-
-    async fn known_with_source_inner(
         &self,
         sha: Option<&str>,
         purl: Option<&str>,
@@ -413,10 +395,7 @@ impl Corpus {
     /// exists to prevent. A single address is never stale by this measure:
     /// there is nowhere to send the traffic instead.
     async fn preferred_is_stale(&self) -> bool {
-        if self.bases.len() < 2 {
-            return false;
-        }
-        let Some(base) = self.bases.first() else {
+        let [base, _, ..] = self.bases.as_slice() else {
             return false;
         };
         let now = Instant::now();
@@ -446,7 +425,6 @@ impl Corpus {
     async fn ask_lag(&self, base: &str) -> Option<Duration> {
         #[derive(serde::Deserialize)]
         struct Status {
-            #[serde(default)]
             lag_seconds: Option<i64>,
         }
         let mut request = self.client.get(format!("{base}/_/replica"));
@@ -460,7 +438,6 @@ impl Corpus {
         let status = response.json::<Status>().await.ok()?;
         status
             .lag_seconds
-            .filter(|secs| *secs >= 0)
             .and_then(|secs| u64::try_from(secs).ok())
             .map(Duration::from_secs)
     }
@@ -554,7 +531,7 @@ impl Corpus {
                 // the artifact made on the strength of never having asked, and it
                 // would strand every lookup on a replica whose token went stale.
                 401 | 403 => {
-                    tracing::warn!(endpoint = %base, status = response.status().as_u16(), "corpus turned us away");
+                    tracing::warn!(endpoint = %base, status, "corpus turned us away");
                     None
                 }
                 // Any other 4xx is this request being wrong, which the next
@@ -715,7 +692,7 @@ mod tests {
         // a timeout.
         let c = corpus("http://127.0.0.1:1");
         assert_eq!(
-            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
                 .await
                 .0,
             Reached::Unreachable,
@@ -730,7 +707,7 @@ mod tests {
         let before = c.order_at(Instant::now());
         assert_eq!(before.first(), Some(&"http://127.0.0.1:1"));
         let _ = c
-            .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
             .await;
         assert_eq!(
             c.order_at(Instant::now()).first(),
@@ -851,7 +828,7 @@ mod tests {
         let (base, attempts) = flaky_endpoint();
         let c = corpus(&base);
         assert!(matches!(
-            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
                 .await
                 .0,
             Reached::Record(_)
@@ -964,7 +941,7 @@ mod tests {
             let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
             let c = corpus(&format!("{replica},{primary}"));
             let reached = c
-                .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+                .known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
                 .await
                 .0;
             let Reached::Record(record) = reached else {
@@ -983,7 +960,7 @@ mod tests {
         let b = endpoint("403 Forbidden", r#"{"error":"nope"}"#);
         let c = corpus(&format!("{a},{b}"));
         assert_eq!(
-            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
                 .await
                 .0,
             Reached::Unreachable,
@@ -999,7 +976,7 @@ mod tests {
         let primary = endpoint("200 OK", r#"{"sha256":"abc","fires_at":-1}"#);
         let c = corpus(&format!("{replica},{primary}"));
         assert_eq!(
-            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"))
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
                 .await
                 .0,
             Reached::Nothing,

@@ -26,14 +26,6 @@ fn only_a_missing_release_is_gone() {
     assert!(!gone(Outcome::BudgetExceeded));
 }
 
-struct FailingMetadata(FetchError);
-
-impl Fetch for FailingMetadata {
-    fn send(&self, _request: &Request<'_>) -> Result<Fetched, FetchError> {
-        Err(self.0.clone())
-    }
-}
-
 #[test]
 fn metadata_outages_survive_resolution_as_infrastructure_failures() {
     let reference = Reference::new(
@@ -50,7 +42,11 @@ fn metadata_outages_survive_resolution_as_infrastructure_failures() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let cache = BlobCache::with_dir(dir.path());
-        let record = fetch_one_record(&reference, &FailingMetadata(error.clone()), &cache);
+        let record = fetch_one_record(
+            &reference,
+            &super::tests_offline::Failing(error.clone()),
+            &cache,
+        );
         assert_eq!(record.outcome, Outcome::Failed(error));
     }
 }
@@ -66,7 +62,7 @@ fn a_metadata_404_remains_a_missing_release() {
     );
     let record = fetch_one_record(
         &reference,
-        &FailingMetadata(FetchError::Status(404)),
+        &super::tests_offline::Failing(FetchError::Status(404)),
         &BlobCache::with_dir(dir.path()),
     );
     assert!(matches!(record.outcome, Outcome::Unresolved(_)));

@@ -43,10 +43,8 @@ fn ensemble_bundle() -> Option<PathBuf> {
 #[test]
 #[ignore = "needs AZOTH_DIR pointing at a real ensemble bundle"]
 fn real_azoth_bundle_loads_grid_at_every_level() {
-    let Some(dir) = ensemble_bundle() else {
-        eprintln!("set AZOTH_DIR to a real ensemble bundle to run this test");
-        return;
-    };
+    // Ignored by default and run on purpose, so a missing bundle fails.
+    let dir = ensemble_bundle().expect("set AZOTH_DIR to a real ensemble bundle (with general/)");
     for level in [Some(0_u16), Some(50), Some(200), Some(1000), None] {
         Model::load(&dir, None, level)
             .unwrap_or_else(|e| panic!("azoth must load at level {level:?}: {e}"));

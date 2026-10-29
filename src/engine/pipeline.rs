@@ -29,7 +29,7 @@ use super::verdict::{
 use super::{
     DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute, MemberEvals, Reason,
     SCHEMA_VERSION, ScanResult, StoredReport, TopFinding, archive_leaf, compact_crit, is_inside,
-    model_version_string, now_rfc3339,
+    now_rfc3339,
 };
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, ParsedReport, RawNeeds};
@@ -151,7 +151,9 @@ impl ClassifiedReport {
     ) -> ScanResult {
         let mut result = self.result;
         result.path = path;
-        result.version = model_version_string(bundle.info());
+        // The model version recorded on every result: `v{spec}.{abi}`.
+        let info = bundle.info();
+        result.version = format!("v{}.{}", info.version, info.abi_version);
         result.analyzed_at = now_rfc3339();
         if !keep_report {
             result.cleave = None;
@@ -468,21 +470,30 @@ fn reference_lengths(edges: &[FetchRecord], report: &AnalysisReport) -> Vec<u64>
     if edges.is_empty() {
         return Vec::new();
     }
-    let mut by_sha: HashMap<&str, &FileAnalysis> = HashMap::new();
+    // Indexed once, (declaring sha, offset) → length: a payload can declare
+    // and cite tens of thousands of references, and a search per edge would be
+    // quadratic in them. The first file and first reference win, as before.
+    let mut lengths: HashMap<(&str, u64), u64> = HashMap::new();
+    let mut seen_sha = HashSet::new();
     for file in &report.files {
-        by_sha.entry(file.sha256.as_str()).or_insert(file);
+        if !seen_sha.insert(file.sha256.as_str()) {
+            continue;
+        }
+        for r in file.filefacts.iter().flat_map(|facts| &facts.references) {
+            if let Some(offset) = r.offset {
+                lengths
+                    .entry((file.sha256.as_str(), offset))
+                    .or_insert_with(|| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX));
+            }
+        }
     }
     edges
         .iter()
         .map(|edge| {
-            edge.source_offset.map_or(1, |offset| {
-                edge.source_sha256
-                    .as_deref()
-                    .and_then(|sha| by_sha.get(sha))
-                    .and_then(|file| file.filefacts.as_ref())
-                    .and_then(|facts| facts.references.iter().find(|r| r.offset == Some(offset)))
-                    .map_or(1, |r| u64::try_from(r.evidence.len()).unwrap_or(u64::MAX))
-            })
+            edge.source_offset
+                .zip(edge.source_sha256.as_deref())
+                .and_then(|(offset, sha)| lengths.get(&(sha, offset)).copied())
+                .unwrap_or(1)
         })
         .collect()
 }
@@ -764,10 +775,8 @@ fn grade_dependencies(
                     report.retain_model_facts();
                     let report = StoredReport::new(&report)
                         .with_context(|| format!("serializing report of {}", dep.locator))?;
-                    match graded {
-                        Some((verdict, members)) => (Some(verdict), members, Some(report)),
-                        None => (None, MemberEvals::new(), Some(report)),
-                    }
+                    let (verdict, members) = graded.unzip();
+                    (verdict, members.unwrap_or_default(), Some(report))
                 }
                 Err(error) => {
                     // No verdict rather than an invented one; its bytes and
@@ -1178,6 +1187,7 @@ fn blend_interpretation(
             )
         };
     } else if graded.grade == LlmGrade::Benign
+        && graded.may_soften
         && *class == Classification::Hostile
         && *lvl == Level::At(0)
     {
@@ -1352,16 +1362,14 @@ fn inject_dependency_backref(report: &mut CompactReport, backref: &DepBackref) {
         Classification::Hostile => (5u8, "Malicious"),
         _ => (4u8, "Suspicious"),
     };
-    let desc = match &backref.detail {
-        Some(detail) => format!(
-            "{sev} dependency: {} | {} — {detail}",
-            backref.locator, backref.dep_sha
-        ),
-        None => format!(
-            "{sev} dependency: {} | {}",
-            backref.locator, backref.dep_sha
-        ),
-    };
+    let mut desc = format!(
+        "{sev} dependency: {} | {}",
+        backref.locator, backref.dep_sha
+    );
+    if let Some(detail) = &backref.detail {
+        desc.push_str(" — ");
+        desc.push_str(detail);
+    }
     let dep = cleave::types::CompactDep {
         locator: backref.locator.clone(),
         sha: backref.dep_sha.clone(),
@@ -1484,14 +1492,12 @@ pub fn extract_top_findings(
         relevant = at_least(Criticality::Suspicious);
     }
 
-    // Deduplicate by base ID.
-    let mut seen = HashSet::new();
-    relevant.retain(|f| {
-        let base = crate::features::trait_path(&f.id);
-        seen.insert(base.to_string())
-    });
-
+    // Strongest first (stable, so report order breaks ties), then one per
+    // base ID: deduplicating first could keep a weaker sibling over a
+    // stronger one.
     relevant.sort_by_key(|f| std::cmp::Reverse(f.crit));
+    let mut seen = HashSet::new();
+    relevant.retain(|f| seen.insert(crate::features::trait_path(&f.id).to_string()));
     relevant.truncate(5);
     relevant
 }

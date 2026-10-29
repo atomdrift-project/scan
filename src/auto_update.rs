@@ -46,15 +46,6 @@ fn stamp_path() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("atomdrift").join("scan").join(name))
 }
 
-/// Unix time of the last refresh attempt (0 when never stamped or unreadable).
-fn last_checked() -> u64 {
-    let Some(path) = stamp_path() else { return 0 };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| toml::from_str::<Stamp>(&text).ok())
-        .map_or(0, |stamp| stamp.checked_unix)
-}
-
 /// Stamp the current time (best-effort; failures are non-fatal).
 fn write_stamp() {
     let Some(path) = stamp_path() else { return };
@@ -93,7 +84,12 @@ pub fn refresh_if_stale(
     if disabled {
         return Ok(());
     }
-    if !force && crate::civil::now_secs().saturating_sub(last_checked()) < CHECK_INTERVAL_SECS {
+    // Unix time of the last refresh attempt (0 when never stamped or unreadable).
+    let last_checked = stamp_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<Stamp>(&text).ok())
+        .map_or(0, |stamp| stamp.checked_unix);
+    if !force && crate::civil::now_secs().saturating_sub(last_checked) < CHECK_INTERVAL_SECS {
         return Ok(());
     }
 
@@ -194,24 +190,8 @@ fn print_checkmark(mode: Mode) {
         None => String::new(),
     };
     eprint!(
-        "\r\x1b[2K \x1b[38;2;80;220;80m\u{2713}\x1b[0m \x1b[38;2;160;160;160mupdated \u{b7} {} hashes \u{b7} {} rules{tail}\x1b[0m\n",
-        commas(counts.hashes_and_purls),
-        commas(counts.rules),
+        "\r\x1b[2K \x1b[38;2;80;220;80m\u{2713}\x1b[0m \x1b[38;2;160;160;160mupdated {}{tail}\x1b[0m\n",
+        crate::output::detection_inventory_text(counts.hashes_and_purls, counts.rules),
     );
     let _ = std::io::stderr().flush();
-}
-
-/// Format an integer with `,` thousands separators (`1093027` → `1,093,027`),
-/// matching the banner's rule-count rendering.
-fn commas(n: u64) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, c) in digits.char_indices() {
-        if i != 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }

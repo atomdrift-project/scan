@@ -171,13 +171,9 @@ pub fn encode_result_body(
 }
 
 fn serialize(payload: &ResultPayload, sha256: &str) -> Option<Vec<u8>> {
-    match serde_json::to_vec(payload) {
-        Ok(json) => Some(json),
-        Err(e) => {
-            tracing::error!(sha256 = %sha256, error = %e, "upload: serialize failed");
-            None
-        }
-    }
+    serde_json::to_vec(payload)
+        .inspect_err(|e| tracing::error!(sha256 = %sha256, error = %e, "upload: serialize failed"))
+        .ok()
 }
 
 /// Worker identity tagged on uploaded results. Hopper's `validWorkerName`
@@ -426,27 +422,22 @@ impl Uploader {
                 let hopper = Hopper::new(http.clone(), &url, worker, thread_tally);
                 hopper.serve(jobs, &thread_pending);
             });
-        match spawned {
+        let (tx, worker) = match spawned {
             Ok(handle) => {
                 tracing::info!(hopper = %hopper_url, "upload: renewing results on hopper");
-                Self {
-                    tx: Some(tx),
-                    worker: Some(handle),
-                    worker_name,
-                    pending,
-                    tally,
-                }
+                (Some(tx), Some(handle))
             }
             Err(e) => {
                 tracing::error!(error = %e, "upload: failed to spawn uploader thread; uploads disabled");
-                Self {
-                    tx: None,
-                    worker: None,
-                    worker_name,
-                    pending,
-                    tally,
-                }
+                (None, None)
             }
+        };
+        Self {
+            tx,
+            worker,
+            worker_name,
+            pending,
+            tally,
         }
     }
 
@@ -1070,7 +1061,7 @@ impl Hopper {
                     if is_permanent(status) {
                         let body = resp.text().unwrap_or_default();
                         self.tally.failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(sha256 = %sha256, purl, %status, body = %body, "upload: hopper rejected result; not retrying");
+                        tracing::error!(sha256 = %sha256, purl, %status, body = %body_excerpt(&body), "upload: hopper rejected result; not retrying");
                         return;
                     }
                     // Hopper sends Retry-After when it sheds; it knows when its

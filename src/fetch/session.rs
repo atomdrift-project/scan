@@ -659,30 +659,16 @@ impl FetchSession {
         selected
     }
 
-    pub(super) fn wanted(&self, r: &Reference, hop: u8) -> bool {
-        if r.context
-            .as_ref()
-            .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci)
-            && !self.policy.ci
-        {
-            return false;
-        }
-        if !self.policy.include_dev_dependencies
-            && r.context
+    /// Whether this hop follows `r`, CI references only under `--ci`. Called
+    /// from [`Self::select`] after it has recorded and dropped transitive and
+    /// development references.
+    fn wanted(&self, r: &Reference, hop: u8) -> bool {
+        (self.policy.ci
+            || !r
+                .context
                 .as_ref()
-                .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
-        {
-            return false;
-        }
-        let wanted = self.policy.wants_at(r.kind, hop);
-        if !wanted && self.policy.wants(r.kind) {
-            tracing::debug!(
-                package = %locator(r),
-                hop = hop + 1,
-                "transitive dependency; registry lookup and fetch both skipped"
-            );
-        }
-        wanted
+                .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci))
+            && self.policy.wants_at(r.kind, hop)
     }
 
     /// Whether a reference can be fetched at all, and — for a discovered URL —
@@ -1385,31 +1371,33 @@ impl FetchSession {
         // grader see the same finding that the merged parent's embedded-file
         // pass sees, so a suspicious or hostile dependency can be pinned back to
         // its declaring manifest.
-        prepare_dependency_report(
+        prepare_dependency_report_with(
             &mut payload,
             registry_findings_for_reference(registry_findings, &l.reference),
             &self.opts,
+            apply_package_composites,
         );
         if let Some(sub) = &payload.sub {
             self.record_unresolved_fetch_calls(sub);
         }
         // Check each fetched npm package in its own manifest context before
-        // it is captured or merged into its parent's report.
+        // it is captured or merged into its parent's report. Only with its
+        // bytes in hand: the root's path is a download name, not a file, and
+        // read from disk it would resolve against the working directory.
         if let Some(sub) = &mut payload.sub
             && let Some(root_path) = sub
                 .files
                 .first()
                 .filter(|f| f.file_type == "npm")
                 .map(|f| f.path.clone())
+            && let Some(bytes) = self.res.cache.load(&l.record.locator)
         {
             let ci = if self.policy.ci {
                 CiRefs::Include
             } else {
                 CiRefs::Skip
             };
-            let bytes = self.res.cache.load(&l.record.locator);
-            let refs =
-                collect_references_from_input(sub, Path::new(&root_path), bytes.as_deref(), ci);
+            let refs = collect_references_from_input(sub, Path::new(&root_path), Some(&bytes), ci);
             attribute_undeclared_npm_imports(sub, &refs);
         }
         // Capture the dependency's standalone report before merge_payload
@@ -1588,7 +1576,10 @@ pub(super) fn attribute_reference_outcomes(
             "references.unresolved_extension_count".to_string(),
             extension_unresolved as f64,
         );
-        touched.push(file.sha256.clone());
+        // The pass below covers every file with this sha at once.
+        if !touched.contains(&file.sha256) {
+            touched.push(file.sha256.clone());
+        }
     }
 
     // Trait evaluation already ran, before the follow phase that produced these

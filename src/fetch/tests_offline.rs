@@ -13,6 +13,15 @@ impl Fetch for Offline {
     }
 }
 
+/// Answers every request with the same error.
+pub(super) struct Failing(pub(super) FetchError);
+
+impl Fetch for Failing {
+    fn send(&self, _request: &Request<'_>) -> Result<Fetched, FetchError> {
+        Err(self.0.clone())
+    }
+}
+
 /// A blob cache in a directory that lives as long as the test process.
 pub(super) fn cache() -> BlobCache {
     let dir = tempfile::tempdir().expect("tempdir").keep();

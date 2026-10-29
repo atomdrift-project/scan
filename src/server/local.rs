@@ -56,8 +56,17 @@ pub(super) fn read(path: &Path, allowed: &[PathBuf], limit: usize) -> Result<Loc
         return Err(refuse(&"not a regular file"));
     }
     // A directory above the file swapped for a symlink between canonicalizing
-    // and opening would have opened something else under the same name.
-    #[cfg(unix)]
+    // and opening would have opened something else under the same name —
+    // and re-resolving the name would follow the same swap. So ask the open
+    // handle where it actually is, and check that against the allow-list.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let opened = opened_path(&file).map_err(|e| refuse(&e))?;
+        if !allowed.iter().any(|dir| opened.starts_with(dir)) {
+            return Err(refuse(&"opened outside --allow-local-paths"));
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         use std::os::unix::fs::MetadataExt as _;
         let named = std::fs::metadata(&canonical).map_err(|e| refuse(&e))?;
@@ -94,6 +103,29 @@ pub(super) fn read(path: &Path, allowed: &[PathBuf], limit: usize) -> Result<Loc
         bytes: buf.into(),
         filename,
     })
+}
+
+/// Where an open file actually is, as the kernel resolved it.
+#[cfg(target_os = "linux")]
+fn opened_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Where an open file actually is, as the kernel resolved it.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most `PATH_MAX`
+    // bytes into `buf`, which is that long, for a descriptor we own.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
 }
 
 #[cfg(test)]

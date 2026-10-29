@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -26,6 +26,9 @@ struct ProcessGroup {
     deleted: bool,
     /// Precomputed SHA256 hex digest.
     sha256: String,
+    /// Where its bytes were read for hashing, and are read again to scan:
+    /// `path`, or the running image under `/proc` for a deleted binary.
+    scan_path: PathBuf,
 }
 
 /// Rizin's size gate for a live-process scan.
@@ -45,14 +48,10 @@ fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u3
     // Group by exe_path → (pids, deleted).
     let mut by_path: HashMap<PathBuf, (Vec<u32>, bool)> = HashMap::new();
     for entry in entries {
-        let (pids, deleted) = by_path
-            .entry(entry.exe_path.clone())
-            .or_insert_with(|| (Vec::new(), entry.deleted));
+        let (pids, deleted) = by_path.entry(entry.exe_path.clone()).or_default();
         pids.push(entry.pid);
         // If any entry says deleted, mark it.
-        if entry.deleted {
-            *deleted = true;
-        }
+        *deleted |= entry.deleted;
     }
 
     // Deduplicate by SHA256.
@@ -60,40 +59,27 @@ fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u3
     let mut hash_errors = 0u32;
 
     for (path, (pids, deleted)) in by_path {
-        let hash = if deleted && !path.exists() {
-            // Try reading via /proc on Linux.
-            #[cfg(target_os = "linux")]
-            {
-                match crate::digest::sha256_file(std::path::Path::new(&format!(
-                    "/proc/{}/exe",
-                    pids[0]
-                ))) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!(
-                            "cannot hash deleted binary {} (pid {}): {e}",
-                            path.display(),
-                            pids[0],
-                        );
-                        hash_errors += 1;
-                        continue;
-                    }
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                tracing::warn!("cannot hash deleted binary: {}", path.display());
+        // On Linux, the running image itself whenever it is ours to read: the
+        // path may since name other bytes (a decoy renamed over it) or not a
+        // file at all. Otherwise the path — which for a deleted binary is
+        // only good while something still exists there.
+        let image = PathBuf::from(format!("/proc/{}/exe", pids[0]));
+        let source = if cfg!(target_os = "linux") && (deleted || std::fs::metadata(&image).is_ok())
+        {
+            image
+        } else if !deleted || path.exists() {
+            path.clone()
+        } else {
+            tracing::warn!("cannot hash deleted binary: {}", path.display());
+            hash_errors += 1;
+            continue;
+        };
+        let hash = match crate::digest::sha256_file(&source) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("cannot hash {} (pid {}): {e}", path.display(), pids[0]);
                 hash_errors += 1;
                 continue;
-            }
-        } else {
-            match crate::digest::sha256_file(&path) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("cannot hash {}: {e}", path.display());
-                    hash_errors += 1;
-                    continue;
-                }
             }
         };
 
@@ -102,29 +88,13 @@ fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u3
             pids: Vec::new(),
             deleted: false,
             sha256: hash,
+            scan_path: source,
         });
         group.pids.extend(pids);
         group.deleted |= deleted;
     }
 
     (by_sha.into_values().collect(), hash_errors)
-}
-
-/// Where to read `group`'s binary: its path, or for a deleted one the
-/// running image under `/proc` on Linux. `None`, logged, when it cannot be read.
-fn scan_path(group: &ProcessGroup) -> Option<PathBuf> {
-    if !group.deleted || group.path.exists() {
-        return Some(group.path.clone());
-    }
-    if cfg!(target_os = "linux") {
-        return Some(PathBuf::from(format!("/proc/{}/exe", group.pids[0])));
-    }
-    tracing::warn!(
-        "deleted binary not scannable: {} (pids: {:?})",
-        group.path.display(),
-        group.pids
-    );
-    None
 }
 
 /// Run a process scan: enumerate, deduplicate, classify.
@@ -147,10 +117,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     // Warn about permission-denied processes.
     if perm_denied > 0 && !is_root() {
-        eprintln!(
-            " \x1b[38;2;255;175;55m\u{26A0}\x1b[0m  \x1b[38;2;180;180;180mSkipping {} processes due to insufficient permissions — re-run as root for full coverage\x1b[0m\n",
-            perm_denied,
-        );
+        crate::output::print_permission_warning(perm_denied);
     }
 
     if proc_result.entries.is_empty() {
@@ -188,7 +155,6 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());
-    let stdout = Mutex::new(std::io::stdout());
 
     let progress = if is_terminal && total > 1 {
         Some(Progress::new(total))
@@ -204,8 +170,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let static_flags = AtomicU32::new(0);
     let flagged_candidates = AtomicU32::new(0);
 
-    // Map each scan path back to its process group for PID annotation. Deleted
-    // binaries that aren't scannable are counted as errors here and omitted.
+    // Map each scan path back to its process group for PID annotation.
     let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
     let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> = HashMap::with_capacity(groups.len());
     for group in &groups {
@@ -216,22 +181,18 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         // still analyzed below.
         if let Some(lookup) = config.bloom()
             && let Some(digest) = burton::parse_sha256_hex(&group.sha256)
-            && let Some(summary) =
+            && let Some(n) =
                 crate::engine::bloom_gate_fresh(config, &group.path, lookup.decide_sha256(&digest))
         {
-            benign.fetch_add(summary.benign, Ordering::Relaxed);
+            benign.fetch_add(n, Ordering::Relaxed);
             if let Some(p) = &progress {
                 p.increment();
             }
             continue;
         }
 
-        let Some(scan_path) = scan_path(group) else {
-            errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        by_scan_path.insert(scan_path.clone(), group);
-        scan_paths.push(scan_path);
+        by_scan_path.insert(group.scan_path.clone(), group);
+        scan_paths.push(group.scan_path.clone());
     }
 
     // Analyze the unique binaries through cleave's batch API: it loads the
@@ -242,25 +203,21 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // serial, at about three times the CPU. Verdict order in the output stream
     // is completion order, which JSON/terminal consumers tolerate.
 
-    let analyze = |scan_path: &std::path::Path, result: Result<cleave::AnalysisReport>| {
+    let analyze = |scan_path: &Path, result: Result<cleave::AnalysisReport>| {
         let Some(group) = by_scan_path.get(scan_path) else {
             return;
         };
+        if let Some(p) = &progress {
+            p.increment();
+        }
         let report = match result {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("error analyzing {}: {e}", group.path.display());
                 errors.fetch_add(1, Ordering::Relaxed);
-                if let Some(p) = &progress {
-                    p.increment();
-                }
                 return;
             }
         };
-
-        if let Some(p) = &progress {
-            p.increment();
-        }
 
         match build_result(
             report,
@@ -285,7 +242,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 ) || config.filter().shows(result.classification)
                 {
                     let print = || {
-                        emit_result(&result, config, progress.is_some(), &stdout);
+                        emit_result(&result, config, progress.is_some());
                     };
                     if let Some(p) = &progress {
                         p.around_result(print);
@@ -407,41 +364,30 @@ fn build_result(
 }
 
 /// Emit a single result with PID annotations.
-fn emit_result(
-    r: &ScanResult,
-    config: &ScanConfig,
-    has_progress: bool,
-    stdout: &Mutex<std::io::Stdout>,
-) {
+fn emit_result(r: &ScanResult, config: &ScanConfig, has_progress: bool) {
     match config.format() {
         OutputFormat::Terminal => {
             output::print_ps_result(r, has_progress, config.extra());
         }
-        OutputFormat::Json => {
-            let envelope = r.envelope_ref();
-            let Ok(mut out) = stdout.lock() else {
-                return;
-            };
-            if let Err(e) = serde_json::to_writer(&mut *out, &envelope) {
-                tracing::error!(path = %r.path, "failed to serialize scan result: {e}");
-                return;
+        // Serialized before stdout is locked, so a slow serialization never
+        // holds up another thread's line.
+        OutputFormat::Json => match serde_json::to_vec(&r.envelope_ref()) {
+            Ok(mut bytes) => {
+                bytes.push(b'\n');
+                let _ = std::io::stdout().lock().write_all(&bytes);
             }
-            let _ = out.write_all(b"\n");
-        }
+            Err(e) => tracing::error!(path = %r.path, "failed to serialize scan result: {e}"),
+        },
         OutputFormat::Tiny => {
-            let Ok(mut out) = stdout.lock() else {
-                return;
-            };
-            if let Err(e) = crate::engine::write_tiny(&mut *out, r) {
+            if let Err(e) = crate::engine::write_tiny(&mut std::io::stdout().lock(), r) {
                 tracing::error!(path = %r.path, "failed to write scan result: {e}");
             }
         }
         // The LLM payload verbatim — no verdict line, no PID annotations.
         OutputFormat::Interpret => {
-            let Ok(mut out) = stdout.lock() else {
-                return;
-            };
-            let _ = out.write_all(r.rendered_context.as_bytes());
+            let _ = std::io::stdout()
+                .lock()
+                .write_all(r.rendered_context.as_bytes());
         }
     }
 }

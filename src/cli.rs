@@ -107,11 +107,6 @@ impl LlmEnv {
     }
 }
 
-/// Read a token file, when one is configured and present.
-fn token_from(path: Option<&Path>) -> Option<String> {
-    crate::interpret::read_token_file(path?)
-}
-
 /// The model bundle a run analyzes with: `dir` when the operator named one,
 /// otherwise the installed bundle (fetched on first use).
 ///
@@ -664,6 +659,12 @@ impl GlobalArgs {
         // fallback with no model pinned, or a primary that is down at startup,
         // should cost that entry, not the scan.
         let single = targets.len() == 1;
+        // A key given outright is for the kind of endpoint named first: an
+        // OpenRouter key never goes to our own vLLM, and our vLLM key never
+        // to OpenRouter, whichever the chain falls back to.
+        let explicit_for_openrouter = targets
+            .first()
+            .is_some_and(|base_url| is_openrouter_endpoint(base_url));
         let mut resolved: Vec<LlmEndpoint> = Vec::with_capacity(targets.len());
         let mut skipped: Vec<String> = Vec::new();
         for (base_url, pinned) in targets.into_iter().zip(pinned) {
@@ -672,13 +673,33 @@ impl GlobalArgs {
             // a third party, so OpenRouter takes its own file or nothing —
             // sending the vLLM key there would hand a working credential to an
             // unrelated host and read as a plain 401 when it did.
-            let api_key = explicit_key.clone().or_else(|| {
-                if openrouter {
-                    token_from(env.openrouter_token_file.as_deref())
-                } else {
-                    token_from(env.llm_token_file.as_deref())
-                }
-            });
+            let api_key = explicit_key
+                .clone()
+                .filter(|_| openrouter == explicit_for_openrouter)
+                .or_else(|| {
+                    let file = if openrouter {
+                        &env.openrouter_token_file
+                    } else {
+                        &env.llm_token_file
+                    };
+                    crate::interpret::read_token_file(file.as_deref()?)
+                });
+            if api_key.is_some()
+                && let Ok(url) = reqwest::Url::parse(&base_url)
+                && url.scheme() == "http"
+                && !url.host_str().is_some_and(|host| {
+                    let host = host.trim_start_matches('[').trim_end_matches(']');
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                })
+            {
+                tracing::warn!(
+                    llm = %base_url,
+                    "the LLM key is sent to this address in cleartext; use https unless the network itself is encrypted"
+                );
+            }
             if openrouter && api_key.is_none() {
                 let why =
                     "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter";
@@ -697,31 +718,28 @@ impl GlobalArgs {
             // model there is nothing sensible to send, and a guessed name
             // would surface as an opaque server-side error mid-scan instead of
             // here.
-            let model = if openrouter {
-                pinned.unwrap_or_else(|| crate::interpret::OPENROUTER_DEFAULT_MODEL.to_string())
-            } else {
-                match pinned {
-                    Some(m) => m,
-                    None => match crate::interpret::discover_model(&base_url, api_key.as_deref()) {
-                        Ok(m) => m,
-                        // Say which of the several ways discovery can fail this
-                        // was — an unreachable host, a 404 from a base URL
-                        // missing its /v1, a rejected key and an endpoint
-                        // serving nothing all need different fixes, and only
-                        // pinning a model is common to all of them.
-                        Err(e) => {
-                            let why = format!(
-                                "no LLM model available from {base_url}: {e}. Fix the endpoint, \
-                                 or name a model with --llm-model (env: SCAN_LLM_MODEL)"
-                            );
-                            if single {
-                                anyhow::bail!("{why}");
-                            }
-                            skipped.push(why);
-                            continue;
+            let model = match pinned {
+                Some(m) => m,
+                None if openrouter => crate::interpret::OPENROUTER_DEFAULT_MODEL.to_string(),
+                None => match crate::interpret::discover_model(&base_url, api_key.as_deref()) {
+                    Ok(m) => m,
+                    // Say which of the several ways discovery can fail this
+                    // was — an unreachable host, a 404 from a base URL missing
+                    // its /v1, a rejected key and an endpoint serving nothing
+                    // all need different fixes, and only pinning a model is
+                    // common to all of them.
+                    Err(e) => {
+                        let why = format!(
+                            "no LLM model available from {base_url}: {e}. Fix the endpoint, \
+                             or name a model with --llm-model (env: SCAN_LLM_MODEL)"
+                        );
+                        if single {
+                            anyhow::bail!("{why}");
                         }
-                    },
-                }
+                        skipped.push(why);
+                        continue;
+                    }
+                },
             };
             resolved.push(LlmEndpoint {
                 base_url,

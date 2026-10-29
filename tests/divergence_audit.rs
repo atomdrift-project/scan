@@ -103,6 +103,10 @@ fn audit_per_route_divergences() {
             let mut by_family_div: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
             let mut by_family_nonzero: BTreeMap<&'static str, usize> = BTreeMap::new();
             let mut detailed_metrics: Vec<(String, f32, f32)> = Vec::new();
+            // In-scope spot check: diverging slots whose names fall inside the
+            // v17 family port. These should always be zero — if not, the port
+            // has a bug.
+            let mut in_scope_div: Vec<(String, f32, f32)> = Vec::new();
             for sample in &fixture.samples {
                 let rust_vec = ctx.extract(&sample.report);
                 for (j, (r, p)) in rust_vec
@@ -120,6 +124,18 @@ fn audit_per_route_divergences() {
                         by_family_div.entry(fam).or_default().0 += 1;
                         if fam == "metrics" && detailed_metrics.len() < 10 {
                             detailed_metrics.push((name.to_string(), *r, *p));
+                        }
+                        let in_scope = name.starts_with("kv:")
+                            || name.starts_with("symbol:")
+                            || name.starts_with("symbol_bi:")
+                            || name.starts_with("symbol_tri:")
+                            || name.starts_with("textenc:")
+                            || name.starts_with("metrics:derived_")
+                            || name == "struct:silent_packer_signal"
+                            || name == "agg:suspicious_bigram_count"
+                            || name == "agg:suspicious_trigram_count";
+                        if in_scope && in_scope_div.len() < 20 {
+                            in_scope_div.push((name.to_string(), *r, *p));
                         }
                     }
                 }
@@ -148,35 +164,6 @@ fn audit_per_route_divergences() {
                 eprintln!("  metrics divergences (first 10):");
                 for (name, r, p) in &detailed_metrics {
                     eprintln!("    {name} rust={r:.6} python={p:.6}");
-                }
-            }
-            // In-scope spot check: enumerate diverging slots whose names fall
-            // inside the v17 family port. These should always be zero — if
-            // not, my port has a bug.
-            let mut in_scope_div: Vec<(String, f32, f32)> = Vec::new();
-            for sample in &fixture.samples {
-                let rust_vec = ctx.extract(&sample.report);
-                for (j, (r, p)) in rust_vec
-                    .iter()
-                    .zip(sample.expected_features.iter())
-                    .enumerate()
-                {
-                    let diff = (r - p).abs();
-                    if diff > 1e-5 {
-                        let name = spec.feature_names()[j].as_str();
-                        let in_scope = name.starts_with("kv:")
-                            || name.starts_with("symbol:")
-                            || name.starts_with("symbol_bi:")
-                            || name.starts_with("symbol_tri:")
-                            || name.starts_with("textenc:")
-                            || name.starts_with("metrics:derived_")
-                            || name == "struct:silent_packer_signal"
-                            || name == "agg:suspicious_bigram_count"
-                            || name == "agg:suspicious_trigram_count";
-                        if in_scope && in_scope_div.len() < 20 {
-                            in_scope_div.push((name.to_string(), *r, *p));
-                        }
-                    }
                 }
             }
             if !in_scope_div.is_empty() {

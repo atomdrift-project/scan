@@ -986,13 +986,16 @@ pub(super) fn render_dependency_context(
     );
     for (rec, content_sha) in landed {
         let root = index.by_sha.get(content_sha).copied();
-        let _ = writeln!(out, "\ndependency: {}", rec.locator);
+        // Every name below is the sample's or a registry's text, and this
+        // appendix is printed by `--format tiny`: escaped like the cards are.
+        let tty = crate::output::tty_text;
+        let _ = writeln!(out, "\ndependency: {}", tty(&rec.locator));
         if let Some(resolved) = rec
             .resolved_url
             .as_deref()
             .filter(|url| *url != rec.locator)
         {
-            let _ = writeln!(out, "  resolved url: {resolved}");
+            let _ = writeln!(out, "  resolved url: {}", tty(resolved));
         }
         let source = rec
             .source_sha256
@@ -1001,8 +1004,9 @@ pub(super) fn render_dependency_context(
             .map_or("<unknown file>", |f| f.path.as_str());
         let _ = write!(
             out,
-            "  referenced: {} in {source}",
-            ref_kind_phrase(&rec.kind)
+            "  referenced: {} in {}",
+            ref_kind_phrase(&rec.kind),
+            tty(source)
         );
         if let Some(off) = rec.source_offset {
             let _ = write!(out, " @ byte {off}");
@@ -1010,7 +1014,7 @@ pub(super) fn render_dependency_context(
         out.push('\n');
         let _ = writeln!(out, "  content sha256: {content_sha}");
         if let Some(root) = root {
-            let _ = writeln!(out, "  analyzed above as: {}", root.path);
+            let _ = writeln!(out, "  analyzed above as: {}", tty(&root.path));
         }
         // The verdict scan computed for this dependency, from the same graded
         // results it uploads, so the render and the record cannot disagree.
@@ -1053,9 +1057,9 @@ pub(super) fn render_dependency_context(
             };
             let _ = write!(out, "  # {sev} {}", fd.id);
             if !fd.desc.is_empty() {
-                let _ = write!(out, " — {}", fd.desc);
+                let _ = write!(out, " — {}", tty(&fd.desc));
             }
-            let _ = writeln!(out, " [{}]", f.path);
+            let _ = writeln!(out, " [{}]", tty(&f.path));
         }
         if total > MAX_DEP_FINDING_LINES {
             let _ = writeln!(

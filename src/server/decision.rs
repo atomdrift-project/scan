@@ -446,13 +446,6 @@ impl V1Decision {
         self
     }
 
-    pub(super) fn asked_about_url(mut self, asked: Option<&str>) -> Self {
-        if let Some(asked) = asked {
-            self.url = Some(asked.to_owned());
-        }
-        self
-    }
-
     pub(super) fn with_url(mut self, url: Option<&str>) -> Self {
         if let Some(url) = url {
             self.url = Some(url.to_owned());

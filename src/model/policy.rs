@@ -285,7 +285,7 @@ pub(super) struct PolicySeverity {
     /// threshold`` over the named routes. Mirrors what
     /// ``azoth_route_policy_search._make_learned_blend_candidate_at_fp`` fits
     /// — the weights live in the same calibrated probability space that
-    /// ``predict_calibrated`` emits, so no isotonic mapping is applied at
+    /// the calibrated route scores carry, so no isotonic mapping is applied at
     /// load time.
     pub(super) blend: Option<BlendPolicy>,
 }
@@ -353,7 +353,7 @@ pub(super) struct BlendPolicy {
     pub(super) weights: Vec<f32>,
     pub(super) intercept: f32,
     /// Calibrated-space threshold on the sigmoid output. Already in the
-    /// space the blend was fit in (post-isotonic, matching ``predict_calibrated``),
+    /// space the blend was fit in (post-isotonic, matching the calibrated route scores),
     /// so the per-route isotonic mapping that ``calibrate_policy_thresholds``
     /// applies to OR-rule thresholds is intentionally NOT applied here.
     pub(super) threshold: f32,

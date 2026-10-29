@@ -16,19 +16,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Default location of the hosted manifests.
-const DEFAULT_BASE_URL: &str = "https://atomdrift.org/updates/";
+/// The hosted manifest the notice reads.
+const MANIFEST_URL: &str = "https://atomdrift.org/updates/litmus.toml";
 /// Minimum interval between network checks for the notice.
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 /// Whole-request budget for a manifest fetch. Short on purpose: the check must
 /// never noticeably delay a command, and an offline host should fail fast.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// The URL of manifest `name` under `base`.
-fn manifest_url(base: &str, name: &str) -> String {
-    let sep = if base.ends_with('/') { "" } else { "/" };
-    format!("{base}{sep}{name}")
-}
 
 /// Fetch and parse a manifest over HTTPS.
 fn fetch(url: &str) -> Result<Manifest> {
@@ -38,15 +32,8 @@ fn fetch(url: &str) -> Result<Manifest> {
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update-check HTTP client")?;
-    let text = client
-        .get(url)
-        .send()
-        .with_context(|| format!("fetching {url}"))?
-        .error_for_status()
-        .with_context(|| format!("{url} returned an error status"))?
-        .text()
-        .context("reading manifest body")?;
-    Manifest::parse(&text)
+    // Size-capped, like every other manifest read.
+    Manifest::parse(&crate::bundle::manifest(&client, url)?)
 }
 
 /// On-disk record of the last notice check (successful or failed).
@@ -124,7 +111,7 @@ pub fn maybe_notify(disabled_by_flag: bool) {
         return;
     }
 
-    let cache = match fetch(&manifest_url(DEFAULT_BASE_URL, "litmus.toml")) {
+    let cache = match fetch(MANIFEST_URL) {
         Ok(manifest) => Cache {
             checked_unix: crate::civil::now_secs(),
             latest: manifest.latest,
@@ -143,21 +130,4 @@ pub fn maybe_notify(disabled_by_flag: bool) {
     };
     write_cache(&cache);
     notify(&cache.latest, cache.url.as_deref(), installed);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manifest_url_joins_with_or_without_a_trailing_slash() {
-        assert_eq!(
-            manifest_url("https://example.test/u/", "litmus.toml"),
-            "https://example.test/u/litmus.toml"
-        );
-        assert_eq!(
-            manifest_url("https://example.test/u", "cleave.toml"),
-            "https://example.test/u/cleave.toml"
-        );
-    }
 }

@@ -139,10 +139,6 @@ pub(crate) struct Breakers {
 
 pub(super) static BREAKERS: OnceLock<Breakers> = OnceLock::new();
 
-pub(super) fn breakers() -> &'static Breakers {
-    BREAKERS.get_or_init(|| Breakers::new(BREAKER_COOLDOWN))
-}
-
 impl Breakers {
     pub(super) fn new(cooldown: Duration) -> Self {
         Self {
@@ -225,17 +221,13 @@ pub(super) struct HealthState {
     pub(super) probing: bool,
 }
 
-pub(super) static HEALTH: OnceLock<Health> = OnceLock::new();
-
-pub(super) fn health() -> &'static Health {
-    HEALTH.get_or_init(|| Health {
-        inner: Mutex::new(HealthState {
-            healthy: true,
-            probing: false,
-        }),
-        cv: Condvar::new(),
-    })
-}
+pub(super) static HEALTH: Health = Health {
+    inner: Mutex::new(HealthState {
+        healthy: true,
+        probing: false,
+    }),
+    cv: Condvar::new(),
+};
 
 impl Health {
     /// Record the outcome of a real request: a success closes the breaker, a

@@ -96,20 +96,10 @@ pub const fn level_confidence(level: Level) -> Option<u8> {
 ///
 /// `L0` never reaches here: `interpret::Evidence::may_cross` refuses the
 /// crossing outright.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a positive value clamped to `ceiling`, which is at most `grid_max`"
-)]
 pub(super) fn softened_level(ml_level: Level, active_level: Option<u16>, grid_max: u16) -> Level {
     let Some(active) = active_level else {
         return Level::Manual;
     };
-    let ceiling = crate::model::capped_suspicious_level(grid_max);
-    let floor = active.saturating_add(1);
-    if floor >= ceiling {
-        return Level::At(ceiling);
-    }
     // No level to scale by (manual-threshold mode) falls back to the midpoint.
     let fraction = match ml_level {
         Level::At(lvl) if lvl > 0 && active > 0 => {
@@ -117,6 +107,22 @@ pub(super) fn softened_level(ml_level: Level, active_level: Option<u16>, grid_ma
         }
         _ => 0.5,
     };
+    suspicious_band_level(active, grid_max, fraction)
+}
+
+/// The rung `fraction` of the way, geometrically, from the strongest
+/// suspicious rung (just past `active`) to the band's ceiling.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a positive value clamped to `ceiling`, which is at most `grid_max`"
+)]
+fn suspicious_band_level(active: u16, grid_max: u16, fraction: f64) -> Level {
+    let ceiling = crate::model::capped_suspicious_level(grid_max);
+    let floor = active.saturating_add(1);
+    if floor >= ceiling {
+        return Level::At(ceiling);
+    }
     let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
     Level::At((placed.round() as u16).clamp(floor, ceiling))
 }
@@ -153,11 +159,6 @@ pub fn synthesized_level(model: &Model, outcome: Classification, corroborated: b
 ///
 /// `active_level` is `None` in manual-threshold mode (no grid); hostile and
 /// suspicious then return [`Level::Manual`], as a genuine ML verdict does there.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a positive value clamped to `ceiling`, which is at most `grid_max`"
-)]
 pub(super) fn interpreted_level(
     active_level: Option<u16>,
     grid_max: u16,
@@ -169,11 +170,6 @@ pub(super) fn interpreted_level(
         (_, None) => Level::Manual,
         (Classification::Hostile, Some(active)) => Level::At(active),
         (Classification::Suspicious, Some(active)) => {
-            let ceiling = crate::model::capped_suspicious_level(grid_max);
-            let floor = active.saturating_add(1);
-            if floor >= ceiling {
-                return Level::At(ceiling);
-            }
             // Placed *within* the band rather than at its weakest rung.
             //
             // Pinning every interpreted-suspicious verdict to the ceiling put all
@@ -190,9 +186,7 @@ pub(super) fn interpreted_level(
             // Corroboration moves it a quarter of the way in instead of half —
             // nearer the hostile boundary, because two detectors agreeing is a
             // stronger claim than one.
-            let fraction = if corroborated { 0.25 } else { 0.5 };
-            let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
-            Level::At((placed.round() as u16).clamp(floor, ceiling))
+            suspicious_band_level(active, grid_max, if corroborated { 0.25 } else { 0.5 })
         }
     }
 }
@@ -357,24 +351,6 @@ const KNOWN_SOFTWARE_PREFIXES: [&str; 5] = [
     "well-known/dual-use/",
 ];
 
-/// Whether cleave confidently recognized this sample as a named application,
-/// library, tool or known dual-use utility.
-///
-/// Used to raise — never to waive — the hostile arm's anchor requirement. A
-/// sample cleave can name is one whose hostile traits are far more likely to be
-/// describing the program's own advertised function: `ansible-core`'s PowerShell
-/// base64-exec *is* its Windows connection plugin, and eight
-/// `well-known/app/infrastructure` Ansible recognizers fire on the same render
-/// while the floor promotes it to hostile on that one trait.
-fn identified_as_known_software(findings: &[CompactTrait]) -> bool {
-    findings.iter().any(|f| {
-        f.confidence >= TRAIT_FLOOR_MIN_CONFIDENCE
-            && KNOWN_SOFTWARE_PREFIXES
-                .iter()
-                .any(|prefix| f.id.starts_with(prefix))
-    })
-}
-
 fn trait_floor_counts(findings: &[CompactTrait]) -> TraitFloorCounts<'_> {
     let mut out = TraitFloorCounts::default();
     for f in findings {
@@ -509,14 +485,27 @@ pub fn trait_floor(
         return None;
     }
     let counts = trait_floor_counts(findings);
-    // Recognized software has to clear a higher anchor before the floor will
+    // Whether cleave confidently recognized this sample as a named application,
+    // library, tool or known dual-use utility. A sample cleave can name is one
+    // whose hostile traits are far more likely to be describing the program's
+    // own advertised function: `ansible-core`'s PowerShell base64-exec *is* its
+    // Windows connection plugin, and eight `well-known/app/infrastructure`
+    // Ansible recognizers fire on the same render while the floor promotes it
+    // to hostile on that one trait.
+    let known_software = findings.iter().any(|f| {
+        f.confidence >= TRAIT_FLOOR_MIN_CONFIDENCE
+            && KNOWN_SOFTWARE_PREFIXES
+                .iter()
+                .any(|prefix| f.id.starts_with(prefix))
+    });
+    // So recognized software has to clear a higher anchor before the floor will
     // *block* it. Not an exemption — one extra confident crit-5, which a genuine
     // compromise adding its own hostile behavior still reaches, while a lone
     // trait describing the program's own advertised function cannot promote
     // a model-clean sample straight past review. Falling short here drops
     // through to the suspicious arm below, which is where "a human should look"
     // belongs.
-    let required_crit5 = if identified_as_known_software(findings) {
+    let required_crit5 = if known_software {
         TRAIT_FLOOR_HOSTILE_CRIT5.saturating_add(1)
     } else {
         TRAIT_FLOOR_HOSTILE_CRIT5

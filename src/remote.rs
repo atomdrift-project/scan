@@ -21,7 +21,7 @@
 //! verdict replaces local analysis and is reported as a `"source": "remote"`
 //! record, the way a bloom decision is reported as `"source": "bloom"`.
 
-use std::collections::HashMap;
+use std::io::Read as _;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -165,10 +165,13 @@ pub fn public_purl(purl: &str) -> bool {
         return false;
     };
     let qualifiers = path.split_once('?').map_or("", |(_, q)| q);
-    if qualifiers
-        .split('&')
-        .any(|q| q.to_ascii_lowercase().starts_with("repository_url="))
-    {
+    // Each names bytes other than the public registry's under this coordinate.
+    if qualifiers.split('&').any(|q| {
+        let q = q.to_ascii_lowercase();
+        ["repository_url=", "download_url=", "vcs_url="]
+            .iter()
+            .any(|key| q.starts_with(key))
+    }) {
         return false;
     }
     MAINSTREAM.contains(&kind.to_ascii_lowercase().as_str())
@@ -192,7 +195,7 @@ pub fn classification(fires_at: Level, level: Option<u16>) -> Option<Classificat
 /// The local files isotope13 already judges, by path, and the files left to
 /// analyze here, in their original order.
 ///
-/// Only files of at least [`crate::analysis::small_job_max_bytes`] are asked
+/// Only files of at least [`crate::analysis::SMALL_JOB_MAX_BYTES`] are asked
 /// about. Each is hashed by streaming it — bounded memory, never a second
 /// resident copy — and the digests go out in batches. A file whose digest
 /// comes back with a standing verdict is answered; everything else, including
@@ -215,25 +218,20 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
     if asked.is_empty() {
         return (Vec::new(), paths);
     }
-    let mut known = precheck.shas(&asked);
+    let known = precheck.shas(&asked);
     let mut answered = Vec::new();
     let mut rest = Vec::with_capacity(paths.len());
     for (path, digest) in paths.into_iter().zip(digests) {
-        match digest.and_then(|sha| verdict_for(&mut known, sha)) {
-            Some((sha, verdict)) => answered.push((path, sha, verdict)),
-            None => rest.push(path),
+        // Cloned rather than removed: two paths may hold the same bytes.
+        if let Some(sha) = digest
+            && let Some(Standing::Adopt(verdict)) = known.get(&sha)
+        {
+            answered.push((path, sha, verdict.clone()));
+        } else {
+            rest.push(path);
         }
     }
     (answered, rest)
-}
-
-/// The adopted verdict for `sha`, if it has one. Cloned rather than removed:
-/// two paths may hold the same bytes.
-fn verdict_for(known: &mut HashMap<String, Standing>, sha: String) -> Option<(String, Verdict)> {
-    match known.get(&sha) {
-        Some(Standing::Adopt(verdict)) => Some((sha, verdict.clone())),
-        _ => None,
-    }
 }
 
 /// The verdict isotope13 holds for a fetched artifact's bytes, under `auto`.
@@ -299,17 +297,19 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     let request = match upload {
         Upload::Purl(purl) => request.query(&[("purl", purl)]),
         Upload::File(path) => {
-            let size = std::fs::metadata(path)
-                .with_context(|| format!("reading {}", path.display()))?
-                .len();
-            if size > MAX_UPLOAD_BYTES {
+            // The cap bounds the read itself: a file that grows after a size
+            // check, or a device or FIFO reporting no length, cannot be
+            // read past it.
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|file| file.take(MAX_UPLOAD_BYTES + 1).read_to_end(&mut bytes))
+                .with_context(|| format!("reading {}", path.display()))?;
+            if bytes.len() as u64 > MAX_UPLOAD_BYTES {
                 anyhow::bail!(
-                    "{} is {size} bytes, over isotope13's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --analyze=auto or --analyze=local",
+                    "{} is over isotope13's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --analyze=auto or --analyze=local",
                     path.display()
                 );
             }
-            let bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
             request
                 .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                 .body(bytes)
@@ -330,8 +330,14 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     let resp = request.send().with_context(|| format!("POST {url}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("isotope13 refused the analysis ({status}): {}", body.trim());
+        // Bounded and escaped: the body is the remote's, and this error is
+        // printed to the operator's terminal.
+        let mut body = String::new();
+        let _ = std::io::Read::read_to_string(&mut resp.take(4096), &mut body);
+        anyhow::bail!(
+            "isotope13 refused the analysis ({status}): {:?}",
+            body.trim()
+        );
     }
     let answer = BufReader::new(resp)
         .lines()

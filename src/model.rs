@@ -569,7 +569,8 @@ impl Model {
             };
             let mut features = route.ctx.extract_from_parsed(parsed);
             route.spec.standardize(&mut features);
-            let (raw, probability) = route.predict_raw_calibrated(&features)?;
+            let raw = route.backend.predict(&features)?;
+            let probability = route.calibrator.as_ref().map_or(raw, |cal| cal.apply(raw));
             Ok(Some(Scored {
                 route: *id,
                 raw,
@@ -671,9 +672,15 @@ impl Model {
                 .iter()
                 .chain(&policy.suspicious.thresholds)
             {
-                if !route_probs.iter().any(|score| score.route == route) {
+                if route_probs.iter().any(|score| score.route == route) {
+                    continue;
+                }
+                // Once per route: both severities usually name the same ones,
+                // and scoring may already have reported it skipped.
+                let model = compact_route_name(self.routes.names.name(route));
+                if !skipped.iter().any(|s| s.model == model) {
                     skipped.push(SkippedRoute {
-                        model: compact_route_name(self.routes.names.name(route)),
+                        model,
                         reason: "unavailable",
                     });
                 }

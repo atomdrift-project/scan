@@ -1,16 +1,8 @@
 use super::*;
 
-struct Answers(FetchError);
-
-impl Fetch for Answers {
-    fn send(&self, _request: &Request<'_>) -> Result<Fetched, FetchError> {
-        Err(self.0.clone())
-    }
-}
-
 fn memoized(error: FetchError, purl: &str) -> Option<Option<Registry>> {
     let res = Resources {
-        net: Box::new(Answers(error)),
+        net: Box::new(super::tests_offline::Failing(error)),
         cache: super::tests_offline::cache(),
     };
     let reference = Reference::new(

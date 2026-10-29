@@ -202,7 +202,13 @@ pub(super) fn annotate_python_import_candidate(
 pub(super) fn npm_package_contexts(report: &AnalysisReport) -> HashMap<String, (String, bool)> {
     let mut result = HashMap::new();
     for file in &report.files {
-        let Some(dir) = file.path.strip_suffix("/package.json") else {
+        // Keyed as `virtual_parent` spells directories: an archive's root is
+        // `x.zip!!`, so its manifest is `x.zip!!package.json`.
+        let Some(dir) = file.path.strip_suffix("/package.json").or_else(|| {
+            file.path
+                .strip_suffix("package.json")
+                .filter(|dir| dir.ends_with("!!"))
+        }) else {
             continue;
         };
         let Some(name) = file
@@ -253,7 +259,7 @@ pub(super) fn declared_npm_imports_in_hop(
     let manifests: HashMap<&str, &cleave::types::FileAnalysis> = report
         .files
         .iter()
-        .filter(|f| f.path.ends_with("/package.json"))
+        .filter(|f| f.path.ends_with("/package.json") || f.path.ends_with("!!package.json"))
         .map(|f| (f.path.as_str(), f))
         .collect();
     let mut declarations: HashMap<&str, HashMap<String, Reference>> = HashMap::new();
@@ -282,7 +288,8 @@ pub(super) fn declared_npm_imports_in_hop(
         let mut dir = virtual_parent(&file.path);
         let mut names = HashMap::new();
         while let Some(current) = dir {
-            let path = format!("{current}/package.json");
+            let separator = if current.ends_with("!!") { "" } else { "/" };
+            let path = format!("{current}{separator}package.json");
             if let Some(manifest) = manifests.get(path.as_str()) {
                 names = declarations
                     .get(manifest.sha256.as_str())

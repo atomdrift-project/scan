@@ -90,6 +90,8 @@ pub const MIN_LOADABLE_SPEC_VERSION: u32 = 16;
 /// Stable model ABI version shared with collimator.
 /// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.
 pub const EXPECTED_MODEL_ABI_VERSION: u32 = EXPECTED_SPEC_VERSION;
+/// Oldest model ABI this build loads.
+pub const MIN_MODEL_ABI_VERSION: u32 = 18;
 
 /// Minimum finding confidence for inclusion (matches collimator MIN_CONFIDENCE).
 const MIN_CONFIDENCE: f64 = 0.65;

@@ -12,8 +12,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::Path;
-
 use scan::model::Model;
 
 mod bundle;
@@ -32,20 +30,11 @@ fn predict(model: &Model) -> f32 {
     decision.probability
 }
 
-fn copy_bundle(src: &Path, files: &[&str]) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    for f in files {
-        std::fs::copy(src.join(f), dir.path().join(f)).unwrap_or_else(|e| panic!("copy {f}: {e}"));
-    }
-    dir
-}
-
 #[test]
 fn onnx_bundle_dispatches_to_onnx_backend() {
     let src = onnx_bundle();
     let src = src.path();
-    let dir = copy_bundle(src, &["model.onnx", "feature_spec.json"]);
-    let model = Model::load(dir.path(), None, None).expect("load ONNX bundle");
+    let model = Model::load(src, None, None).expect("load ONNX bundle");
     assert_eq!(model.backend_kind(), "onnx");
     assert!(model.spec().total_features() > 0);
 
@@ -79,8 +68,7 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 
-    let single = copy_bundle(src, &["model.onnx", "feature_spec.json"]);
-    let single_model = Model::load(single.path(), None, None).expect("load single bundle");
+    let single_model = Model::load(src, None, None).expect("load single bundle");
     let single_prob = predict(&single_model);
     assert!(
         (prob - single_prob).abs() < 1e-6,

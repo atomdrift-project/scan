@@ -117,7 +117,7 @@ pub fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<Scan
     let retained = data.clone();
     let analyze = move || cleave::analyze_bytes_shared(data, label, &opts);
     let report = match lane {
-        Some(lane) => lane.install(analyze),
+        Some(lane) => lane.pool.install(analyze),
         None => analyze(),
     }
     .with_context(|| format!("cleave analysis of {label}"))?;
@@ -465,13 +465,6 @@ pub struct WhaleLane {
     _slot: Option<WhaleSlot>,
 }
 
-impl WhaleLane {
-    /// Run `f` on this lane's pool, blocking until it returns.
-    pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(f)
-    }
-}
-
 /// Big-whale slots in use and available, for `/_/stats`.
 #[must_use]
 pub fn whale_slot_usage() -> (usize, usize) {
@@ -480,9 +473,9 @@ pub fn whale_slot_usage() -> (usize, usize) {
 
 /// The lane a payload of `bytes` analyzes on: a private pool sized to it —
 /// [`small_pool_threads`] wide at or below the small cap, [`whale_pool_threads`]
-/// above it, after waiting for a slot if the payload is big — or `None` (the
-/// global pool) when private pools are disabled for its size or fail to
-/// build. The wait is the caller's phase to report.
+/// above it, holding a slot if the payload is big — or `None` (the global
+/// pool) when the request is alone on the box, where the global pool is the
+/// widest lane there is, or when a private pool fails to build.
 ///
 /// Built per analysis and dropped after it: parking idle pools for reuse
 /// (warm thread-local caches) gains nothing measurable on latency or

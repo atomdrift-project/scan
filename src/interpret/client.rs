@@ -221,7 +221,15 @@ pub(super) fn chat_raw(
     priority: u8,
 ) -> std::result::Result<(String, String), CallError> {
     let client = http_client().map_err(CallError::Transport)?;
-    chat_raw_with(breakers(), cfg, client, system, user, max_tokens, priority)
+    chat_raw_with(
+        BREAKERS.get_or_init(|| Breakers::new(BREAKER_COOLDOWN)),
+        cfg,
+        client,
+        system,
+        user,
+        max_tokens,
+        priority,
+    )
 }
 
 /// The process's one HTTP client for LLM endpoints, built on first use.
@@ -327,8 +335,6 @@ pub(super) fn chat_raw_with(
     Err(err.unwrap_or_else(|| CallError::Transport(anyhow!("no LLM endpoint configured"))))
 }
 
-/// POST a system+user prompt to one endpoint and return the model's reply text,
-/// classifying failures for the caller's health accounting.
 /// How long one attempt against `base_url` may take: the configured timeout
 /// for the local origin, and at least [`OPENROUTER_MIN_TIMEOUT_SECS`] for a
 /// hosted route that cannot answer on a short origin budget.
@@ -341,6 +347,8 @@ pub(super) fn attempt_timeout(cfg: &InterpretConfig, base_url: &str) -> Duration
     }
 }
 
+/// POST a system+user prompt to one endpoint and return the model's reply text,
+/// classifying failures for the caller's health accounting.
 pub(super) fn chat_once(
     client: &reqwest::blocking::Client,
     cfg: Attempt<'_>,
@@ -596,9 +604,9 @@ pub(super) fn probe_endpoint(cfg: &InterpretConfig) -> bool {
 pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Result<String> {
     let client = http_client()?;
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let keyed = api_key.is_some_and(|k| !k.is_empty());
+    let key = api_key.filter(|k| !k.is_empty());
     let mut req = client.get(&url).timeout(HEALTH_PROBE_TIMEOUT);
-    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+    if let Some(key) = key {
         req = req.bearer_auth(key);
     }
     let resp = req
@@ -608,7 +616,7 @@ pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Result<String> {
     if !status.is_success() {
         return Err(anyhow!(
             "GET {url} returned {status}{}",
-            status_hint(status, base_url, keyed)
+            status_hint(status, base_url, key.is_some())
         ));
     }
     let list: ModelList = resp
@@ -747,15 +755,8 @@ pub(super) fn cache_path(hash: &str) -> Option<PathBuf> {
     Some(cache_base()?.join(format!("{hash}.json")))
 }
 
-/// Best-effort, atomic write (temp file + rename). A failure just means the next
-/// scan re-queries.
-pub(super) fn cache_put(path: &Path, verdict: &CachedVerdict) {
-    if let Err(e) = write_cached(path, verdict) {
-        tracing::debug!(path = %path.display(), error = format!("{e:#}"), "LLM verdict not cached");
-    }
-}
-
-fn write_cached(path: &Path, verdict: &CachedVerdict) -> Result<()> {
+/// Atomic cache write (temp file + rename).
+pub(super) fn cache_put(path: &Path, verdict: &CachedVerdict) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().context("cache path has no directory")?;
     std::fs::create_dir_all(parent).context("creating the cache directory")?;
@@ -772,12 +773,8 @@ pub(super) const BODY_SNIPPET: usize = 512;
 
 /// A char-boundary-safe leading slice of an undecodable body, for diagnostics.
 pub(super) fn body_snippet(s: &str) -> &str {
-    let mut end = s.len().min(BODY_SNIPPET);
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    // `end` is always a valid char boundary ≤ len, so the slice never misses.
-    s.get(..end).unwrap_or(s)
+    // A char boundary ≤ len, so the slice never misses.
+    s.get(..s.floor_char_boundary(BODY_SNIPPET)).unwrap_or(s)
 }
 
 /// Longest `reason` kept from a reply. The prompt asks for five words; anything
@@ -804,7 +801,3 @@ pub(super) fn parse_grade_reason(content: &str) -> Option<(LlmGrade, String)> {
     }
     Some((grade, reason.trim_end().to_string()))
 }
-
-// ── concurrency permit ──────────────────────────────────────────────────────
-// A small blocking counting semaphore so a parallel directory scan never opens
-// more than `max_concurrency` sockets to the (single, local) endpoint.

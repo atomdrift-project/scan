@@ -508,7 +508,6 @@ pub struct MlSection {
     pub level: Level,
     /// Pessimistic integer confidence percent derived from `level`; `null` when no
     /// level table applies (manual-threshold mode).
-    /// Optional model confidence percent.
     pub conf: Option<u8>,
     /// Scores from models that ran.
     #[serde(rename = "mods", skip_serializing_if = "Vec::is_empty")]
@@ -519,7 +518,6 @@ pub struct MlSection {
     /// Model bundle version.
     pub version: String,
     /// Scan engine build (`CARGO_PKG_VERSION`) that produced this report.
-    /// Scan engine version.
     pub eng: &'static str,
     /// UTC analysis timestamp.
     pub analyzed_at: String,

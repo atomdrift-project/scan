@@ -76,6 +76,11 @@ pub struct Graded {
     /// hostile boundary than the middle of the band.
     #[serde(skip)]
     pub corroborated: bool,
+    /// Whether this read was trusted to soften: a readable render, no text
+    /// aimed at the grader, no cleave hostile finding. Carried out so every
+    /// downstream use of a clearing grade obeys the same gate as the blend.
+    #[serde(skip)]
+    pub may_soften: bool,
     /// Blended confidence in `[0, 1]`.
     #[serde(rename = "conf")]
     pub blended: f32,
@@ -283,6 +288,12 @@ pub(super) struct Evidence {
 }
 
 impl Evidence {
+    /// Whether the LLM's read is credible enough to make a sample look better:
+    /// see [`blend`].
+    pub(super) const fn may_soften(self) -> bool {
+        self.readable && !self.analyzer_directed && !self.hostile_finding
+    }
+
     /// Whether the LLM may move the verdict from band `from` to band `to`.
     ///
     /// Only the **hostile** boundary has to be earned. The two boundaries are not
@@ -380,12 +391,12 @@ pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Cla
 ///   [`addresses_the_analyzer`]; a clear is precisely what an injected sample is
 ///   fishing for).
 ///
+/// A third discards it too: a **cleave hostile finding**, which the LLM's prose
+/// cannot overrule.
+///
 /// The trust requirement covers *every* softening, not just a class drop — an
 /// agreed-benign score also moves down, so it is gated the same way. The
 /// resulting invariant is the one worth remembering:
-///
-/// A third discards it too: a **cleave hostile finding**, which the LLM's prose
-/// cannot overrule.
 ///
 /// > When the LLM's read is untrusted, the blend never lowers the class and never
 /// > lowers the score.
@@ -409,7 +420,7 @@ pub(super) fn blend(
     // cleave hostile finding: the LLM reads text the author wrote, so a prompt
     // injection the phrase list misses must still not argue a sample past a
     // detector that never read its prose.
-    let may_soften = ev.readable && !ev.analyzer_directed && !ev.hostile_finding;
+    let may_soften = ev.may_soften();
     // A class move is capped at one rung *and* has to clear the proximity gate;
     // when it does not, the score still steers but the band holds.
     let stepped = |toward_severe: bool| {
@@ -424,14 +435,9 @@ pub(super) fn blend(
         // one model's word: cleave independently surfaced a hostile finding and
         // the LLM independently graded the sample hostile, with ML the lone
         // outlier. Escalation-only, so a sample still cannot corroborate its own
-        // clearing, and `may_cross` still has to admit the crossing.
+        // clearing. (`may_cross` admits any escalation backed by a hostile finding.)
         Ordering::Greater if target == Classification::Hostile && ev.hostile_finding => {
-            let class = if ev.may_cross(ml, target) {
-                target
-            } else {
-                one_step_toward(ml, target)
-            };
-            (class, steer(p, true))
+            (target, steer(p, true))
         }
         Ordering::Greater => stepped(true),
         // Agreement is corroboration, so it firms up the verdict already held:
@@ -469,6 +475,7 @@ pub(super) fn blended(
             lvl: ev.levels.fired,
         },
         corroborated: ev.hostile_finding,
+        may_soften: ev.may_soften(),
         cached,
     })
 }

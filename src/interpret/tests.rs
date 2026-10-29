@@ -490,19 +490,17 @@ fn llm_models_aligns_with_the_target_list() {
     );
 }
 
-/// A one-shot OpenAI-compatible server: answers `n` requests with `status`
-/// and a fixed grade, recording the bearer token and model it was sent.
+/// A one-shot OpenAI-compatible server: answers one request per `(status,
+/// body)` reply, in order, recording each request it was sent.
 fn fake_llm(
-    status: &'static str,
-    body: &'static str,
-    n: usize,
+    replies: Vec<(&'static str, &'static str)>,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake llm");
     let addr = listener.local_addr().expect("addr");
     let handle = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        for _ in 0..n {
+        for (status, body) in replies {
             let Ok((mut stream, _)) = listener.accept() else {
                 break;
             };
@@ -542,7 +540,7 @@ fn queue_priority_is_shortest_job_first_among_foreground_callers() {
 
 #[test]
 fn background_priority_is_sent_and_withdrawn_when_refused() {
-    let (ok, ok_h) = fake_llm("200 OK", GRADE_BODY, 2);
+    let (ok, ok_h) = fake_llm(vec![("200 OK", GRADE_BODY); 2]);
     let cfg = InterpretConfig {
         base_url: ok,
         model: "m".to_string(),
@@ -584,35 +582,13 @@ fn background_priority_is_sent_and_withdrawn_when_refused() {
 
     // A server that refuses the priority once, then answers: the resend
     // must go to the same endpoint, without the field.
-    let (strict, strict_h) = {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let handle = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            let replies = [
-                (
-                    "400 Bad Request",
-                    r#"{"error":{"message":"priority must be 0 unless the scheduler uses priority scheduling"}}"#,
-                ),
-                ("200 OK", GRADE_BODY),
-            ];
-            for (status, body) in replies {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                seen.push(String::from_utf8_lossy(&buf[..read]).to_string());
-                let head = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len(),
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(body.as_bytes());
-            }
-            seen
-        });
-        (format!("http://{addr}/v1"), handle)
-    };
+    let (strict, strict_h) = fake_llm(vec![
+        (
+            "400 Bad Request",
+            r#"{"error":{"message":"priority must be 0 unless the scheduler uses priority scheduling"}}"#,
+        ),
+        ("200 OK", GRADE_BODY),
+    ]);
     let cfg = InterpretConfig {
         base_url: strict,
         model: "m".to_string(),
@@ -638,8 +614,8 @@ fn background_priority_is_sent_and_withdrawn_when_refused() {
 /// second opinion.
 #[test]
 fn a_401_on_the_primary_falls_over_to_the_next_endpoint() {
-    let (dead, dead_h) = fake_llm("401 Unauthorized", r#"{"error":"Unauthorized"}"#, 1);
-    let (live, live_h) = fake_llm("200 OK", GRADE_BODY, 1);
+    let (dead, dead_h) = fake_llm(vec![("401 Unauthorized", r#"{"error":"Unauthorized"}"#)]);
+    let (live, live_h) = fake_llm(vec![("200 OK", GRADE_BODY)]);
     let cfg = InterpretConfig {
         base_url: dead,
         model: "primary-model".to_string(),
@@ -672,7 +648,7 @@ fn a_401_on_the_primary_falls_over_to_the_next_endpoint() {
 /// billed per call.
 #[test]
 fn a_healthy_primary_never_reaches_the_fallback() {
-    let (live, live_h) = fake_llm("200 OK", GRADE_BODY, 1);
+    let (live, live_h) = fake_llm(vec![("200 OK", GRADE_BODY)]);
     let cfg = InterpretConfig {
         base_url: live,
         model: "primary-model".to_string(),
@@ -695,7 +671,7 @@ fn a_healthy_primary_never_reaches_the_fallback() {
 /// a vague "all failed" that names nothing to fix.
 #[test]
 fn every_endpoint_failing_reports_the_last_error() {
-    let (dead, dead_h) = fake_llm("500 Internal Server Error", "boom", 1);
+    let (dead, dead_h) = fake_llm(vec![("500 Internal Server Error", "boom")]);
     let cfg = InterpretConfig {
         base_url: "http://127.0.0.1:1/v1".to_string(),
         model: "primary-model".to_string(),
@@ -824,7 +800,7 @@ fn breaker_opens_after_consecutive_transport_failures_and_probes_once() {
 #[test]
 fn an_open_breaker_skips_the_dead_primary_until_the_cooldown() {
     let calls = BREAKER_TRIP_AFTER as usize + 3;
-    let (live, live_h) = fake_llm("200 OK", GRADE_BODY, calls);
+    let (live, live_h) = fake_llm(vec![("200 OK", GRADE_BODY); calls]);
     let cfg = InterpretConfig {
         // Port 1 refuses at once: each attempt is a fast transport failure.
         base_url: "http://127.0.0.1:1/v1".to_string(),
@@ -1190,6 +1166,7 @@ fn interpretation_bytes_are_pinned() {
             lvl: Level::Clean,
         },
         corroborated: true,
+        may_soften: false,
         cached: true,
     };
     let manual = Graded {

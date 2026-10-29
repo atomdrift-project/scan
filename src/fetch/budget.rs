@@ -40,16 +40,14 @@ impl TotalBudget {
     pub(super) fn reserve(&self, want: Allowance) -> Allowance {
         let fetches = self
             .fetches
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                Some(left - left.min(want.fetches))
-            })
-            .unwrap_or_else(|left| left);
+            .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left - left.min(want.fetches)
+            });
         let bytes = self
             .bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                Some(left - left.min(want.bytes))
-            })
-            .unwrap_or_else(|left| left);
+            .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left - left.min(want.bytes)
+            });
         Allowance {
             fetches: fetches.min(want.fetches),
             bytes: bytes.min(want.bytes),
@@ -60,19 +58,17 @@ impl TotalBudget {
     /// any overshoot is taken too — fletch's byte cap is best-effort, stopping
     /// only after the fetch that crossed it. The count cap is exact.
     pub(super) fn settle(&self, granted: Allowance, spent: Allowance) {
-        let _ = self
-            .fetches
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                Some(left.saturating_add(granted.fetches.saturating_sub(spent.fetches)))
+        self.fetches
+            .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.saturating_add(granted.fetches.saturating_sub(spent.fetches))
             });
-        let _ = self
-            .bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                Some(if spent.bytes <= granted.bytes {
+        self.bytes
+            .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                if spent.bytes <= granted.bytes {
                     left.saturating_add(granted.bytes - spent.bytes)
                 } else {
                     left.saturating_sub(spent.bytes - granted.bytes)
-                })
+                }
             });
     }
 }

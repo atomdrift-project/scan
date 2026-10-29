@@ -25,13 +25,6 @@ use crate::bundle::{self, Bundle};
 /// be compared against the remote manifest on refresh.
 const SIDECAR: &str = "bloom.toml";
 
-/// Path prefix for this build's bloom artifacts: namespaced under `bloom/` and
-/// selecting the on-wire format it speaks, e.g. `bloom/v1`. A format bump moves
-/// the whole prefix, so old and new clients never read each other's artifacts.
-fn bloom_prefix_for(version: u16) -> String {
-    format!("bloom/v{version}")
-}
-
 /// The installed manifest (sidecar), if present and parseable.
 fn installed_manifest(dir: &Path) -> Option<Manifest> {
     let text = std::fs::read_to_string(dir.join(SIDECAR)).ok()?;
@@ -143,7 +136,10 @@ impl Bundle for Bloom {
 fn fetch_manifest(client: &Client) -> Result<Published> {
     let mut tried: Vec<String> = Vec::new();
     for version in SUPPORTED_VERSIONS {
-        let prefix = bloom_prefix_for(*version);
+        // Namespaced under `bloom/` and selecting the on-wire format this build
+        // speaks, e.g. `bloom/v1`. A format bump moves the whole prefix, so old
+        // and new clients never read each other's artifacts.
+        let prefix = format!("bloom/v{version}");
         let url = bundle::url(&format!("{prefix}/{SIDECAR}"));
         match bundle::manifest(client, &url) {
             Ok(text) => {

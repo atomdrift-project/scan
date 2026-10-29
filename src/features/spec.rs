@@ -67,52 +67,13 @@ pub(super) const KEY_METRICS: &[(&str, &str, bool)] = &[
 ];
 
 /// Feature specification loaded from feature_spec.json (v16).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct FeatureSpec {
-    pub(super) version: u32,
-    pub(super) abi_version: u32,
-    pub(super) presence_vocab: Vec<String>,
-    pub(super) filetype_vocab: Vec<String>,
-    pub(super) element_vocab: Vec<String>,
-    pub(super) bigram_vocab: Vec<String>,
-    pub(super) ghost_vocab: Vec<String>,
-    pub(super) skeleton_vocab: Vec<String>,
-    pub(super) rare_element_vocab: Vec<String>,
-    pub(super) trigram_vocab: Vec<String>,
-    pub(super) metric_vocab: Vec<String>,
-    pub(super) metric_transforms: Option<HashMap<String, String>>,
-    pub(super) metric_getters: Vec<String>,
-    pub(super) metric_reference_year: u32,
-    pub(super) metric_correlations: HashMap<String, [[String; 2]; 2]>,
-    pub(super) crit_unigram_vocab: Vec<String>,
-    pub(super) crit_bigram_vocab: Vec<String>,
-    pub(super) crit_trigram_vocab: Vec<String>,
-    pub(super) attack_bigram_vocab: Vec<String>,
-    pub(super) attack_trigram_vocab: Vec<String>,
-    pub(super) mbc_bigram_vocab: Vec<String>,
-    pub(super) mbc_trigram_vocab: Vec<String>,
-    pub(super) tiered_bigram_vocab: Vec<String>,
-    pub(super) tiered_trigram_vocab: Vec<String>,
-    pub(super) tiered_quadgram_vocab: Vec<String>,
-    pub(super) kv_vocab: Vec<String>,
-    pub(super) symbol_vocab: Vec<String>,
-    pub(super) symbol_bigram_vocab: Vec<String>,
-    pub(super) symbol_trigram_vocab: Vec<String>,
-    pub(super) feature_names: Vec<String>,
-    pub(super) total_features: usize,
-    pub(super) feature_means: Option<Vec<f32>>,
-    pub(super) feature_stds: Option<Vec<f32>>,
-    pub(super) standardized: bool,
-    pub(super) trait_path_depth: usize,
-    pub(super) tiered_min_crit: [u32; 3],
-    pub(super) tiered_branch_min_crit: HashMap<String, u32>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub(super) struct RawFeatureSpec {
     #[serde(default)]
     pub(super) version: u32,
-    #[serde(default = "default_abi_version")]
+    /// 0 when omitted; `load` then inherits the spec version, never the
+    /// serving version.
+    #[serde(default)]
     pub(super) abi_version: u32,
     #[serde(default)]
     pub(super) presence_vocab: Vec<String>,
@@ -196,79 +157,35 @@ pub(super) const fn default_standardized() -> bool {
     true
 }
 
-pub(super) const fn default_abi_version() -> u32 {
-    0 // An omitted ABI inherits the spec version, never the serving version.
-}
-
 impl FeatureSpec {
     /// Load feature specification from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
-        let raw: RawFeatureSpec = serde_json::from_str(&data).context("parsing feature spec")?;
+        let mut spec: Self = serde_json::from_str(&data).context("parsing feature spec")?;
 
-        if raw.version < MIN_LOADABLE_SPEC_VERSION || raw.version > EXPECTED_SPEC_VERSION {
+        if spec.version < MIN_LOADABLE_SPEC_VERSION || spec.version > EXPECTED_SPEC_VERSION {
             anyhow::bail!(
                 "feature spec version mismatch: this installed model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
                  The model is incompatible with this build. Run 'atomscan update-rules' to install a matching model bundle.",
-                raw.version,
+                spec.version,
             );
         }
-        if raw.version < EXPECTED_SPEC_VERSION
+        if spec.version < EXPECTED_SPEC_VERSION
             && WARNED_OLD_SPEC_VERSIONS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(raw.version)
+                .insert(spec.version)
         {
             tracing::warn!(
-                version = raw.version,
+                version = spec.version,
                 expected = EXPECTED_SPEC_VERSION,
                 "loading older feature spec; features added since this version are absent from the model; retrain at v{EXPECTED_SPEC_VERSION} to use them"
             );
         }
 
-        let spec = Self {
-            version: raw.version,
-            abi_version: if raw.abi_version == 0 {
-                raw.version
-            } else {
-                raw.abi_version
-            },
-            presence_vocab: raw.presence_vocab,
-            filetype_vocab: raw.filetype_vocab,
-            element_vocab: raw.element_vocab,
-            bigram_vocab: raw.bigram_vocab,
-            ghost_vocab: raw.ghost_vocab,
-            skeleton_vocab: raw.skeleton_vocab,
-            rare_element_vocab: raw.rare_element_vocab,
-            trigram_vocab: raw.trigram_vocab,
-            metric_vocab: raw.metric_vocab,
-            metric_transforms: raw.metric_transforms,
-            metric_getters: raw.metric_getters,
-            metric_reference_year: raw.metric_reference_year,
-            metric_correlations: raw.metric_correlations,
-            crit_unigram_vocab: raw.crit_unigram_vocab,
-            crit_bigram_vocab: raw.crit_bigram_vocab,
-            crit_trigram_vocab: raw.crit_trigram_vocab,
-            attack_bigram_vocab: raw.attack_bigram_vocab,
-            attack_trigram_vocab: raw.attack_trigram_vocab,
-            mbc_bigram_vocab: raw.mbc_bigram_vocab,
-            mbc_trigram_vocab: raw.mbc_trigram_vocab,
-            tiered_bigram_vocab: raw.tiered_bigram_vocab,
-            tiered_trigram_vocab: raw.tiered_trigram_vocab,
-            tiered_quadgram_vocab: raw.tiered_quadgram_vocab,
-            kv_vocab: raw.kv_vocab,
-            symbol_vocab: raw.symbol_vocab,
-            symbol_bigram_vocab: raw.symbol_bigram_vocab,
-            symbol_trigram_vocab: raw.symbol_trigram_vocab,
-            feature_names: raw.feature_names,
-            total_features: raw.total_features,
-            feature_means: raw.feature_means,
-            feature_stds: raw.feature_stds,
-            standardized: raw.standardized,
-            trait_path_depth: raw.trait_path_depth,
-            tiered_min_crit: raw.tiered_min_crit,
-            tiered_branch_min_crit: raw.tiered_branch_min_crit,
-        };
+        if spec.abi_version == 0 {
+            spec.abi_version = spec.version;
+        }
         spec.validate()?;
         Ok(spec)
     }
@@ -379,7 +296,7 @@ impl FeatureSpec {
             }
         }
 
-        if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
+        if !(MIN_MODEL_ABI_VERSION..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
             anyhow::bail!(
                 "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{}",
                 self.abi_version,

@@ -305,17 +305,19 @@ pub fn llm_models(raw: Option<&str>, endpoints: usize) -> Vec<Option<String>> {
         })
         .collect();
     slots.resize(endpoints, None);
-    slots.truncate(endpoints);
     slots
 }
 
 /// Whether this base URL (or the unresolved `openrouter` alias) is OpenRouter.
+///
+/// By host, exactly: the answer decides which key a request carries, so
+/// `https://openrouter.ai.example/` — or any URL merely containing the name —
+/// must not be handed the OpenRouter key.
 #[must_use]
 pub fn is_openrouter_endpoint(base_url: &str) -> bool {
-    let t = base_url.trim_end_matches('/');
-    t == "openrouter"
-        || t.eq_ignore_ascii_case(OPENROUTER_BASE_URL.trim_end_matches('/'))
-        || t.contains("openrouter.ai")
+    base_url.trim_end_matches('/') == "openrouter"
+        || reqwest::Url::parse(base_url)
+            .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("openrouter.ai"))
 }
 
 /// `$HOME/.tok/<name>` — the convention for operator-supplied secrets across
@@ -344,9 +346,28 @@ pub fn openrouter_token_path() -> Option<PathBuf> {
 }
 
 /// First non-empty trimmed line of a token file.
+///
+/// A file other users can read is still used — refusing it would turn a
+/// permissions slip into an outage — but said so, since the token in it is a
+/// credential for the whole fleet. Read to a bound, so a path naming a device
+/// or something huge cannot hold the process.
 #[must_use]
 pub fn read_token_file(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    #[cfg(unix)]
+    if let Ok(meta) = file.metadata() {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{:o}", meta.mode() & 0o777),
+                "token file is readable by other users; chmod 600 it"
+            );
+        }
+    }
+    let mut text = String::new();
+    file.take(64 * 1024).read_to_string(&mut text).ok()?;
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
@@ -551,7 +572,7 @@ pub fn interpret_admitted(
     // Health gate: only send work to a healthy endpoint. If it's currently down,
     // wait for it to recover (re-probing every `HEALTH_RETRY_INTERVAL`) up to the
     // request timeout, rather than firing a doomed minute-long request per file.
-    if !health().wait_until_healthy(cfg.timeout, HEALTH_RETRY_INTERVAL, &|| probe_endpoint(cfg)) {
+    if !HEALTH.wait_until_healthy(cfg.timeout, HEALTH_RETRY_INTERVAL, &|| probe_endpoint(cfg)) {
         let error = format!(
             "no LLM endpoint of {} became healthy within {}s",
             cfg.attempts()
@@ -574,15 +595,16 @@ pub fn interpret_admitted(
     let _permit = IN_FLIGHT.acquire(cfg.max_concurrency, cfg.background_concurrency, caller);
     match request(cfg, user, caller.priority(user.len())) {
         Ok((grade, reason, model)) => {
-            health().set(true);
+            HEALTH.set(true);
             if let Some(path) = &cache {
-                cache_put(
-                    path,
-                    &CachedVerdict {
-                        grade: grade.as_str().to_string(),
-                        reason: reason.clone(),
-                    },
-                );
+                let verdict = CachedVerdict {
+                    grade: grade.as_str().to_string(),
+                    reason: reason.clone(),
+                };
+                // Best effort: a failure just means the next scan re-queries.
+                if let Err(e) = cache_put(path, &verdict) {
+                    tracing::debug!(path = %path.display(), error = format!("{e:#}"), "LLM verdict not cached");
+                }
             }
             Some(blended(&model, ml_class, ml_prob, grade, reason, ev, false))
         }
@@ -592,7 +614,7 @@ pub fn interpret_admitted(
             // leaves health alone (the server answered). Either way the pass was
             // attempted, so surface the failure in the `llm` JSON `error` and log
             // it. Failures are never cached — a transient outage should retry.
-            health().set(!matches!(e, CallError::Transport(_)));
+            HEALTH.set(!matches!(e, CallError::Transport(_)));
             let error = format!("{:#}", e.into_inner());
             tracing::error!(model = %cfg.model, "interpretation failed: {error}");
             Some(failure(

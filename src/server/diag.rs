@@ -259,20 +259,6 @@ impl Info {
     }
 }
 
-/// Build a body on a blocking thread — it reads files — and serve it.
-async fn collected<T: Serialize + Send + 'static>(
-    state: Arc<AppState>,
-    collect: fn(&AppState) -> T,
-) -> Response {
-    match tokio::task::spawn_blocking(move || collect(&state)).await {
-        Ok(body) => Json(body).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "collecting a diagnostic body panicked");
-            super::error::ApiError::internal().into_response()
-        }
-    }
-}
-
 /// GET /_/info — static server capacity and version info.
 ///
 /// Read by clients (e.g. hopper) on startup so they can size their per-node
@@ -280,7 +266,14 @@ async fn collected<T: Serialize + Send + 'static>(
 /// model/traits commits across nodes for drift detection. Always 200,
 /// independent of readiness — readiness is reported by /_/health.
 pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
-    collected(state, Info::collect).await
+    // On a blocking thread: collecting reads files.
+    match tokio::task::spawn_blocking(move || Info::collect(&state)).await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "collecting a diagnostic body panicked");
+            super::error::ApiError::internal().into_response()
+        }
+    }
 }
 
 /// A class of work's windowed latency, in milliseconds.
@@ -591,7 +584,11 @@ pub(super) async fn memory_stats(State(state): State<Arc<AppState>>) -> Json<Mem
             active_tasks: state.active_tasks(),
             stuck_orphans: state.stuck_orphans.load(Ordering::Relaxed),
             max_concurrent_tasks: state.config.workers,
-            requests_total: state.next_request_id.load(Ordering::Relaxed),
+            // Ids start at 1, so the next one is one past the count served.
+            requests_total: state
+                .next_request_id
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
         },
         thread_pools: MemoryPools {
             rayon_threads: rayon::current_num_threads(),

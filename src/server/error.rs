@@ -1,8 +1,5 @@
-//! Error responses, rendered in the shape of the route family that returns them.
-//!
-//! The legacy routes answer `{"error": "<message>"}`; the `/v1` routes answer
-//! `{"error": {"code": "<code>", "message": "<message>"}}`. Both carry the same
-//! routing hints beside the error — `lane`, `retry_after_secs`,
+//! Error responses: `{"error": {"code": "<code>", "message": "<message>"}}`,
+//! with the routing hints beside the error — `lane`, `retry_after_secs`,
 //! `timeout_secs` — and a 429 adds the `Retry-After` header, so a router reads
 //! a refusal the same way whichever route produced it.
 //!
@@ -166,38 +163,30 @@ impl ApiError {
     /// Render as a response: `{"error": {"code", "message"}}`, with the routing
     /// hints beside it.
     pub(super) fn response(&self) -> Response {
-        self.render(V1Detail {
-            code: self.code,
-            message: &self.message,
-        })
-    }
-
-    /// The body alone, for a stream frame that carries an error.
-    pub(super) fn body_json(&self) -> serde_json::Value {
-        serde_json::to_value(self.body(V1Detail {
-            code: self.code,
-            message: &self.message,
-        }))
-        .unwrap_or(serde_json::Value::Null)
-    }
-
-    fn body<E: Serialize>(&self, error: E) -> Body<'_, E> {
-        Body {
-            error,
-            lane: self.lane,
-            retry_after_secs: self.retry_after_secs,
-            timeout_secs: self.timeout_secs,
-        }
-    }
-
-    fn render<E: Serialize>(&self, error: E) -> Response {
-        let mut response = (self.status, Json(self.body(error))).into_response();
+        let mut response = (self.status, Json(self.body())).into_response();
         if let Some(secs) = self.retry_after_secs {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
         response
+    }
+
+    /// The body alone, for a stream frame that carries an error.
+    pub(super) fn body_json(&self) -> serde_json::Value {
+        serde_json::to_value(self.body()).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn body(&self) -> Body<'_> {
+        Body {
+            error: Detail {
+                code: self.code,
+                message: &self.message,
+            },
+            lane: self.lane,
+            retry_after_secs: self.retry_after_secs,
+            timeout_secs: self.timeout_secs,
+        }
     }
 }
 
@@ -208,8 +197,8 @@ impl IntoResponse for ApiError {
 }
 
 #[derive(Serialize)]
-struct Body<'a, E> {
-    error: E,
+struct Body<'a> {
+    error: Detail<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,7 +208,7 @@ struct Body<'a, E> {
 }
 
 #[derive(Serialize)]
-struct V1Detail<'a> {
+struct Detail<'a> {
     code: &'a str,
     message: &'a str,
 }

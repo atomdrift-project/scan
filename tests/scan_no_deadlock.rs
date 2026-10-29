@@ -23,15 +23,6 @@ use std::time::{Duration, Instant};
 /// means the binary is wedged, not slow.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// atomscan exit codes: 0=clean, 1=hostile, 2=suspicious, 3=errors,
-/// 4=incomplete rule set. Only 0/1/2 mean the scan ran to completion; any
-/// other code, or a timeout, means the binary failed or hung. We don't
-/// assert a specific verdict because that's a model-correctness concern,
-/// not a deadlock regression concern.
-fn scan_ran_to_completion(code: i32) -> bool {
-    (0..=2).contains(&code)
-}
-
 #[test]
 #[ignore = "needs a model bundle in SCAN_MODELS_DIR; run with --ignored"]
 fn scan_cli_completes_under_cold_yara_cache() {
@@ -104,9 +95,14 @@ fn scan_cli_completes_under_cold_yara_cache() {
         }
     };
 
+    // atomscan exit codes: 0=clean, 1=hostile, 2=suspicious, 3=errors,
+    // 4=incomplete rule set. Only 0/1/2 mean the scan ran to completion; any
+    // other code, or a timeout, means the binary failed or hung. We don't
+    // assert a specific verdict because that's a model-correctness concern,
+    // not a deadlock regression concern.
     let code = status.code().unwrap_or(-1);
     assert!(
-        scan_ran_to_completion(code),
+        (0..=2).contains(&code),
         "atomscan scan exited with code {code} (expected 0/1/2 — any verdict \
          is fine, we only reject error code 3 or termination by signal); \
          elapsed {:?}\n=== captured child stderr ===\n{}\n=== end captured stderr ===",

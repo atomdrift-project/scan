@@ -216,20 +216,10 @@ impl Inner {
         let frame = SPINNER[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNER.len()];
         let bar_w = 20;
         let filled = (done as usize * bar_w / self.total.max(1) as usize).min(bar_w);
-        let bar: String = (0..bar_w)
-            .map(|i| {
-                if i < filled {
-                    '\u{2501}' // ━
-                } else if i == filled {
-                    '\u{2578}' // ╸
-                } else {
-                    '\u{2500}' // ─
-                }
-            })
-            .collect();
-
-        let filled_str: String = bar.chars().take(filled + 1).collect();
-        let dim_str: String = bar.chars().skip(filled + 1).collect();
+        // ━━━╸ then ─── for the remainder; a full bar has no tip.
+        let tip = if filled < bar_w { "\u{2578}" } else { "" };
+        let filled_str = format!("{}{tip}", "\u{2501}".repeat(filled));
+        let dim_str = "\u{2500}".repeat(bar_w.saturating_sub(filled + 1));
 
         let stats = progress_stats(done, self.total, elapsed);
 
@@ -259,13 +249,6 @@ impl Inner {
             fg(TRACK, &dim_str),
             fg(STATS, &stats),
         ));
-    }
-
-    /// Halt the heartbeat and wait out any in-flight render, so the caller can
-    /// write a final line the ticker can no longer overwrite.
-    fn quiesce(&self) {
-        self.stopped.store(true, Ordering::Relaxed);
-        drop(lock(&self.draw_lock));
     }
 }
 
@@ -483,7 +466,10 @@ impl Progress {
     /// Stop the heartbeat without printing anything, for callers that render
     /// their own final line in the bar's place (e.g. `ps`).
     pub(crate) fn quiesce(&self) {
-        self.inner.quiesce();
+        // Halt the heartbeat and wait out any in-flight render, so the caller
+        // can write a final line the ticker can no longer overwrite.
+        self.inner.stopped.store(true, Ordering::Relaxed);
+        drop(lock(&self.inner.draw_lock));
         if let Some(heartbeat) = &self.heartbeat {
             heartbeat.thread().unpark();
         }
