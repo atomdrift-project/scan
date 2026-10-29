@@ -1112,7 +1112,7 @@ impl BloomMark {
             crate::bloom_repo::Decision::SightedHostile
             | crate::bloom_repo::Decision::SightedSuspicious => Some(Self::Sighted),
             crate::bloom_repo::Decision::Conflicted => Some(Self::Conflicted),
-            crate::bloom_repo::Decision::Unknown => None,
+            crate::bloom_repo::Decision::Unknown | crate::bloom_repo::Decision::Unavailable => None,
         }
     }
 

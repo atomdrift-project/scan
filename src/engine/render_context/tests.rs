@@ -578,12 +578,7 @@ fn provenance_fixture() -> (
     let registries = vec![crate::fetch::DependencyRegistry {
         locator: "pkg:test/dep@1".to_string(),
         provenance: crate::provenance::RegistryProvenance::from_record_sources(
-            fletch::Registry {
-                ecosystem: "test".to_string(),
-                name: "dep".to_string(),
-                version: "1".to_string(),
-                ..fletch::Registry::default()
-            },
+            crate::test_registry("test", "dep", "1"),
             &[fletch::fetch::RecordedSource {
                 url: "https://registry.example/dep".to_string(),
                 status: 200,
@@ -965,7 +960,7 @@ fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
             "title": claim("Q3 Vendor Invoice", "docprops.core.title"),
             "authors": [{
                 "name": "Aleksandr Petrov",
-                "role": "creator",
+                "role": "author",
                 "source": "docprops.core.creator",
             }],
             "organization": claim("Contoso Ltd", "docprops.app.company"),
@@ -1155,14 +1150,10 @@ fn metadata_only_root_keeps_provenance_without_a_duplicate_graft() {
         !root_needs_registry_graft(&report),
         "the registry document is already the analyzed root"
     );
+    let mut removed = crate::test_registry("test", "removed", "1");
+    removed.version_removed = Some(true);
     let provenance = crate::provenance::RegistryProvenance::from_record_sources(
-        fletch::Registry {
-            ecosystem: "test".to_string(),
-            name: "removed".to_string(),
-            version: "1".to_string(),
-            version_removed: Some(true),
-            ..fletch::Registry::default()
-        },
+        removed,
         &[fletch::fetch::RecordedSource {
             url: "https://registry.example/removed".to_string(),
             status: 200,

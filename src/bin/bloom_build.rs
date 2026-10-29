@@ -14,7 +14,7 @@ use clap::Parser;
 use sha2::{Digest, Sha256};
 
 use burton::Tier;
-use burton::build::{read_manifest, verify, write_bundle};
+use burton::{Ratio, read_manifest, verify, write_bundle};
 use scan::bloom_build::read_pool;
 
 #[derive(Debug, Parser)]
@@ -119,15 +119,14 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
     // Size the new build against the previous one (read before we overwrite it).
-    let prev = read_manifest(&args.out);
-    let filters = sets.into_filters_for(args.format_version, args.fp);
+    // An unreadable previous manifest is an error, not "no baseline": that
+    // would silently switch off the growth checks below.
+    let prev = read_manifest(&args.out).context("reading the previous bloom manifest")?;
+    let filters = sets
+        .into_filters_for(args.format_version, args.fp)
+        .context("building bloom filters")?;
     if filters.is_empty() {
-        anyhow::bail!(
-            "format version {} produced no filters — is it a version this build knows? \
-             (supported: {:?})",
-            args.format_version,
-            burton::SUPPORTED_VERSIONS,
-        );
+        anyhow::bail!("the pool produced no filters");
     }
 
     // Fail loud before writing, so a poisoned or hollow build never lands in the
@@ -136,7 +135,11 @@ fn main() -> Result<()> {
         &filters,
         prev.as_ref(),
         &host_good_digests(),
-        args.accept_unusual_growth,
+        if args.accept_unusual_growth {
+            Ratio::Waive
+        } else {
+            Ratio::Enforce
+        },
     )
     .context("bloom safety check failed")?;
     // Loud on purpose. The override exists for a rule change the operator made

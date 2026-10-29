@@ -132,7 +132,7 @@ const TOOLS: &[(&str, &str)] = &[
 const SEVENZIP_BINS: &[&str] = &["7z", "7za", "7zz", "7zr"];
 
 fn tool_available(name: &str) -> bool {
-    filefacts::tools::resolve(name).is_some()
+    cleave::tool_resolution::resolve(name).is_some()
 }
 
 fn install_hint(name: &str) -> &'static str {

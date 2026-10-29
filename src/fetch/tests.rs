@@ -85,26 +85,22 @@ fn manifest_relpath_leads_with_the_scanned_artifact() {
 
 #[test]
 fn dep_pulled_covers_removed_yank_and_hold() {
-    let base = Registry::default();
+    let base = crate::test_registry("", "", "");
     assert!(!dep_pulled(&base));
-    assert!(dep_pulled(&Registry {
-        version_removed: Some(true),
-        ..Registry::default()
-    }));
-    assert!(dep_pulled(&Registry {
-        security_hold: Some(true),
-        ..Registry::default()
-    }));
+    let mut removed = base.clone();
+    removed.version_removed = Some(true);
+    assert!(dep_pulled(&removed));
+    let mut held = base.clone();
+    held.security_hold = Some(true);
+    assert!(dep_pulled(&held));
     // pypi/crates record a yank as a `deprecated` reason, never `version_removed`.
-    assert!(dep_pulled(&Registry {
-        deprecated: Some("Yanked: critical CVE".to_string()),
-        ..Registry::default()
-    }));
+    let mut yanked = base.clone();
+    yanked.deprecated = Some("Yanked: critical CVE".to_string());
+    assert!(dep_pulled(&yanked));
     // An ordinary deprecation notice is not a withdrawal.
-    assert!(!dep_pulled(&Registry {
-        deprecated: Some("use v2 instead".to_string()),
-        ..Registry::default()
-    }));
+    let mut deprecated = base;
+    deprecated.deprecated = Some("use v2 instead".to_string());
+    assert!(!dep_pulled(&deprecated));
 }
 
 fn test_finding(id: &str, crit: cleave::Criticality) -> Finding {
@@ -246,7 +242,6 @@ fn fetched_record() -> FetchRecord {
         content_sha256: Some("d".repeat(64)),
         size: Some(399),
         served: Some(Served::Cache),
-        pin_verified: None,
         outcome: Outcome::Ok,
     }
 }
@@ -408,7 +403,6 @@ fn summary_line_omits_zero_counts() {
         content_sha256: None,
         size,
         served: Some(served),
-        pin_verified: None,
         outcome,
     };
     // Two cache hits, nothing live: the `0 live` is dropped, bytes stay.
@@ -1236,7 +1230,6 @@ fn merge_payload_renames_the_subtree_to_its_locator() {
         content_sha256: Some("d".repeat(64)),
         size: None,
         served: Some(Served::Network),
-        pin_verified: None,
         outcome: Outcome::Ok,
     };
 
@@ -1297,7 +1290,6 @@ fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
         content_sha256: Some("abc123".to_string()),
         size: None,
         served: Some(Served::Network),
-        pin_verified: None,
         outcome: Outcome::Ok,
     };
     assert_eq!(payload_name(&rec), "x-1.0.0.tgz");
@@ -1350,12 +1342,7 @@ fn report_of(files: &serde_json::Value) -> AnalysisReport {
 fn registry_sources_are_released_before_payloads_finish() {
     for skip in [None, Some(SkipReason::AgedOut)] {
         for crit in [cleave::Criticality::Baseline, cleave::Criticality::Notable] {
-            let record = Registry {
-                ecosystem: "npm".to_string(),
-                name: "fixture".to_string(),
-                version: "1".to_string(),
-                ..Default::default()
-            };
+            let record = crate::test_registry("npm", "fixture", "1");
             let body = format!(
                 r#"{{"future_provider_field":"{}"}}"#,
                 "history".repeat(50_000)
@@ -1405,7 +1392,7 @@ fn registry_sources_are_released_before_payloads_finish() {
 fn absent_registry_analysis_drops_sources_and_memo_hits_stay_lazy() {
     let mut gated = Gated {
         reference: purl_ref("pkg:npm/fixture@1"),
-        record: Registry::default(),
+        record: crate::test_registry("", "", ""),
         sources: Some(vec![RecordedSource {
             url: "https://registry.example/fixture".to_string(),
             status: 200,

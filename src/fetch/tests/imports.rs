@@ -419,14 +419,25 @@ fn static_es_module_references_keep_locations_and_skip_builtins() {
         {"specifier":"node:fs", "offset":70},
         {"specifier":"./local.js", "offset":90}
     ]}}});
-    let refs = static_es_module_refs("root!!package/dist/index.js", "javascript", &values);
+    let refs = static_es_module_refs(
+        "root!!package/dist/index.js",
+        filefacts::FileType::JavaScript,
+        &values,
+    );
     assert_eq!(
         refs.iter().map(locator).collect::<Vec<_>>(),
         ["pkg:npm/axios", "pkg:npm/%40scope/dep"]
     );
     assert_eq!(refs[0].offset, Some(12));
     assert!(refs.iter().all(|r| r.source == "ast-import"));
-    assert!(static_es_module_refs("root!!package/index.d.ts", "typescript", &values).is_empty());
+    assert!(
+        static_es_module_refs(
+            "root!!package/index.d.ts",
+            filefacts::FileType::TypeScript,
+            &values
+        )
+        .is_empty()
+    );
 }
 
 #[test]

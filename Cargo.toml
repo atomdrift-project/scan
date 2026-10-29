@@ -224,6 +224,10 @@ tikv-jemalloc-sys = "0.7"
 # any divergence a loud resolve error rather than a silent dual copy.
 tree-sitter = "0.28"
 
+[dev-dependencies]
+# Tests drive fletch's fetcher with canned responses (`fletch::fetch::Fixtures`).
+fletch = { git = "https://github.com/atomdrift-project/fletch.git", features = ["test-util"] }
+
 [features]
 # Keep the per-member Rayon breadcrumbs compiled into release binaries. They are
 # dormant unless a wedge is detected, but make the next archive failure

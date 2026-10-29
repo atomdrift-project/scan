@@ -406,7 +406,7 @@ pub fn report_registry(reg: &Registry, progress: bool) {
         "\n  {}  {} {}",
         fg(Rgb(180, 160, 255), "\u{24d8}"),
         fg(LABEL, "registry"),
-        fg(MUTED, &reg.ecosystem)
+        fg(MUTED, reg.ecosystem.as_str())
     );
     let parts = registry_summary(reg);
     if !parts.is_empty() {
@@ -607,6 +607,8 @@ pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
         Outcome::Failed(why) => {
             FetchRow::new('\u{2716}', "fail", FAILED).detail(failure_detail(why))
         }
+        // An outcome newer than this build: say so rather than guess.
+        _ => FetchRow::new('\u{00b7}', "?", MUTED).detail("unrecognized outcome".to_string()),
     }
 }
 
@@ -643,7 +645,7 @@ pub(super) fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
         Decision::KnownBad => ('\u{1f6a9}', Rgb(235, 120, 120)), // 🚩
         Decision::SightedHostile | Decision::SightedSuspicious => ('\u{1f441}', Rgb(235, 170, 120)), // 👁
         Decision::Skip => ('\u{2713}', GOOD),
-        Decision::Unknown => return None,
+        Decision::Unknown | Decision::Unavailable => return None,
     };
     Some(FetchRow::new(glyph, "known", color))
 }
@@ -717,7 +719,8 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
             }
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin => live += 1,
             Outcome::Failed(_) => failed += 1,
-            Outcome::BudgetExceeded | Outcome::Unresolved(_) | Outcome::Skipped => {}
+            // Not a byte transfer, or an outcome newer than this build.
+            _ => {}
         }
     }
     // Only the counts that actually happened, so a warm run reads

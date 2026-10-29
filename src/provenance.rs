@@ -133,7 +133,7 @@ impl Upload<'_> {
             schema_version: SCHEMA_VERSION,
             artifact: self.artifact(),
             package: self.purl.map(|purl| Package {
-                ecosystem: Some(&record.ecosystem),
+                ecosystem: Some(record.ecosystem.as_str()),
                 name: Some(&record.name),
                 version: Some(&record.version),
                 purl,
@@ -169,8 +169,8 @@ impl Upload<'_> {
         raw: Option<&'r serde_json::value::RawValue>,
     ) -> RegistryBlock<'r> {
         RegistryBlock {
-            source_id: &record.ecosystem,
-            ecosystem: &record.ecosystem,
+            source_id: record.ecosystem.as_str(),
+            ecosystem: record.ecosystem.as_str(),
             format: "fletch.registry",
             url: self.url,
             at: self.at,
@@ -683,7 +683,7 @@ mod tests {
             r#"{{"artifact":{{"sha256":"ab"}},"registry":{{"record":{RECORD},"sources":[]}}}}"#
         );
         let rec = registry_record(json.as_bytes()).expect("record present");
-        assert_eq!(rec.ecosystem, "npm");
+        assert_eq!(rec.ecosystem, filefacts::Ecosystem::Npm);
         assert_eq!(rec.name, "left-pad");
         assert_eq!(rec.version, "1.3.0");
     }
@@ -813,12 +813,7 @@ mod tests {
     fn wrapping_bare_provenance_applies_hopper_raw_cap() {
         let large = format!(r#"{{"blob":"{}"}}"#, "x".repeat(super::MAX_RAW_BYTES)).into_bytes();
         let provenance = super::RegistryProvenance::from_record_sources(
-            fletch::Registry {
-                ecosystem: "npm".to_string(),
-                name: "large".to_string(),
-                version: "1".to_string(),
-                ..fletch::Registry::default()
-            },
+            crate::test_registry("npm", "large", "1"),
             &[fletch::fetch::RecordedSource {
                 url: "https://registry.example/large".to_string(),
                 status: 200,
@@ -940,12 +935,7 @@ mod tests {
 
     #[test]
     fn build_sidecar_with_registry_round_trips_and_carries_schema() {
-        let reg = fletch::Registry {
-            ecosystem: "npm".into(),
-            name: "left-pad".into(),
-            version: "1.3.0".into(),
-            ..Default::default()
-        };
+        let reg = crate::test_registry("npm", "left-pad", "1.3.0");
         let sources = vec![
             fletch::fetch::RecordedSource {
                 url: "https://registry.npmjs.org/left-pad".to_string(),
@@ -976,7 +966,7 @@ mod tests {
 
         // What scan writes, scan (and postdoc's worker) reads back as the same record.
         let rec = registry_record(&json).expect("registry record present");
-        assert_eq!(rec.ecosystem, "npm");
+        assert_eq!(rec.ecosystem, filefacts::Ecosystem::Npm);
         assert_eq!(rec.name, "left-pad");
         assert_eq!(rec.version, "1.3.0");
 
@@ -1007,12 +997,7 @@ mod tests {
         // A packument larger than MAX_RAW_BYTES must not ride along verbatim: it
         // would push the provenance part past hopper's transport cap and be
         // rejected. Drop raw, mark the record partial, keep the normalized record.
-        let reg = fletch::Registry {
-            ecosystem: "npm".into(),
-            name: "socket".into(),
-            version: "1.1.137".into(),
-            ..Default::default()
-        };
+        let reg = crate::test_registry("npm", "socket", "1.1.137");
         let huge = format!(
             r#"{{"name":"socket","blob":"{}"}}"#,
             "x".repeat(super::MAX_RAW_BYTES)

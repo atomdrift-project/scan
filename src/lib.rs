@@ -29,6 +29,7 @@ pub mod bloom_repo;
 pub mod bloom_update;
 pub(crate) mod bundle;
 pub mod cache_cleanup;
+mod cache_sweep;
 mod civil;
 pub mod cli;
 pub(crate) mod deptree;
@@ -247,6 +248,15 @@ pub fn cache_dir() -> Option<std::path::PathBuf> {
 /// has always used, and every analysis pool must match it or a member that
 /// recurses fine on one pool overflows on another.
 pub const RAYON_STACK_MB: usize = 256;
+
+/// A test registry record: `name`@`version` in `ecosystem`, every other field
+/// unknown.
+#[cfg(test)]
+pub(crate) fn test_registry(ecosystem: &str, name: &str, version: &str) -> fletch::Registry {
+    let mut record = fletch::Registry::new(filefacts::Ecosystem::from_label(ecosystem), name);
+    record.version = version.to_string();
+    record
+}
 
 #[cfg(test)]
 mod archive_password_tests {

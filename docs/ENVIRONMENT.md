@@ -31,6 +31,7 @@ does not parse is a startup error, not a silent default.
 | `SCAN_MODELS_DIR` | Use the model bundle in this directory, and never update it. |
 | `SCAN_NO_ANALYSIS_CACHE` | `1` disables every analysis cache in the stack (scan, cleave, filefacts, stng) while keeping compiled rules, for honest benchmarks. |
 | `SCAN_NO_UPDATE_CHECK` | `1` skips the once-a-day check for a newer release. |
+| `SCAN_NO_UPLOAD` | `1` disables CLI result and artifact uploads; Hopper corpus lookups continue. |
 | `CLEAVE_RAYON_THREADS` | Width of the analysis thread pool. Default: the physical core count. |
 | `CLEAVE_TRAITS_DIR` | Read traits from this directory instead of the installed ones (shared with cleave). |
 | `RUST_LOG` | Log filter, e.g. `scan=debug`. |

@@ -308,12 +308,7 @@ fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
         source_sha: "a".repeat(64),
         registries: vec![Gated {
             reference: reference.clone(),
-            record: Registry {
-                ecosystem: "pypi".into(),
-                name: "scapy".into(),
-                version: "1.0".into(),
-                ..Default::default()
-            },
+            record: crate::test_registry("pypi", "scapy", "1.0"),
             sources: None,
             provenance: None,
             skip: None,
@@ -494,7 +489,14 @@ fn supplied_unpinned_code_is_recorded_without_claiming_integrity() {
     let records = pass.finish(&mut supplied).records;
     assert_eq!(records.len(), 1);
     assert!(matches!(records[0].outcome, Outcome::Skipped));
-    assert!(records[0].pin_verified.is_none());
+    // Unpinned code makes no integrity claim either way.
+    assert!(!records[0].coverage.iter().any(|fact| matches!(
+        fact,
+        Coverage::Supplied {
+            pin_verified: Some(_),
+            ..
+        }
+    )));
     assert!(records[0].content_sha256.is_none());
     assert!(
         records[0]

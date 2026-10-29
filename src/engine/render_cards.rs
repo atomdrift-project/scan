@@ -911,7 +911,7 @@ pub(super) fn render_terminal_fetch_context(
             )
         );
         let mut signals = Vec::new();
-        if rec.pin_verified == Some(false) {
+        if matches!(rec.outcome, fletch::fetch::Outcome::PinMismatch) {
             signals.push("checksum mismatch");
         }
         if let Some(registry) = subject.registry {

@@ -61,10 +61,9 @@ pub(super) fn unresolved_downloader_records(
         let Some(view) = &file.filefacts else {
             continue;
         };
-        for call in find::discover_fetch_calls(&file.file_type, &view.symbols)
-            .unresolved
-            .into_iter()
-            .chain(find::discover_batch_programs(&file.file_type, &view.values).unresolved)
+        let file_type = report_file_type(&file.file_type);
+        for call in
+            find::references_from_facts(file_type, &view.values, &view.symbols, &[]).unresolved
         {
             let location = call
                 .offset
@@ -1020,7 +1019,7 @@ impl FetchSession {
             {
                 l.record.coverage.push(Coverage::Supplied {
                     path: path.clone(),
-                    pin_verified: Some(l.record.pin_verified == Some(true)),
+                    pin_verified: pin_verified(&l.reference, &l.record),
                 });
             }
             self.reporter.landed(&l.reference, &l.record);
@@ -1070,11 +1069,12 @@ impl FetchSession {
         let budget = FetchBudget {
             max_count: grant.fetches,
             max_bytes: grant.bytes,
+            ..FetchBudget::default()
         };
         let mut records = match class {
-            FetchClass::Deps => fetch_references_with(
+            FetchClass::Deps => fetch_references(
                 refs,
-                source_sha,
+                Some(source_sha),
                 UrlFetches::Skip,
                 &*self.res.net,
                 &self.res.cache,
@@ -1089,9 +1089,9 @@ impl FetchSession {
                         .filter_map(|r| Some((locator(r).to_owned(), client_user_agent(r)?)))
                         .collect(),
                 };
-                fetch_references_with(
+                fetch_references(
                     refs,
-                    source_sha,
+                    Some(source_sha),
                     UrlFetches::Include,
                     &net,
                     &self.res.cache,
@@ -1375,7 +1375,7 @@ impl FetchSession {
                 // needed, and only now.
                 let provenance = provenance.unwrap_or_else(|| {
                     let sources = sources.unwrap_or_else(|| {
-                        fletch::registry_with_sources(
+                        fletch::registry::lookup_recorded(
                             &reference.locator,
                             &*self.res.net,
                             &self.res.cache,

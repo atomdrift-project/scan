@@ -7,54 +7,18 @@
 )]
 use super::*;
 
-pub(super) const FORMAT_GROUPS: &[(&str, &[&str])] = &[
-    (
-        "script",
-        &[
-            "batch",
-            "javascript",
-            "lua",
-            "perl",
-            "php",
-            "powershell",
-            "python",
-            "ruby",
-            "shell",
-            "typescript",
-            "vbscript",
-        ],
-    ),
-    ("native_binary", &["elf", "macho", "pe"]),
-    (
-        "archive_package",
-        &[
-            "7z", "apk", "cab", "deb", "egg", "gz", "jar", "msi", "rar", "rpm", "tar", "tgz",
-            "vsix", "war", "whl", "xpi", "xz", "zip", "zst",
-        ],
-    ),
-    (
-        "document",
-        &[
-            "doc", "docx", "html", "pdf", "ppt", "pptx", "rtf", "xls", "xlsx",
-        ],
-    ),
-    (
-        "source_code",
-        &[
-            "c", "cpp", "csharp", "go", "java", "kotlin", "makefile", "rust", "scala", "swift",
-        ],
-    ),
-    (
-        "config_data",
-        &["ini", "json", "plist", "toml", "xml", "yaml", "yml"],
-    ),
-    (
-        "media",
-        &[
-            "bmp", "gif", "jpg", "jpeg", "mp3", "mp4", "png", "svg", "webp",
-        ],
-    ),
-];
+/// Group 6b's format groups: filefacts' groups in label order, the order
+/// collimator lays them out in. `unknown` is left out; a file with no
+/// identified type counts toward `format:unknown_file_fraction` instead.
+pub(super) static FORMAT_GROUPS: LazyLock<Vec<filefacts::Group>> = LazyLock::new(|| {
+    let mut groups: Vec<_> = filefacts::Group::ALL
+        .iter()
+        .copied()
+        .filter(|&group| group != filefacts::Group::Unknown)
+        .collect();
+    groups.sort_by_key(|group| group.label());
+    groups
+});
 
 /// Expected ghosts (v16 group 23).
 pub(super) const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
@@ -305,7 +269,8 @@ pub(super) fn metric_base_feature_names() -> impl Iterator<Item = String> {
 pub(super) static FORMAT_FEATURE_NAMES: LazyLock<Vec<[String; 5]>> = LazyLock::new(|| {
     FORMAT_GROUPS
         .iter()
-        .map(|&(group, _)| {
+        .map(|group| {
+            let group = group.label();
             [
                 format!("format:{group}"),
                 format!("format:{group}_file_fraction"),

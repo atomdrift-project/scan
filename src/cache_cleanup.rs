@@ -6,15 +6,15 @@
 //! the per-payload analysis a daemon runs. [`start`] therefore picks a one-shot
 //! sweep for CLI runs and a recurring loop for daemons.
 //!
-//! The mechanism is filefacts' `cache_sweep` (best-effort, self-gated to once a
-//! day, non-blocking): one detached thread that dies with the process. Each component
-//! gets one budget capped at 30 days and 2 GiB (both env-overridable). fletch's
-//! blob cache is the exception: fletch sweeps it with its own copy of the same
-//! mechanism, since only fletch knows its layout and budget.
+//! The mechanism is scan's `cache_sweep` module (best-effort, self-gated to once a
+//! day, non-blocking): one detached thread that dies with the process. scan's
+//! caches share one budget capped at 30 days and 2 GiB. fletch's blob cache and
+//! filefacts' own cache are swept by those crates, since only they know their
+//! layout and budget.
 
 use std::time::Duration;
 
-use filefacts::cache_sweep::{self, Budget, Root};
+use crate::cache_sweep::{self, Budget, Root};
 
 /// Re-sweep interval for daemon modes. The daily marker makes most wakes a
 /// single `stat`, so this only bounds how soon a newly-oversized cache is seen.
@@ -24,7 +24,7 @@ const DAEMON_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// never exits (sweep must recur); otherwise a one-shot CLI that sweeps once at
 /// startup, racing the real work.
 pub fn start(daemon: bool) {
-    let budgets = budgets();
+    let budgets = vec![budget()];
     // fletch's blob cache: sharded, a blob and its sidecar evicted together,
     // flat leftovers of an older layout reclaimed, `FLETCH_CACHE_*` overrides.
     let refs = vec![fletch::cache_sweep::refs_budget()];
@@ -37,12 +37,8 @@ pub fn start(daemon: bool) {
     }
 }
 
-/// Every cache a scan process is responsible for, one budget per component.
-fn budgets() -> Vec<Budget> {
-    // The string/rizin caches older stng releases filled, aging out now that
-    // filefacts caches strings itself; honours a relocated STNG_STRING_CACHE_DIR.
-    let mut out = vec![cache_sweep::legacy_stng_budget()];
-
+/// The caches scan owns, under one budget.
+fn budget() -> Budget {
     // scan's own caches: the analysis snapshot store
     // (`analysis/<version>/<key>.zst`, depth 2), the lookup verdict index
     // (`lookup/<version>/<sha>.json` and its `<key>.purl` aliases, also depth
@@ -58,13 +54,11 @@ fn budgets() -> Vec<Budget> {
     if let Some(path) = crate::interpret::cache_base() {
         scan_roots.push(Root { path, depth: 1 });
     }
-    out.push(Budget {
+    Budget {
         label: "scan",
         roots: scan_roots,
         max_age: Duration::from_secs(30 * 24 * 60 * 60),
         max_bytes: 2 * 1024 * 1024 * 1024,
         max_entries: filefacts::cache::DEFAULT_MAX_ITEMS,
-    });
-
-    out
+    }
 }

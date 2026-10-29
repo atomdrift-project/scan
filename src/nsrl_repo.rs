@@ -29,7 +29,9 @@ pub fn install_dir() -> anyhow::Result<PathBuf> {
 /// The installed NSRL identity, without loading its large bit array.
 #[must_use]
 pub fn installed_manifest() -> Option<Manifest> {
-    let manifest = burton::build::read_manifest(&install_dir().ok()?)?;
+    let manifest = burton::read_manifest(&install_dir().ok()?)
+        .inspect_err(|error| tracing::warn!(%error, "NSRL manifest unreadable"))
+        .ok()??;
     validate_manifest(&manifest).ok()?;
     Some(manifest)
 }
@@ -63,7 +65,9 @@ fn release_key(version: &str) -> Option<[u32; 3]> {
 
 /// Open an NSRL bundle, checking its explicit dataset identity.
 pub(crate) fn open(dir: &Path) -> Result<burton::Lookup> {
-    let manifest = burton::build::read_manifest(dir).context("reading NSRL manifest")?;
+    let manifest = burton::read_manifest(dir)
+        .context("reading NSRL manifest")?
+        .context("no NSRL manifest")?;
     validate_manifest(&manifest)?;
     burton::Lookup::open(dir, KEY_SCHEME).context("opening NSRL bundle")
 }
@@ -235,7 +239,7 @@ mod tests {
     }
 
     fn release(built: &str, version: &str) -> Release {
-        let entry = |stem: &str, n: u64| burton::build::Entry {
+        let entry = |stem: &str, n: u64| burton::Entry {
             file: format!("{stem}-{}.adbl", "a".repeat(64)),
             sha256: "a".repeat(64),
             format_version: 1,
@@ -327,7 +331,7 @@ mod tests {
             std::fs::write(dir.path().join(&file), bytes).unwrap();
             manifest.filter.insert(
                 stem.to_owned(),
-                burton::build::Entry {
+                burton::Entry {
                     file,
                     sha256,
                     n,
@@ -357,7 +361,7 @@ mod tests {
 
     #[test]
     fn accepts_only_content_addressed_digest_filters_from_nsrl() {
-        let entry = |stem: &str, n: u64| burton::build::Entry {
+        let entry = |stem: &str, n: u64| burton::Entry {
             file: format!("{stem}-{}.adbl", "a".repeat(64)),
             sha256: "a".repeat(64),
             format_version: 1,

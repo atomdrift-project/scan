@@ -13,11 +13,13 @@ use super::*;
 /// filefacts; declaration files never execute even when they omit `type`.
 pub(super) fn static_es_module_refs(
     path: &str,
-    file_type: &str,
+    file_type: filefacts::FileType,
     values: &serde_json::Value,
 ) -> Vec<Reference> {
-    if !matches!(file_type, "javascript" | "typescript")
-        || path.ends_with(".d.ts")
+    if !matches!(
+        file_type,
+        filefacts::FileType::JavaScript | filefacts::FileType::TypeScript
+    ) || path.ends_with(".d.ts")
         || path.ends_with(".d.cts")
         || path.ends_with(".d.mts")
     {
