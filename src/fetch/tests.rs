@@ -490,6 +490,73 @@ fn purl_precheck_requires_an_exact_version() {
     }
 }
 
+/// Only a coordinate whose bytes cannot change may be answered by name.
+#[test]
+fn only_immutable_coordinates_are_answered_by_name() {
+    for purl in [
+        "pkg:npm/foo@1.2.3",
+        "pkg:cargo/serde@1.0.200",
+        "pkg:golang/github.com/a/b@v1.2.3",
+        "pkg:nuget/Newtonsoft.Json@13.0.3",
+        "pkg:maven/org.a/b@1.0",
+        "pkg:github/o/r@0123456789abcdef0123456789abcdef01234567",
+    ] {
+        assert!(immutable_coordinate(purl, None), "{purl}");
+    }
+    for purl in [
+        "pkg:github/o/r@v1.2.3",
+        "pkg:pypi/foo@1.0",
+        "pkg:gem/rails@7.1.0",
+        "pkg:docker/library/alpine@3.19",
+        "pkg:maven/org.a/b@1.0-SNAPSHOT",
+        "pkg:npm/foo@1.2.3?repository_url=https://npm.corp.example",
+        "pkg:npm/foo@1.2.3?download_url=https://evil.example/foo.tgz",
+        "pkg:npm/foo@latest",
+        "pkg:npm/foo",
+    ] {
+        assert!(!immutable_coordinate(purl, None), "{purl}");
+    }
+    // PyPI closes a release to new files 14 days after it opens (July 2026);
+    // a day of margin covers whose clock and which start PyPI means.
+    let day = 86_400;
+    assert!(!immutable_coordinate("pkg:pypi/foo@1.0", Some(14 * day)));
+    assert!(!immutable_coordinate("pkg:pypi/foo@1.0", Some(15 * day)));
+    assert!(immutable_coordinate("pkg:pypi/foo@1.0", Some(15 * day + 1)));
+    assert!(!immutable_coordinate(
+        "pkg:pypi/foo@1.0?repository_url=https://pypi.corp.example",
+        Some(400 * day)
+    ));
+    // Age makes no other mutable ecosystem immutable.
+    assert!(!immutable_coordinate(
+        "pkg:gem/rails@7.1.0",
+        Some(400 * day)
+    ));
+}
+
+/// A mutable coordinate resolves to the digest the registry lists for the
+/// file a fetch would download, and to nothing when it lists none.
+#[test]
+fn a_mutable_coordinate_resolves_to_its_registry_digest() {
+    let sha = "ab".repeat(32);
+    let doc = format!(
+        r#"{{"info":{{"version":"1.0"}},"urls":[{{"filename":"widget-1.0-py3-none-any.whl",
+        "url":"https://files.pythonhosted.org/w/widget-1.0-py3-none-any.whl",
+        "packagetype":"bdist_wheel","digests":{{"sha256":"{}"}}}}]}}"#,
+        sha.to_ascii_uppercase()
+    );
+    let net = fletch::fetch::Fixtures::default()
+        .with("https://pypi.org/pypi/widget/1.0/json", doc.as_bytes());
+    let cache = super::tests_offline::cache();
+    assert_eq!(
+        registry_digest("pkg:pypi/widget@1.0", &net, &cache).as_deref(),
+        Some(sha.as_str())
+    );
+    assert_eq!(
+        registry_digest("pkg:github/o/r@v1", &super::tests_offline::Offline, &cache),
+        None
+    );
+}
+
 #[test]
 fn unavailable_commands_are_typed_and_attributed_to_the_declaring_file() {
     let sha = "a".repeat(64);
@@ -1209,6 +1276,9 @@ fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
     // Query string is stripped.
     rec.resolved_url = Some("https://reg.test/dl?file=stage2.sh".to_string());
     // basename before '?' is "dl" (path component), so query strip applies to it.
+    assert_eq!(payload_name(&rec), "dl");
+    // A slash in the query is not a path separator.
+    rec.resolved_url = Some("https://reg.test/dl?f=a/stage2.sh".to_string());
     assert_eq!(payload_name(&rec), "dl");
 
     // No usable basename → content hash.

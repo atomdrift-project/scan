@@ -13,9 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
-mod decision_cache;
-use decision_cache::DecisionCache;
-
 pub use burton::{Artifact, Decision};
 
 /// The PURL canonicalization scan's keys are in.
@@ -64,18 +61,12 @@ pub fn reload() {
     }
 }
 
-/// Scan's view of a [`burton::Lookup`]: the bundle, plus a bounded memo for the
-/// lookup routes.
-///
-/// [`Self::memo_sha256`] / [`Self::memo_purl`] keep a 4096-entry LRU of recent
-/// decisions for `GET /sha256/{sha}` and `GET /purl`. Scan-time probes go
-/// straight through, so a unique-file crawl cannot evict the lookup working set.
+/// Scan's view of a [`burton::Lookup`]: the bundle, plus the optional NSRL
+/// digest filter that may vouch for a file the bundle does not know.
 #[derive(Debug)]
 pub struct Lookup {
     inner: burton::Lookup,
     nsrl: Option<burton::Lookup>,
-    sha256_memo: DecisionCache<[u8; 32]>,
-    purl_memo: DecisionCache<String>,
 }
 
 impl Default for Lookup {
@@ -86,12 +77,7 @@ impl Default for Lookup {
 
 impl Lookup {
     fn wrap(inner: burton::Lookup) -> Self {
-        Self {
-            inner,
-            nsrl: None,
-            sha256_memo: DecisionCache::new(decision_cache::CAP),
-            purl_memo: DecisionCache::new(decision_cache::CAP),
-        }
+        Self { inner, nsrl: None }
     }
 
     /// Open the installed bundle, or carry on without one.
@@ -240,24 +226,6 @@ impl Lookup {
         } else {
             Decision::Unknown
         }
-    }
-
-    /// The verdict for an artifact known by both keys.
-    pub fn decide_both(&self, purl: &str, digest: &[u8; 32]) -> Decision {
-        self.decide_any(Some(purl), Some(digest))
-    }
-
-    /// Memoized [`Self::decide_sha256`], for `GET /sha256/{sha}`.
-    pub fn memo_sha256(&self, digest: &[u8; 32]) -> Decision {
-        self.sha256_memo
-            .get_or_insert(digest, || self.decide_sha256(digest))
-    }
-
-    /// Memoized [`Self::decide_purl`], for `GET /purl`. Keyed on the request
-    /// string, so a hit skips canonicalization as well as the filter probe.
-    pub fn memo_purl(&self, purl: &str) -> Decision {
-        self.purl_memo
-            .get_or_insert(purl, || self.decide_purl(purl))
     }
 
     /// True when a bundle is loaded.
@@ -431,7 +399,6 @@ mod tests {
         let mut lookup = Lookup::load_from(primary.path());
         lookup.attach_nsrl(primary.path(), nsrl.path());
         assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Skip);
-        assert_eq!(lookup.memo_sha256(&digest(1)), Decision::Skip);
         assert!(lookup.may_skip(&Artifact::sha256(&digest(1))));
         assert_eq!(lookup.decide_sha256(&digest(2)), Decision::KnownBad);
         assert_eq!(lookup.decide_sha256(&digest(3)), Decision::SightedHostile);
@@ -440,15 +407,15 @@ mod tests {
             Decision::SightedSuspicious
         );
         assert_eq!(
-            lookup.decide_both("pkg:npm/ok@1", &digest(1)),
+            lookup.decide_any(Some("pkg:npm/ok@1"), Some(&digest(1))),
             Decision::Skip
         );
         assert_eq!(
-            lookup.decide_both("pkg:npm/unknown@1", &digest(1)),
+            lookup.decide_any(Some("pkg:npm/unknown@1"), Some(&digest(1))),
             Decision::Unknown
         );
         assert_eq!(
-            lookup.decide_both("pkg:npm/bad@1", &digest(1)),
+            lookup.decide_any(Some("pkg:npm/bad@1"), Some(&digest(1))),
             Decision::KnownBad
         );
         assert_eq!(lookup.decide_purl("pkg:npm/unknown@1"), Decision::Unknown);
@@ -538,39 +505,19 @@ mod tests {
         let lk = Lookup::load_from(tmp.path());
 
         assert_eq!(
-            lk.decide_both("pkg:npm/left-pad@1.3.0", &digest(3)),
+            lk.decide_any(Some("pkg:npm/left-pad@1.3.0"), Some(&digest(3))),
             Decision::Skip
         );
         // A blessed digest under a coordinate nobody blessed: the grinding case.
         assert_eq!(
-            lk.decide_both("pkg:npm/attacker@1.0.0", &digest(3)),
+            lk.decide_any(Some("pkg:npm/attacker@1.0.0"), Some(&digest(3))),
             Decision::Unknown
         );
         // Keys that disagree outright.
         assert_eq!(
-            lk.decide_both("pkg:npm/left-pad@1.3.0", &digest(4)),
+            lk.decide_any(Some("pkg:npm/left-pad@1.3.0"), Some(&digest(4))),
             Decision::Conflicted
         );
-    }
-
-    #[test]
-    fn the_memo_returns_what_the_direct_probe_would() {
-        let tmp = tempfile::tempdir().unwrap();
-        publish(
-            tmp.path(),
-            &[
-                (Tier::Good, rec(Some("pkg:npm/ok@1.0.0"), Some(digest(5)))),
-                (Tier::SightedHostile, rec(None, Some(digest(6)))),
-            ],
-        );
-        let lk = Lookup::load_from(tmp.path());
-
-        for _ in 0..2 {
-            assert_eq!(lk.memo_purl("pkg:npm/ok@1.0.0"), Decision::Skip);
-            assert_eq!(lk.memo_sha256(&digest(5)), Decision::Skip);
-            assert_eq!(lk.memo_sha256(&digest(6)), Decision::SightedHostile);
-            assert_eq!(lk.memo_sha256(&digest(7)), Decision::Unknown);
-        }
     }
 
     #[test]
@@ -608,12 +555,12 @@ mod tests {
         .expect("write bundle");
 
         let lk = Lookup::load_from(tmp.path());
-        assert_eq!(lk.memo_purl("pkg:npm/good@1"), Decision::Skip);
-        assert_eq!(lk.memo_purl("pkg:npm/evil@1"), Decision::KnownBad);
-        assert_eq!(lk.memo_sha256(&good_sha), Decision::Skip);
+        assert_eq!(lk.decide_purl("pkg:npm/good@1"), Decision::Skip);
+        assert_eq!(lk.decide_purl("pkg:npm/evil@1"), Decision::KnownBad);
+        assert_eq!(lk.decide_sha256(&good_sha), Decision::Skip);
         let mut unseen = [0u8; 32];
         unseen[0] = 0xab;
-        assert_eq!(lk.memo_sha256(&unseen), Decision::Unknown);
+        assert_eq!(lk.decide_sha256(&unseen), Decision::Unknown);
     }
 
     /// Without filters installed every key is `unknown` — fail closed, never
@@ -622,7 +569,7 @@ mod tests {
     fn filters_absent_reads_unknown() {
         use crate::bloom_repo::{Decision, Lookup};
         let lk = Lookup::default();
-        assert_eq!(lk.memo_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
-        assert_eq!(lk.memo_sha256(&[7u8; 32]), Decision::Unknown);
+        assert_eq!(lk.decide_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
+        assert_eq!(lk.decide_sha256(&[7u8; 32]), Decision::Unknown);
     }
 }

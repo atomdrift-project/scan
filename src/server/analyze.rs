@@ -14,7 +14,7 @@ use tokio::runtime::Handle;
 
 use super::corpus::{Corpus, Reached};
 use super::error::ApiError;
-use super::flight::{Flight, Outcome};
+use super::flight::{Flight, FlightKey, Outcome};
 use super::{AnalysisOutcome, AnalysisPermit, AppState, InFlightRequest, RequestGuard};
 use crate::analysis::{Analysis, ModelResources, RequestPhase};
 use crate::engine::{HopperRoute, ScanResult};
@@ -244,15 +244,16 @@ impl Leader {
             .run(work)
             .await;
 
+        let elapsed_ms = crate::duration_ms(started.elapsed());
         let key = self.flight.key();
-        let finished = Finished {
-            request_id: self.request_id,
+        match record(
+            &self.state,
+            self.request_id,
             key,
-            purl: key.purl(),
-            elapsed_ms: crate::duration_ms(started.elapsed()),
-            phases: phase.timeline(),
-        };
-        match record(&self.state, &finished, outcome) {
+            elapsed_ms,
+            &phase.timeline(),
+            outcome,
+        ) {
             Ok(result) => self.file(result).await,
             Err(refusal) => Outcome::Failed(refusal),
         }
@@ -283,33 +284,17 @@ impl Leader {
     }
 }
 
-/// A finished analysis, for its completion line.
-pub(super) struct Finished<'a> {
-    pub(super) request_id: u64,
-    /// What the request was about, as the log names it.
-    pub(super) key: &'a (dyn Display + Sync),
-    /// The package it was named by, for the per-type figures.
-    pub(super) purl: Option<&'a str>,
-    pub(super) elapsed_ms: u64,
-    /// Where the wall time went, from [`RequestPhase::timeline`].
-    pub(super) phases: String,
-}
-
 /// Log a finished analysis and count it in the routing figures; turn a failure
 /// into its answer. Every analyze route reports here, so none of them can
-/// drift out of `/_/stats`.
+/// drift out of `/_/stats`. `phases` is [`RequestPhase::timeline`].
 fn record(
     state: &AppState,
-    finished: &Finished<'_>,
+    request_id: u64,
+    key: &FlightKey,
+    elapsed_ms: u64,
+    phases: &str,
     outcome: AnalysisOutcome,
 ) -> Result<Box<ScanResult>, ApiError> {
-    let Finished {
-        request_id,
-        key,
-        purl,
-        elapsed_ms,
-        ref phases,
-    } = *finished;
     match outcome {
         AnalysisOutcome::Ok(Ok(result)) => {
             tracing::info!(
@@ -339,7 +324,7 @@ fn record(
                 },
                 "<-- 200 OK",
             );
-            state.jobs.finished(&result, elapsed_ms, purl);
+            state.jobs.finished(&result, elapsed_ms, key.purl());
             Ok(result)
         }
         AnalysisOutcome::Ok(Err(e)) => {

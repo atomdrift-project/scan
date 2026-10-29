@@ -30,14 +30,12 @@ pub use self::envelope::{
     DepResult, EmbeddedFile, HopperRoute, MemberEvals, MlSection, ScanResult, ScanResultEnvelope,
     ScanResultEnvelopeRef, StoredFile, StoredReport, TopFinding,
 };
-pub use self::pipeline::{PendingLlm, count_findings, extract_top_findings};
+pub use self::pipeline::PendingLlm;
 pub use self::run::{
     Fetched, FetchedKind, report_remote, run, run_bytes, run_paths, run_paths_with, run_with,
     scan_bytes, scan_file,
 };
-pub use self::verdict::{
-    FloorArm, FloorDecision, level_confidence, synthesized_level, trait_floor,
-};
+pub use self::verdict::{FloorArm, FloorDecision, level_confidence, synthesized_level};
 
 pub(crate) use self::envelope::dep_envelope;
 pub(crate) use self::hopper::artifact_filename;
@@ -495,7 +493,9 @@ pub fn render_saved_report(
         crate::OutputFormat::Terminal => Ok(format_context(&loaded.report, &TinyOpts::terminal())),
         crate::OutputFormat::Tiny => Ok(format_context(&loaded.report, &TinyOpts::tiny())),
         crate::OutputFormat::Interpret => render_context::render_saved_interpret(loaded),
-        _ => anyhow::bail!("render supports --format terminal, tiny, or interpret"),
+        crate::OutputFormat::Json => {
+            anyhow::bail!("render supports --format terminal, tiny, or interpret")
+        }
     }
 }
 

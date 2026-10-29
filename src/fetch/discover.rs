@@ -260,11 +260,15 @@ pub(super) fn collect_references_from_input(
             .map_or_else(|| name_path.to_string_lossy(), |n| n.to_string_lossy());
         // A provenance document names one artifact and catalogues many. The
         // string hunt cannot tell those apart, so it is replaced by the subject
-        // this document is *about* — see `provenance_subject`.
-        let mut hunted = if is_provenance_document(&root.file_type, &name) {
-            provenance_subject(&bytes).into_iter().collect()
-        } else {
-            find::references_in_bytes(&bytes, &name)
+        // this document is *about* — see `provenance_subject`. Only when it
+        // states one: anything can be named `*.forage.json`, and a name alone
+        // must not switch the hunt off.
+        let subject = is_provenance_document(&root.file_type, &name)
+            .then(|| provenance_subject(&bytes))
+            .flatten();
+        let mut hunted = match subject {
+            Some(subject) => vec![subject],
+            None => find::references_in_bytes(&bytes, &name),
         };
         if is_ci_context(root) {
             mark_scope(&mut hunted, filefacts::DependencyScope::Ci);

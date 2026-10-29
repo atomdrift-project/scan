@@ -51,10 +51,7 @@ impl RulesStartup {
         if let Some(dir) = self.traits_dir.as_ref() {
             cleave::traits_repo::set_override_dir(Some(dir.into()));
         }
-        refresh_rules_at_startup(
-            self.refresh == Refresh::Force,
-            self.refresh == Refresh::Skip,
-        )?;
+        refresh_rules_at_startup(self.refresh)?;
         let model_dir = crate::cli::resolve_model_dir(self.model_dir)?;
         let level = crate::cli::operating_level(self.level, self.thresholds.is_some(), &model_dir);
         Ok(Rules {
@@ -219,7 +216,8 @@ pub fn refresh(
 }
 
 /// Refresh every rule source as a long-lived process starts, unless
-/// `no_update`. Every failure but one is ridden out on the installed rules: a
+/// [`Refresh::Skip`]; [`Refresh::IfStale`] still fetches, since a daemon only
+/// starts on deploy or restart. Every failure but one is ridden out on the installed rules: a
 /// host in a disconnected environment must still start.
 ///
 /// This is also what fills a `--traits-dir` naming an empty directory on a
@@ -229,12 +227,12 @@ pub fn refresh(
 /// The one failure that is fatal: `--enriched` was asked for and the token is
 /// missing or refused. A daemon that came up anyway would serve rules nobody
 /// deployed it with.
-pub fn refresh_rules_at_startup(force: bool, no_update: bool) -> Result<()> {
-    if no_update {
+pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
+    if refresh == Refresh::Skip {
         tracing::warn!("--no-update: skipping the startup rules refresh");
         return Ok(());
     }
-    let refreshed = refresh(&Source::ALL, None, force, true);
+    let refreshed = self::refresh(&Source::ALL, None, refresh == Refresh::Force, true);
     for (source, e) in refreshed.failures() {
         tracing::warn!(
             source = source.name(),

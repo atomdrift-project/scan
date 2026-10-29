@@ -91,6 +91,10 @@ hopper it answers from the index alone.
 One artifact answers with one object; repeated keys answer with a list, in
 the order asked.
 
+`X-Scan-Source` names the layer that answered: `scan:index`, `scan:bloom`,
+`scan:replica`, `scan:primary`, or `none` when nothing could. A list reports
+the most expensive layer any row reached, in that order.
+
 | `decision`    | Meaning |
 | ------------- | ------- |
 | `allow`       | Analyzed; not hostile at the caller's budget. |
@@ -190,7 +194,8 @@ recent latency by type and size, upload backlog.
 `/_/reload` reloads the model bundle and traits from disk and swaps them in;
 on failure the previous model stays. `/_/update` first pulls the latest
 traits, models, bloom and NSRL filters; its `update_errors` names each source
-that failed to update and why, and is empty when none did. One at a time; a
+that failed to update, and is empty when none did. Why a source or a reload
+failed is logged, never returned: those errors carry install paths. One at a time; a
 concurrent call gets `409`.
 
 ### `GET /_/memory`, `GET /_/requests`, `GET /_/threads`

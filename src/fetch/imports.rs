@@ -347,12 +347,9 @@ pub(super) fn reconcile_python_imports(
     if candidate_sources.is_empty() {
         return Vec::new();
     }
-    let mut source_refs: HashMap<&str, Vec<Reference>> = HashMap::new();
+    let mut source_refs: HashMap<&str, Vec<&Reference>> = HashMap::new();
     for (sha, refs) in worklist.iter() {
-        source_refs
-            .entry(sha)
-            .or_default()
-            .extend(refs.iter().cloned());
+        source_refs.entry(sha).or_default().extend(refs);
     }
     let mut owners: HashMap<String, HashMap<String, Vec<Reference>>> = HashMap::new();
     for file in &report.files {
@@ -378,7 +375,7 @@ pub(super) fn reconcile_python_imports(
             continue;
         }
         let names = owners.entry(owner).or_default();
-        for reference in source_refs.get(file.sha256.as_str()).into_iter().flatten() {
+        for &reference in source_refs.get(file.sha256.as_str()).into_iter().flatten() {
             if reference.kind != RefKind::Dependency {
                 continue;
             }
@@ -424,7 +421,6 @@ pub(super) fn reconcile_python_imports(
             existing.extend(declarations);
         }
     }
-    drop(candidate_sources);
     let mut covered = Vec::new();
     for (source, refs) in worklist {
         let mut updated = Vec::new();

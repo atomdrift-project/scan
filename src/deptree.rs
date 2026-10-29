@@ -21,6 +21,7 @@
 //! drawing, at most once a tick, so network threads never wait on the terminal.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -321,7 +322,7 @@ fn render(state: &mut State, finished: bool) {
     let mut out = String::new();
     // Move up to the top of the previously drawn region.
     if state.drawn > 0 {
-        out.push_str(&format!("\x1b[{}A", state.drawn));
+        let _ = write!(out, "\x1b[{}A", state.drawn);
     }
     // Repaint each line, clearing whatever it overwrites.
     for line in &lines {
@@ -337,7 +338,7 @@ fn render(state: &mut State, finished: bool) {
         out.push('\n');
     }
     if leftover > 0 {
-        out.push_str(&format!("\x1b[{leftover}A"));
+        let _ = write!(out, "\x1b[{leftover}A");
     }
     state.drawn = lines.len();
     state.dirty = false;
@@ -401,10 +402,12 @@ fn compose(state: &State, finished: bool) -> Vec<String> {
     // flight, then the most recently settled (a sense of motion), then upcoming
     // pending — reserving one line for the footer that counts the remainder.
     let slots = body.saturating_sub(1);
+    // A whole batch goes in flight at once, so even that set must be capped.
     let mut chosen: Vec<usize> = visible
         .iter()
         .copied()
         .filter(|&i| matches!(state.entries[i].status, Status::Active(_)))
+        .take(slots)
         .collect();
     let mut recent: Vec<usize> = visible
         .iter()
@@ -412,20 +415,12 @@ fn compose(state: &State, finished: bool) -> Vec<String> {
         .filter(|&i| state.entries[i].status.is_done())
         .collect();
     recent.sort_unstable_by_key(|&i| std::cmp::Reverse(state.entries[i].seq));
-    for i in recent {
-        if chosen.len() >= slots {
-            break;
-        }
-        chosen.push(i);
-    }
-    for &i in &visible {
-        if chosen.len() >= slots {
-            break;
-        }
-        if matches!(state.entries[i].status, Status::Pending) {
-            chosen.push(i);
-        }
-    }
+    let pending = visible
+        .iter()
+        .copied()
+        .filter(|&i| matches!(state.entries[i].status, Status::Pending));
+    let room = slots - chosen.len();
+    chosen.extend(recent.into_iter().chain(pending).take(room));
     // Render in discovery order so rows hold a stable position frame to frame.
     chosen.sort_unstable();
     lines.extend(chosen.iter().map(|&i| draw(i)));
@@ -446,7 +441,7 @@ fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize)
     };
     let mut text = format!("dependencies  {done}/{total}");
     if active > 0 {
-        text.push_str(&format!("  \u{b7}  {active} in flight"));
+        let _ = write!(text, "  \u{b7}  {active} in flight");
     }
     let line = format!(
         "  {}  {}",
@@ -731,6 +726,19 @@ mod tests {
         assert!(body.contains("d51"), "active row d51 not surfaced");
         assert!(body.contains("more"), "hidden remainder not counted");
         assert!(strip_ansi(&lines[0]).contains("2 in flight"));
+    }
+
+    #[test]
+    fn a_whole_batch_in_flight_stays_within_the_cap() {
+        let entries: Vec<Entry> = (0..50).map(|i| active(&format!("a{i}"), i)).collect();
+        let rows = 12;
+        let lines = compose(&state(entries, rows), false);
+        assert!(
+            lines.len() <= rows - RESERVE_ROWS,
+            "region exceeds viewport"
+        );
+        assert!(strip_ansi(&lines[0]).contains("50 in flight"));
+        assert!(strip_ansi(lines.last().unwrap()).contains("more"));
     }
 
     #[test]

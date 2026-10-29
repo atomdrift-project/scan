@@ -21,9 +21,13 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(21 * 60 + 120);
 /// What a reload installed.
 struct Reloaded {
     elapsed_ms: u128,
-    /// Why the cleave traits did not reload; the previous traits stay.
-    traits_reload_error: Option<String>,
+    /// False when the cleave traits failed to reload; the previous traits stay.
+    traits_reloaded: bool,
 }
+
+/// What a caller is told when the traits did not reload. The error itself is
+/// logged: like a failed model load, it carries filesystem paths.
+const TRAITS_RELOAD_FAILED: &str = "Failed to reload traits; previous traits retained";
 
 impl AppState {
     /// Reload the cleave traits and the model bundle from disk and serve them.
@@ -31,14 +35,14 @@ impl AppState {
     fn reload_bundle(&self) -> anyhow::Result<Reloaded> {
         let start = Instant::now();
         // Traits first, so the new model runs against fresh rules.
-        let traits_reload_error = match cleave::reload_capability_mapper() {
+        let traits_reloaded = match cleave::reload_capability_mapper() {
             Err(e) => {
                 tracing::warn!("cleave trait reload failed (previous traits retained): {e:#}");
-                Some(e)
+                false
             }
             Ok(_) => {
                 tracing::info!("cleave traits reloaded");
-                None
+                true
             }
         };
         cleave::clear_all_thread_caches();
@@ -69,7 +73,7 @@ impl AppState {
         }
         Ok(Reloaded {
             elapsed_ms,
-            traits_reload_error,
+            traits_reloaded,
         })
     }
 }
@@ -106,8 +110,8 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
                 "status": "ok",
                 "elapsed_ms": reloaded.elapsed_ms,
             });
-            if let Some(err) = &reloaded.traits_reload_error {
-                body["traits_reload_error"] = serde_json::json!(err);
+            if !reloaded.traits_reloaded {
+                body["traits_reload_error"] = TRAITS_RELOAD_FAILED.into();
             }
             Json(body).into_response()
         }
@@ -140,11 +144,11 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// Pull every rule source, then reload the bloom filters if they changed.
-/// Every failure is reported and none is fatal: the model reload that follows
-/// runs against whatever is on disk, and a bundle that fails validation never
-/// lands there. Blocking.
-fn pull_updates() -> Vec<(crate::rules::Source, String)> {
+/// Pull every rule source, then reload the bloom filters if they changed, and
+/// return the sources that failed. Every failure is logged and none is fatal:
+/// the model reload that follows runs against whatever is on disk, and a
+/// bundle that fails validation never lands there. Blocking.
+fn pull_updates() -> Vec<crate::rules::Source> {
     use crate::rules::Source;
     let refreshed = crate::rules::refresh(&Source::ALL, None, false, true);
     if refreshed.changed_source(Source::Bloom) || refreshed.changed_source(Source::Nsrl) {
@@ -158,7 +162,7 @@ fn pull_updates() -> Vec<(crate::rules::Source, String)> {
                 error = format!("{e:#}"),
                 "update failed"
             );
-            (source, format!("{e:#}"))
+            source
         })
         .collect()
 }
@@ -198,10 +202,16 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             .into_response();
         }
     };
-    // Per source that failed to update, why; empty when all of them did.
+    // Each source that failed to update; empty when all of them did. Why is in
+    // the log, not here: an update error names install paths and bucket URLs.
     let update_errors: serde_json::Map<String, serde_json::Value> = failures
         .into_iter()
-        .map(|(source, why)| (source.name().to_owned(), why.into()))
+        .map(|source| {
+            (
+                source.name().to_owned(),
+                "update failed; see the server log".into(),
+            )
+        })
         .collect();
     match reloaded {
         Ok(reloaded) => {
@@ -213,8 +223,8 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
                 "model_commit": crate::models_repo::version(),
                 "traits_commit": cleave::traits_repo::version(),
             });
-            if let Some(err) = &reloaded.traits_reload_error {
-                body["traits_reload_error"] = serde_json::json!(err);
+            if !reloaded.traits_reloaded {
+                body["traits_reload_error"] = TRAITS_RELOAD_FAILED.into();
             }
             Json(body).into_response()
         }

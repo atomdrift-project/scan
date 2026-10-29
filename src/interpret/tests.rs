@@ -869,6 +869,33 @@ fn an_open_breaker_skips_the_dead_primary_until_the_cooldown() {
     assert_eq!(live_h.join().expect("thread").len(), calls);
 }
 
+/// `--llm-min-level` bounds the level admission: a placement looser than the
+/// cutoff is not enough on its own, and unset admits any placement.
+#[test]
+fn min_level_bounds_the_level_admission() {
+    let placed_at = |min_level| {
+        admit(
+            &InterpretConfig {
+                min_level,
+                ..Default::default()
+            },
+            Classification::Benign,
+            0.0,
+            LevelContext {
+                fired: Level::At(5000),
+                active: Some(100),
+                grid_max: 25000,
+            },
+            FindingSeverity::from_findings(&[]),
+            "test-sample",
+        )
+        .map(|a| a.tier)
+    };
+    assert_eq!(placed_at(None), Some(LlmAdmission::Optional));
+    assert_eq!(placed_at(Some(10000)), Some(LlmAdmission::Optional));
+    assert_eq!(placed_at(Some(1000)), None, "fired looser than the cutoff");
+}
+
 /// The token carries the gate's verdict and the ML reading it was made
 /// on, so a deferred call needs no second gate pass.
 #[test]

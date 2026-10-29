@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::Mode;
+use crate::cli::Refresh;
 
 /// Refresh rules + models once per day. Matches the network-check cadence of the
 /// version notice ([`crate::update_check`]).
@@ -61,8 +62,8 @@ fn write_stamp() {
 
 /// Refresh the trait and model bundles when they are stale, by default.
 ///
-/// `force` (from `-u/--update`) bypasses the 24h gate. `disabled` (from
-/// `--no-update`) turns the whole mechanism off.
+/// [`Refresh::Force`] (`-u/--update`) bypasses the 24h gate;
+/// [`Refresh::Skip`] (`--no-update`) turns the whole mechanism off.
 /// `mode` matches the run's bloom usage so the reported rule count equals the
 /// banner's. `terminal` gates the transient/checkmark UI: a non-terminal run
 /// still refreshes, silently.
@@ -75,13 +76,8 @@ fn write_stamp() {
 /// The one failure that is not best-effort: `--enriched` was asked for and the
 /// token is missing or refused. Scanning on with other rules would answer a
 /// question nobody asked.
-pub fn refresh_if_stale(
-    force: bool,
-    disabled: bool,
-    mode: Mode,
-    terminal: bool,
-) -> anyhow::Result<()> {
-    if disabled {
+pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow::Result<()> {
+    if refresh == Refresh::Skip {
         return Ok(());
     }
     // Unix time of the last refresh attempt (0 when never stamped or unreadable).
@@ -89,7 +85,9 @@ pub fn refresh_if_stale(
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| toml::from_str::<Stamp>(&text).ok())
         .map_or(0, |stamp| stamp.checked_unix);
-    if !force && crate::civil::now_secs().saturating_sub(last_checked) < CHECK_INTERVAL_SECS {
+    if refresh == Refresh::IfStale
+        && crate::civil::now_secs().saturating_sub(last_checked) < CHECK_INTERVAL_SECS
+    {
         return Ok(());
     }
 
@@ -98,7 +96,7 @@ pub fn refresh_if_stale(
         let _ = std::io::stderr().flush();
     }
 
-    let outcome = refresh();
+    let outcome = self::refresh();
     // Always stamp the attempt — success *or* failure — so an offline host
     // records that it tried and won't re-check (and re-time-out) every run; the
     // next attempt is a day away, or immediate with `-u`/`update-rules`.

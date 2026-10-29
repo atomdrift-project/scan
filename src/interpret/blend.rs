@@ -204,21 +204,6 @@ pub struct LevelContext {
 }
 
 impl LevelContext {
-    /// Whether the calibration placed this file at a real level at all.
-    ///
-    /// Broader than [`Self::ml_admits`], which additionally requires the fired
-    /// level to sit at or below a cutoff. Being placed anywhere is itself the
-    /// signal: across 1072 measured samples only 4 of 655 benign are placed,
-    /// against 226 of 417 malicious, which is a better exchange rate than any
-    /// probability floor on that population.
-    ///
-    /// [`Level::Clean`] is ML seeing nothing and is not a placement; counting
-    /// it would make this admission unconditional in level mode.
-    /// Manual-threshold mode has no axis to read and abstains.
-    pub(super) fn ml_placed(self) -> bool {
-        matches!(self.fired, Level::At(_))
-    }
-
     /// Whether ML's own position admits this file to the LLM: it fires somewhere
     /// on the grid, no looser than the cutoff. [`Level::Clean`] (never fires) is
     /// ML seeing nothing and is not an admission.
@@ -453,7 +438,7 @@ pub(super) fn blend(
 /// Assemble a successful [`Interpretation`] from a grade + reason, applying the
 /// agreement-adjusted blend against the current ML verdict.
 pub(super) fn blended(
-    model: &str,
+    model: String,
     ml_class: Classification,
     ml_prob: f32,
     grade: LlmGrade,
@@ -467,7 +452,7 @@ pub(super) fn blended(
         outcome,
         blended: conf,
         interpretation: reason,
-        model: model.to_string(),
+        model,
         analyzer_directed: ev.analyzer_directed,
         before: MlVerdict {
             class: ml_class,

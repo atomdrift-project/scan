@@ -170,13 +170,11 @@ fn terminal_label_contains_identity(label: &str, identity: &str) -> bool {
             .any(|candidate| candidate == identity.as_slice())
 }
 
-/// The provenance rows a card can carry above its digest: what the artifact is,
-/// and what the registry said about it. Both are recovered from a collector's
-/// capture record or a `--registry-map`, and both are empty for a scan of a file
+/// The provenance row a card can carry above its digest: what the registry
+/// said about the artifact, from `--registry-map`. Empty for a scan of a file
 /// nobody collected.
 #[derive(Debug, Default)]
 pub(super) struct CardProvenance {
-    pub(super) purl: Option<String>,
     pub(super) registry: Option<String>,
 }
 
@@ -191,24 +189,8 @@ pub(super) struct CardHead<'a> {
     pub(super) provenance: CardProvenance,
 }
 
-/// What the card claims this artifact *is*, in the row under its name.
-///
-/// The bytes come first: an identity cleave read out of the artifact is a
-/// property of the sample itself. A collected sample usually has none — a
-/// package tarball carries no self-description cleave admits, and its filename
-/// is just a filename — so the coordinate the collector recorded falls in
-/// behind it. Without that row a scan of a collected corpus never names the
-/// package it is judging, which is the one thing an operator needs to act on a
-/// verdict about a package that no longer exists to look up.
-fn card_identity(
-    root: Option<&FileAnalysis>,
-    label: &str,
-    collected: Option<&str>,
-) -> Option<String> {
-    root.and_then(|root| terminal_identity_summary(root, label))
-        .or_else(|| collected.map(str::to_string))
-}
-
+/// What the card claims this artifact *is*, in the row under its name: an
+/// identity cleave read out of the bytes themselves.
 fn terminal_identity_summary(root: &FileAnalysis, label: &str) -> Option<String> {
     let identity = root.identity.as_ref()?;
     let (what, title) = if let Some(claim) = &identity.title {
@@ -467,7 +449,7 @@ fn card_head(files: &[&FileAnalysis], head: &CardHead<'_>, is_container: bool) -
     ));
     out.push('\n');
     let rows = [
-        card_identity(root, head.label, head.provenance.purl.as_deref())
+        root.and_then(|root| terminal_identity_summary(root, head.label))
             .as_deref()
             .and_then(output::terminal_identity_line),
         head.provenance
@@ -503,7 +485,7 @@ pub(super) fn render_terminal_context(
     }
 
     let mut out = card_head(files, head, is_container);
-    if let Some(interp) = output::terminal_interpretation(head.interpretation, 1) {
+    if let Some(interp) = output::terminal_interpretation(head.interpretation) {
         out.push_str(&interp);
         out.push('\n');
     } else if let Some(trailer) = output::terminal_trailer(head.reasons) {
@@ -694,7 +676,7 @@ fn render_archive_cards(
 
     // ── Banner: verdict rule → 📦 name · TYPE · size → hash ──
     let mut out = card_head(files, head, true);
-    if let Some(interp) = output::terminal_interpretation(head.interpretation, 1) {
+    if let Some(interp) = output::terminal_interpretation(head.interpretation) {
         out.push_str(&interp);
         out.push('\n');
     }
@@ -1117,57 +1099,6 @@ mod tests {
 
     fn terminal_report(value: serde_json::Value) -> cleave::AnalysisReport {
         serde_json::from_value(value).expect("valid terminal report fixture")
-    }
-
-    /// A collected package tarball describes itself nowhere cleave can read, so
-    /// without the capture record the card names a filename and nothing else.
-    #[test]
-    fn collected_coordinate_names_a_package_the_bytes_do_not() {
-        let report = terminal_report(serde_json::json!({
-            "version": "3",
-            "files": [{
-                "id": 0, "path": "blueai-cli-0.7.0.tgz", "depth": 0,
-                "file_type": "gzip", "sha256": "root", "size": 10, "findings": []
-            }]
-        }));
-        assert_eq!(
-            card_identity(
-                report.files.first(),
-                "blueai-cli-0.7.0.tgz",
-                Some("pkg:npm/blueai-cli@0.7.0")
-            )
-            .as_deref(),
-            Some("pkg:npm/blueai-cli@0.7.0"),
-        );
-        assert_eq!(
-            card_identity(report.files.first(), "blueai-cli-0.7.0.tgz", None),
-            None
-        );
-    }
-
-    /// An identity read out of the bytes outranks one claimed about them.
-    #[test]
-    fn content_identity_outranks_the_capture_record() {
-        let report = terminal_report(serde_json::json!({
-            "version": "3",
-            "files": [{
-                "id": 0, "path": "installer.msi", "depth": 0,
-                "file_type": "msi", "sha256": "root", "size": 10, "findings": [],
-                "identity": {
-                    "title": {"value": "NordPass Installer", "source": "msi.title", "verified": false},
-                    "trust": "unsigned"
-                }
-            }]
-        }));
-        assert_eq!(
-            card_identity(
-                report.files.first(),
-                "installer.msi",
-                Some("pkg:npm/evil@1.0.0")
-            )
-            .as_deref(),
-            Some("\u{201c}NordPass Installer\u{201d}"),
-        );
     }
 
     #[test]

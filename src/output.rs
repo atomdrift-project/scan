@@ -1,7 +1,8 @@
 //! Terminal and JSON output formatting with color-graded confidence indicators.
 //! Supports both dark and light terminal backgrounds via auto-detection.
 
-use std::io::IsTerminal;
+use std::fmt::Write as _;
+use std::io::{IsTerminal, Write as _};
 use std::sync::OnceLock;
 use unicode_width::UnicodeWidthStr;
 
@@ -149,14 +150,13 @@ pub fn detect_theme() -> Theme {
     *DETECTED.get_or_init(|| {
         // Terminal queries must only be attempted on a real TTY. Without one,
         // the read blocks indefinitely or the kernel sends SIGTTIN.
-        if !std::io::stderr().is_terminal() {
-            Theme::Dark
+        if std::io::stderr().is_terminal()
+            && let Ok(terminal_colorsaurus::ColorScheme::Light) =
+                terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default())
+        {
+            Theme::Light
         } else {
-            match terminal_colorsaurus::color_scheme(terminal_colorsaurus::QueryOptions::default())
-            {
-                Ok(terminal_colorsaurus::ColorScheme::Light) => Theme::Light,
-                Ok(terminal_colorsaurus::ColorScheme::Dark) | Err(_) => Theme::Dark,
-            }
+            Theme::Dark
         }
     })
 }
@@ -447,14 +447,9 @@ pub(crate) fn terminal_trailer(reasons: &[crate::explain::Reason]) -> Option<Str
 /// no interpretation ran.
 pub(crate) fn terminal_interpretation(
     interpretation: Option<&crate::interpret::Interpretation>,
-    indent: usize,
 ) -> Option<String> {
     let llm = interpretation?;
-    let lead = rail(
-        indent,
-        "\u{2728}",
-        &format!("{}\u{2728} ", " ".repeat(indent)),
-    );
+    let lead = rail(1, "\u{2728}", " \u{2728} ");
     let p = palette();
     Some(match llm {
         crate::interpret::Interpretation::Failed(_) => {
@@ -810,29 +805,30 @@ pub(crate) fn terminal_card(
         let Rgb(r, g, b) = accent;
         let bar = fg(accent, "\u{2502}"); // │
         let stamp = format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {word} \x1b[0m");
-        out.push_str(&format!(
-            "{} {stamp} {} {}\n",
+        let _ = writeln!(
+            out,
+            "{} {stamp} {} {}",
             fg(accent, "\u{256d}\u{2500}"), // ╭─
             fg_bold(p.path_name, &name),
             fg(p.dim, &format!("\u{00b7} {meta}")),
-        ));
+        );
         for line in body.lines() {
             if line.is_empty() {
                 out.push_str(&bar);
                 out.push('\n');
             } else {
-                out.push_str(&format!("{bar} {line}\n"));
+                let _ = writeln!(out, "{bar} {line}");
             }
         }
         out.push_str(&fg(accent, "\u{2570}\u{2500}")); // ╰─
         out.push('\n');
     } else {
-        out.push_str(&format!("{word} {name} \u{00b7} {meta}\n"));
+        let _ = writeln!(out, "{word} {name} \u{00b7} {meta}");
         for line in body.lines() {
             if line.is_empty() {
                 out.push('\n');
             } else {
-                out.push_str(&format!("  {line}\n"));
+                let _ = writeln!(out, "  {line}");
             }
         }
     }
@@ -1171,9 +1167,15 @@ impl BloomMark {
 
 /// Report a bloom decision as a real result, not a debug line: a JSON record on
 /// the output stream in `--format json`, a themed one-liner on stderr otherwise.
-pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFormat) {
+pub fn print_bloom_verdict(
+    label: &str,
+    verdict: BloomVerdict,
+    format: OutputFormat,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
     if matches!(format, OutputFormat::Json) {
-        println!(
+        return writeln!(
+            std::io::stdout().lock(),
             "{}",
             serde_json::json!({
                 "path": label,
@@ -1185,7 +1187,6 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
                 "scanned": false,
             })
         );
-        return;
     }
 
     let p = palette();
@@ -1201,11 +1202,12 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
             "not in known sets (fast mode)",
         ),
     };
-    eprintln!(
+    writeln!(
+        std::io::stderr().lock(),
         " {icon}  {name} {}  {}",
         fg(p.very_dim, reason),
         fg(p.header_path, &tty_text(label)),
-    );
+    )
 }
 
 /// Write one artifact isotope13 judged (`--enriched`), in place of a local
@@ -1549,12 +1551,14 @@ pub fn print_version(
     hashes_and_purls: u64,
     rules: u64,
     rows: &[SourceRow],
-) {
+) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
     let p = palette();
     let now = i64::try_from(crate::civil::now_secs()).unwrap_or(i64::MAX);
 
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         " \u{269b}\u{fe0f} {} {} {edition} {}",
         fg_bold(p.path_name, &format!("Atomdrift Scan v{scan_version}")),
         fg(p.very_dim, "\u{00b7}"),
@@ -1562,8 +1566,8 @@ pub fn print_version(
             p.very_dim,
             &detection_inventory_text(hashes_and_purls, rules)
         ),
-    );
-    println!();
+    )?;
+    writeln!(out)?;
 
     let metrics: Vec<String> = rows
         .iter()
@@ -1578,16 +1582,17 @@ pub fn print_version(
             Some(e) => (fmt_date(e), fmt_age(now - e), freshness_color(now - e)),
             None => ("\u{2014}".to_string(), String::new(), p.very_dim),
         };
-        println!(
+        writeln!(
+            out,
             "   {}  {}  {}  {}  {}",
             fg(p.dim, &format!("{:<label_w$}", r.label)),
             fg(p.path_name, &format!("{metric:>metric_w$}")),
             fg(p.very_dim, &format!("{:<version_w$}", r.version)),
             fg(freshness, &format!("{date:<10}")),
             fg(freshness, &age),
-        );
+        )?;
     }
-    println!();
+    writeln!(out)
 }
 
 /// Format an upstream Unix timestamp as a UTC `YYYY-MM-DD` date.

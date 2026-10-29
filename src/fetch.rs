@@ -167,6 +167,50 @@ fn pins_exact_version(purl: &str) -> bool {
             .any(|part| part.eq_ignore_ascii_case("x"))
 }
 
+/// How long after its first file a PyPI release stops accepting new ones:
+/// PyPI's 14 days (July 2026), plus a day because PyPI does not say where it
+/// counts from and our clock is not theirs.
+const PYPI_RELEASE_CLOSED_SECS: u64 = 15 * 86_400;
+
+/// Whether a PURL names bytes that can never change: a registry that refuses
+/// to replace a published version (npm, crates.io, the Go checksum database,
+/// NuGet, Maven Central releases), a PyPI release past
+/// [`PYPI_RELEASE_CLOSED_SECS`] (`age_secs` is the release's age, `None` when
+/// unknown), or a version that is itself a commit hash. Everywhere else the
+/// same coordinate can name new bytes, so nothing stored against it may stand
+/// in for a fetch: git tags, gems, container tags, distro packages, a Maven
+/// `-SNAPSHOT`, a young PyPI release, anything served from a non-default
+/// repository.
+fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
+    let Some(parsed) = fletch::purl::Purl::parse(purl).ok() else {
+        return false;
+    };
+    let Some(version) = parsed.version() else {
+        return false;
+    };
+    let pinned = ["download_url", "vcs_url", "repository_url"]
+        .iter()
+        .all(|q| parsed.qualifier(q).is_none());
+    let commit = matches!(version.len(), 40 | 64) && version.bytes().all(|b| b.is_ascii_hexdigit());
+    let fixed_registry = match parsed.typ() {
+        "npm" | "cargo" | "golang" | "nuget" => true,
+        "maven" => !version.ends_with("-SNAPSHOT"),
+        "pypi" => age_secs.is_some_and(|age| age > PYPI_RELEASE_CLOSED_SECS),
+        _ => false,
+    };
+    pinned && pins_exact_version(purl) && (commit || fixed_registry)
+}
+
+/// The sha256 a registry lists for the exact file a fetch of `purl` would
+/// download — the [`fletch::fetch::ArtifactMatrix::preferred`] candidate the
+/// fetch itself picks. `None` when the registry lists no sha256 for it.
+fn registry_digest(purl: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<String> {
+    let matrix = fletch::fetch::resolve_artifacts(&RefLocator::Purl(purl.to_owned()), net, cache)?;
+    let sha = matrix.preferred()?.checksums.get("sha256")?;
+    (sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| sha.to_ascii_lowercase())
+}
+
 /// The root sample's imperative hunt re-reads it from disk and re-parses it.
 /// Skip that for large roots — the win is scripts/manifests/Dockerfiles, which
 /// are small; a multi-megabyte binary root has no imperative install commands to

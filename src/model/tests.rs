@@ -937,3 +937,104 @@ fn raw_needs_cover_the_specialists_a_file_type_selects() -> Result<()> {
     assert_ne!(model.raw_needs(["python", "elf"]), general_only);
     Ok(())
 }
+
+/// A file type with no route policy is swept against the general grid, and
+/// the probabilities it is compared with are calibrated, so the grid must be
+/// too. Here the raw cutoff 0.0 calibrates to 0.2.
+#[test]
+fn the_general_grid_is_swept_in_calibrated_space() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let general = root.path().join("general");
+    std::fs::create_dir_all(&general)?;
+    std::fs::write(
+        general.join("model.onnx"),
+        include_bytes!("../../tests/fixtures/cli-model.onnx"),
+    )?;
+    let spec = serde_json::json!({
+        "version": crate::features::EXPECTED_SPEC_VERSION,
+        "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+        "presence_vocab": ["metadata"],
+        "kv_vocab": [],
+        "feature_names": ["present:metadata"],
+        "total_features": 1,
+        "standardized": false,
+        "metric_transforms": {}
+    });
+    std::fs::write(
+        general.join("feature_spec.json"),
+        serde_json::to_vec(&spec)?,
+    )?;
+    std::fs::write(
+        general.join("calibrator.json"),
+        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,1.0],"y":[0.2,0.9]}"#,
+    )?;
+    std::fs::write(
+        root.path().join("config.json"),
+        r#"{"levels": [{"level": 25, "hostile": {"thresholds": {"general": 0.0}}}]}"#,
+    )?;
+    let model = Model::load(root.path(), None, Some(25))?;
+
+    let mut report = cleave::types::CompactReport::default();
+    report.files.push(cleave::types::CompactFile {
+        file_type: "python".into(),
+        ..Default::default()
+    });
+    let (decision, _, _) = model.predict_report(&report)?;
+    assert_eq!(decision.level, Level::At(25));
+    assert!(
+        (decision.threshold - 0.2).abs() < 1e-6,
+        "threshold {} is not calibrated",
+        decision.threshold
+    );
+    Ok(())
+}
+
+/// A specialist built after the bundle on disk was replaced would be scored
+/// against the old bundle's calibrators and thresholds, so it is refused.
+#[test]
+fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    for dir in ["general", "filetypes/elf"] {
+        let dir = root.path().join(dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("model.onnx"),
+            include_bytes!("../../tests/fixtures/cli-model.onnx"),
+        )?;
+        let spec = serde_json::json!({
+            "version": crate::features::EXPECTED_SPEC_VERSION,
+            "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "presence_vocab": ["metadata"],
+            "kv_vocab": [],
+            "feature_names": ["present:metadata"],
+            "total_features": 1,
+            "standardized": false,
+            "metric_transforms": {}
+        });
+        std::fs::write(dir.join("feature_spec.json"), serde_json::to_vec(&spec)?)?;
+    }
+    std::fs::write(
+        root.path().join("config.json"),
+        r#"{"levels": [{"level": 25, "hostile": {"thresholds":
+            {"general": 0.99, "filetypes/elf": 0.99}}}]}"#,
+    )?;
+    let sidecar = |commit: &str| {
+        std::fs::write(
+            root.path().join(".litmus-models.toml"),
+            format!(
+                "commit = \"{commit}\"\ndate = \"2026-10-29\"\nsource = \"latest\"\nversion = \"0\"\n"
+            ),
+        )
+    };
+    sidecar("old")?;
+    let held = Model::load(root.path(), None, None)?;
+    let swapped = Model::load(root.path(), None, None)?;
+
+    held.validate_all_routes()?;
+    sidecar("new")?;
+    let err = swapped
+        .validate_all_routes()
+        .expect_err("a specialist from the replaced bundle must be refused");
+    assert!(format!("{err:#}").contains("replaced"), "{err:#}");
+    Ok(())
+}

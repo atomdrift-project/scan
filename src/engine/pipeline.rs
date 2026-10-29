@@ -431,7 +431,7 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
             std::mem::take(&mut report.files),
             Facts::Full,
         );
-        report = AnalysisReport::new(report.target.clone());
+        report = AnalysisReport::new(std::mem::take(&mut report.target));
         compact
     };
     validate_report_references(req.label, &compact);
@@ -1066,12 +1066,11 @@ fn interpret(
 
 /// What the card's provenance rows say about the root. A fetched root has
 /// none: `pkg`/`url` already printed the registry banner before the fetch.
-fn card_provenance(req: &ClassifyRequest<'_>, sha256: &str) -> CardProvenance {
+fn card_provenance(req: &ClassifyRequest<'_>) -> CardProvenance {
     if req.root_fetch.is_some() {
         return CardProvenance::default();
     }
     CardProvenance {
-        purl: crate::provenance::collector_purl(req.root_path, sha256),
         registry: req
             .root_registry
             .map(|provenance| crate::fetch::registry_summary(&provenance.record))
@@ -1111,7 +1110,7 @@ fn render(
             .iter()
             .filter(|file| !index.is_fetched(file.id) && !registry_ids.contains(&file.id))
             .collect();
-        card.provenance = card_provenance(req, card.sha256);
+        card.provenance = card_provenance(req);
         let mut rendered = render_terminal_context(&own, &card, members);
         if let Some(account) = render_terminal_fetch_context(fetched, typed, index) {
             rendered.push_str(&account);
@@ -1313,10 +1312,10 @@ pub fn apply_pending_interpretation(
 /// the root. A metadata-only package fallback already analyzes the registry
 /// document as its root and must not receive a duplicate sidecar node.
 pub(super) fn root_needs_registry_graft(report: &cleave::AnalysisReport) -> bool {
-    !report
+    report
         .files
         .first()
-        .is_some_and(|file| file.file_type == "registry")
+        .is_none_or(|file| file.file_type != "registry")
 }
 
 /// One confirmed hostile/suspicious fetched dependency, ready to pin back onto
@@ -1359,8 +1358,8 @@ struct DepBackref {
 /// the sentence.
 fn inject_dependency_backref(report: &mut CompactReport, backref: &DepBackref) {
     let (crit, sev) = match backref.class {
-        Classification::Hostile => (5u8, "Malicious"),
-        _ => (4u8, "Suspicious"),
+        Classification::Hostile => (cleave::Criticality::Hostile.rank(), "Malicious"),
+        _ => (cleave::Criticality::Suspicious.rank(), "Suspicious"),
     };
     let mut desc = format!(
         "{sev} dependency: {} | {}",
@@ -1456,7 +1455,7 @@ fn adopted_detail(v: &crate::corpus_precheck::Verdict) -> Option<String> {
 /// Count a report's findings by criticality — the root file's own findings,
 /// which are the ones that describe the artifact scan was asked about.
 #[must_use]
-pub fn count_findings(report: &CompactReport) -> FindingCounts {
+fn count_findings(report: &CompactReport) -> FindingCounts {
     let mut counts = FindingCounts::default();
     for f in root_findings(report) {
         match compact_crit(f) {
@@ -1471,7 +1470,7 @@ pub fn count_findings(report: &CompactReport) -> FindingCounts {
 
 /// Extract a small set of human-facing findings relevant to the classification.
 #[must_use]
-pub fn extract_top_findings(
+fn extract_top_findings(
     findings: &[CompactTrait],
     classification: Classification,
 ) -> Vec<TopFinding> {

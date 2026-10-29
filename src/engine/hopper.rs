@@ -242,8 +242,7 @@ pub fn collect_upload_artifacts(
     // sidecar's fetch slot, and — when the locator is a PURL — the package slot
     // hopper projects into its queryable purl_base column. A local `scan path`
     // root reads from disk and claims none of the rest.
-    let purl = artifact_purl(root_fetch).unwrap_or_default();
-    let purl = purl.as_str();
+    let purl = artifact_purl(root_fetch).filter(|purl| !purl.is_empty());
     let (root_name, bytes, url) = match root_fetch {
         Some(rec) => {
             let url = crate::fetch::fetched_url(rec).unwrap_or_default();
@@ -265,17 +264,6 @@ pub fn collect_upload_artifacts(
             "",
         ),
     };
-    // A collector that fetched this file left its capture record beside it.
-    // That record holds the source URL and package identity the bytes came from
-    // — which a local scan cannot reconstruct, and which for a since-deleted
-    // package exists nowhere else — so it is uploaded as this artifact's
-    // provenance instead of the thin one built below. A fetched root has no such
-    // neighbour on disk, and an explicit `--registry-map` entry still wins.
-    let collected = root_fetch
-        .is_none()
-        .then(|| crate::provenance::collector_sidecar(file_path, &root_name, sha256, size_bytes))
-        .flatten();
-    let from_collector = collected.is_some();
     let upload = Upload {
         filename: &root_name,
         sha256,
@@ -283,19 +271,14 @@ pub fn collect_upload_artifacts(
         collector,
         at: &now,
         url,
-        purl: (!purl.is_empty()).then_some(purl),
+        purl: purl.as_deref(),
     };
-    let sidecar = match (root_provenance, collected) {
-        (Some(provenance), collected) => {
-            upload
-                .sidecar_from_provenance(provenance)
-                .map(|supplied| match collected {
-                    Some(collected) => crate::provenance::with_registry_from(&collected, &supplied),
-                    None => supplied,
-                })
-        }
-        (None, Some(collected)) => Ok(collected),
-        (None, None) => upload.sidecar(None, &[]),
+    // Never a capture record lying beside the file: whoever supplied the file
+    // wrote that too, and its `package` would become hopper's identity for
+    // these bytes. Collected provenance arrives explicitly or not at all.
+    let sidecar = match root_provenance {
+        Some(provenance) => upload.sidecar_from_provenance(provenance),
+        None => upload.sidecar(None, &[]),
     };
     let sidecar = match sidecar {
         Ok(sidecar) => sidecar,
@@ -312,7 +295,7 @@ pub fn collect_upload_artifacts(
         sidecar,
         // Registry data or a PURL identity is worth backfilling onto a sample
         // hopper already has; a plain local file's thin sidecar is not.
-        backfill: root_provenance.is_some() || from_collector || !purl.is_empty(),
+        backfill: root_provenance.is_some() || purl.is_some(),
     }]
 }
 
@@ -507,7 +490,7 @@ mod tests {
 
     #[test]
     fn collect_upload_artifacts_backfills_preserved_root_provenance() {
-        let provenance = crate::provenance::registry_provenance(
+        let provenance = crate::provenance::RegistryProvenance::from_json(
             br#"{"record":{"ecosystem":"npm","name":"proj","version":"1.0.0"},"sources":[{"url":"https://registry.example/proj","status":200,"body":{"provider_only":42}}]}"#,
         )
         .unwrap();
@@ -566,11 +549,10 @@ mod tests {
         assert_eq!(sidecar["artifact"]["filename"], "lodash-4.17.21.tgz");
     }
 
-    /// A collector's capture record is the only surviving account of where a
-    /// deleted package's bytes came from, so an upload must carry it rather than
-    /// the thin record a local scan can rebuild.
+    /// A capture record beside a scanned file is written by whoever supplied
+    /// the file, so it must not name the package hopper files these bytes under.
     #[test]
-    fn local_root_uploads_the_collector_sidecar_beside_it() {
+    fn local_root_ignores_a_capture_record_beside_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact = dir.path().join("evil-1.0.0.tgz");
         std::fs::write(&artifact, b"bytes").expect("write artifact");
@@ -579,13 +561,12 @@ mod tests {
             serde_json::json!({
                 "schema_version": "1.0",
                 "artifact": {"filename": "evil-1.0.0.tgz", "sha256": "CC33", "size_bytes": 5},
-                "package": {"purl": "pkg:npm/evil@1.0.0", "ecosystem": "javascript"},
+                "package": {"purl": "pkg:npm/lodash@4.17.21", "ecosystem": "javascript"},
                 "fetch": {
                     "collector": "forager",
                     "category": "submitted",
                     "at": "2026-09-08T10:06:05Z",
-                    "url": "https://socket.dev/npm/package/evil/files/1.0.0",
-                    "original_url": "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+                    "url": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
                 },
             })
             .to_string(),
@@ -594,16 +575,10 @@ mod tests {
 
         let arts = collect_upload_artifacts(&artifact, "cc33", 5, "scan+test", None, None);
         let art = &arts[0];
-        assert!(art.backfill, "collected provenance is worth backfilling");
+        assert!(!art.backfill);
         let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
-        assert_eq!(sidecar["fetch"]["collector"], "forager");
-        assert_eq!(
-            sidecar["fetch"]["url"],
-            "https://socket.dev/npm/package/evil/files/1.0.0"
-        );
-        assert_eq!(sidecar["package"]["purl"], "pkg:npm/evil@1.0.0");
-        assert_eq!(sidecar["artifact"]["sha256"], "cc33");
-        assert_eq!(sidecar["artifact"]["size_bytes"], 5);
+        assert_eq!(sidecar["fetch"]["collector"], "scan+test");
+        assert!(sidecar.get("package").is_none());
     }
 
     #[test]

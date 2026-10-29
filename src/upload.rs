@@ -828,18 +828,6 @@ impl Hopper {
     /// already computed for it. Best-effort throughout — a failure logs and the
     /// next dependency proceeds, exactly like the artifact reconciliation it
     /// builds on.
-    fn sync_dependencies(
-        &self,
-        version: &str,
-        analyzed_at: &str,
-        cache: Option<&fletch::fetch::BlobCache>,
-        seen: &mut HashSet<String>,
-        deps: Vec<crate::engine::DepResult>,
-    ) {
-        let deps = prepare_dependencies(&self.worker, deps, version, analyzed_at, &self.tally);
-        self.sync_prepared_dependencies(cache, seen, deps);
-    }
-
     fn sync_prepared_dependencies(
         &self,
         cache: Option<&fletch::fetch::BlobCache>,
@@ -1126,7 +1114,8 @@ pub fn sync_result_dependencies(
     }
     // Standalone reconciliation: nothing is watching the tally here.
     let hopper = Hopper::new(client.clone(), base_url, worker.to_owned(), Arc::default());
-    hopper.sync_dependencies(version, analyzed_at, cache, &mut HashSet::new(), deps);
+    let deps = prepare_dependencies(&hopper.worker, deps, version, analyzed_at, &hopper.tally);
+    hopper.sync_prepared_dependencies(cache, &mut HashSet::new(), deps);
 }
 
 /// Build the upload artifact for a fetched dependency. Its bytes load from the
