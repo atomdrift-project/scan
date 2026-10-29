@@ -252,10 +252,16 @@ impl ScanConfig {
         self.zip_passwords.as_slice()
     }
 
-    /// Hopper base URL to renew results on, or `None` when uploading is disabled.
+    /// Hopper base URL for corpus lookups and optional result renewal.
     #[must_use]
     pub(crate) fn hopper(&self) -> Option<&str> {
         self.hopper.as_deref()
+    }
+
+    /// A read-only scan still consults Hopper, but never prepares upload work.
+    pub(crate) fn upload_hopper(&self) -> Option<&str> {
+        self.hopper()
+            .filter(|_| !crate::env::flag(crate::env::SCAN_NO_UPLOAD))
     }
 
     /// Set the external-reference fetch policy: which kinds of reference

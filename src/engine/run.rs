@@ -443,8 +443,13 @@ impl<'a> Session<'a> {
         let mut opts = analysis_options(config);
         opts.cancellation = Some(Arc::clone(&cancel));
         opts.skip_predicate = bloom_skip_predicate(config);
+        if config.upload_hopper().is_none()
+            && let Some(url) = config.hopper()
+        {
+            crate::hopper::configure(url);
+        }
         let uploader = config
-            .hopper()
+            .upload_hopper()
             .map(|url| crate::upload::Uploader::new(url, crate::upload::default_worker_name()));
         Self {
             config,
@@ -820,7 +825,7 @@ impl Classifier<'_> {
                     // `--show=all` with JSON output: list every archive member,
                     // even the no-finding ones cleave skipped analyzing.
                     list_all_members: json && config.filter().is_all(),
-                    deps_for_upload: config.hopper().is_some(),
+                    deps_for_upload: config.upload_hopper().is_some(),
                 },
                 root_registry: origin.registry,
                 root_fetch: origin.fetch,
@@ -851,7 +856,7 @@ impl Classifier<'_> {
 
         // JSON output and hopper renewals carry the report (so hopper stores it
         // and explodes archive members); the terminal never reads it.
-        let keep_report = json || config.hopper().is_some();
+        let keep_report = json || config.upload_hopper().is_some();
         Ok(classified.into_scan_result(label, self.model, keep_report))
     }
 }

@@ -16,6 +16,7 @@
 //! result known not to be persisted.
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,6 +47,16 @@ const ZSTD_RESULT_LEVEL: i32 = 3;
 /// spooled to temporary files rather than blocking analysis or retaining large
 /// reports in RAM. Shutdown still drains every accepted job.
 const UPLOAD_QUEUE_DEPTH: usize = 16;
+
+/// Match Hopper's three reserved renewal slots without occupying analysis lanes.
+const RENEW_WORKERS: usize = 3;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Renewal {
+    sha256: String,
+    purl: Option<String>,
+    body: EncodedResult,
+}
 
 /// Cap on the uploader's reconciled-sha dedup set (~64-byte hex strings; the cap
 /// bounds it near 10 MB). See the clear in the uploader loop.
@@ -686,6 +697,58 @@ impl Hopper {
     /// The uploader thread's loop: handle every queued job until the sender
     /// side is dropped.
     fn serve(&self, jobs: queue::Receiver<Job>, pending: &AtomicUsize) {
+        std::thread::scope(|scope| {
+            let mut senders = Vec::new();
+            for lane in 0..RENEW_WORKERS {
+                // One active and one resident queued payload per worker.
+                // Overflow spills to disk: a stalled digest's FIFO lane must
+                // not prevent the coordinator from feeding the other lanes.
+                let (tx, rx) = queue::channel::<Renewal>(1);
+                match std::thread::Builder::new()
+                    .name(format!("scan-renew-{lane}"))
+                    .spawn_scoped(scope, move || {
+                        for job in rx {
+                            match job {
+                                Ok(job) => self.renew_encoded(&job.sha256, job.purl.as_deref(), job.body),
+                                Err(error) => {
+                                    self.tally.failed.fetch_add(1, Ordering::Relaxed);
+                                    tracing::error!(%error, "upload: could not read spooled renewal");
+                                }
+                            }
+                        }
+                    }) {
+                    Ok(_) => senders.push(tx),
+                    Err(error) => tracing::warn!(%error, "upload: could not start renewal worker"),
+                }
+            }
+            let publish = |job: Renewal| {
+                if senders.is_empty() {
+                    self.renew_encoded(&job.sha256, job.purl.as_deref(), job.body);
+                    return;
+                }
+                // Repeated updates for one digest stay on one FIFO lane. A
+                // slow older verdict must never overwrite its newer successor.
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                job.sha256.hash(&mut hash);
+                let lane = hash.finish() as usize % senders.len();
+                if let Err((job, error)) = senders[lane].send(job) {
+                    tracing::warn!(%error, "upload: renewal queue unavailable; sending inline");
+                    self.renew_encoded(&job.sha256, job.purl.as_deref(), job.body);
+                }
+            };
+            self.serve_jobs(jobs, pending, &publish);
+            // Scope exit joins all workers after closing their channels, so
+            // Uploader::drop still waits for every accepted verdict.
+            drop(senders);
+        });
+    }
+
+    fn serve_jobs(
+        &self,
+        jobs: queue::Receiver<Job>,
+        pending: &AtomicUsize,
+        publish: &impl Fn(Renewal),
+    ) {
         // The same default blob cache scan fetched dependencies into, so a
         // missing dep's bytes are loaded locally rather than re-fetched.
         let cache = crate::fetch::open_blob_cache()
@@ -720,9 +783,7 @@ impl Hopper {
                 // answer aged the moment it arrived, because only the store is
                 // ordered against the other producers pushing the same
                 // dependency (hopper's `unchangedStore`).
-                Job::Result { sha256, purl, body } => {
-                    self.renew_encoded(&sha256, purl.as_deref(), body)
-                }
+                Job::Result { sha256, purl, body } => publish(Renewal { sha256, purl, body }),
                 Job::Artifacts {
                     artifacts,
                     cleanup_dirs,
@@ -731,7 +792,7 @@ impl Hopper {
                     cleanup_upload_dirs(cleanup_dirs);
                 }
                 Job::Dependencies { deps } => {
-                    self.sync_prepared_dependencies(cache.as_ref(), &mut seen, deps)
+                    self.sync_prepared_dependencies(cache.as_ref(), &mut seen, deps, publish)
                 }
             }
         }
@@ -833,6 +894,7 @@ impl Hopper {
         cache: Option<&fletch::fetch::BlobCache>,
         seen: &mut HashSet<String>,
         deps: Vec<PreparedDependency>,
+        publish: &impl Fn(Renewal),
     ) {
         // Each dependency is reconciled and verdict-posted once per run; a dependency
         // shared by many scanned files is handled the first time it is seen.
@@ -875,11 +937,12 @@ impl Hopper {
             };
             // A dependency's locator is a PURL or a URL; only the former belongs
             // under a `purl` field, so a URL-sourced dependency logs by digest.
-            let purl = dep
-                .locator
-                .starts_with("pkg:")
-                .then_some(dep.locator.as_str());
-            self.renew_encoded(&dep.sha256, purl, body);
+            let purl = dep.locator.starts_with("pkg:").then_some(dep.locator);
+            publish(Renewal {
+                sha256: dep.sha256,
+                purl,
+                body,
+            });
         }
     }
 
@@ -1115,7 +1178,9 @@ pub fn sync_result_dependencies(
     // Standalone reconciliation: nothing is watching the tally here.
     let hopper = Hopper::new(client.clone(), base_url, worker.to_owned(), Arc::default());
     let deps = prepare_dependencies(&hopper.worker, deps, version, analyzed_at, &hopper.tally);
-    hopper.sync_prepared_dependencies(cache, &mut HashSet::new(), deps);
+    hopper.sync_prepared_dependencies(cache, &mut HashSet::new(), deps, &|job| {
+        hopper.renew_encoded(&job.sha256, job.purl.as_deref(), job.body);
+    });
 }
 
 /// Build the upload artifact for a fetched dependency. Its bytes load from the
@@ -1253,33 +1318,153 @@ mod tests {
     ) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = Vec::new();
-            let mut buf = [0u8; 8192];
-            let body_start = loop {
-                let n = stream.read(&mut buf).expect("read");
-                assert!(n > 0, "connection closed before the headers ended");
-                request.extend_from_slice(&buf[..n]);
-                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break at + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .map_or(0, |v| v.trim().parse().expect("content-length"));
-            while request.len() < body_start + length {
-                let n = stream.read(&mut buf).expect("read body");
-                assert!(n > 0, "connection closed mid-body");
-                request.extend_from_slice(&buf[..n]);
-            }
+            let request = read_request(&mut stream);
             stream.write_all(response).expect("respond");
             request
         })
     }
 
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 8192];
+        let body_start = loop {
+            let n = stream.read(&mut buf).expect("read");
+            assert!(n > 0, "connection closed before the headers ended");
+            request.extend_from_slice(&buf[..n]);
+            if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |v| v.trim().parse().expect("content-length"));
+        while request.len() < body_start + length {
+            let n = stream.read(&mut buf).expect("read body");
+            assert!(n > 0, "connection closed mid-body");
+            request.extend_from_slice(&buf[..n]);
+        }
+        request
+    }
+
     const NO_CONTENT: &[u8] =
         b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn renewal_workers_preserve_order_and_keep_other_lanes_moving() {
+        let lane = |sha: &str| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            sha.hash(&mut hash);
+            hash.finish() as usize % RENEW_WORKERS
+        };
+        let slow = "a".repeat(64);
+        let fast = (0..100)
+            .map(|n| format!("{n:064x}"))
+            .find(|sha| lane(sha) != lane(&slow))
+            .expect("a different FIFO lane");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&completed);
+        let fast_arrived = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_overlap = Arc::clone(&overlapped);
+        let slow_sha = slow.clone();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().expect("accept renewal");
+                let observed = Arc::clone(&observed);
+                let fast_arrived = Arc::clone(&fast_arrived);
+                let overlapped = Arc::clone(&server_overlap);
+                let slow_sha = slow_sha.clone();
+                handlers.push(std::thread::spawn(move || {
+                    let request = read_request(&mut stream);
+                    let offset = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&request[offset..]).unwrap();
+                    let sha = value["sha256"].as_str().unwrap().to_owned();
+                    let sequence = value["sequence"].as_u64().unwrap();
+                    let (ready, wake) = &*fast_arrived;
+                    if sha == slow_sha && sequence == 0 {
+                        // Hold the first lane until the other lane reaches HTTP.
+                        // A blocking lane queue stalls on this digest's third
+                        // update and never submits the independent verdict.
+                        let (arrived, _) = wake
+                            .wait_timeout_while(
+                                ready.lock().unwrap(),
+                                Duration::from_secs(5),
+                                |v| !*v,
+                            )
+                            .unwrap();
+                        overlapped.store(*arrived, Ordering::Relaxed);
+                    } else if sha != slow_sha {
+                        *ready.lock().unwrap() = true;
+                        wake.notify_all();
+                    }
+                    observed.lock().unwrap().push((sha, sequence));
+                    stream.write_all(NO_CONTENT).expect("acknowledge");
+                }));
+            }
+            for handler in handlers {
+                handler.join().expect("HTTP handler");
+            }
+        });
+        let (tx, jobs) = queue::channel(1);
+        for (sha, count) in [(&slow, 3), (&fast, 2)] {
+            for sequence in 0..count {
+                tx.send(Job::Result {
+                    sha256: sha.clone(),
+                    purl: None,
+                    body: EncodedResult {
+                        bytes: serde_json::to_vec(
+                            &serde_json::json!({"sha256": sha, "sequence": sequence}),
+                        )
+                        .unwrap(),
+                        zstd: false,
+                    },
+                })
+                .expect("enqueue");
+            }
+        }
+        drop(tx);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hopper = hopper_at(&base);
+            let pending = AtomicUsize::new(5);
+            hopper.serve(jobs, &pending);
+            done.send((
+                pending.load(Ordering::Relaxed),
+                hopper.tally.uploaded.load(Ordering::Relaxed),
+                hopper.tally.failed.load(Ordering::Relaxed),
+            ))
+            .unwrap();
+        });
+        assert_eq!(
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("drain all workers"),
+            (0, 5, 0)
+        );
+        server.join().expect("HTTP server");
+        assert!(
+            overlapped.load(Ordering::Relaxed),
+            "one stalled digest blocked another lane"
+        );
+        let completed = completed.lock().unwrap();
+        for (sha, count) in [(&slow, 3), (&fast, 2)] {
+            let sequence: Vec<_> = completed
+                .iter()
+                .filter(|(s, _)| s == sha)
+                .map(|(_, n)| *n)
+                .collect();
+            assert_eq!(sequence, (0..count).collect::<Vec<_>>());
+        }
+    }
 
     fn artifact(sha: &str, size: u64, bytes: ArtifactBytes) -> UploadArtifact {
         UploadArtifact {

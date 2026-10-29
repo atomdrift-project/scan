@@ -44,6 +44,7 @@ vars! {
     SCAN_LLM_BACKGROUND_CONCURRENCY: Number, "Of those, how many work nobody waits on may hold.";
     SCAN_LLM_SYSTEM_PROMPT_FILE: Text, "Replace the built-in LLM grading prompt with this file.";
     SCAN_HOPPER: Text, "Hopper base URL(s), when `--hopper` is not given.";
+    SCAN_NO_UPLOAD: Flag, "Disable CLI result and artifact uploads while retaining Hopper corpus lookups.";
     SCAN_MODELS_DIR: Text, "Use the model bundle in this directory, and never update it.";
     SCAN_NO_ANALYSIS_CACHE: Flag, "Disable every analysis cache in the stack, for benchmarks.";
     SCAN_NO_UPDATE_CHECK: Flag, "Do not check for a newer release.";
