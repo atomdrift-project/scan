@@ -95,7 +95,7 @@ impl DisplayFilter {
 
     /// Returns true if the filter includes the given classification.
     #[must_use]
-    pub fn shows(&self, c: &Classification) -> bool {
+    pub fn shows(&self, c: Classification) -> bool {
         match c {
             Classification::Hostile => self.hostile,
             Classification::Suspicious => self.suspicious,
@@ -177,7 +177,7 @@ impl ScanConfig {
     /// let config = ScanConfig::new("/path/to/models", OutputFormat::Terminal, None)?;
     ///
     /// assert_eq!(config.format(), OutputFormat::Terminal);
-    /// assert!(config.filter().shows(&Classification::Hostile));
+    /// assert!(config.filter().shows(Classification::Hostile));
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new(

@@ -453,7 +453,7 @@ fn card_head(files: &[&FileAnalysis], head: &CardHead<'_>, is_container: bool) -
     let mut out = String::from("\n");
     if output::color_enabled() {
         out.push_str(&output::terminal_rule(
-            &decision.class,
+            decision.class,
             decision.probability,
             decision.threshold,
             decision.level,
@@ -462,7 +462,7 @@ fn card_head(files: &[&FileAnalysis], head: &CardHead<'_>, is_container: bool) -
         out.push('\n');
     } else {
         let (stamp, _) = output::terminal_badge(
-            &decision.class,
+            decision.class,
             decision.probability,
             decision.threshold,
             decision.level,
@@ -743,24 +743,19 @@ fn render_archive_cards(
         // Rank over every member in the package, then spend exactly three rows
         // on its strongest distinct traits. A large package reads like one
         // artifact instead of a transcript of its member traversal.
-        let package: Vec<FileAnalysis> = files
+        let package: Vec<&FileAnalysis> = files
             .iter()
+            .copied()
             .filter(|f| member_ids.contains(&f.id))
-            .map(|f| {
-                let mut f = (*f).clone();
-                f.path = collapse_decoded_dup(&f.path);
-                f
-            })
             .collect();
-        let package: Vec<&FileAnalysis> = package.iter().collect();
         let rows = output::terminal_trait_rows(
             &terminal_top_traits(&package),
             terminal_width().saturating_sub(2),
         );
         if embedded_tree {
-            output::terminal_embedded_branch(&pkg.decision.class, &name, ptype, psize, &rows, last)
+            output::terminal_embedded_branch(pkg.decision.class, &name, ptype, psize, &rows, last)
         } else {
-            output::terminal_card(&pkg.decision.class, &name, ptype, psize, &rows)
+            output::terminal_card(pkg.decision.class, &name, ptype, psize, &rows)
         }
     };
 
@@ -802,7 +797,7 @@ fn render_archive_cards(
                 let file_type = root.file_type.as_str();
                 out.push('\n');
                 out.push_str(&output::terminal_card(
-                    &head.decision.class,
+                    head.decision.class,
                     head.label,
                     file_type,
                     root.size,
@@ -986,10 +981,7 @@ pub(super) fn render_terminal_fetch_context(
             out.push('\n');
         }
         out.push_str(&output::terminal_reference_branch(
-            branch
-                .verdict
-                .as_ref()
-                .map(|(classification, probability)| (classification, *probability)),
+            branch.verdict,
             branch.subject,
             &branch.source,
             &branch.body,

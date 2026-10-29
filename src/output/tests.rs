@@ -70,7 +70,7 @@ fn hash_line_carries_the_bloom_glyph() {
     // An absent hash renders nothing.
     assert!(terminal_hash_line("", Some(BloomMark::KnownBad)).is_none());
     // The badge itself carries no bloom glyph.
-    let (badge, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Level::At(0));
+    let (badge, _) = terminal_badge(Classification::Hostile, 0.99, 0.65, Level::At(0));
     assert!(!badge.contains(BloomMark::KnownBad.glyph()));
 }
 
@@ -149,7 +149,7 @@ fn embedded_branch_uses_two_lines_without_a_closing_rule() {
     colored::control::set_override(false);
     let body = " \u{25cf}\u{25cf}\u{25cf} Payload behavior";
     let rendered = terminal_embedded_branch(
-        &Classification::Hostile,
+        Classification::Hostile,
         "embedded base64 @ 11096",
         "shell",
         11_766,
@@ -183,7 +183,7 @@ fn plain_renderers_emit_grep_able_text() {
         }])
         .unwrap(),
         terminal_reference_branch(
-            Some((&Classification::Hostile, 0.97)),
+            Some((Classification::Hostile, 0.97)),
             "dependency",
             "package.json",
             "body",
@@ -298,7 +298,7 @@ fn unflagged_badge_reports_distance_to_cutoff_not_zero() {
     //
     // Asserted with `contains` so the test holds in both the plain and the
     // colored badge form.
-    let (unflagged, _) = terminal_badge(&Classification::Benign, 0.998, 0.999, Level::Clean);
+    let (unflagged, _) = terminal_badge(Classification::Benign, 0.998, 0.999, Level::Clean);
     assert!(
         unflagged.contains("BENIGN") && unflagged.contains("50%"),
         "unflagged badge should show the threshold-relative percentage, got {unflagged:?}"
@@ -306,7 +306,7 @@ fn unflagged_badge_reports_distance_to_cutoff_not_zero() {
 
     // A level that IS on the grid still reports its calibrated confidence,
     // so the fix does not disturb the flagged path.
-    let (flagged, _) = terminal_badge(&Classification::Hostile, 0.99, 0.65, Level::At(0));
+    let (flagged, _) = terminal_badge(Classification::Hostile, 0.99, 0.65, Level::At(0));
     assert!(
         flagged.contains("HOSTILE") && flagged.contains("100%"),
         "flagged badge should keep the level-derived confidence, got {flagged:?}"

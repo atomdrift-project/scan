@@ -449,107 +449,116 @@ pub(super) fn chat_once(
                 .with_context(|| format!("posting to {url}"))
                 .map_err(CallError::Transport)
         };
-    // The queue priority goes only to our own vLLM (OpenRouter does not know
-    // the field), and only when it says something: 0 is vLLM's default.
-    let mut priority = (!openrouter && priority > 0).then_some(priority);
-    let mut resp = match post(priority) {
-        Ok(r) => r,
-        Err(e) => {
-            call_log(
-                if matches!(&e, CallError::Transport(t)
-                    if t.root_cause().downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout))
-                {
-                    "timeout"
-                } else {
-                    "transport-error"
-                },
-                None,
+    // Every attempt ends in exactly one call line: content, or an error with
+    // the outcome it is logged under.
+    let attempt = || -> std::result::Result<(String, Option<Usage>), (CallError, String)> {
+        let transport = |e: CallError| {
+            let timed_out = matches!(&e, CallError::Transport(t)
+                if t.root_cause().downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
+            let outcome = if timed_out {
+                "timeout"
+            } else {
+                "transport-error"
+            };
+            (e, outcome.to_owned())
+        };
+        let bad_reply = |e: anyhow::Error| (CallError::BadReply(e), "bad-reply".to_owned());
+        // The queue priority goes only to our own vLLM (OpenRouter does not know
+        // the field), and only when it says something: 0 is vLLM's default.
+        let mut priority = (!openrouter && priority > 0).then_some(priority);
+        let mut resp = post(priority).map_err(transport)?;
+        if priority.is_some() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            // A vLLM not started with `--scheduling-policy priority` refuses any
+            // non-zero priority outright. That is a deployment mismatch, not a
+            // reason to give up on the sample — and certainly not one to fall
+            // over to a paid endpoint for — so the request goes again without
+            // it. Any other 400 is the usual bad request.
+            let raw = resp.text().unwrap_or_default();
+            if !raw.contains("priority") {
+                return Err((
+                    CallError::BadReply(anyhow!(
+                        "LLM endpoint returned 400 Bad Request: {:?}",
+                        body_snippet(raw.trim())
+                    )),
+                    "http-400".to_owned(),
+                ));
+            }
+            tracing::warn!(
+                endpoint = %cfg.base_url,
+                "LLM endpoint refused the request priority (not running \
+                 --scheduling-policy priority); resending without it"
             );
-            return Err(e);
+            priority = None;
+            resp = post(priority).map_err(transport)?;
         }
-    };
-    if priority.is_some() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
-        // A vLLM not started with `--scheduling-policy priority` refuses any
-        // non-zero priority outright. That is a deployment mismatch, not a
-        // reason to give up on the sample — and certainly not one to fall over
-        // to a paid endpoint for — so the request goes again without it. Any
-        // other 400 is the usual bad request and is reported as such below.
-        let raw = resp.text().unwrap_or_default();
-        if !raw.contains("priority") {
-            return Err(CallError::BadReply(anyhow!(
-                "LLM endpoint returned 400 Bad Request: {:?}",
+        // 5xx is the endpoint's problem (unhealthy); 4xx is ours (bad request or
+        // auth). On a 4xx the body is the whole diagnosis — an over-budget
+        // prompt, an unknown model and a rejected key all arrive as a bare
+        // 400/404/401, and the endpoint explained which in the body.
+        let status = resp.status();
+        if !status.is_success() {
+            let raw = resp.text().unwrap_or_default();
+            let e = anyhow!(
+                "LLM endpoint returned {status}: {:?}",
                 body_snippet(raw.trim())
+            );
+            let e = if status.is_server_error() {
+                CallError::Transport(e)
+            } else {
+                CallError::BadReply(e)
+            };
+            return Err((e, format!("http-{}", status.as_u16())));
+        }
+        let html_content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/html"));
+        // Buffer the body as text before parsing so an undecodable reply can
+        // show what the endpoint actually sent (empty body, an SSE stream, a
+        // proxy's HTML error page, a "model loading" notice) instead of a bare
+        // serde position. A read failure is a dropped connection.
+        let raw = resp
+            .text()
+            .with_context(|| format!("reading response body from {url}"))
+            .map_err(|e| transport(CallError::Transport(e)))?;
+        // A 200 carrying an HTML page means the base URL points at a web UI (a
+        // dashboard, a reverse-proxy landing page), not an OpenAI-compatible
+        // API. Say so plainly rather than as a serde error over markup.
+        if html_content_type || raw.trim_start().starts_with('<') {
+            return Err(bad_reply(anyhow!(
+                "endpoint at {url} returned an HTML page, not JSON — the base URL \
+                 likely points at a web UI, not an OpenAI-compatible API; body \
+                 starts: {:?}",
+                body_snippet(&raw),
             )));
         }
-        tracing::warn!(
-            endpoint = %cfg.base_url,
-            "LLM endpoint refused the request priority (not running \
-             --scheduling-policy priority); resending without it"
-        );
-        priority = None;
-        resp = post(priority)?;
+        let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
+            bad_reply(anyhow!(
+                "decoding LLM response ({} bytes): {e}; body starts: {:?}",
+                raw.len(),
+                body_snippet(&raw),
+            ))
+        })?;
+        let content = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.text())
+            .unwrap_or_default();
+        Ok((content, parsed.usage))
+    };
+    match attempt() {
+        Ok((content, usage)) => {
+            call_log("ok", usage.as_ref());
+            tracing::debug!(model = %cfg.model, "LLM response\n{content}");
+            Ok(content)
+        }
+        Err((e, outcome)) => {
+            call_log(&outcome, None);
+            Err(e)
+        }
     }
-    // 5xx is the endpoint's problem (unhealthy); 4xx is ours (bad request/auth).
-    // The body is the whole diagnosis on a 4xx — an over-budget prompt, an
-    // unknown model name and a rejected key all arrive as a bare 400/404/401,
-    // and dropping it leaves nothing to act on — a log line reading only "LLM
-    // endpoint returned 400 Bad Request" does not say which of those happened,
-    // and the endpoint had already explained itself in the body.
-    let status = resp.status();
-    if !status.is_success() {
-        let raw = resp.text().unwrap_or_default();
-        call_log(&format!("http-{}", status.as_u16()), None);
-        let e = anyhow!(
-            "LLM endpoint returned {status}: {:?}",
-            body_snippet(raw.trim())
-        );
-        return Err(if status.is_server_error() {
-            CallError::Transport(e)
-        } else {
-            CallError::BadReply(e)
-        });
-    }
-    let html_content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/html"));
-    // Buffer the body as text before parsing so an undecodable reply can show
-    // what the endpoint actually sent (empty body, an SSE stream, a proxy's HTML
-    // error page, a "model loading" notice) instead of a bare serde position.
-    // A read failure here is a dropped connection — a transport problem.
-    let raw = resp
-        .text()
-        .with_context(|| format!("reading response body from {url}"))
-        .map_err(CallError::Transport)?;
-    // A 200 carrying an HTML page means the base URL points at a web UI (a
-    // dashboard, a reverse-proxy landing page), not an OpenAI-compatible API.
-    // Say so plainly — the alternative is a serde "expected value at column 1"
-    // over a screenful of markup.
-    if html_content_type || raw.trim_start().starts_with('<') {
-        return Err(CallError::BadReply(anyhow!(
-            "endpoint at {url} returned an HTML page, not JSON — the base URL \
-             likely points at a web UI, not an OpenAI-compatible API; body \
-             starts: {:?}",
-            body_snippet(&raw),
-        )));
-    }
-    let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
-        CallError::BadReply(anyhow!(
-            "decoding LLM response ({} bytes): {e}; body starts: {:?}",
-            raw.len(),
-            body_snippet(&raw),
-        ))
-    })?;
-    let content = parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.text())
-        .unwrap_or_default();
-    call_log("ok", parsed.usage.as_ref());
-    tracing::debug!(model = %cfg.model, "LLM response\n{content}");
-    Ok(content)
 }
 
 /// Lightweight health probe: `GET {base}/models` (the standard OpenAI listing,
@@ -741,21 +750,20 @@ pub(super) fn cache_path(hash: &str) -> Option<PathBuf> {
 /// Best-effort, atomic write (temp file + rename). A failure just means the next
 /// scan re-queries.
 pub(super) fn cache_put(path: &Path, verdict: &CachedVerdict) {
+    if let Err(e) = write_cached(path, verdict) {
+        tracing::debug!(path = %path.display(), error = format!("{e:#}"), "LLM verdict not cached");
+    }
+}
+
+fn write_cached(path: &Path, verdict: &CachedVerdict) -> Result<()> {
     use std::io::Write;
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(json) = serde_json::to_vec(verdict) else {
-        return;
-    };
-    if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent)
-        && tmp.write_all(&json).is_ok()
-    {
-        let _ = tmp.persist(path);
-    }
+    let parent = path.parent().context("cache path has no directory")?;
+    std::fs::create_dir_all(parent).context("creating the cache directory")?;
+    let json = serde_json::to_vec(verdict).context("serializing the verdict")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).context("creating a temporary file")?;
+    tmp.write_all(&json).context("writing the verdict")?;
+    tmp.persist(path).context("moving the verdict into place")?;
+    Ok(())
 }
 
 /// Longest body prefix included verbatim when a reply fails to decode — enough
