@@ -519,7 +519,7 @@ checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
  "bincode_derive",
  "serde",
- "unty 0.0.4",
+ "unty",
 ]
 
 [[package]]
@@ -528,7 +528,7 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
 dependencies = [
- "virtue 0.0.18",
+ "virtue",
 ]
 
 [[package]]
@@ -1471,7 +1471,7 @@ source = "git+https://github.com/copper-project/cu-bincode#3c3041a3278cafb1c7370
 dependencies = [
  "cu-bincode-derive",
  "serde",
- "unty 0.0.5",
+ "unty",
 ]
 
 [[package]]
@@ -1479,7 +1479,7 @@ name = "cu-bincode-derive"
 version = "2.2.0-beta"
 source = "git+https://github.com/copper-project/cu-bincode#3c3041a3278cafb1c73701eeecb7961b7ecf6814"
 dependencies = [
- "virtue 0.0.19",
+ "virtue",
 ]
 
 [[package]]
@@ -1955,7 +1955,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#036bda5e889100fc5be981a293ee8084ae0963c4"
+source = "git+https://github.com/atomdrift-project/filefacts.git#c830155da63f47be140626e891b1597198fe3389"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -5513,7 +5513,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#561dbed3cf9d517710a46582f0d4ef17a0687b5c"
+source = "git+https://github.com/atomdrift-project/stng.git#7f767a8b986e457b9d6d58aedd7c897b32c2737a"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5545,7 +5545,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#561dbed3cf9d517710a46582f0d4ef17a0687b5c"
+source = "git+https://github.com/atomdrift-project/stng.git#7f767a8b986e457b9d6d58aedd7c897b32c2737a"
 dependencies = [
  "libc",
 ]
@@ -5696,7 +5696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
@@ -6294,11 +6294,10 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#b6a85b1062dac229f8008613d5017edeadbcfa97"
+source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
 dependencies = [
  "cc",
  "regex",
- "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
 ]
@@ -6345,7 +6344,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#036bda5e889100fc5be981a293ee8084ae0963c4"
+source = "git+https://github.com/atomdrift-project/filefacts.git#c830155da63f47be140626e891b1597198fe3389"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6425,7 +6424,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?branch=master#b6a85b1062dac229f8008613d5017edeadbcfa97"
+source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
 
 [[package]]
 name = "tree-sitter-lua"
@@ -6690,12 +6689,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
-name = "unty"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dbe8d477efbc6c70a1dea1f9f1e0482168983a9147dee6b3a619f666f3aeac6"
-
-[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6758,12 +6751,6 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
-
-[[package]]
-name = "virtue"
-version = "0.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2063ed945650e9080bcfa2b56cbde318efe1347a3cf06882e23e2f124183e88"
 
 [[package]]
 name = "walkdir"
