@@ -50,19 +50,19 @@ pub(super) fn skipped_record(
     record
 }
 
-/// Stamp references as running only in CI: their declaring file is a CI
-/// context, so whatever they name never reaches an installed artifact.
-pub(super) fn mark_ci_scope(refs: &mut [Reference]) {
+/// Stamp references with the scope their declaring file gives them: a CI
+/// context, say, whose references never reach an installed artifact.
+pub(super) fn mark_scope(refs: &mut [Reference], scope: filefacts::DependencyScope) {
     for reference in refs {
-        let context = reference
+        reference
             .context
             .get_or_insert(filefacts::DependencyContext {
-                scope: filefacts::DependencyScope::Ci,
+                scope,
                 optional: false,
                 has_install_script: false,
                 installed_path: None,
-            });
-        context.scope = filefacts::DependencyScope::Ci;
+            })
+            .scope = scope;
     }
 }
 
@@ -219,7 +219,7 @@ pub(super) fn collect_references_from_input(
             continue;
         }
         if is_ci_context(file) {
-            mark_ci_scope(&mut refs);
+            mark_scope(&mut refs, filefacts::DependencyScope::Ci);
         }
         groups.push((file.sha256.clone(), refs));
     }
@@ -267,7 +267,7 @@ pub(super) fn collect_references_from_input(
             find::references_in_bytes(&bytes, &name)
         };
         if is_ci_context(root) {
-            mark_ci_scope(&mut hunted);
+            mark_scope(&mut hunted, filefacts::DependencyScope::Ci);
         }
         if !hunted.is_empty() {
             merge_into_root(&mut groups, &root.sha256, hunted);
@@ -439,12 +439,8 @@ pub(super) fn hunt_download_members(
         hunted_members += 1;
         let archive_path = if let Some(data) = root_bytes {
             if staged.is_none() {
-                let stage = (|| -> std::io::Result<tempfile::NamedTempFile> {
-                    use std::io::Write;
-                    let mut file = tempfile::NamedTempFile::new()?;
-                    file.write_all(data)?;
-                    Ok(file)
-                })();
+                let stage = tempfile::NamedTempFile::new()
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, data).map(|()| file));
                 match stage {
                     Ok(file) => staged = Some(file),
                     Err(e) => {
@@ -701,9 +697,10 @@ impl LocalNpmPackages {
             // implicit index.js deliberately remain external until established.
             if targets.is_empty()
                 || !file.analysis_gaps.is_empty()
-                || paths
-                    .iter()
-                    .any(|path| path.starts_with(&format!("{root}/")))
+                || paths.iter().any(|path| {
+                    path.strip_prefix(root.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
             {
                 continue;
             }
@@ -781,23 +778,20 @@ impl LocalNpmPackages {
     /// Mirror Node's package-level lookup: walk upward from the importing
     /// file, looking for `node_modules/<package>`. Exports and subpaths do not
     /// matter here because fletch retrieves whole packages.
+    ///
+    /// The walk stops at an archive's root (see [`virtual_parent`]), which it
+    /// does check: a zipped app's `x.zip!!node_modules/` resolves its imports.
     pub(super) fn resolves(&self, source_path: &str, package: &str) -> bool {
-        let normalized = source_path.replace('\\', "/");
-        let Some((mut dir, _)) = normalized.rsplit_once('/') else {
-            return false;
-        };
-        loop {
-            if self
-                .roots
-                .contains(&format!("{dir}/node_modules/{package}"))
+        let mut dir = virtual_parent(&source_path.replace('\\', "/"));
+        while let Some(current) = dir {
+            if safe_package_path(&current, &format!("node_modules/{package}"))
+                .is_some_and(|root| self.roots.contains(&root))
             {
                 return true;
             }
-            let Some((parent, _)) = dir.rsplit_once('/') else {
-                return false;
-            };
-            dir = parent;
+            dir = virtual_parent(&current);
         }
+        false
     }
 }
 
@@ -874,12 +868,14 @@ pub(super) fn npm_import_name(reference: &Reference) -> Option<String> {
 /// Merge the root's hunted references into its group (creating it if the root
 /// declared none), skipping any locator already present.
 pub(super) fn merge_into_root(groups: &mut Vec<Group>, root_sha: &str, hunted: Vec<Reference>) {
-    if !groups.iter().any(|(sha, _)| sha == root_sha) {
-        groups.push((root_sha.to_string(), Vec::new()));
-    }
-    let Some((_, group)) = groups.iter_mut().find(|(sha, _)| sha == root_sha) else {
-        return; // unreachable: just ensured the group exists
-    };
+    let i = groups
+        .iter()
+        .position(|(sha, _)| sha == root_sha)
+        .unwrap_or_else(|| {
+            groups.push((root_sha.to_string(), Vec::new()));
+            groups.len() - 1
+        });
+    let group = &mut groups[i].1;
     let mut seen: HashSet<String> = group.iter().map(|r| locator(r).to_owned()).collect();
     for r in hunted {
         if r.kind == RefKind::Undefined {

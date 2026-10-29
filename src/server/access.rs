@@ -37,13 +37,6 @@ use super::AppState;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RequestId(pub(super) u64);
 
-impl RequestId {
-    /// The numeric id, as every log line and diagnostic endpoint spells it.
-    pub(super) fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// Marks a response that did not perform its own analysis: it attached to a
 /// run already in flight for the same bytes (or the same PURL) and replayed
 /// that result.
@@ -107,9 +100,8 @@ impl Subject {
     }
 
     /// A request about an artifact named by its exact fetch URL.
-    pub(super) fn url(value: &str, sha256: Option<&str>) -> Self {
+    pub(super) fn url(value: &str) -> Self {
         Self {
-            sha256: sha256.and_then(subject_field),
             url: subject_field(value),
             ..Self::default()
         }
@@ -230,11 +222,12 @@ fn loggable(headers: &HeaderMap, name: header::HeaderName, max_len: usize) -> Op
     (!clean.is_empty()).then_some(clean)
 }
 
-/// Drop control characters and bound the length. The one gate every piece of
-/// caller-supplied text passes through before it reaches a log line.
+/// Drop control characters (C0 and C1 — `U+009B` is a CSI on its own) and
+/// anything else a terminal acts on, and bound the length. The one gate every
+/// piece of caller-supplied text passes through before it reaches a log line.
 fn sanitize(raw: &str, max_len: usize) -> String {
     raw.chars()
-        .filter(|c| !c.is_ascii_control())
+        .filter(|&c| !crate::output::tty_hostile(c) && !matches!(c, '\u{2028}' | '\u{2029}'))
         .take(max_len)
         .collect()
 }
@@ -275,7 +268,9 @@ pub(super) async fn access_log(
     next: Next,
 ) -> Response {
     let started = Instant::now();
-    let id = state.next_request_id();
+    let id = state
+        .next_request_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     req.extensions_mut().insert(RequestId(id));
 
     let method = req.method().clone();

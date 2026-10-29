@@ -263,7 +263,7 @@ async fn health_detail_requires_authentication() -> Result<()> {
         auth_digest: Some(digest),
         ..common::ready_config()?
     };
-    let app = build_app(&config).await?;
+    let app = common::ready_app(&config).await?;
 
     let body_of = async |authorization: Option<&str>| -> Result<serde_json::Value> {
         let response = app
@@ -274,18 +274,6 @@ async fn health_detail_requires_authentication() -> Result<()> {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
         serde_json::from_slice(&bytes).context("health body is not JSON")
     };
-
-    // Readiness can take ~15s in release and longer in debug.
-    let max_polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
-    let mut ready = false;
-    for _ in 0..max_polls {
-        if body_of(None).await?["status"] == "ok" {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(ready, "server did not become ready");
 
     let public = body_of(None).await?;
     for key in ["status", "rss_mb", "active_tasks", "uptime_secs", "load"] {

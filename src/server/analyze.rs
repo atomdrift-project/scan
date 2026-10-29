@@ -68,14 +68,6 @@ pub(super) enum Job {
 }
 
 impl Job {
-    /// The payload size when it is known before the fetch.
-    fn size_hint(&self) -> Option<u64> {
-        match self {
-            Self::Bytes { bytes, .. } => Some(bytes.len() as u64),
-            Self::Purl(_) | Self::Url(_) => None,
-        }
-    }
-
     /// How `/_/requests` and the phase tracker name the run.
     fn name(&self) -> &str {
         match self {
@@ -128,7 +120,10 @@ fn acquire(state: &AppState) -> Result<AnalysisPermit, ApiError> {
         .map_err(|_no_permit| {
             ApiError::at_capacity("At capacity (every core busy)", None, Some(30))
         })?;
-    Ok(AnalysisPermit::new(slot, cpu))
+    Ok(AnalysisPermit {
+        _slot: slot,
+        _cpu: cpu,
+    })
 }
 
 /// Start the analysis behind a flight this request leads, and publish its
@@ -179,7 +174,11 @@ impl Leader {
         self.flight.set_phase(phase.clone());
         let entry = InFlightRequest::new(
             job.name(),
-            job.size_hint().unwrap_or(0),
+            // The payload size, when it is known before the fetch.
+            match &job {
+                Job::Bytes { bytes, .. } => bytes.len() as u64,
+                Job::Purl(_) | Job::Url(_) => 0,
+            },
             self.flight.cancellation(),
             phase.clone(),
         );
@@ -320,7 +319,14 @@ fn record(
                 phases = %phases,
                 classification = %result.classification,
                 probability = result.probability,
-                analysis = analysis_source(&result),
+                // `cached` means cleave replayed the whole report from its
+                // on-disk cache (SQLite, keyed by content digest, options, and
+                // traits revision) rather than running the pipeline. It
+                // survives restarts, so a fast response is not evidence of a
+                // warm process. A request that rode *another request's*
+                // in-flight run reports `shared=true` on its access line
+                // instead: only the leader logs the completion.
+                analysis = if result.analysis_cached { "cached" } else { "fresh" },
                 llm = llm_source(result.interpretation.as_ref()),
                 // Where this verdict goes next. `queued` hands it to the
                 // uploader thread, whose own line reports whether it landed;
@@ -351,22 +357,6 @@ fn record(
             tracing::warn!(id = request_id, key = %key, elapsed_ms, timeout_secs = secs, "<-- 504 analysis timeout");
             Err(ApiError::timeout(secs))
         }
-    }
-}
-
-/// Where this result's analysis came from, for the completion log line.
-///
-/// `cached` means cleave replayed the whole report from its on-disk cache
-/// (SQLite, keyed by content digest, options, and traits revision) rather than
-/// running the pipeline. It survives restarts, so a fast response is not
-/// evidence of a warm process. A request that instead rode *another request's*
-/// in-flight run reports `shared=true` on its access line — that path never
-/// reaches here, because only the leader logs the completion.
-fn analysis_source(result: &ScanResult) -> &'static str {
-    if result.analysis_cached {
-        "cached"
-    } else {
-        "fresh"
     }
 }
 
@@ -530,13 +520,10 @@ fn classify_purl(
 
     // A removed version, or a download that failed where the registry still
     // has a record: analyze the registry's document instead.
-    let fallback = match &fetched {
-        Ok(_) => registry
-            .as_ref()
-            .filter(|reg| reg.version_removed == Some(true))
-            .and_then(crate::fetch::registry_document),
-        Err(_) => registry.as_ref().and_then(crate::fetch::registry_document),
-    };
+    let fallback = registry
+        .as_ref()
+        .filter(|reg| fetched.is_err() || reg.version_removed == Some(true))
+        .and_then(crate::fetch::registry_document);
     if let Some((name, bytes)) = fallback {
         mark("purl:registry-document");
         let hopper_route =
@@ -652,7 +639,8 @@ fn offer_registry_fallback(
     let Some((corpus, runtime)) = corpus else {
         return HopperRoute::Suppress;
     };
-    let (reached, _source) = runtime.block_on(corpus.known_with_source(None, Some(purl)));
+    let (reached, _source) =
+        runtime.block_on(corpus.known_with_source(None, Some(purl), /* fresh = */ false));
     let Reached::Record(record) = reached else {
         return HopperRoute::Suppress;
     };
@@ -770,6 +758,7 @@ mod tests {
                     lvl: crate::model::Level::Manual,
                 },
                 corroborated: false,
+                may_soften: true,
                 cached,
             })
         };

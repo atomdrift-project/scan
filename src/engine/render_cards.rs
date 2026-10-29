@@ -248,7 +248,10 @@ fn terminal_identity_summary(root: &FileAnalysis, label: &str) -> Option<String>
     }
 
     let what = if title { format!("“{what}”") } else { what };
-    Some(detail.map_or(what.clone(), |d| format!("{what} · {d}")))
+    Some(match detail {
+        Some(d) => format!("{what} · {d}"),
+        None => what,
+    })
 }
 
 fn terminal_finding_path(path: &str) -> String {
@@ -261,7 +264,7 @@ fn terminal_finding_path(path: &str) -> String {
     terminal_safe_text(name)
 }
 
-fn terminal_note_anchor(file: &FileAnalysis, finding_id: &str) -> Option<String> {
+fn terminal_note_line(file: &FileAnalysis, finding_id: &str) -> Option<u64> {
     let notes = cleave::context::notes(&file.findings, &file.context);
     for (line, notes) in file.context.iter().zip(notes) {
         let Some(note) = notes.iter().find(|n| n.id.as_str() == finding_id) else {
@@ -274,7 +277,7 @@ fn terminal_note_anchor(file: &FileAnalysis, finding_id: &str) -> Option<String>
                 .min(line.data.len());
             let added = line.data[..upto].iter().filter(|&&b| b == b'\n').count();
             let added = u64::try_from(added).unwrap_or(u64::MAX);
-            return Some(format!(":{}", base_line.saturating_add(added)));
+            return Some(base_line.saturating_add(added));
         }
         // Byte offsets are precise but add little triage value in the compact
         // trait grid. Keep source lines when available; otherwise the filename
@@ -292,7 +295,9 @@ fn terminal_finding_location(
     file: &FileAnalysis,
     finding: &Finding,
 ) -> String {
-    if let Some(source) = file
+    // A composite reads from the member its sources point at; anything else
+    // from its own file's notes.
+    let (file, line) = file
         .composite_sources
         .get(finding.id.as_str())
         .and_then(|sources| {
@@ -301,30 +306,14 @@ fn terminal_finding_location(
                 .find(|s| s.line.is_some() || s.offset.is_some())
                 .or_else(|| sources.first())
         })
-        && let Some(source_file) = by_id.get(&source.file)
-    {
-        if Some(source_file.id) == primary_id {
-            return source
-                .line
-                .map_or_else(String::new, |line| format!("line {line}"));
-        }
-        let mut location = terminal_finding_path(&source_file.path);
-        if let Some(line) = source.line {
-            let _ = write!(location, ":{line}");
-        }
-        return location;
-    }
-
+        .and_then(|source| Some((*by_id.get(&source.file)?, source.line)))
+        .unwrap_or_else(|| (file, terminal_note_line(file, finding.id.as_str())));
     if Some(file.id) == primary_id {
-        return terminal_note_anchor(file, finding.id.as_str())
-            .map_or_else(String::new, |anchor| {
-                format!("line {}", anchor.trim_start_matches(':'))
-            });
+        return line.map_or_else(String::new, |line| format!("line {line}"));
     }
-
     let mut location = terminal_finding_path(&file.path);
-    if let Some(anchor) = terminal_note_anchor(file, finding.id.as_str()) {
-        location.push_str(&anchor);
+    if let Some(line) = line {
+        let _ = write!(location, ":{line}");
     }
     location
 }
@@ -670,6 +659,12 @@ fn render_archive_cards(
         .filter(|p| p.decision.class >= Classification::Suspicious)
         .collect();
 
+    // Fall back to the single classic card unless this is genuinely a grab-bag
+    // (two or more independently-notable packages).
+    if notable.len() < 2 {
+        return None;
+    }
+
     // Does a root finding belong to the archive itself? It must be non-inherited
     // (native to the container — no `src` child pointing into a member) *and*
     // native to nothing below it: a trait that also fired natively on some member
@@ -696,12 +691,6 @@ fn render_archive_cards(
             .iter()
             .any(|f| f.crit >= Criticality::Hostile && is_archive_own(f))
     });
-
-    // Fall back to the single classic card unless this is genuinely a grab-bag
-    // (two or more independently-notable packages).
-    if notable.len() < 2 {
-        return None;
-    }
 
     // ── Banner: verdict rule → 📦 name · TYPE · size → hash ──
     let mut out = card_head(files, head, true);
@@ -1054,14 +1043,14 @@ fn terminal_fetch_source(rec: &FetchRecord, index: &ReportIndex<'_>) -> String {
 fn write_terminal_fetch_redirects(out: &mut String, rec: &FetchRecord) {
     let resolved = rec.resolved_url.as_deref();
     if let Some(resolved) = resolved.filter(|url| *url != rec.locator) {
-        let _ = writeln!(out, " \u{00b7}   resolved  {resolved}");
+        let _ = writeln!(out, " \u{00b7}   resolved  {}", output::tty_text(resolved));
     }
     if let Some(final_url) = rec
         .final_url
         .as_deref()
         .filter(|url| Some(*url) != resolved && *url != rec.locator)
     {
-        let _ = writeln!(out, " \u{00b7}   final  {final_url}");
+        let _ = writeln!(out, " \u{00b7}   final  {}", output::tty_text(final_url));
     }
 }
 
@@ -1107,16 +1096,18 @@ fn write_terminal_registry_provenance(
         signals.push("install script");
     }
     if let Some(deprecated) = record.deprecated.as_deref() {
-        let _ = writeln!(out, "{prefix}deprecated  {deprecated}");
+        // Publisher-written text, like the repository URL below: escaped so
+        // a deprecation notice cannot drive the terminal.
+        let _ = writeln!(out, "{prefix}deprecated  {}", output::tty_text(deprecated));
     }
     if !signals.is_empty() {
         let _ = writeln!(out, "{prefix}signals  {}", signals.join(" · "));
     }
     if let Some(repository) = record.repository.as_deref() {
-        let _ = writeln!(out, "{prefix}upstream  {repository}");
+        let _ = writeln!(out, "{prefix}upstream  {}", output::tty_text(repository));
     }
     for url in registry.provenance.source_urls() {
-        let _ = writeln!(out, "{prefix}metadata  {url}");
+        let _ = writeln!(out, "{prefix}metadata  {}", output::tty_text(&url));
     }
 }
 

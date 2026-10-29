@@ -182,9 +182,7 @@ pub(super) fn write_structural_extensions(
         let lines = lines as u64;
         total_loc += lines;
 
-        if !s.path.is_empty()
-            && s.path.contains('.')
-            && let Some(ext) = s.path.rsplit('.').next()
+        if let Some((_, ext)) = s.path.rsplit_once('.')
             && binary_like.contains(&s.file_type.as_str())
             && text_exts.contains(&ext.to_ascii_lowercase().as_str())
         {
@@ -232,8 +230,13 @@ pub(super) fn write_structural_extensions(
                 .sum::<f64>() as f32,
         );
     }
+    let mean_entropy = if entropies.is_empty() {
+        0.0
+    } else {
+        entropies.iter().sum::<f64>() / entropies.len() as f64
+    };
     if entropies.len() > 1 {
-        let mean = entropies.iter().sum::<f64>() / entropies.len() as f64;
+        let mean = mean_entropy;
         let var =
             entropies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / entropies.len() as f64;
         w.set("struct:entropy_std_dev", var.sqrt() as f32);
@@ -251,16 +254,14 @@ pub(super) fn write_structural_extensions(
         ),
     );
     if !code_entropies.is_empty() {
-        let avg_ent = if entropies.is_empty() {
-            0.0
-        } else {
-            entropies.iter().sum::<f64>() / entropies.len() as f64
-        };
         let max_code_ent = code_entropies
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
-        w.set("struct:code_entropy_spike", (max_code_ent - avg_ent) as f32);
+        w.set(
+            "struct:code_entropy_spike",
+            (max_code_ent - mean_entropy) as f32,
+        );
     }
     w.set(
         "struct:foreign_binary_signal",
@@ -707,9 +708,8 @@ pub(super) fn file_symbols(facts: &cleave::types::CompactFacts) -> Vec<String> {
         insert(name);
         match (lib.is_empty(), name.is_empty()) {
             (false, false) => insert(&format!("{lib}!{name}")),
-            (true, false) => insert(name),
             (false, true) => insert(lib),
-            (true, true) => {}
+            (true, _) => {}
         }
     }
     for name in facts
@@ -926,14 +926,11 @@ pub(super) fn write_silent_packer_signal(
 /// Aggregate-level suspicious n-gram co-occurrence counts. Mirrors
 /// collimator's `include_suspicious_trigrams` branch.
 pub(super) fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut FeatureWriter<'_>) {
-    let mut sus_paths: Vec<&String> = combined
+    let n = combined
         .sample_paths
-        .iter()
-        .filter(|&(_, &mo)| mo >= 4)
-        .map(|(p, _)| p)
-        .collect();
-    sus_paths.sort();
-    let n = sus_paths.len();
+        .values()
+        .filter(|&&mo| mo >= 4)
+        .count();
     let mut n_bi: u64 = 0;
     let mut n_tri: u64 = 0;
     for i in 0..n {

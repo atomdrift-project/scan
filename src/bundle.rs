@@ -173,7 +173,9 @@ const MAX_FILE_BYTES: u64 = 4 << 30;
 /// fetches. `quick` fails fast when the bucket is unreachable; a first install
 /// or an explicit update stays patient so a slow first fetch still completes.
 fn client(quick: bool) -> Result<Client> {
-    let mut builder = Client::builder().timeout(TIMEOUT);
+    // The bucket is https; a redirect must not take a manifest or a bundle
+    // off it onto cleartext.
+    let mut builder = Client::builder().timeout(TIMEOUT).https_only(true);
     if quick {
         builder = builder.connect_timeout(QUICK_CONNECT_TIMEOUT);
     }

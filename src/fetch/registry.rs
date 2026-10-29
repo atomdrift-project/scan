@@ -250,7 +250,12 @@ pub fn registry_summary(reg: &Registry) -> Vec<String> {
     if let Some(dep) = &reg.deprecated {
         parts.push(format!("\u{26a0} {dep}"));
     }
+    // Registry text is publisher-controlled and lands on a terminal: an author
+    // or deprecation notice carrying escapes must not rewrite the verdict.
     parts
+        .into_iter()
+        .map(|part| crate::output::tty_text(&part).into_owned())
+        .collect()
 }
 
 /// Most registry requests of each kind (range resolution, record lookup) one
@@ -432,10 +437,6 @@ pub(super) fn registry_doc_name(reg: &Registry) -> String {
     format!("{base}.registry.json")
 }
 
-/// Tally the run's fetches into a one-line summary mirroring the progress bar's
-/// completion line: how many came live off the network vs. served from cache,
-/// how many failed, and the total bytes pulled. Used by the live tree, which
-/// prints it beneath the settled dependency rows.
 /// A manifest peer range is a candidate, not evidence of an installed version.
 pub(super) fn mark_peer_candidate(record: &mut FetchRecord, source: &str) {
     let source = if source == "package.json:peerDependencies" {

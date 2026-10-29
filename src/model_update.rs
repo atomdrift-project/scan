@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Seek;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -20,9 +20,7 @@ use crate::bundle::{self, Bundle};
 const SIDECAR: &str = ".litmus-models.toml";
 
 /// This build's version, matched against the manifest's release keys (e.g. `2.0.0-rc.4`).
-fn our_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
+const OUR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -83,6 +81,68 @@ pub fn check(dir: &Path) -> Result<()> {
 }
 
 /// The model bundle, as [`bundle::update`] installs it.
+/// Most bytes a model bundle may unpack to. The download is capped, but zstd
+/// is not: a small tarball can claim terabytes.
+const MAX_UNPACKED_BYTES: u64 = 16 << 30;
+
+/// Extract a model tarball into `staging`, accepting only what a model bundle
+/// is: regular files and directories, each named once, by a relative path of
+/// plain components. Links are refused outright — one named like the sidecar
+/// would turn the metadata write after it into a write anywhere — and so is a
+/// `.git`, which would mark the tree git-managed and stop every later update.
+fn unpack(reader: impl Read, staging: &Path) -> Result<()> {
+    use std::path::Component;
+    let mut archive = tar::Archive::new(reader);
+    // Never group- or world-writable, whatever modes the tarball carries.
+    archive.set_mask(0o022);
+    let mut seen = std::collections::HashSet::new();
+    let mut total: u64 = 0;
+    for entry in archive.entries().context("reading tar entries")? {
+        let mut entry = entry.context("reading tar entry")?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            std::io::copy(&mut entry, &mut std::io::sink()).context("reading a PAX header")?;
+            continue;
+        }
+        let path = entry
+            .path()
+            .context("reading a tar entry path")?
+            .into_owned();
+        if !kind.is_file() && !kind.is_dir() {
+            bail!("unsupported tar entry {kind:?} at {}", path.display());
+        }
+        // `./name` is how `tar -C dir .` spells a member; anything else that is
+        // not a plain name (`..`, a root, a prefix) is refused.
+        if !path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            bail!("tar entry {} is not a plain relative path", path.display());
+        }
+        let path: std::path::PathBuf = path
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .collect();
+        if path.as_os_str().is_empty() && kind.is_dir() {
+            continue; // the archive's own `./`
+        }
+        if path.as_os_str().is_empty() || path.starts_with(".git") || path == Path::new(SIDECAR) {
+            bail!("tar entry {} is reserved", path.display());
+        }
+        if !seen.insert(path.clone()) {
+            bail!("tar entry {} appears twice", path.display());
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_UNPACKED_BYTES {
+            bail!("bundle unpacks to more than {MAX_UNPACKED_BYTES} bytes");
+        }
+        entry
+            .unpack_in(staging)
+            .with_context(|| format!("extracting {}", path.display()))?;
+    }
+    Ok(())
+}
+
 struct Models;
 
 /// The bundle this build should run, resolved from the manifest.
@@ -111,8 +171,8 @@ impl Bundle for Models {
         let mut manifest: Manifest =
             toml::from_str(&text).with_context(|| format!("parsing manifest {url}"))?;
         // This build's own `[stable]` pointer, else `latest`.
-        let (key, source) = match manifest.stable.remove(our_version()) {
-            Some(key) => (key, format!("stable:{}", our_version())),
+        let (key, source) = match manifest.stable.remove(OUR_VERSION) {
+            Some(key) => (key, format!("stable:{}", OUR_VERSION)),
             None if !manifest.latest.is_empty() => (manifest.latest, "latest".to_owned()),
             None => bail!("manifest has no pointer for this version and no `latest`"),
         };
@@ -120,7 +180,7 @@ impl Bundle for Models {
             format!("manifest references {key} but has no [artifacts.{key}] entry")
         })?;
         Ok(Release {
-            upgrade: manifest.upgrade.remove(our_version()),
+            upgrade: manifest.upgrade.remove(OUR_VERSION),
             key,
             source,
             artifact,
@@ -151,9 +211,7 @@ impl Bundle for Models {
         )?;
         tarball.rewind().context("rewinding the download")?;
         let decoder = zstd::Decoder::new(tarball).context("opening zstd stream")?;
-        tar::Archive::new(decoder)
-            .unpack(staging)
-            .with_context(|| format!("extracting {}", artifact.file))?;
+        unpack(decoder, staging).with_context(|| format!("extracting {}", artifact.file))?;
 
         // Force every specialist route to construct its ONNX graph at least once.
         crate::model::Model::load(staging, None, None)
@@ -170,10 +228,19 @@ impl Bundle for Models {
             commit: artifact.commit.clone(),
             date: artifact.date.clone(),
             source: remote.source.clone(),
-            version: our_version().to_owned(),
+            version: OUR_VERSION.to_owned(),
         };
         let rendered = toml::to_string(&meta).context("rendering sidecar")?;
-        fs::write(staging.join(SIDECAR), rendered).context("writing sidecar")
+        // `create_new`: `unpack` refuses a bundle entry by this name, and this
+        // must never write through whatever is there instead.
+        let mut sidecar = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staging.join(SIDECAR))
+            .context("creating sidecar")?;
+        sidecar
+            .write_all(rendered.as_bytes())
+            .context("writing sidecar")
     }
 
     fn describe(remote: &Release) -> String {
@@ -194,7 +261,7 @@ impl Bundle for Models {
         remote.upgrade.as_ref().map(|target| {
             format!(
                 "Note: Atomdrift Scan {} cannot use the newest models. Upgrade to Atomdrift Scan {target} for the latest detections.",
-                our_version()
+                OUR_VERSION
             )
         })
     }

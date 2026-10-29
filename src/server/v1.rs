@@ -30,6 +30,7 @@ use crate::lookup::pick_verdict;
 /// a sequence, and `serde_urlencoded` — what axum's `Query` is built on —
 /// cannot deserialize one. It silently rejects the whole request instead, which
 /// would make `?purl=a&purl=b` a 400 with no explanation.
+#[derive(Default)]
 pub(super) struct V1Query {
     purl: Vec<String>,
     url: Vec<String>,
@@ -89,42 +90,28 @@ fn matching_traits_version(stored: Option<&str>, local: Option<&str>) -> bool {
         .is_some_and(|(stored, local)| stored == local)
 }
 
-/// `X-Hopper-Fresh`, the header spelling of `?fresh=1`.
-///
-/// Named for hopper's own escape hatch rather than for scan, because it is the
-/// same request travelling: a caller sets it once and every hop that can answer
-/// from something cheaper stands down. Accepts the same spellings the query
-/// parameter does — hopper itself only reads `1`, and accepting a superset here
-/// costs nothing and surprises nobody.
-fn header_wants_fresh(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-hopper-fresh")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(affirmative)
-}
-
 impl V1Query {
     /// Fold the header alias into the parsed query. Either spelling opts in;
     /// neither can opt back out, so a proxy that adds the header cannot be
     /// defeated by a stale `fresh=0` further down the chain.
+    ///
+    /// `X-Hopper-Fresh` is named for hopper's own escape hatch rather than for
+    /// scan, because it is the same request travelling: a caller sets it once
+    /// and every hop that can answer from something cheaper stands down. It
+    /// accepts the same spellings the query parameter does — hopper itself
+    /// only reads `1`, and accepting a superset here costs nothing and
+    /// surprises nobody.
     fn with_fresh_header(mut self, headers: &HeaderMap) -> Self {
-        self.fresh = self.fresh || header_wants_fresh(headers);
+        self.fresh = self.fresh
+            || headers
+                .get("x-hopper-fresh")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(affirmative);
         self
     }
 
     fn parse(raw: Option<&str>) -> Self {
-        let mut q = Self {
-            purl: Vec::new(),
-            url: Vec::new(),
-            sha256: Vec::new(),
-            false_positive_budget: None,
-            bad_budget: None,
-            force: false,
-            fresh: false,
-            refresh: false,
-            path: Vec::new(),
-            follow: Vec::new(),
-        };
+        let mut q = Self::default();
         for (key, value) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             match key.as_ref() {
                 "purl" => q.purl.push(value.into_owned()),
@@ -195,6 +182,12 @@ fn v1_follow_policy(
         )
     })
 }
+
+/// Longest an upload may go without delivering a byte. An idle bound, not a
+/// total one: a large artifact on a slow link still arrives, but a client
+/// dripping a body (or stalling mid-upload) cannot hold its buffer and its
+/// busy mark open indefinitely.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many packages one URL may name.
 ///
@@ -334,12 +327,9 @@ impl V1Analyze {
                 Some(url.to_owned())
             }
             _ => {
-                return Err(Box::new(
-                    ApiError::bad_request(
-                        "too_many_packages",
-                        "Only one exact url may be analyzed per request.",
-                    )
-                    .response(),
+                return Err(reject(
+                    "too_many_packages",
+                    "Only one exact url may be analyzed per request.",
                 ));
             }
         };
@@ -377,7 +367,7 @@ impl V1Analyze {
 
 /// POST /v1/analyze — analyze an artifact and answer with a decision.
 ///
-/// The whole point of this route over `/analyze-purl` is that it survives being
+/// The whole point of this streamed answer is that it survives being
 /// slow. A proxy between us and the caller gives up on a silent connection —
 /// after as little as 125 seconds — and tears it down, which costs the
 /// caller an analysis that in fact completed: the server finishes,
@@ -399,18 +389,17 @@ impl V1Analyze {
 /// named in the query.
 pub(super) async fn v1_analyze(
     State(state): State<Arc<AppState>>,
-    Extension(request_id): Extension<RequestId>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
     raw: axum::extract::RawQuery,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    let request_id = request_id.get();
     let q = V1Query::parse(raw.0.as_deref()).with_fresh_header(&headers);
     let req = match V1Analyze::parse(&state, request_id, q) {
         Ok(req) => req,
         Err(rejected) => return *rejected,
     };
-    if let Some(path) = req.path.clone() {
+    if let Some(path) = req.path.as_deref() {
         if !body.is_end_stream() {
             return ApiError::bad_request(
                 "path_with_body",
@@ -418,17 +407,14 @@ pub(super) async fn v1_analyze(
             )
             .response();
         }
-        return analyze_path(&state, &req, &path).await;
+        return analyze_path(&state, &req, path).await;
     }
 
     // Memory is checked before the body is read: an artifact of up to
     // `--max-size-mb` is read only by a server with room for it. Full admission
     // waits until it has to analyze, so a verdict already held for these bytes
-    // is answered even by a server whose startup failed. A refresh may be
-    // answered from what is already held, so it is admitted once it has to
-    // analyze.
-    if !req.q.refresh
-        && !body.is_end_stream()
+    // is answered even by a server whose startup failed.
+    if !body.is_end_stream()
         && let Err(refusal) = state.check_memory().await
     {
         return refusal.response();
@@ -467,8 +453,8 @@ pub(super) async fn v1_analyze(
     if let Some(url) = req.url.clone() {
         return analyze_url(&state, &req, url).await;
     }
-    if req.purl.is_some() {
-        return analyze_purl(&state, &req).await;
+    if let Some((asked, purl)) = req.purl.clone() {
+        return analyze_purl(&state, &req, asked, purl).await;
     }
     ApiError::bad_request(
         "missing_package",
@@ -490,8 +476,12 @@ async fn read_body(
         let next = std::future::poll_fn(|cx| {
             futures_core::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
         });
-        let Ok(next) = tokio::time::timeout(super::BODY_IDLE_TIMEOUT, next).await else {
-            return Err(super::body_idle_timeout());
+        let Ok(next) = tokio::time::timeout(BODY_IDLE_TIMEOUT, next).await else {
+            return Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "body_timeout",
+                "The request body stalled.",
+            ));
         };
         let Some(chunk) = next else {
             break;
@@ -534,6 +524,9 @@ async fn analyze_bytes(
         .get("x-filename")
         .and_then(|v| v.to_str().ok())
         .map(sanitize_upload_filename)
+        // `""` and `.` name the staging directory itself: staging would fail,
+        // and with it every request sharing this flight.
+        .filter(|name| !name.is_empty() && name != ".")
         .unwrap_or_else(|| format!("upload-{request_id}"));
     let asked = req.purl.as_ref().map(|(asked, _)| asked.as_str());
     let purl = req.purl.as_ref().map(|(_, purl)| purl.clone());
@@ -705,7 +698,14 @@ fn repair(state: &AppState, request_id: u64, filename: &str, sha: &str, bytes: b
 /// when hopper's verdict is missing or from other traits.
 async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap) -> Response {
     let request_id = req.request_id;
-    let Some(sha) = req.q.sha256.first().map(|sha| sha.to_ascii_lowercase()) else {
+    // Trimmed as validation trimmed it, so the digest matches the index and
+    // hopper's keys.
+    let Some(sha) = req
+        .q
+        .sha256
+        .first()
+        .map(|sha| sha.trim().to_ascii_lowercase())
+    else {
         return ApiError::bad_request("missing_sha256", "refresh=1 requires ?sha256=.").response();
     };
     // The local index is already namespaced by the currently loaded traits
@@ -736,7 +736,9 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
         .response();
     };
 
-    let (reached, source) = corpus.known_fresh_with_source(Some(&sha), None).await;
+    let (reached, source) = corpus
+        .known_with_source(Some(&sha), None, /* fresh = */ true)
+        .await;
     if let Reached::Record(record) = reached {
         // Reads the installed traits on first use, so off the reactor.
         let local = tokio::task::spawn_blocking(crate::corpus_precheck::local_traits)
@@ -746,11 +748,10 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
         if matching_traits_version(record.traits_version.as_deref(), local) {
             let decided = V1Decision::corpus(&record, Some(&sha), None, req.budget);
             let mut resp = answered(decided, corpus_source(source), req.elapsed_ms());
-            if let Some(name) = req.follow.policy.follow_name()
-                && let Ok(value) = HeaderValue::from_str(&name)
-            {
-                resp.headers_mut().insert("X-Scan-Follow", value);
-            }
+            insert_follow(
+                resp.headers_mut(),
+                req.follow.policy.follow_name().as_deref(),
+            );
             resp.extensions_mut().insert(Subject::sha256(&sha));
             tracing::info!(id = request_id, sha256 = %sha, traits_version = ?record.traits_version, "refresh answered from Hopper at the current traits version");
             return resp;
@@ -763,7 +764,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
         return ApiError::at_capacity("Too many artifacts downloading", None, Some(5)).response();
     };
     if let Err(refusal) = state.admit_request(request_id).await {
-        return refusal.response();
+        return refused(req, &refusal);
     }
     let sample = match corpus.sample(&sha, state.config.max_body_size).await {
         Ok(sample) => sample,
@@ -799,7 +800,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze, mut headers: HeaderMap)
 async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Response {
     let request_id = req.request_id;
     if let Err(refusal) = state.admit_request(request_id).await {
-        return refusal.response();
+        return refused(req, &refusal);
     }
     let attachment = state.flights.join(FlightKey::new(
         Artifact::Url(url.clone()),
@@ -828,12 +829,13 @@ async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Res
 }
 
 /// Analyze a package named by PURL, unless what we already know answers it.
-async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
+async fn analyze_purl(
+    state: &Arc<AppState>,
+    req: &V1Analyze,
+    asked: String,
+    purl: String,
+) -> Response {
     let request_id = req.request_id;
-    let Some((asked, purl)) = req.purl.clone() else {
-        return ApiError::bad_request("missing_package", "Name an artifact with ?purl=.")
-            .response();
-    };
 
     // Already answered?
     //
@@ -906,15 +908,22 @@ async fn analyze_purl(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     answer(req, attachment, named).await
 }
 
+/// `X-Scan-Follow`: the follow policy a decision was made under, so a caller
+/// can file it, and a retry need not infer which policy was in play.
+fn insert_follow(headers: &mut HeaderMap, follow: Option<&str>) {
+    if let Some(value) = follow.and_then(|name| HeaderValue::from_str(name).ok()) {
+        headers.insert("X-Scan-Follow", value);
+    }
+}
+
 /// A request refused admission, named with the follow policy it would have
 /// run under — as every other analyze answer is, refusals included.
 fn refused(req: &V1Analyze, refusal: &ApiError) -> Response {
     let mut resp = refusal.response();
-    if let Some(name) = req.follow.policy.follow_name()
-        && let Ok(value) = HeaderValue::from_str(&name)
-    {
-        resp.headers_mut().insert("X-Scan-Follow", value);
-    }
+    insert_follow(
+        resp.headers_mut(),
+        req.follow.policy.follow_name().as_deref(),
+    );
     resp
 }
 
@@ -960,11 +969,13 @@ impl Named {
         self.asked.as_deref().unwrap_or(&self.subject)
     }
 
+    /// The access-line subject: an upload with no coordinate is named by its
+    /// digest, never logged as a `purl`.
     fn access_subject(&self) -> Subject {
-        if self.is_url {
-            Subject::url(&self.subject, None)
-        } else {
-            Subject::purl(&self.subject, None)
+        match (self.is_url, self.key.as_deref()) {
+            (true, _) => Subject::url(&self.subject),
+            (false, Some(purl)) => Subject::purl(purl, None),
+            (false, None) => Subject::sha256(&self.subject),
         }
     }
 
@@ -978,7 +989,7 @@ impl Named {
         let key = self.key.as_deref();
         if self.is_url {
             let verdict = crate::lookup::Verdict::from_scan(result, None);
-            V1Decision::stored(&verdict, None, budget).asked_about_url(self.asked.as_deref())
+            V1Decision::stored(&verdict, None, budget).with_url(self.asked.as_deref())
         } else {
             let verdict = crate::lookup::Verdict::from_scan(result, key);
             V1Decision::stored(&verdict, key, budget).asked_about(self.asked.as_deref())
@@ -1056,11 +1067,7 @@ fn outcome_response(
     // configuration, and the answer has to be filed under what was measured
     // rather than what was requested. On refusals too: a caller correlating a
     // retry should not have to infer which policy was in play.
-    if let Some(name) = framing.follow.as_deref()
-        && let Ok(value) = HeaderValue::from_str(name)
-    {
-        resp.headers_mut().insert("X-Scan-Follow", value);
-    }
+    insert_follow(resp.headers_mut(), framing.follow.as_deref());
     // The normalized coordinate, so a caching caller can file one entry per
     // artifact rather than one per spelling.
     //
@@ -1210,7 +1217,7 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
                 let reason = unretrievable_reason(refusal.status);
                 if named.is_url {
                     V1Decision::unavailable(None, None)
-                        .asked_about_url(named.asked.as_deref())
+                        .with_url(named.asked.as_deref())
                         .because(reason)
                 } else {
                     V1Decision::unavailable(None, named.key.as_deref())
@@ -1240,11 +1247,7 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
     headers.insert("X-Scan-Source", HeaderValue::from_static("scan:analysis"));
     // See `outcome_response`. These headers go out before the first progress
     // frame, so a caller knows how to file the decision before it arrives.
-    if let Some(name) = follow
-        && let Ok(value) = HeaderValue::from_str(&name)
-    {
-        headers.insert("X-Scan-Follow", value);
-    }
+    insert_follow(headers, follow.as_deref());
     if let Some(key) = canonical.as_deref()
         && let Ok(value) = HeaderValue::from_str(key)
     {
@@ -1306,32 +1309,26 @@ pub(super) async fn v1_lookup(
     response
 }
 
+/// The values given, trimmed, with blanks dropped.
+fn nonblank(values: &[String]) -> Vec<&str> {
+    values
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1Query) -> Result<Response, ApiError> {
     let budget = q.budget(state.config.level)?;
-    let shas: Vec<&str> = q
-        .sha256
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let shas = nonblank(&q.sha256);
     // One digest pairs with a PURL naming the same bytes. Several digests are
     // several artifacts, listed the way several PURLs are.
     let sha = match shas.as_slice() {
         [one] => Some(*one),
         _ => None,
     };
-    let purls: Vec<&str> = q
-        .purl
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
-    let urls: Vec<&str> = q
-        .url
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .collect();
+    let purls = nonblank(&q.purl);
+    let urls = nonblank(&q.url);
 
     if !purls.is_empty() && !urls.is_empty() {
         return Err(ApiError::bad_request(
@@ -1374,7 +1371,7 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1Query) -> Result<Response,
         }
         let key = Key::parse(sha, None, Some(url))?;
         let (decided, source) = decide(state, &key, budget, q.fresh).await;
-        return Ok(sourced(Json(decided.asked_about_url(Some(url))), source));
+        return Ok(sourced(Json(decided.with_url(Some(url))), source));
     }
 
     // One package named two ways is one question, so a lone sha256 and a lone
@@ -1584,20 +1581,6 @@ async fn decide_many(
     out
 }
 
-/// The filters' opinion of an artifact named by a digest, a PURL, or both.
-///
-/// Both keys are evidence about one artifact, so both are supplied and `burton`
-/// combines them: the worst claim against either wins, and a blessing needs all
-/// of them. A caller who names both is asserting they are the same thing, so a
-/// bless on one beside a claim on the other is a contradiction, not a coin flip.
-fn bloom_decision(sha: Option<&str>, purl: Option<&str>) -> crate::bloom_repo::Decision {
-    use crate::bloom_repo::Decision;
-    let Some(lk) = crate::bloom_repo::global() else {
-        return Decision::Unknown;
-    };
-    lk.decide_any(purl, sha.and_then(burton::parse_sha256_hex).as_ref())
-}
-
 fn corpus_source(source: Option<corpus::CorpusSource>) -> &'static str {
     match source {
         Some(corpus::CorpusSource::Replica) => "scan:replica",
@@ -1624,10 +1607,15 @@ async fn decide_unheld(
     // after a write — or checking whether a revocation has landed — needs
     // bypassed. Withholding the decision here disables both bloom paths at
     // once: the fast bless below, and the derived fallback after the corpus.
-    let bloom = if fresh {
-        crate::bloom_repo::Decision::Unknown
-    } else {
-        bloom_decision(sha, purl)
+    //
+    // Both keys are evidence about one artifact, so both are supplied and
+    // `burton` combines them: the worst claim against either wins, and a
+    // blessing needs all of them. A caller who names both is asserting they
+    // are the same thing, so a bless on one beside a claim on the other is a
+    // contradiction, not a coin flip.
+    let bloom = match crate::bloom_repo::global() {
+        Some(lk) if !fresh => lk.decide_any(purl, sha.and_then(burton::parse_sha256_hex).as_ref()),
+        _ => crate::bloom_repo::Decision::Unknown,
     };
 
     // A bless answers immediately and does not pay the hopper round trip. The
@@ -1659,7 +1647,9 @@ async fn decide_unheld(
     let Some(corpus) = state.corpus.as_ref() else {
         return (filters_or_unanalyzed(), "scan:bloom");
     };
-    let (reached, source) = corpus.known_with_source(sha, purl).await;
+    let (reached, source) = corpus
+        .known_with_source(sha, purl, /* fresh = */ false)
+        .await;
     let decided = match reached {
         Reached::Record(record) => V1Decision::corpus(&record, sha, purl, budget).with_url(url),
         // The corpus holds nothing either. A filter claim is the last thing we

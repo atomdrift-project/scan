@@ -190,15 +190,13 @@ fn shared_resources() -> Option<&'static Resources> {
     if let Some(res) = RESOURCES.get() {
         return Some(res);
     }
-    let built = HttpFetch::new()
+    let net = HttpFetch::new()
         .map_err(|e| tracing::warn!("fetch disabled: http client unavailable: {e:#}"))
-        .ok()
-        .zip(
-            open_blob_cache()
-                .map_err(|e| tracing::warn!("fetch disabled: blob cache unavailable: {e:#}"))
-                .ok(),
-        )?;
-    let (net, cache) = built;
+        .ok();
+    let cache = open_blob_cache()
+        .map_err(|e| tracing::warn!("fetch disabled: blob cache unavailable: {e:#}"))
+        .ok();
+    let (net, cache) = net.zip(cache)?;
     Some(RESOURCES.get_or_init(|| Resources {
         net: Box::new(net.with_max_bytes(settings().max_fetch_bytes)),
         cache,

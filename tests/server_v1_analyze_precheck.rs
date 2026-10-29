@@ -103,14 +103,10 @@ async fn analyze(app: Router, uri: &str, body: &str) -> Result<(StatusCode, serd
             .uri(uri)
             .body(Body::from(body.to_owned()))?,
     );
-    let res = app.oneshot(req).await?;
-    let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await?;
     // The short-circuit answers one JSON object. A run that reaches the streaming
     // path answers NDJSON, which will not parse whole — and that is itself the
     // signal, so a parse failure is Null rather than an error.
-    let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    Ok((status, parsed))
+    common::status_and_json(app.oneshot(req).await?).await
 }
 
 /// The whole point: a verdict the corpus already holds is answered without

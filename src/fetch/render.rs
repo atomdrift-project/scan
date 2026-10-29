@@ -224,9 +224,9 @@ impl Reporter {
                     "fetch: known-good dependency skipped"
                 );
             }
-            Self::Stream { .. } => {
-                crate::engine::print_above_bar(|| report_skip(r, reg, now, reason))
-            }
+            // Aged-out returned above and known-good is the arm before, so
+            // only a withdrawn version reaches the stream.
+            Self::Stream { .. } => crate::engine::print_above_bar(|| report_removed(r, reg, now)),
             Self::Tree { tree, .. } => {
                 tree.add(locator(r), &dep_display_name(r), "");
                 tree.set(locator(r), skip_state(reg, now, reason));
@@ -369,7 +369,7 @@ pub(super) fn done_state(rec: &FetchRecord) -> DepState {
     }
 }
 
-/// The settled tree state for an age-gate skip, mirroring [`report_skip`]'s
+/// The settled tree state for an age-gate skip, mirroring [`report_removed`]'s
 /// glyph and colour with a concise reason as the detail.
 pub(super) fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
     let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
@@ -663,12 +663,11 @@ pub(super) fn failure_detail(why: &FetchError) -> String {
     }
 }
 
-/// Render one skipped dependency to stderr in the fetch progress block: the
-/// package, its age in days, and the strongest reputation signal the registry
-/// gave (downloads, else votes/rating). A known-good skip reads green with a ✓
-/// (trusted, not re-scanned); a removed version reads muted (no artifact to
-/// fetch). Aged-out deps never reach here — they stay at debug.
-pub(super) fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipReason) {
+/// Render one withdrawn dependency (no artifact to fetch) to stderr in the
+/// fetch progress block: the package, its age in days, and the strongest
+/// reputation signal the registry gave (downloads, else votes/rating). The
+/// other skips never reach the stream: aged-out and known-good stay at debug.
+pub(super) fn report_removed(r: &Reference, reg: &Registry, now: u64) {
     let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
     let signal = reg
         .downloads_recent
@@ -676,14 +675,9 @@ pub(super) fn report_skip(r: &Reference, reg: &Registry, now: u64, reason: SkipR
         .map(|d| format!("{d} dl"))
         .or_else(|| reg.rating_count.map(|v| format!("{v} votes")));
     let detail = signal.map_or_else(String::new, |signal| format!("  {}", fg(MUTED, &signal)));
-    let (glyph, label, color) = match reason {
-        SkipReason::KnownGood => ('\u{2713}', "known-good", GOOD),
-        SkipReason::Removed => ('\u{00b7}', "removed", MUTED),
-        SkipReason::AgedOut => ('\u{00b7}', "skip", MUTED),
-    };
     eprintln!(
         "    {} {}  {}{detail}",
-        fg(color, &format!("{glyph} {label:<10}")),
+        fg(MUTED, &format!("\u{00b7} {:<10}", "removed")),
         fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
         crate::output::tty_text(locator(r))
     );
@@ -730,16 +724,10 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     // `2 cached  ·  160.5 MB` instead of padding a `0 live` nobody asked about.
     // Bytes always show — the total pulled is the headline the tally exists for.
     let mut parts = Vec::new();
-    if live > 0 {
-        parts.push(format!("{live} live"));
-    }
-    if cached > 0 {
-        parts.push(format!("{cached} cached"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
     for (count, label) in [
+        (live, "live"),
+        (cached, "cached"),
+        (failed, "failed"),
         (pending, "pending"),
         (local, "supplied locally"),
         (dev, "development excluded"),

@@ -247,6 +247,18 @@ pub struct Verdict {
     pub engine_version: Option<String>,
 }
 
+impl From<Record> for Verdict {
+    fn from(rec: Record) -> Self {
+        Self {
+            fires_at: rec.fires_at,
+            reason: rec.reason,
+            findings: rec.findings,
+            analyzed_at: rec.analyzed_at,
+            engine_version: rec.engine_version,
+        }
+    }
+}
+
 /// What the corpus lets us skip, and whether it also hands us an answer.
 ///
 /// The distinction is the whole point: a verdict is only ours to report when it
@@ -339,6 +351,24 @@ impl Precheck {
         }
     }
 
+    /// Send `request`, authenticated, and feed the outcome to the breaker.
+    fn send(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        what: &str,
+    ) -> Option<reqwest::blocking::Response> {
+        match self.authed(request).send() {
+            Ok(r) => {
+                self.breaker.succeeded();
+                Some(r)
+            }
+            Err(e) => {
+                self.breaker.failed(crate::civil::now_secs(), what, &e);
+                None
+            }
+        }
+    }
+
     fn authed(
         &self,
         request: reqwest::blocking::RequestBuilder,
@@ -413,16 +443,8 @@ impl Precheck {
             .get(&self.lookup_url)
             .timeout(self.timeout())
             .query(&[("sha256", content_sha)]);
-        let resp = match self.authed(request).send() {
-            Ok(r) => {
-                self.breaker.succeeded();
-                r
-            }
-            Err(e) => {
-                self.breaker
-                    .failed(crate::civil::now_secs(), "corpus precheck", &e);
-                return Standing::Analyze;
-            }
+        let Some(resp) = self.send(request, "corpus precheck") else {
+            return Standing::Analyze;
         };
         if !self.answered(resp.status(), "corpus precheck") {
             return Standing::Analyze; // 404 unknown, 202 bytes-only, 401/5xx — all "scan it".
@@ -463,16 +485,8 @@ impl Precheck {
                 .iter()
                 .fold(lookup, |req, sha| req.query(&[("sha256", sha.as_str())]));
             let started = std::time::Instant::now();
-            let resp = match self.authed(request).send() {
-                Ok(r) => {
-                    self.breaker.succeeded();
-                    r
-                }
-                Err(e) => {
-                    self.breaker
-                        .failed(crate::civil::now_secs(), "sha precheck", &e);
-                    continue;
-                }
+            let Some(resp) = self.send(request, "sha precheck") else {
+                continue;
             };
             let status = resp.status();
             if !self.answered(status, "sha precheck") {
@@ -555,16 +569,8 @@ impl Precheck {
             let request = chunk
                 .iter()
                 .fold(lookup, |req, purl| req.query(&[("purl", purl.as_str())]));
-            let resp = match self.authed(request).send() {
-                Ok(r) => {
-                    self.breaker.succeeded();
-                    r
-                }
-                Err(e) => {
-                    self.breaker
-                        .failed(crate::civil::now_secs(), "purl precheck", &e);
-                    continue;
-                }
+            let Some(resp) = self.send(request, "purl precheck") else {
+                continue;
             };
             if !self.answered(resp.status(), "purl precheck") {
                 continue;
@@ -630,7 +636,7 @@ pub fn analyzed_verdict(line: &str) -> Result<(String, Verdict), String> {
     }
     let answer: Answer =
         serde_json::from_str(line).map_err(|e| format!("unreadable analysis answer: {e}"))?;
-    let rec = answer.record;
+    let mut rec = answer.record;
     if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Err(format!(
             "isotope13 could not analyze it ({}{})",
@@ -638,17 +644,8 @@ pub fn analyzed_verdict(line: &str) -> Result<(String, Verdict), String> {
             answer.cause.map(|c| format!(": {c}")).unwrap_or_default()
         ));
     }
-    let sha = rec.sha256.unwrap_or_default().to_ascii_lowercase();
-    Ok((
-        sha,
-        Verdict {
-            fires_at: rec.fires_at,
-            reason: rec.reason,
-            findings: rec.findings,
-            analyzed_at: rec.analyzed_at,
-            engine_version: rec.engine_version,
-        },
-    ))
+    let sha = rec.sha256.take().unwrap_or_default().to_ascii_lowercase();
+    Ok((sha, rec.into()))
 }
 
 /// One answer as a list of items: several keys answer with a list, one with an
@@ -666,6 +663,17 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
 /// scan asked for — except a clean one older than `max_age_s`, which is
 /// analyzed again rather than trusted past its freshness. Anything not
 /// `analyzed`, or with no level, is analyzed here.
+/// Most a record's `analyzed_at` may lie ahead of this clock (skew between
+/// hosts) and still count as when it was analyzed.
+const MAX_CLOCK_SKEW_S: u64 = 300;
+
+/// Whether a clean verdict analyzed at `at` is within `max_age_s` of `now`. A
+/// time further ahead than clock skew explains is not a time at all: read as
+/// "now", it would keep the verdict fresh until that date.
+fn fresh_at(at: u64, max_age_s: u64, now: u64) -> bool {
+    at <= now.saturating_add(MAX_CLOCK_SKEW_S) && now.saturating_sub(at) <= max_age_s
+}
+
 fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
     if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Standing::Analyze;
@@ -675,18 +683,12 @@ fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
             .analyzed_at
             .as_deref()
             .and_then(parse_rfc3339_epoch)
-            .is_some_and(|at| now.saturating_sub(at) <= max_age_s);
+            .is_some_and(|at| fresh_at(at, max_age_s, now));
         if !fresh {
             return Standing::Analyze;
         }
     }
-    Standing::Adopt(Verdict {
-        fires_at: rec.fires_at,
-        reason: rec.reason,
-        findings: rec.findings,
-        analyzed_at: rec.analyzed_at,
-        engine_version: rec.engine_version,
-    })
+    Standing::Adopt(rec.into())
 }
 
 /// The policy, pure so the tests can hold it still: rule 1 (same analyzer,
@@ -707,13 +709,7 @@ fn standing_of(
         && !mine.is_empty()
         && mine == theirs
     {
-        return Standing::Adopt(Verdict {
-            fires_at: rec.fires_at,
-            reason: rec.reason,
-            findings: rec.findings,
-            analyzed_at: rec.analyzed_at,
-            engine_version: rec.engine_version,
-        });
+        return Standing::Adopt(rec.into());
     }
     // Downloaded bytes need current-analyzer coverage. Returning SkipBenign
     // here would discard the payload report, lose its next-hop references,
@@ -731,7 +727,7 @@ fn standing_of(
     let Some(at) = rec.analyzed_at.as_deref().and_then(parse_rfc3339_epoch) else {
         return Standing::Analyze;
     };
-    if now.saturating_sub(at) <= max_age_s {
+    if fresh_at(at, max_age_s, now) {
         Standing::SkipBenign
     } else {
         Standing::Analyze

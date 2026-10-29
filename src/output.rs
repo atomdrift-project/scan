@@ -215,29 +215,25 @@ fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
-/// Normalized progress within the current classification band.
-///
-/// `threshold` is the cutoff that defined `classification` (the value `prob`
-/// was compared against). The envelope does not carry both suspicious and
-/// hostile cutoffs, so the suspicious band uses the same "distance to 1.0"
-/// formula as the hostile band — an acceptable approximation for the
-/// band-internal color ramp.
-fn band_progress(probability: f32, classification: Classification, threshold: f32) -> f32 {
-    match classification {
-        Classification::Hostile | Classification::Suspicious => {
-            ((probability - threshold) / (1.0 - threshold).max(f32::EPSILON)).clamp(0.0, 1.0)
-        }
-        Classification::Benign => (probability / threshold.max(f32::EPSILON)).clamp(0.0, 1.0),
-    }
-}
-
 /// Color gradient within each classification band.
+///
+/// `threshold` is the cutoff that defined `classification` (the value
+/// `probability` was compared against).
 fn indicator_colors(
     probability: f32,
     classification: Classification,
     threshold: f32,
 ) -> (Rgb, Rgb, Rgb) {
-    let t = band_progress(probability, classification, threshold);
+    // Normalized progress within the band. The envelope does not carry both
+    // suspicious and hostile cutoffs, so the suspicious band uses the same
+    // "distance to 1.0" formula as the hostile band — an acceptable
+    // approximation for the band-internal color ramp.
+    let t = match classification {
+        Classification::Hostile | Classification::Suspicious => {
+            ((probability - threshold) / (1.0 - threshold).max(f32::EPSILON)).clamp(0.0, 1.0)
+        }
+        Classification::Benign => (probability / threshold.max(f32::EPSILON)).clamp(0.0, 1.0),
+    };
     let theme = current_theme();
 
     match (theme, classification) {
@@ -377,15 +373,6 @@ fn rail(indent: usize, marker: &str, plain: &str) -> String {
         terminal_marker_prefix(indent, marker)
     } else {
         plain.to_string()
-    }
-}
-
-/// Classification label colored to match the band.
-fn colored_label(classification: Classification, p: &Palette) -> String {
-    match classification {
-        Classification::Hostile => fg(p.hostile, "hostile"),
-        Classification::Suspicious => fg(p.suspicious, "suspicious"),
-        Classification::Benign => fg(p.benign, "benign"),
     }
 }
 
@@ -702,11 +689,7 @@ pub(crate) fn terminal_artifact_line(
     } else {
         "\u{1f4c4}" // 📄
     };
-    let mut meta = file_type.to_uppercase();
-    let size = human_size(size);
-    if !size.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {size}"));
-    }
+    let meta = type_and_size(file_type, size);
     let p = palette();
     format!(
         "{}{} {}",
@@ -786,11 +769,7 @@ pub(crate) fn terminal_reference_locator_row(locator: &str) -> String {
 
 /// Hash/type/size row used inside a compact fetched-reference branch.
 pub(crate) fn terminal_reference_hash_row(sha256: &str, file_type: &str, size: u64) -> String {
-    let mut meta = file_type.to_uppercase();
-    let size = human_size(size);
-    if !size.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {size}"));
-    }
+    let meta = type_and_size(file_type, size);
     let hash = format!(
         "{}{}",
         terminal_marker_prefix(1, "\u{1f9ec}"), // 🧬
@@ -821,11 +800,7 @@ pub(crate) fn terminal_card(
     // archive banner; the cards rank by severity (worst first) and by class.
     let word = verdict_word(classification);
     let name = tty_text(name);
-    let mut meta = file_type.to_uppercase();
-    let size = human_size(size);
-    if !size.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {size}"));
-    }
+    let meta = type_and_size(file_type, size);
     let mut out = String::new();
     // Plain (piped) output drops the frame and indents instead, so every line
     // stays grep-able.
@@ -877,11 +852,7 @@ pub(crate) fn terminal_embedded_branch(
     last: bool,
 ) -> String {
     let name = tty_text(name);
-    let mut meta = file_type.to_uppercase();
-    let size = human_size(size);
-    if !size.is_empty() {
-        meta.push_str(&format!(" \u{00b7} {size}"));
-    }
+    let meta = type_and_size(file_type, size);
 
     let fork = if last {
         "\u{2514}\u{2500}"
@@ -939,7 +910,10 @@ pub fn print_ps_result(result: &ScanResult, has_progress: bool, extra: bool) {
         format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
     let pid_display = fg(p.dim, &format!("[pids: {pid_str}]"));
-    let label = colored_label(result.classification, p);
+    let label = fg(
+        class_color(result.classification),
+        &result.classification.to_string(),
+    );
 
     let deleted_marker = if deleted {
         format!(" {}", fg(p.hostile_finding, "(deleted)"))
@@ -1097,35 +1071,15 @@ fn print_extra(result: &ScanResult, p: &Palette) {
     }
 }
 
-/// A bloom-filter verdict, surfaced before (or instead of) expensive analysis.
+/// A bloom-filter verdict that stands instead of analysis. Known-bad and
+/// conflicted are flags, not short-circuits: they are scanned, and ride the
+/// result as a [`BloomMark`].
 #[derive(Debug, Clone, Copy)]
 pub enum BloomVerdict {
     /// Matched the known-good set — the scan was skipped.
     KnownGood,
-    /// Matched the known-bad set — flagged, and still scanned to confirm.
-    KnownBad,
-    /// In both the good and bad sets — contradictory; flagged and scanned.
-    Conflicted,
     /// In neither set; left unscanned because the mode is `fast`.
     Unscanned,
-}
-
-impl BloomVerdict {
-    /// Whether the artifact still goes through full analysis after this verdict.
-    /// Known-bad and conflicted are flags, not short-circuits; good and unscanned
-    /// stop here.
-    const fn scanned(self) -> bool {
-        matches!(self, Self::KnownBad | Self::Conflicted)
-    }
-
-    const fn json_str(self) -> &'static str {
-        match self {
-            Self::KnownGood => "known-good",
-            Self::KnownBad => "known-bad",
-            Self::Conflicted => "conflicted",
-            Self::Unscanned => "unscanned",
-        }
-    }
 }
 
 /// The inline bloom provenance marker for a *scanned* file — the glyph plus its
@@ -1224,8 +1178,11 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
             serde_json::json!({
                 "path": label,
                 "source": "bloom",
-                "verdict": verdict.json_str(),
-                "scanned": verdict.scanned(),
+                "verdict": match verdict {
+                    BloomVerdict::KnownGood => "known-good",
+                    BloomVerdict::Unscanned => "unscanned",
+                },
+                "scanned": false,
             })
         );
         return;
@@ -1237,16 +1194,6 @@ pub fn print_bloom_verdict(label: &str, verdict: BloomVerdict, format: OutputFor
             fg(p.benign, "\u{2713}"),
             fg(p.benign, "known-good"),
             "skipping scan",
-        ),
-        BloomVerdict::KnownBad => (
-            fg(p.hostile, "\u{2717}"),
-            fg(p.hostile, "known-bad"),
-            "flagged — scanning",
-        ),
-        BloomVerdict::Conflicted => (
-            fg(p.warning, "\u{26a0}"),
-            fg(p.warning, "conflicted"),
-            "in good and bad — scanning",
         ),
         BloomVerdict::Unscanned => (
             fg(p.warning, "!"),
@@ -1280,11 +1227,7 @@ pub(crate) fn write_remote_verdict(
     class: Classification,
     format: OutputFormat,
 ) -> std::io::Result<()> {
-    let name = match class {
-        Classification::Hostile => "hostile",
-        Classification::Suspicious => "suspicious",
-        Classification::Benign => "benign",
-    };
+    let name = class.to_string();
     if matches!(format, OutputFormat::Json) {
         let findings: Vec<_> = verdict
             .findings
@@ -1294,17 +1237,12 @@ pub(crate) fn write_remote_verdict(
                 serde_json::json!({ "id": f.id, "crit": f.crit, "desc": desc })
             })
             .collect();
-        let fires_at = match verdict.fires_at {
-            Level::Clean => Some(-1),
-            Level::At(n) => Some(i32::from(n)),
-            Level::Manual => None,
-        };
         let mut record = serde_json::json!({
             "path": label,
             "source": "remote",
             "verdict": name,
             "sha256": sha256,
-            "fires_at": fires_at,
+            "fires_at": verdict.fires_at,
             "analyzed_at": verdict.analyzed_at,
             "engine_version": verdict.engine_version,
             "findings": findings,
@@ -1337,7 +1275,7 @@ pub(crate) fn write_remote_verdict(
         out,
         " {}  {} {}  {}",
         fg(color, icon),
-        fg(color, name),
+        fg(color, &name),
         fg(p.very_dim, &format!("isotope13{when}{why}")),
         fg(p.header_path, &tty_text(label)),
     )
@@ -1362,45 +1300,7 @@ pub fn print_summary(summary: &ScanSummary) {
         } else {
             p.suspicious
         };
-        // Colored segments paired with their plain text, so the rule fill can
-        // be sized from real visible width.
-        let mut parts: Vec<(String, String)> = Vec::new();
-        let plain = |s: &str| (s.to_string(), s.to_string());
-        parts.push(plain(&format!(
-            "{} file{}",
-            summary.total_files,
-            if summary.total_files == 1 { "" } else { "s" }
-        )));
-        if summary.hostile > 0 {
-            let s = format!("{} hostile", summary.hostile);
-            parts.push((fg(p.hostile, &s), s));
-        }
-        if summary.suspicious > 0 {
-            let s = format!("{} suspicious", summary.suspicious);
-            parts.push((fg(p.suspicious, &s), s));
-        }
-        if summary.errors > 0 {
-            let s = format!("{} errors", summary.errors);
-            parts.push((fg(p.header_path, &s), s));
-        }
-        if summary.dependency_attention.gaps > 0 {
-            let n = summary.dependency_attention.gaps;
-            let s = format!("{n} dependency gap{}", if n == 1 { "" } else { "s" });
-            parts.push((fg(p.warning, &s), s));
-        }
-        if summary.static_flags > 0 {
-            let s = format!("{} with severe static findings", summary.static_flags);
-            parts.push((fg(p.warning, &s), s));
-        }
-        if summary.dependency_attention.flagged_candidates > 0 {
-            let n = summary.dependency_attention.flagged_candidates;
-            let s = format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" });
-            parts.push((fg(p.warning, &s), s));
-        }
-        {
-            let s = format!("{} graded benign", summary.benign);
-            parts.push((fg(p.very_dim, &s), s));
-        }
+        let mut parts = summary_counts(summary, p);
         if bloom.flagged > 0 {
             let s = format!("{} known-bad", bloom.flagged);
             parts.push((fg(p.hostile, &s), s));
@@ -1414,7 +1314,7 @@ pub fn print_summary(summary: &ScanSummary) {
             parts.push((fg(p.very_dim, &s), s));
         }
         let sep_colored = format!(" {} ", fg(p.dot_sep, "\u{00b7}"));
-        let colored_line: Vec<String> = parts.iter().map(|(c, _)| c.clone()).collect();
+        let colored_line: Vec<&str> = parts.iter().map(|(c, _)| c.as_str()).collect();
         let plain_len: usize =
             parts.iter().map(|(_, s)| s.chars().count()).sum::<usize>() + (parts.len() - 1) * 3;
         // ` ` + `━━` + ` ` + content + ` ` + fill, 1-col right margin.
@@ -1481,48 +1381,91 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
         );
     }
 
-    let mut parts = vec![format!(
-        "{} file{}",
-        summary.total_files,
-        if summary.total_files == 1 { "" } else { "s" }
-    )];
-    if summary.hostile > 0 {
-        parts.push(fg(p.hostile, &format!("{} hostile", summary.hostile)));
-    }
-    if summary.suspicious > 0 {
-        parts.push(fg(
-            p.suspicious,
-            &format!("{} suspicious", summary.suspicious),
-        ));
-    }
-    if summary.errors > 0 {
-        parts.push(fg(p.header_path, &format!("{} errors", summary.errors)));
-    }
-    if summary.dependency_attention.gaps > 0 {
-        let n = summary.dependency_attention.gaps;
-        parts.push(fg(
-            p.warning,
-            &format!("{n} dependency gap{}", if n == 1 { "" } else { "s" }),
-        ));
-    }
-    if summary.static_flags > 0 {
-        parts.push(fg(
-            p.warning,
-            &format!("{} with severe static findings", summary.static_flags),
-        ));
-    }
-    if summary.dependency_attention.flagged_candidates > 0 {
-        let n = summary.dependency_attention.flagged_candidates;
-        parts.push(fg(
-            p.warning,
-            &format!("{n} flagged candidate{}", if n == 1 { "" } else { "s" }),
-        ));
-    }
-    parts.push(fg(p.very_dim, &format!("{} graded benign", summary.benign)));
+    let mut parts: Vec<String> = summary_counts(summary, p)
+        .into_iter()
+        .map(|(colored, _)| colored)
+        .collect();
     parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
 
     let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
     parts.join(&sep)
+}
+
+/// The count segments both summaries share, in order, each as (colored,
+/// plain) so the flagged rule can size its fill from visible width.
+fn summary_counts(summary: &ScanSummary, p: &Palette) -> Vec<(String, String)> {
+    let plural = |n: u32| if n == 1 { "" } else { "s" };
+    let ScanSummary {
+        total_files,
+        hostile,
+        suspicious,
+        benign,
+        errors,
+        static_flags,
+        dependency_attention:
+            crate::engine::DependencyAttention {
+                gaps,
+                flagged_candidates,
+            },
+        ..
+    } = *summary;
+    let files = format!("{total_files} file{}", plural(total_files));
+    let mut parts = vec![(files.clone(), files)];
+    for (n, color, text) in [
+        (hostile, p.hostile, format!("{hostile} hostile")),
+        (suspicious, p.suspicious, format!("{suspicious} suspicious")),
+        (errors, p.header_path, format!("{errors} errors")),
+        (
+            gaps,
+            p.warning,
+            format!("{gaps} dependency gap{}", plural(gaps)),
+        ),
+        (
+            static_flags,
+            p.warning,
+            format!("{static_flags} with severe static findings"),
+        ),
+        (
+            flagged_candidates,
+            p.warning,
+            format!(
+                "{flagged_candidates} flagged candidate{}",
+                plural(flagged_candidates)
+            ),
+        ),
+    ] {
+        if n > 0 {
+            parts.push((fg(color, &text), text));
+        }
+    }
+    let benign = format!("{benign} graded benign");
+    parts.push((fg(p.very_dim, &benign), benign));
+    parts
+}
+
+/// `TYPE · size`, the size omitted when it renders empty.
+fn type_and_size(file_type: &str, size: u64) -> String {
+    let size = human_size(size);
+    if size.is_empty() {
+        file_type.to_uppercase()
+    } else {
+        format!("{} \u{00b7} {size}", file_type.to_uppercase())
+    }
+}
+
+/// Warn that a process scan skipped `count` processes it may not inspect.
+pub(crate) fn print_permission_warning(count: u32) {
+    let p = palette();
+    eprintln!(
+        " {}  {}\n",
+        fg(p.suspicious, "\u{26A0}"),
+        fg(
+            p.header_path,
+            &format!(
+                "Skipping {count} processes due to insufficient permissions — re-run as root for full coverage"
+            ),
+        ),
+    );
 }
 
 /// Print the scan banner shared by every scanning subcommand (`ps`, directory,
@@ -1545,7 +1488,7 @@ pub(crate) fn print_banner(counts: crate::engine::DetectionCounts) {
     );
 }
 
-fn detection_inventory_text(hashes_and_purls: u64, rules: u64) -> String {
+pub(crate) fn detection_inventory_text(hashes_and_purls: u64, rules: u64) -> String {
     format!(
         "\u{00b7} {} hashes \u{00b7} {} rules",
         with_commas(hashes_and_purls),
@@ -1684,7 +1627,9 @@ fn freshness_color(secs: i64) -> Rgb {
 #[must_use]
 pub fn parse_ymd(s: &str) -> Option<i64> {
     let mut parts = s.splitn(3, '-');
-    let y: i64 = parts.next()?.trim().parse().ok()?;
+    // A four-digit year: a manifest's date is not trusted to keep the day
+    // arithmetic below from overflowing.
+    let y = i64::from(parts.next()?.trim().parse::<u16>().ok()?);
     let m: u32 = parts.next()?.trim().parse().ok()?;
     let d: u32 = parts.next()?.trim().parse().ok()?;
     Some(crate::civil::to_days(y, m, d)? * 86_400)

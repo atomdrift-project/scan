@@ -569,12 +569,15 @@ pub(super) fn redirect_destinations(bytes: &[u8]) -> Vec<String> {
         }
     }
 
+    // First-seen order, deduplicated through a set: a hostile page can name
+    // thousands of destinations, and a linear `contains` makes that quadratic.
+    let mut seen = std::collections::HashSet::new();
     let mut urls: Vec<String> = Vec::new();
     for url in found {
         let url = url.replace("\\/", "/").replace("&amp;", "&");
         let lowered = url.to_ascii_lowercase();
         if (lowered.starts_with("https://") || lowered.starts_with("http://"))
-            && !urls.contains(&url)
+            && seen.insert(url.clone())
         {
             urls.push(url);
         }
@@ -614,13 +617,27 @@ pub(super) fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 /// the page. A destination the byte hunt missed (a script-escaped `https:\/\/`)
 /// is added.
 pub(super) fn mark_redirect_destinations(bytes: &[u8], refs: &mut Vec<Reference>) {
-    for url in redirect_destinations(bytes) {
-        let existing = refs
-            .iter_mut()
-            .find(|r| matches!(&r.locator, RefLocator::Url(u) if *u == url));
-        tracing::info!(url = %url, "fetched page is a redirect; following its destination");
-        match existing {
-            Some(reference) => {
+    let destinations = redirect_destinations(bytes);
+    if destinations.is_empty() {
+        return;
+    }
+    // Indexed once: a hostile page can name thousands of destinations, and a
+    // search of `refs` per destination would be quadratic in them.
+    let mut by_url: HashMap<String, usize> = HashMap::new();
+    for (i, r) in refs.iter().enumerate() {
+        if let RefLocator::Url(u) = &r.locator {
+            by_url.entry(u.clone()).or_insert(i);
+        }
+    }
+    tracing::info!(
+        destinations = destinations.len(),
+        "fetched page is a redirect; following its destination"
+    );
+    for url in destinations {
+        tracing::debug!(url = ?url, "redirect destination");
+        match by_url.get(&url) {
+            Some(&i) => {
+                let reference = &mut refs[i];
                 reference.kind = RefKind::UrlFetch;
                 REDIRECT_DESTINATION_SOURCE.clone_into(&mut reference.source);
             }

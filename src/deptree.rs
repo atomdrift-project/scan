@@ -163,12 +163,6 @@ impl State {
         entry.seq = seq;
         entry.status = status;
     }
-
-    fn any_active(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| matches!(e.status, Status::Active(_)))
-    }
 }
 
 /// Shared between the handle the fetch loop drives and the heartbeat thread.
@@ -239,7 +233,9 @@ impl DepTree {
                     let mut state = beat.lock();
                     state.tick = state.tick.wrapping_add(1);
                     // Spinners animate; a settled tree redraws only on change.
-                    if state.dirty || state.any_active() {
+                    if state.dirty
+                        || state.entries.iter().any(|e| matches!(e.status, Status::Active(_)))
+                    {
                         render(&mut state, false);
                     }
                 }
@@ -472,7 +468,11 @@ fn footer(hidden: usize, cols: usize) -> String {
 fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     let (glyph, color, detail) = match &entry.status {
         Status::Pending => ('\u{00b7}', DIM, "pending".to_string()),
-        Status::Active(label) => (spinner(tick), IN_FLIGHT, format!("{label}\u{2026}")),
+        Status::Active(label) => (
+            SPINNER[tick as usize % SPINNER.len()],
+            IN_FLIGHT,
+            format!("{label}\u{2026}"),
+        ),
         Status::Hidden => (' ', Rgb(0, 0, 0), String::new()),
         Status::Done {
             glyph,
@@ -524,11 +524,6 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
         used + source_width,
         cols,
     )
-}
-
-/// The spinner frame for this heartbeat tick.
-fn spinner(tick: u32) -> char {
-    SPINNER[tick as usize % SPINNER.len()]
 }
 
 /// Display columns a glyph takes: two for an emoji flag, one otherwise.
@@ -610,20 +605,25 @@ fn clip(line: &str, visible: usize, cols: usize) -> String {
     truncate(&strip_ansi(line), cols)
 }
 
-/// Drop ANSI SGR escapes from a line, leaving its visible text.
-pub(crate) fn strip_ansi(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
+/// Remove ANSI CSI escape sequences (`ESC [ … <final>`), and any other
+/// lone `ESC`. Only the sequence itself goes: text after a non-SGR sequence
+/// (`ESC [2J`) is kept, not eaten up to the next `m`.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip up to and including the terminating 'm' of the SGR sequence.
-            for e in chars.by_ref() {
-                if e == 'm' {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Skip a CSI sequence: ESC '[' params... final byte in '@'..='~'.
+        if chars.clone().next() == Some('[') {
+            chars.next();
+            for n in chars.by_ref() {
+                if ('@'..='~').contains(&n) {
                     break;
                 }
             }
-        } else {
-            out.push(c);
         }
     }
     out

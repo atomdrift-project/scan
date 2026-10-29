@@ -91,8 +91,14 @@ impl TractOnnxBackend {
         use tract_onnx::prelude::*;
         // Parse the ONNX graph first to recover n_features from the
         // (dynamic-batch) input fact.
+        // Read from an open file rather than by path: given a path, tract
+        // resolves a tensor's `external_data` location against the model's
+        // directory with no containment, so a downloaded model could read any
+        // local file into its weights. Without a directory, it refuses.
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("opening ONNX model {}", path.display()))?;
         let mut model = tract_onnx::onnx()
-            .model_for_path(path)
+            .model_for_read(&mut file)
             .with_context(|| format!("parsing ONNX model {}", path.display()))?;
         let input_fact_dyn = model
             .input_fact(0)
@@ -179,7 +185,7 @@ impl TractOnnxBackend {
 ///
 /// Holds one or more trained models for a route. Single-model bundles (the
 /// single-bundle layout, `model.onnx` directly under the bundle dir) load
-/// `models = [one_model]`. Multi-seed bundles store `models/seed_NN.onnx` and
+/// one model as `first` with no `rest`. Multi-seed bundles store `models/seed_NN.onnx` and
 /// load all of them; `predict` returns the arithmetic mean of every member's
 /// score, which is the variance-reducing equivalent of training K seeds and
 /// ensembling them at inference time.

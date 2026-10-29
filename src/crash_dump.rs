@@ -79,7 +79,11 @@ mod imp {
     /// calls `write(2)`, both async-signal-safe.
     pub fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
         let mut buf = [0u8; LINE];
-        let n = format_line(&mut buf, analysis_id, thread_id, sha, file);
+        // The name is the caller's (an upload's filename, a member path), and
+        // the dump goes to an operator's terminal: escaped here, off the
+        // signal path, where allocating is fine.
+        let file = crate::output::tty_text(file);
+        let n = format_line(&mut buf, analysis_id, thread_id, sha, &file);
 
         for (idx, slot) in REGISTRY.iter().enumerate() {
             // Claim with the sentinel first so a concurrent dump never sees a

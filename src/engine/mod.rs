@@ -366,13 +366,6 @@ impl ScanConfig {
     pub(crate) fn bloom(&self) -> Option<&Lookup> {
         self.bloom.as_deref()
     }
-
-    /// A shared handle to the bloom filters, for the cleave skip predicate (which
-    /// must be `'static`). `None` when bloom is disabled.
-    #[must_use]
-    pub(crate) fn bloom_arc(&self) -> Option<Arc<Lookup>> {
-        self.bloom.clone()
-    }
 }
 
 /// Dependency coverage warnings, independent of the model's file grades.
@@ -442,11 +435,6 @@ pub struct FindingCounts {
 /// long-lived server no first-request or throughput gain, only more peak RSS.
 pub fn prefetch_cleave_resources() {
     cleave::prefetch_shared_resources_with(true, false);
-}
-
-/// The model version recorded on every result: `v{spec_version}.{abi_version}`.
-pub(crate) fn model_version_string(info: &crate::model::ModelInfo) -> String {
-    format!("v{}.{}", info.version, info.abi_version)
 }
 
 /// The current time as an RFC 3339 string in UTC (`2026-10-01T13:02:22Z`).

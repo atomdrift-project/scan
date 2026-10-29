@@ -140,6 +140,7 @@ fn full_result_serializes_identically() {
                 lvl: Level::At(85),
             },
             corroborated: true,
+            may_soften: false,
             cached: false,
         })),
         pending_llm: None,

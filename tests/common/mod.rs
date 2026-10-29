@@ -95,18 +95,6 @@ pub(crate) fn ready_config() -> Result<ServerConfig> {
     })
 }
 
-/// Install a tracing subscriber so server logs are visible on test failure.
-/// Silently ignored if another test in the process already installed one.
-pub(crate) fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
 /// Build the app for `config` and wait until it reports ready. YARA warmup
 /// can take ~15s in release and longer in debug builds.
 pub(crate) async fn ready_app(config: &ServerConfig) -> Result<Router> {

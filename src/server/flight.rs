@@ -18,11 +18,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::watch;
 
 use super::error::ApiError;
+use super::lock;
 use crate::analysis::RequestPhase;
 use crate::engine::ScanResult;
 
@@ -80,19 +81,6 @@ impl From<Artifact> for FlightKey {
         Self {
             artifact,
             follow: None,
-        }
-    }
-}
-
-impl From<&FlightKey> for super::access::Subject {
-    /// The key a flight was created under is exactly the artifact its requests
-    /// were about, so the access line takes it verbatim: uploads are named by
-    /// the digest of their bytes, PURL analyses by the canonical locator.
-    fn from(key: &FlightKey) -> Self {
-        match &key.artifact {
-            Artifact::Sha(sha) => Self::sha256(sha),
-            Artifact::Purl(purl) => Self::purl(purl, None),
-            Artifact::Url(url) => Self::url(url, None),
         }
     }
 }
@@ -204,9 +192,8 @@ impl Flight {
 /// Registry of analyses currently in progress.
 #[derive(Debug, Default)]
 pub(super) struct Flights {
-    /// Attachment counts live inside the map so that joining and leaving are
-    /// atomic with respect to each other: a flight cannot gain a follower
-    /// between its count reaching zero and its removal.
+    /// Attachment counts live inside the map, under the same lock as the
+    /// flights they count.
     live: Mutex<HashMap<FlightKey, Live>>,
 }
 
@@ -214,13 +201,6 @@ pub(super) struct Flights {
 struct Live {
     flight: Arc<Flight>,
     attached: usize,
-}
-
-/// A poisoned lock here means a panic happened while the map was borrowed. The
-/// map is only ever inserted into and removed from under this lock, so there is
-/// no half-updated invariant to recover from and the data stays usable.
-fn lock(live: &Mutex<HashMap<FlightKey, Live>>) -> MutexGuard<'_, HashMap<FlightKey, Live>> {
-    live.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Flights {
@@ -265,12 +245,10 @@ impl Flights {
     /// Snapshot how much work de-duplication is saving right now.
     pub(super) fn census(&self) -> Census {
         let live = lock(&self.live);
-        let census = Census {
+        Census {
             analyses: live.len(),
             attached: live.values().map(|entry| entry.attached).sum(),
-        };
-        drop(live);
-        census
+        }
     }
 
     /// Retire `flight` and wake everyone waiting on it.
@@ -324,17 +302,13 @@ impl Attachment {
 
 impl Drop for Attachment {
     fn drop(&mut self) {
-        let mut live = lock(&self.flights.live);
-        let key = self.flight.key();
-        match live.get_mut(key) {
-            // A later request may have started a fresh flight under this key
-            // after ours retired; its count is none of our business.
-            Some(entry) if Arc::ptr_eq(&entry.flight, &self.flight) => {
-                entry.attached -= 1;
-            }
-            _ => return,
+        // A later request may have started a fresh flight under this key
+        // after ours retired; its count is none of our business.
+        if let Some(entry) = lock(&self.flights.live).get_mut(self.flight.key())
+            && Arc::ptr_eq(&entry.flight, &self.flight)
+        {
+            entry.attached -= 1;
         }
-        drop(live);
         // Deliberately *not* cancelled when the last request leaves. An
         // analysis is worth finishing with nobody waiting: its verdict is
         // indexed locally and renewed on hopper, so a caller that hung up — or

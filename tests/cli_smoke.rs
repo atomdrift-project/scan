@@ -109,7 +109,7 @@ impl Fixture {
                 let _ = child.wait();
                 panic!(
                     "command exceeded {timeout:?}: {args:?}\n{}",
-                    read_capture(stderr)
+                    String::from_utf8_lossy(&read_bytes(stderr))
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -175,10 +175,6 @@ fn read_bytes(mut file: File) -> Vec<u8> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).unwrap();
     bytes
-}
-
-fn read_capture(file: File) -> String {
-    String::from_utf8_lossy(&read_bytes(file)).into_owned()
 }
 
 #[test]

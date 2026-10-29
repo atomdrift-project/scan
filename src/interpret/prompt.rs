@@ -175,24 +175,4 @@ pub(super) fn addresses_the_analyzer(rendered: &str) -> bool {
     ANALYZER_DIRECTED.iter().any(|p| haystack.contains(p))
 }
 
-/// Remove ANSI CSI escape sequences (`ESC [ … <final>`).
-pub(super) fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // Skip a CSI sequence: ESC '[' params... final byte in '@'..='~'.
-        if chars.clone().next() == Some('[') {
-            chars.next();
-            for n in chars.by_ref() {
-                if ('@'..='~').contains(&n) {
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
+pub(super) use crate::deptree::strip_ansi;

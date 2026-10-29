@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -121,18 +120,17 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     let total_targets = targets.len();
     eprintln!("validate fixtures: scanning {total_targets} benign targets...");
     let completed = AtomicUsize::new(0);
-    let slow_fixtures = Mutex::new(Vec::new());
+    let slow_fixtures = AtomicUsize::new(0);
 
     let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
         .into_par_iter()
         .map(|path| {
             let started = Instant::now();
-            let analysis_started = Instant::now();
             let result = engine
                 .analyze_file(&path, &options)
                 .with_context(|| format!("cleave analysis of {}", path.display()))
                 .and_then(|report| {
-                    let analysis_elapsed = analysis_started.elapsed();
+                    let analysis_elapsed = started.elapsed();
                     let classify_started = Instant::now();
                     let label = path.display().to_string();
                     // Validation consumes ML verdicts only: no LLM, renders,
@@ -164,9 +162,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                     path.display(),
                     elapsed.as_secs_f64()
                 );
-                if let Ok(mut slow) = slow_fixtures.lock() {
-                    slow.push((path.clone(), elapsed));
-                }
+                slow_fixtures.fetch_add(1, Ordering::Relaxed);
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if done == total_targets || done.is_multiple_of(PROGRESS_EVERY) {
@@ -176,7 +172,7 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
         })
         .collect();
 
-    let slow_count = slow_fixtures.lock().map_or(0, |slow| slow.len());
+    let slow_count = slow_fixtures.load(Ordering::Relaxed);
     if slow_count > 0 {
         eprintln!("validate fixtures: {slow_count} fixture(s) exceeded 15s");
     }

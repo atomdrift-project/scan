@@ -56,9 +56,16 @@ pub(super) fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
 /// itself, and `Url::parse` silently drops tab, CR and LF, so a raw control
 /// character (a forged log line, a terminal escape) is refused outright; a
 /// real URL percent-encodes them.
+///
+/// A URL carrying credentials (`https://user:pass@host/`) is refused too: it
+/// would be logged, listed in `/_/requests` and stored in fetch provenance.
 pub(super) fn valid_http_url(raw: &str) -> bool {
     !raw.chars().any(char::is_control)
-        && reqwest::Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        && reqwest::Url::parse(raw).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
 }
 
 #[cfg(test)]

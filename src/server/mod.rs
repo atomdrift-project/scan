@@ -433,18 +433,6 @@ pub(super) struct AnalysisPermit {
     _cpu: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl AnalysisPermit {
-    pub(super) fn new(
-        slot: tokio::sync::OwnedSemaphorePermit,
-        cpu: tokio::sync::OwnedSemaphorePermit,
-    ) -> Self {
-        Self {
-            _slot: slot,
-            _cpu: cpu,
-        }
-    }
-}
-
 /// RAII guard over one admitted analysis. On drop — the analysis finished, or
 /// the handler future was dropped on a client disconnect — it signals
 /// cooperative cancellation to the blocking thread and removes the in-flight
@@ -755,21 +743,6 @@ const MAX_BUFFERED: usize = 4;
 /// Comfortably inside systemd's default 90-second stop timeout.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Longest an upload may go without delivering a byte. An idle bound, not a
-/// total one: a large artifact on a slow link still arrives, but a client
-/// dripping a body (or stalling mid-upload) cannot hold its buffer and its
-/// busy mark open indefinitely.
-const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The refusal for a body that stalled past [`BODY_IDLE_TIMEOUT`].
-fn body_idle_timeout() -> ApiError {
-    ApiError::new(
-        axum::http::StatusCode::REQUEST_TIMEOUT,
-        "body_timeout",
-        "The request body stalled.",
-    )
-}
-
 struct AppState {
     config: ServerConfig,
     /// Process uptime anchor — captured when the app is built, very close to
@@ -814,7 +787,7 @@ struct AppState {
 }
 
 /// A poisoned lock means a panic happened while it was held. Everything kept
-/// under these locks is replaced whole, so the data stays usable.
+/// under these locks is replaced or removed whole, so the data stays usable.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -832,10 +805,6 @@ impl AppState {
         self.config
             .workers
             .saturating_sub(self.available_analysis_permits())
-    }
-
-    fn next_request_id(&self) -> u64 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The loaded bundle, or why there is none.
@@ -977,9 +946,6 @@ impl AppState {
         Err(ApiError::overloaded())
     }
 
-    /// Stop background work, cancel what no client is waiting on, and wait a
-    /// bounded time for it to wind down — so an analysis that finished as the
-    /// server stopped still files its verdict.
     /// Stop background work and cancel every analysis in flight.
     fn stop(&self) {
         self.shutdown.send_replace(true);
@@ -988,6 +954,9 @@ impl AppState {
         }
     }
 
+    /// Stop, then wait a bounded time for owned background work to wind down —
+    /// so an analysis that finished as the server stopped still files its
+    /// verdict.
     async fn drain(&self) {
         self.stop();
         if tokio::time::timeout(DRAIN_TIMEOUT, self.tasks.drained())

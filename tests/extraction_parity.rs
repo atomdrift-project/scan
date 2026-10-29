@@ -38,9 +38,6 @@ struct ExtractionSample {
     expected_probability: Option<f64>,
     #[serde(default)]
     expected_classification: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    threshold: Option<f64>,
 }
 
 /// Reason the parity tests are ignored: they need collimator's artifacts.

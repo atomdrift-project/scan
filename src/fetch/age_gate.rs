@@ -267,14 +267,6 @@ pub(super) fn versioned_purl(locator: &str) -> Option<(&str, &str)> {
     Some((coordinate.key, version))
 }
 
-/// True when `r` is a bare (versionless) PURL whose coordinate is pinned by a
-/// version-carrying sibling elsewhere in the tree (`pinned` holds those
-/// coordinates). A manifest range reaches us version-stripped — `pkg:npm/foo` —
-/// and would resolve to `dist-tags/latest`; when a lockfile pins the same
-/// coordinate (`pkg:npm/foo@1.2.3`), that pin is ground truth and the bare
-/// sibling is redundant, so it is dropped. A versionless PURL's whole string is
-/// its coordinate, so an exact set membership is the supersede; a git/tag pin
-/// (`pkg:npm/foo@dev`) keeps its `@ref`, is not versionless, and never matches.
 /// Whether `purl` carries the qualifier `key`, whatever its value.
 pub(super) fn has_qualifier(purl: &str, key: &str) -> bool {
     purl.split_once('?')
@@ -286,6 +278,14 @@ pub(super) fn has_qualifier(purl: &str, key: &str) -> bool {
         })
 }
 
+/// True when `r` is a bare (versionless) PURL whose coordinate is pinned by a
+/// version-carrying sibling elsewhere in the tree (`pinned` holds those
+/// coordinates). A manifest range reaches us version-stripped — `pkg:npm/foo` —
+/// and would resolve to `dist-tags/latest`; when a lockfile pins the same
+/// coordinate (`pkg:npm/foo@1.2.3`), that pin is ground truth and the bare
+/// sibling is redundant, so it is dropped. A versionless PURL's whole string is
+/// its coordinate, so an exact set membership is the supersede; a git/tag pin
+/// (`pkg:npm/foo@dev`) keeps its `@ref`, is not versionless, and never matches.
 pub(super) fn superseded_by_pin(r: &Reference, pinned: &HashSet<String>) -> bool {
     let RefLocator::Purl(p) = &r.locator else {
         return false;
@@ -331,7 +331,7 @@ pub(super) fn dependency_execution_priority(reference: &Reference) -> u8 {
 /// validating any of them.
 pub(super) fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    pub(super) fn component_cmp(x: &str, y: &str) -> Ordering {
+    fn component_cmp(x: &str, y: &str) -> Ordering {
         let digits = |s: &str| s.chars().take_while(char::is_ascii_digit).count();
         let (nx, rx) = x.split_at(digits(x));
         let (ny, ry) = y.split_at(digits(y));
@@ -354,7 +354,7 @@ pub(super) fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     );
     for (x, y) in ca.iter().zip(cb.iter()) {
         let ord = component_cmp(x, y);
-        if ord != std::cmp::Ordering::Equal {
+        if ord != Ordering::Equal {
             return ord;
         }
     }
@@ -451,7 +451,7 @@ pub(super) fn age_gate(
     // old module can be aged out without asking the proxy. Only applies when a
     // ceiling is set — with `--fetch-max-age 0` nothing ages out, so there is
     // nothing to short-circuit.
-    let (selected, self_dated): (Vec<Reference>, Vec<Reference>) =
+    let (mut selected, self_dated): (Vec<Reference>, Vec<Reference>) =
         selected.into_iter().partition(|r| {
             let RefLocator::Purl(purl) = &r.locator else {
                 return true;
@@ -476,7 +476,6 @@ pub(super) fn age_gate(
     }
     // The network round-trips run concurrently up front; the gate decision below
     // is then pure, so it stays deterministic in `selected` order.
-    let mut selected = selected;
     if selected.len() > MAX_REGISTRY_LOOKUPS {
         tracing::warn!(
             declared = selected.len(),

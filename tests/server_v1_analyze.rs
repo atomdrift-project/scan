@@ -27,11 +27,7 @@ async fn post(uri: &str, body: &str) -> Result<(StatusCode, serde_json::Value)> 
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))?,
     );
-    let res = app.oneshot(req).await?;
-    let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await?;
-    let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    Ok((status, parsed))
+    common::status_and_json(app.oneshot(req).await?).await
 }
 
 /// The package is named in the query, as it is on /v1/lookup. The body is the

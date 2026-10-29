@@ -146,14 +146,10 @@ pub(crate) fn collect_hits(report: &cleave::types::CompactReport) -> Vec<Hit> {
             if !finding.from.is_empty() {
                 continue;
             }
-            let pkg = finding
-                .dep
-                .as_ref()
-                .map(|d| d.locator.clone())
-                .unwrap_or_default();
+            let pkg = finding.dep.as_ref().map_or("", |d| d.locator.as_str());
             // One row per (trait, file, component): the same trait firing on a
             // dozen members of one archive is one fact, not a dozen.
-            if !seen.insert((finding.id.clone(), file.path.clone(), pkg.clone())) {
+            if !seen.insert((finding.id.as_str(), file.path.as_str(), pkg)) {
                 continue;
             }
             let (off, line) = locate(file, finding);
@@ -161,7 +157,7 @@ pub(crate) fn collect_hits(report: &cleave::types::CompactReport) -> Vec<Hit> {
                 id: finding.id.clone(),
                 crit: finding.criticality,
                 file: file.path.clone(),
-                pkg,
+                pkg: pkg.to_owned(),
                 desc: finding.description.clone(),
                 off,
                 line,
@@ -505,8 +501,15 @@ impl Index {
         }
         self.memo().put(sha.clone(), Some(verdict.clone()));
         // The alias is written after the verdict it points at, so a PURL never
-        // resolves to a sha whose record is not yet readable.
-        if let Some(key) = verdict.purl.as_deref().and_then(purl_key)
+        // resolves to a sha whose record is not yet readable. And only for a
+        // PURL that names the whole release: one whose `file_name`, `kind` or
+        // subpath selected a single artifact of it is a verdict about that
+        // artifact, and filed under the bare coordinate it would answer for
+        // every other artifact the release ships.
+        if let Some(purl) = verdict.purl.as_deref().map(str::trim)
+            && fletch::purl::normalize(purl)
+                .is_some_and(|full| fletch::purl::identity(purl).is_some_and(|bare| bare == full))
+            && let Some(key) = purl_key(purl)
             && let Err(e) = self.write_atomic(&self.alias_path(&key), sha.as_bytes())
         {
             tracing::debug!(sha256 = %sha, error = %e, "verdict index alias write failed");
@@ -567,10 +570,7 @@ pub(crate) fn pick_verdict(
     by_purl: impl FnOnce() -> Option<Verdict>,
     sha: &str,
 ) -> Option<Verdict> {
-    if by_sha.is_some() {
-        return by_sha;
-    }
-    by_purl().filter(|v| v.sha256.eq_ignore_ascii_case(sha))
+    by_sha.or_else(|| by_purl().filter(|v| v.sha256.eq_ignore_ascii_case(sha)))
 }
 
 #[cfg(test)]

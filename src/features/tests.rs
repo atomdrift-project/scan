@@ -23,20 +23,23 @@ fn ranked_tokens_keep_strongest_with_stable_ties() {
 #[test]
 fn ranked_score_uses_paired_severity_and_confidence() {
     let summary = summarize_findings(&[
-        FindingView {
-            id: "a/b::one",
+        RawFinding {
+            id: "a/b::one".into(),
             crit: 5,
             conf: 0.7,
+            ..RawFinding::default()
         },
-        FindingView {
-            id: "a/b::two",
+        RawFinding {
+            id: "a/b::two".into(),
             crit: 3,
             conf: 1.0,
+            ..RawFinding::default()
         },
-        FindingView {
-            id: "a/b::low",
+        RawFinding {
+            id: "a/b::low".into(),
             crit: 5,
             conf: 0.1,
+            ..RawFinding::default()
         },
     ]);
     assert_eq!(summary.path_scores["a/b"], 5.0 * f64::from(0.7_f32));
@@ -119,10 +122,9 @@ fn kv_tokens_cover_booleans_and_strings_only() {
 
 #[test]
 fn trait_depth_spec_defaults_and_reads_explicit_value() {
-    let old: RawFeatureSpec = serde_json::from_str("{}").expect("legacy defaults");
+    let old: FeatureSpec = serde_json::from_str("{}").expect("legacy defaults");
     assert_eq!(old.trait_path_depth, 3);
-    let new: RawFeatureSpec =
-        serde_json::from_str(r#"{"trait_path_depth":5}"#).expect("depth field");
+    let new: FeatureSpec = serde_json::from_str(r#"{"trait_path_depth":5}"#).expect("depth field");
     assert_eq!(new.trait_path_depth, 5);
 }
 

@@ -322,8 +322,8 @@ pub(super) async fn acl(
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|c| normalize(c.0.ip()));
 
-    // ConnectInfo is installed by `into_make_service_with_connect_info` in
-    // `run`. Tests inject it manually. If it's missing here in production
+    // ConnectInfo is inserted per request by the accept loop in `serve`.
+    // Tests inject it manually. If it's missing here in production
     // that's a wiring bug — fail closed rather than allow.
     let Some(ip) = peer else {
         return forbidden("peer address unavailable", Auth::NoPeerInfo);

@@ -127,15 +127,14 @@ impl Latency {
     /// `record` with the clock supplied, so a test can age a window without
     /// sleeping through it.
     pub(crate) fn record_at(&self, micros: u64, now: Instant) {
-        let Ok(mut w) = self.window.lock() else {
-            return; // a poisoned stats lock must never take down an analysis
-        };
+        let mut w = super::lock(&self.window);
         Self::advance(&mut w, now);
         let cur = w.cur;
         let slot = &mut w.slots[cur];
         slot.count += 1;
         slot.micros += micros;
         slot.hist[bucket_of(micros)] += 1;
+        drop(w);
     }
 
     /// Summarise the window as of now.
@@ -144,9 +143,7 @@ impl Latency {
     }
 
     pub(crate) fn summary_at(&self, now: Instant) -> Summary {
-        let Ok(mut w) = self.window.lock() else {
-            return Summary::default();
-        };
+        let mut w = super::lock(&self.window);
         // Advance on read too, or a server that stopped receiving work would
         // keep reporting whatever it was doing when the traffic stopped.
         Self::advance(&mut w, now);
@@ -161,6 +158,7 @@ impl Latency {
                 *acc += u64::from(*n);
             }
         }
+        drop(w);
         if count == 0 {
             return Summary::default();
         }

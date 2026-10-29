@@ -215,27 +215,16 @@ impl Thresholds {
     pub fn decide(&self, probability: f32) -> Decision {
         // The raw threshold path carries no level table (manual `--threshold-*`
         // mode, single-bundle, or the no-grid fallback), so `level` is `Manual`.
-        if probability >= self.hostile {
-            Decision {
-                class: Classification::Hostile,
-                probability,
-                threshold: self.hostile,
-                level: Level::Manual,
-            }
-        } else if probability >= self.suspicious {
-            Decision {
-                class: Classification::Suspicious,
-                probability,
-                threshold: self.suspicious,
-                level: Level::Manual,
-            }
-        } else {
-            Decision {
-                class: Classification::Benign,
-                probability,
-                threshold: self.suspicious,
-                level: Level::Manual,
-            }
+        let class = self.classify(probability);
+        Decision {
+            class,
+            probability,
+            threshold: if class == Classification::Hostile {
+                self.hostile
+            } else {
+                self.suspicious
+            },
+            level: Level::Manual,
         }
     }
 }
@@ -290,15 +279,6 @@ impl Level {
     pub const fn is_manual(&self) -> bool {
         matches!(self, Self::Manual)
     }
-
-    /// The wire encoding.
-    pub(super) fn wire(self) -> Option<i32> {
-        match self {
-            Self::Manual => None,
-            Self::Clean => Some(-1),
-            Self::At(n) => Some(i32::from(n)),
-        }
-    }
 }
 
 impl fmt::Display for Level {
@@ -314,7 +294,12 @@ impl fmt::Display for Level {
 
 impl serde::Serialize for Level {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(&self.wire(), serializer)
+        let wire = match self {
+            Self::Manual => None,
+            Self::Clean => Some(-1),
+            Self::At(n) => Some(i32::from(*n)),
+        };
+        serde::Serialize::serialize(&wire, serializer)
     }
 }
 

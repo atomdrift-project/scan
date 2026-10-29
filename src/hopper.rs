@@ -13,15 +13,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 
-/// A hopper bearer token and where it was found. The origin is a path or an
-/// environment variable name — never the secret — so it is safe to log.
-#[derive(Debug)]
-struct Credential {
-    token: String,
-    origin: String,
-}
-
-/// The process's hopper credential, and the file it was (or would have been)
+/// The process's hopper token, and the file it was (or would have been)
 /// read from — resolved once, environment included.
 ///
 /// The first non-empty line of `~/.tok/hopper` — the same convention as
@@ -31,17 +23,14 @@ struct Credential {
 ///
 /// Resolved once per process: hopper reads its own copy once at startup too,
 /// so rotation is a restart on both ends.
-fn credentials() -> &'static (Option<Credential>, Option<PathBuf>) {
-    static CREDENTIALS: OnceLock<(Option<Credential>, Option<PathBuf>)> = OnceLock::new();
+fn credentials() -> &'static (Option<String>, Option<PathBuf>) {
+    static CREDENTIALS: OnceLock<(Option<String>, Option<PathBuf>)> = OnceLock::new();
     CREDENTIALS.get_or_init(|| {
         let path = crate::interpret::tok_path("hopper");
-        let credential = path.as_deref().and_then(|path| {
-            Some(Credential {
-                token: crate::interpret::read_token_file(path)?,
-                origin: path.display().to_string(),
-            })
-        });
-        (credential, path)
+        (
+            path.as_deref().and_then(crate::interpret::read_token_file),
+            path,
+        )
     })
 }
 
@@ -49,7 +38,7 @@ fn credentials() -> &'static (Option<Credential>, Option<PathBuf>) {
 /// Never the origin, never logged.
 #[must_use]
 pub fn token() -> Option<&'static str> {
-    credentials().0.as_ref().map(|c| c.token.as_str())
+    credentials().0.as_deref()
 }
 
 /// The process's blocking HTTP client for hopper, with `REQUEST_TIMEOUT` as
@@ -184,12 +173,15 @@ pub fn configure(hopper_url: &str) {
 /// every request. Say so once at startup rather than
 /// leaving an operator to infer it from a retry loop.
 fn log_hopper_credential() {
-    match credentials() {
-        (Some(credential), _) => {
-            tracing::info!(source = %credential.origin, "hopper API token loaded");
-        }
-        (None, expected) => tracing::warn!(
-            expected = %expected.as_deref().unwrap_or(std::path::Path::new("")).display(),
+    let (token, path) = credentials();
+    let path = path
+        .as_deref()
+        .unwrap_or(std::path::Path::new(""))
+        .display();
+    match token {
+        Some(_) => tracing::info!(source = %path, "hopper API token loaded"),
+        None => tracing::warn!(
+            expected = %path,
             "no hopper API token found; unless hopper runs unauthenticated every \
              request will be rejected with 401 — install the token at \
              ~/.tok/hopper (mode 0600)",
@@ -300,11 +292,7 @@ pub fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
 /// Pure, with the random draw passed in, so the policy is testable without
 /// sleeping or seeding.
 pub(crate) fn backoff(attempt: usize, retry_after: Option<Duration>, fuzz: f64) -> Duration {
-    let ceiling = RETRY_MAX_BACKOFF.min(
-        RETRY_MIN_BACKOFF
-            .saturating_mul(1u32 << attempt.min(16))
-            .max(RETRY_MIN_BACKOFF),
-    );
+    let ceiling = RETRY_MAX_BACKOFF.min(RETRY_MIN_BACKOFF.saturating_mul(1u32 << attempt.min(16)));
     ceiling
         .mul_f64(fuzz.clamp(0.0, 1.0))
         .max(retry_after.unwrap_or(RETRY_MIN_BACKOFF))

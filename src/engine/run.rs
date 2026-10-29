@@ -120,7 +120,13 @@ pub fn run_paths_with(
             session.tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
-    session.show_progress(files.len() + dir_files.len());
+    // Print the banner and start the bar, when a terminal scan covers more
+    // than one file.
+    let total = files.len() + dir_files.len();
+    if config.format() == OutputFormat::Terminal && total > 1 {
+        crate::output::print_banner(detection_counts(config));
+        session.progress = Some(Progress::new(u32::try_from(total).unwrap_or(u32::MAX)));
+    }
     // Each batch keeps its own policy, so each is offered to isotope13 alone.
     let files = session.judge_remotely(files);
     let dir_files = session.judge_remotely(dir_files);
@@ -158,7 +164,7 @@ fn scan_partitioned(
             registry: mapped.or(collected.as_ref()),
             fetch: None,
         };
-        session.record(&Target::new(origin, named), analyzed);
+        session.record(&Target::new(origin, named), analyzed, None);
     };
 
     // A single artifact has no file-count bar, so its static analysis —
@@ -280,10 +286,9 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
             Analyze::Local => {}
         }
     }
-    // Content-digest short-circuit happens inside cleave via the skip predicate,
-    // complementing the PURL gate in `pkg.rs`: it catches known *content* even
-    // when the package locator was not in the filter. `record` emits the verdict
-    // from the minimal report cleave returns on a skip.
+    // No bloom short-circuit here: a `url`/`purl` scan names the one artifact
+    // the operator asked about, so its config carries no filters (see
+    // `with_bloom` in main.rs) and it is always analyzed.
     let bytes = bytes::Bytes::from(bytes);
     let analyzed = cleave::analyze_bytes_shared(bytes.clone(), name, &session.opts)
         .with_context(|| format!("cleave analysis of {label}"));
@@ -298,7 +303,7 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
         fallback_purl,
         ..Target::new(origin, true)
     };
-    session.record_input(&target, analyzed, Some(bytes));
+    session.record(&target, analyzed, Some(bytes));
     session.finish()
 }
 
@@ -461,33 +466,13 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Print the banner and start the bar, when a terminal scan covers more
-    /// than one file.
-    fn show_progress(&mut self, files: usize) {
-        if self.config.format() == OutputFormat::Terminal && files > 1 {
-            crate::output::print_banner(detection_counts(self.config));
-            self.progress = Some(Progress::new(u32::try_from(files).unwrap_or(u32::MAX)));
-        }
-    }
-
-    fn classifier(&self) -> Classifier<'_> {
-        Classifier {
-            config: self.config,
-            model: self.model,
-            shap: self.shap,
-            cancel: Some(self.cancel.as_ref()),
-        }
-    }
-
     /// Classify one analyzed file and account for it: tally, print, renew.
     /// Called from rayon workers, so every shared input is behind `&`/atomics.
-    fn record(&self, target: &Target<'_>, analyzed: Result<AnalysisReport>) {
-        self.record_input(target, analyzed, None);
-    }
-
-    /// Keep an in-memory root available through dependency discovery. The
-    /// classifier consumes this shared handle and releases it after that phase.
-    fn record_input(
+    ///
+    /// `root_bytes` keeps an in-memory root available through dependency
+    /// discovery. The classifier consumes this shared handle and releases it
+    /// after that phase.
+    fn record(
         &self,
         target: &Target<'_>,
         analyzed: Result<AnalysisReport>,
@@ -503,23 +488,22 @@ impl<'a> Session<'a> {
             && let Some(digest) = burton::parse_sha256_hex(&report.target.sha256)
         {
             let decision = lookup.decide_sha256(&digest);
-            // Two known-good files are still scanned on their own merits, and in
-            // both the skip predicate already declined to skip, so cleave has
-            // produced a full report: one created/changed/modified within
-            // KNOWN_GOOD_RESCAN, and one the operator named on the command line.
-            // The second is a policy, not an optimization: a bless is a bulk
-            // shortcut for dependencies and directory walks, and returning one
-            // where a scan was asked for answers a different question. The mark
-            // is still emitted, so a named known-bad still says so.
-            let path = target.origin.path;
-            let scan_anyway = decision == BloomDecision::Skip
-                && (target.named
-                    || file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now()));
-            if !scan_anyway
-                && let Some(summary) =
-                    bloom_gate(self.config, &path.display().to_string(), decision)
+            // A file the operator named on the command line is scanned on its
+            // own merits: cleave got no skip predicate (see
+            // `named_target_opts`), so it has produced a full report — past a
+            // bless, and past fast mode's unknown-skip. That is a policy, not
+            // an optimization: a bless is a bulk shortcut for dependencies and
+            // directory walks, and returning one where a scan was asked for
+            // answers a different question. A known-good touched within
+            // KNOWN_GOOD_RESCAN is scanned too (see `bloom_gate_fresh`). The
+            // mark is still emitted, so a named known-bad still says so.
+            let named_analyzed = target.named
+                && (decision == BloomDecision::Skip
+                    || (decision == BloomDecision::Unknown && self.config.mode() == Mode::Fast));
+            if !named_analyzed
+                && let Some(benign) = bloom_gate_fresh(self.config, target.origin.path, decision)
             {
-                if summary.benign > 0 {
+                if benign > 0 {
                     self.tally.count(Classification::Benign);
                 }
                 self.advance();
@@ -530,7 +514,13 @@ impl<'a> Session<'a> {
         }
 
         let classified = analyzed.and_then(|report| {
-            self.classifier().classify(
+            Classifier {
+                config: self.config,
+                model: self.model,
+                shap: self.shap,
+                cancel: Some(self.cancel.as_ref()),
+            }
+            .classify(
                 report,
                 target.origin,
                 bloom_mark,
@@ -593,22 +583,29 @@ impl<'a> Session<'a> {
             self.config.format(),
             OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
         ) || self.config.filter().shows(class);
-        if !shown || self.broken_pipe.load(Ordering::Relaxed) {
+        if shown {
+            self.write_result(|| {
+                let mut out = io::stdout().lock();
+                crate::output::write_remote_verdict(
+                    &mut out,
+                    label,
+                    sha,
+                    purl,
+                    verdict,
+                    class,
+                    self.config.format(),
+                )
+                .and_then(|()| out.flush())
+            });
+        }
+    }
+
+    /// Write one result to stdout around the progress bar, unless an earlier
+    /// write found the pipe closed.
+    fn write_result(&self, write: impl FnOnce() -> io::Result<()>) {
+        if self.broken_pipe.load(Ordering::Relaxed) {
             return;
         }
-        let write = || {
-            let mut out = io::stdout().lock();
-            crate::output::write_remote_verdict(
-                &mut out,
-                label,
-                sha,
-                purl,
-                verdict,
-                class,
-                self.config.format(),
-            )
-            .and_then(|()| out.flush())
-        };
         let written = match &self.progress {
             Some(progress) => progress.around_result(write),
             None => write(),
@@ -654,14 +651,8 @@ impl<'a> Session<'a> {
                 &result.top_findings,
                 &result.embedded_files,
             );
-        if shown && !self.broken_pipe.load(Ordering::Relaxed) {
-            let written = match &self.progress {
-                Some(progress) => progress.around_result(|| emit_result(&result, self.config)),
-                None => emit_result(&result, self.config),
-            };
-            if let Err(error) = written {
-                self.output_failed(&error);
-            }
+        if shown {
+            self.write_result(|| emit_result(&result, self.config));
         }
         // Renewed after the result is printed, so local output never waits on
         // the handoff; the upload itself runs on the uploader's thread. Only
@@ -956,13 +947,10 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
 }
 
 /// Apply a bloom-filter decision before any expensive analysis. Emits the
-/// verdict and returns `Some(summary)` when the artifact is short-circuited (a
-/// known-good skip, or — in fast mode — a bloom-only verdict); `None` to proceed.
-pub(crate) fn bloom_gate(
-    config: &ScanConfig,
-    label: &str,
-    decision: BloomDecision,
-) -> Option<ScanSummary> {
+/// verdict and returns the artifact's benign count (1 for a known-good skip, 0
+/// for fast mode's bloom-only unscanned) when it is short-circuited; `None` to
+/// proceed.
+pub(crate) fn bloom_gate(config: &ScanConfig, label: &str, decision: BloomDecision) -> Option<u32> {
     use crate::output::BloomVerdict;
     let fast = config.mode() == Mode::Fast;
     let format = config.format();
@@ -977,7 +965,7 @@ pub(crate) fn bloom_gate(
             if show_quiet {
                 crate::output::print_bloom_verdict(label, BloomVerdict::KnownGood, format);
             }
-            Some(one_file_summary(0, 0, 1))
+            Some(1)
         }
         // Known-bad and conflicted are flags, not short-circuits: they run full
         // analysis in every mode — the scan is the verdict — and the flag rides
@@ -1004,7 +992,7 @@ pub(crate) fn bloom_gate(
             if show_quiet {
                 crate::output::print_bloom_verdict(label, BloomVerdict::Unscanned, format);
             }
-            one_file_summary(0, 0, 0)
+            0
         }),
     }
 }
@@ -1012,16 +1000,13 @@ pub(crate) fn bloom_gate(
 /// The bloom short-circuit for a scan target, honoring the local known-good
 /// freshness override: a known-good file created, status-changed, or modified
 /// within the last 48h is scanned on its own merits rather than skipped on its
-/// bloom vouch. Returns `Some(summary)` when the target is short-circuited
-/// (counted, not scanned) and `None` when it must be scanned. Used by process
-/// scans, which decide before analysis; path scans apply the same override in
-/// [`Session::record`], where cleave has already produced a minimal report by
-/// the time the decision is known and a fresh known-good is re-analyzed in place.
+/// bloom vouch. Returns the benign count (see [`bloom_gate`]) when the target
+/// is short-circuited (counted, not scanned) and `None` when it must be scanned.
 pub(crate) fn bloom_gate_fresh(
     config: &ScanConfig,
     path: &Path,
     decision: BloomDecision,
-) -> Option<ScanSummary> {
+) -> Option<u32> {
     if decision == BloomDecision::Skip
         && file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now())
     {
@@ -1051,7 +1036,7 @@ fn named_target_opts(opts: &AnalysisOptions) -> AnalysisOptions {
 /// every file's verdict line is emitted later in [`Session::record`], which
 /// re-derives the decision from the report's sha. `None` when bloom is disabled.
 fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
-    let lookup = config.bloom_arc()?;
+    let lookup = config.bloom.clone()?;
     let fast = config.mode() == Mode::Fast;
     Some(cleave::SkipPredicate(Arc::new(
         move |sha_hex: &str, path: &Path| {
@@ -1075,23 +1060,6 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
             }
         },
     )))
-}
-
-/// A one-file [`ScanSummary`] for a bloom-decided artifact that was not analyzed.
-const fn one_file_summary(hostile: u32, suspicious: u32, benign: u32) -> ScanSummary {
-    ScanSummary {
-        total_files: 1,
-        hostile,
-        suspicious,
-        benign,
-        errors: 0,
-        dependency_attention: super::DependencyAttention {
-            gaps: 0,
-            flagged_candidates: 0,
-        },
-        static_flags: 0,
-        duration_ms: 0,
-    }
 }
 
 /// Enumerate the regular files under `dir` for a directory scan, mirroring the
@@ -1188,7 +1156,8 @@ impl Tally {
     }
 
     /// Assemble the final [`ScanSummary`]. Every analyzed file lands in exactly
-    /// one of the four counters, so their sum is the total file count.
+    /// one of the three verdict counters (errors are counted apart), so their
+    /// sum is the total file count.
     fn summary(&self, scan_start: Instant) -> ScanSummary {
         let hostile = self.hostile.load(Ordering::Relaxed);
         let suspicious = self.suspicious.load(Ordering::Relaxed);

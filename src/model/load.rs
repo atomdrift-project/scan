@@ -88,21 +88,24 @@ pub(super) fn load_evaluation_thresholds(dir: &Path) -> Result<Option<Thresholds
     let Some(eval) = read_json::<EvaluationJson>(&path)? else {
         return Ok(None);
     };
-    if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&eval.model_abi_version) {
+    if !(crate::features::MIN_MODEL_ABI_VERSION..=EXPECTED_MODEL_ABI_VERSION)
+        .contains(&eval.model_abi_version)
+    {
         anyhow::bail!(
             "{} has model_abi_version {} but this build expects {EXPECTED_MODEL_ABI_VERSION}",
             path.display(),
             eval.model_abi_version,
         );
     }
-    let Some(hostile) = eval.recommended_thresholds.as_ref().and_then(|r| r.hostile) else {
+    let Some(EvaluationThresholds {
+        suspicious,
+        hostile: Some(hostile),
+    }) = eval.recommended_thresholds
+    else {
         return Ok(None);
     };
     let t = Thresholds {
-        suspicious: eval
-            .recommended_thresholds
-            .and_then(|r| r.suspicious)
-            .unwrap_or(hostile),
+        suspicious: suspicious.unwrap_or(hostile),
         hostile,
     };
     t.validate()
@@ -294,7 +297,7 @@ pub(super) fn load_bundle(
         .with_context(|| format!("loading optional calibrator from {}", bundle_dir.display()))?;
     // When a calibrator is present, push the bundle-level thresholds through
     // it so threshold comparisons happen in the same (calibrated) probability
-    // space as `predict_calibrated`'s output.  Isotonic is monotone, so this
+    // space as the calibrated route scores.  Isotonic is monotone, so this
     // is decision-equivalent to comparing raw_score >= raw_threshold — but
     // every emitted probability is now on a meaningful [0,1] scale matching
     // the empirical malware fraction we observed at training time.
@@ -427,7 +430,8 @@ pub(super) fn load_specialists(
     out
 }
 
-/// Load and validate one specialist bundle, applying the ABI-version rule.
+/// Load and validate one specialist bundle (its spec's ABI range is enforced
+/// by [`FeatureSpec::load`]).
 /// Errors here are recoverable — the specialist is dropped, not fatal.
 pub(super) fn load_specialist(
     bundle_dir: &Path,
@@ -436,14 +440,6 @@ pub(super) fn load_specialist(
 ) -> Result<Route> {
     let bundle = load_bundle(bundle_dir, Some(thresholds), /* is_general = */ false)
         .with_context(|| format!("specialist {name}"))?;
-
-    if !(18..=EXPECTED_MODEL_ABI_VERSION).contains(&bundle.spec.abi_version()) {
-        anyhow::bail!(
-            "ABI mismatch: specialist abi_version={} (build expects {})",
-            bundle.spec.abi_version(),
-            EXPECTED_MODEL_ABI_VERSION,
-        );
-    }
 
     let ctx = ExtractContext::new(&bundle.spec);
 
@@ -472,17 +468,6 @@ pub(super) struct Route {
     /// bundles without `calibrator.json` carry `None` and behave like
     /// before — backward compatible.
     pub(super) calibrator: Option<IsotonicCalibrator>,
-}
-
-impl Route {
-    /// Score a feature vector and return `(raw, calibrated)`. The raw value is
-    /// the backend's pre-isotonic probability; the calibrated value is what
-    /// every decision path consumes.
-    pub(super) fn predict_raw_calibrated(&self, features: &[f32]) -> Result<(f32, f32)> {
-        let raw = self.backend.predict(features)?;
-        let calibrated = self.calibrator.as_ref().map_or(raw, |cal| cal.apply(raw));
-        Ok((raw, calibrated))
-    }
 }
 
 /// A specialist registered at load and built on first use.

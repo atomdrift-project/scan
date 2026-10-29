@@ -188,10 +188,20 @@ pub fn registry_fallback_artifact(
 /// hopper projects into its queryable `purl_base` column — and by the verdict
 /// handed to the uploader, so the bytes and the verdict can never disagree
 /// about what this artifact is.
+///
+/// Not a PURL whose bytes came from somewhere it names itself: a
+/// `download_url` or `vcs_url` fetches from wherever its author pointed it,
+/// and claiming the package for those bytes would file them, in hopper, under
+/// a coordinate whose registry never served them.
 fn fetched_purl(root_fetch: Option<&FetchRecord>) -> Option<&str> {
     root_fetch
         .map(|rec| rec.locator.as_str())
         .filter(|locator| locator.starts_with("pkg:"))
+        .filter(|locator| {
+            fletch::purl::Purl::parse(locator).is_ok_and(|purl| {
+                purl.qualifier("download_url").is_none() && purl.qualifier("vcs_url").is_none()
+            })
+        })
 }
 
 /// The package an artifact *is*, as far as anything here can tell.

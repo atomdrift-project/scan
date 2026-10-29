@@ -390,12 +390,10 @@ where
         .iter()
         .take_while(|arg| *arg != "--")
         .filter_map(|arg| arg.to_str());
-    let mut subcommands = Cli::command();
-    let subcommands: Vec<&str> = subcommands
-        .get_subcommands_mut()
-        .flat_map(|sub| {
-            std::iter::once(sub.get_name()).chain(sub.get_all_aliases().collect::<Vec<_>>())
-        })
+    let command = Cli::command();
+    let subcommands: Vec<&str> = command
+        .get_subcommands()
+        .flat_map(|sub| std::iter::once(sub.get_name()).chain(sub.get_all_aliases()))
         .collect();
     for arg in named {
         if subcommands.contains(&arg)
@@ -669,11 +667,6 @@ impl Commands {
     fn is_daemon(&self) -> bool {
         matches!(self, Self::Serve(_))
     }
-
-    /// Whether this command runs cleave, and so needs its external tools.
-    fn runs_analysis(&self) -> bool {
-        self.is_scan() || self.is_daemon() || matches!(self, Self::Validate { .. })
-    }
 }
 
 /// Warn when `MALLOC_CONF` asks FreeBSD's in-libc jemalloc for a background
@@ -832,7 +825,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     );
 
     // Warn about missing analysis tools for commands that will run cleave.
-    if command.runs_analysis() {
+    if command.is_scan() || command.is_daemon() || matches!(command, Commands::Validate { .. }) {
         scan::tools::warn_missing();
     }
     // Interactive commands get a once-a-day, zero-telemetry update notice. The
@@ -932,7 +925,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
 /// Settle the process's settings from its flags, and start the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
-    use std::time::Duration;
     scan::settings::configure(scan::settings::Settings {
         rizin_timeout: Some(Duration::from_secs(global.rizin_timeout_secs)),
         rizin_retry_timeout: global.rizin_retry_timeout_secs.map(Duration::from_secs),
@@ -1043,20 +1035,16 @@ fn theme(global: &GlobalArgs, command: &Commands) -> Option<scan::output::Theme>
 /// follows everything (see [`scan::fetch::default_service_follow_policy`]).
 /// An explicit selection is honored verbatim; the knobs always apply.
 fn fetch_policy(global: &GlobalArgs, command: &Commands) -> scan::fetch::FetchPolicy {
-    let (default_follow, max_age): (fn() -> scan::fetch::FetchPolicy, u32) = match command {
-        Commands::Serve(_) => (
-            scan::fetch::default_service_follow_policy,
-            scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
-        ),
-        _ => (
-            default_cli_follow_policy,
-            scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
-        ),
+    let daemon = command.is_daemon();
+    let default_follow = if daemon {
+        scan::fetch::default_service_follow_policy
+    } else {
+        default_cli_follow_policy
     };
     global.fetch_policy(
         global.follow.unwrap_or_else(default_follow),
-        max_age,
-        command.is_daemon(),
+        scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
+        daemon,
     )
 }
 

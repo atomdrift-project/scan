@@ -526,12 +526,12 @@ pub fn admit(
     } else {
         None
     };
-    let why = match (decision, vetoed, reasons.is_empty()) {
-        (Some(LlmAdmission::Required), _, _) => "admitted",
-        (Some(LlmAdmission::Optional), true, _) => "vetoed by size, kept for its level placement",
-        (Some(LlmAdmission::Optional), false, _) => "level placement only",
-        (None, true, _) => "vetoed by size",
-        (None, false, _) => "no admission fired",
+    let why = match (decision, vetoed) {
+        (Some(LlmAdmission::Required), _) => "admitted",
+        (Some(LlmAdmission::Optional), true) => "vetoed by size, kept for its level placement",
+        (Some(LlmAdmission::Optional), false) => "level placement only",
+        (None, true) => "vetoed by size",
+        (None, false) => "no admission fired",
     };
     tracing::info!(
         subject,

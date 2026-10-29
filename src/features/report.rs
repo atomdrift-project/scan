@@ -164,16 +164,7 @@ impl ParsedReport {
     pub(super) fn rebuild_at_trait_path_depth(&self, depth: usize) -> Self {
         let mut summaries = self.summaries.clone();
         for file in &mut summaries {
-            let views: Vec<_> = file
-                .raw_findings
-                .iter()
-                .map(|f| FindingView {
-                    id: &f.id,
-                    conf: f.conf,
-                    crit: f.crit,
-                })
-                .collect();
-            file.findings = summarize_findings_at_depth(&views, depth);
+            file.findings = summarize_findings_at_depth(&file.raw_findings, depth);
             file.risk.suspicious_category_breadth = file.findings.suspicious_category_breadth;
             file.risk.hostile_category_breadth = file.findings.hostile_category_breadth;
         }
@@ -265,7 +256,9 @@ impl ParsedReport {
         let combined = summarize_report_summaries(&summaries);
         let merged_metrics = merge_metric_summaries(&summaries);
         let crit_tokens = crit_category_tokens(&combined);
-        let tiered_tokens = tiered_path_tokens(&combined);
+        // Sorted `tier:path` tokens shared by the tiered bigram and trigram
+        // feature builders.
+        let tiered_tokens = tiered_path_tokens_with_options(&combined, 3, &HashMap::new());
         let mut attack_codes: HashSet<&str> = HashSet::new();
         let mut mbc_codes: HashSet<&str> = HashSet::new();
         for finding in summaries.iter().flat_map(|s| &s.raw_findings) {
@@ -315,15 +308,7 @@ impl FileSummary {
             })
             .collect();
         let facts = &file.facts;
-        let finding_views: Vec<FindingView<'_>> = raw_findings
-            .iter()
-            .map(|f| FindingView {
-                id: &f.id,
-                conf: f.conf,
-                crit: f.crit,
-            })
-            .collect();
-        let findings = summarize_findings(&finding_views);
+        let findings = summarize_findings(&raw_findings);
 
         let size_bytes = file.size as f64;
         let size_kb = (size_bytes / 1024.0).max(1.0) as f32;
@@ -342,10 +327,10 @@ impl FileSummary {
             max_crit,
         };
 
-        let mut unique_3level_paths: Vec<String> = finding_views
+        let mut unique_3level_paths: Vec<String> = raw_findings
             .iter()
             .filter(|f| f.conf >= MIN_CONFIDENCE && f.crit >= CRIT_NOTABLE)
-            .map(|f| trait_path(f.id).to_string())
+            .map(|f| trait_path(&f.id).to_string())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -412,7 +397,6 @@ pub(super) struct FindingSummary {
     pub(super) notable_finding_count: u32,
     pub(super) suspicious_finding_count: u32,
     pub(super) hostile_finding_count: u32,
-    pub(super) unique_notable_ids: usize,
     pub(super) unique_suspicious_ids: usize,
     pub(super) unique_hostile_ids: usize,
     pub(super) suspicious_category_breadth: usize,
@@ -496,30 +480,17 @@ pub(super) fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
     out
 }
 
-/// The whole of a finding that scoring reads: its id, confidence and
-/// criticality ordinal.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct FindingView<'a> {
-    pub(super) id: &'a str,
-    pub(super) conf: f64,
-    pub(super) crit: u32,
-}
-
-pub(super) fn summarize_findings(findings: &[FindingView<'_>]) -> FindingSummary {
+pub(super) fn summarize_findings(findings: &[RawFinding]) -> FindingSummary {
     summarize_findings_at_depth(findings, default_trait_path_depth())
 }
 
-pub(super) fn summarize_findings_at_depth(
-    findings: &[FindingView<'_>],
-    depth: usize,
-) -> FindingSummary {
+pub(super) fn summarize_findings_at_depth(findings: &[RawFinding], depth: usize) -> FindingSummary {
     let mut summary = FindingSummary::default();
-    let mut notable_ids: HashSet<&str> = HashSet::new();
     let mut suspicious_ids: HashSet<&str> = HashSet::new();
     let mut hostile_ids: HashSet<&str> = HashSet::new();
 
     for finding in findings {
-        let fid = finding.id;
+        let fid = finding.id.as_str();
         if fid.is_empty() {
             continue;
         }
@@ -534,7 +505,6 @@ pub(super) fn summarize_findings_at_depth(
 
         if crit_ord >= CRIT_NOTABLE {
             summary.notable_finding_count += 1;
-            notable_ids.insert(fid);
         }
         if crit_ord >= CRIT_SUSPICIOUS {
             summary.suspicious_finding_count += 1;
@@ -597,7 +567,6 @@ pub(super) fn summarize_findings_at_depth(
         }
     }
 
-    summary.unique_notable_ids = notable_ids.len();
     summary.unique_suspicious_ids = suspicious_ids.len();
     summary.unique_hostile_ids = hostile_ids.len();
     (
@@ -632,7 +601,6 @@ pub(super) fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSu
     // so the sets hold `&str` — matching `summarize_findings`'s shape — and
     // avoid one `String` allocation per qualifying finding per criticality
     // tier.
-    let mut notable_ids: HashSet<&str> = HashSet::new();
     let mut suspicious_ids: HashSet<&str> = HashSet::new();
     let mut hostile_ids: HashSet<&str> = HashSet::new();
 
@@ -689,9 +657,6 @@ pub(super) fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSu
                 continue;
             }
             let crit = finding.crit;
-            if crit >= CRIT_NOTABLE {
-                notable_ids.insert(fid);
-            }
             if crit >= CRIT_SUSPICIOUS {
                 suspicious_ids.insert(fid);
             }
@@ -701,7 +666,6 @@ pub(super) fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSu
         }
     }
 
-    combined.unique_notable_ids = notable_ids.len();
     combined.unique_suspicious_ids = suspicious_ids.len();
     combined.unique_hostile_ids = hostile_ids.len();
     (

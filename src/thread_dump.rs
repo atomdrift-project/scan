@@ -29,8 +29,8 @@
 //! breadcrumb/wait-channel census instead.
 
 use std::io::Write;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 /// Set once the capture handler is in place. `SIGUSR2`'s default action
 /// terminates the process, so a dump must never signal a thread without it.
@@ -46,10 +46,8 @@ static DUMPING: AtomicBool = AtomicBool::new(false);
 /// after idle timeout, so each registration installs a thread-local guard that
 /// removes the id when its thread exits — otherwise dead tids would accumulate
 /// for the life of a long-running process.
-fn registry() -> &'static Mutex<std::collections::BTreeSet<u64>> {
-    static REGISTRY: OnceLock<Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
-}
+static REGISTRY: Mutex<std::collections::BTreeSet<u64>> =
+    Mutex::new(std::collections::BTreeSet::new());
 
 /// Removes its thread's id from the registry when the thread exits (thread-local
 /// destructors run on normal thread termination, including tokio blocking-pool
@@ -58,7 +56,7 @@ struct Unregister(u64);
 
 impl Drop for Unregister {
     fn drop(&mut self) {
-        if let Ok(mut reg) = registry().lock() {
+        if let Ok(mut reg) = REGISTRY.lock() {
             reg.remove(&self.0);
         }
     }
@@ -78,7 +76,7 @@ pub fn register_self() {
     REGISTERED.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            if let Ok(mut reg) = registry().lock() {
+            if let Ok(mut reg) = REGISTRY.lock() {
                 reg.insert(tid);
             }
             *slot = Some(Unregister(tid));
@@ -311,7 +309,7 @@ fn write_registered_backtraces(out: &mut impl Write) {
     use std::time::{Duration, Instant};
 
     let self_tid = os_thread_id();
-    let targets: Vec<u64> = registry()
+    let targets: Vec<u64> = REGISTRY
         .lock()
         .map(|reg| reg.iter().copied().filter(|&t| t != self_tid).collect())
         .unwrap_or_default();

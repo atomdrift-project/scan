@@ -307,13 +307,10 @@ fn memory_value_mb(value: Option<&str>) -> Option<u64> {
     memory_value_bytes(value).map(|b| b / MIB)
 }
 
-/// Parse a cgroup memory file. `max` means "no limit" and maps to `None`.
+/// Parse a cgroup memory file. `max` means "no limit", and like anything else
+/// that is not a number maps to `None`.
 fn memory_value_bytes(value: Option<&str>) -> Option<u64> {
-    let value = value?;
-    if value == "max" {
-        return None;
-    }
-    value.parse::<u64>().ok()
+    value?.parse().ok()
 }
 
 /// `MemTotal` from `/proc/meminfo`, in MiB.
@@ -340,44 +337,27 @@ mod tests {
     use super::*;
 
     /// A disposable cgroup-shaped directory tree.
-    struct TempTree(PathBuf);
+    struct TempTree(tempfile::TempDir);
 
     impl TempTree {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "scan-memory-test-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&dir).expect("create temp tree");
-            Self(dir)
+        fn new() -> Self {
+            Self(tempfile::tempdir().expect("create temp tree"))
         }
 
         fn write(&self, rel: &str, file: &str, value: &str) {
-            let dir = if rel.is_empty() {
-                self.0.clone()
-            } else {
-                self.0.join(rel)
-            };
+            let dir = self.path(rel);
             std::fs::create_dir_all(&dir).expect("create cgroup dir");
             std::fs::write(dir.join(file), value).expect("write cgroup file");
         }
 
+        /// `rel` under the tree; empty is the root itself (`join("")` would
+        /// add a trailing separator).
         fn path(&self, rel: &str) -> PathBuf {
             if rel.is_empty() {
-                self.0.clone()
+                self.0.path().to_owned()
             } else {
-                self.0.join(rel)
+                self.0.path().join(rel)
             }
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -385,7 +365,7 @@ mod tests {
     fn limit_on_a_parent_binds_a_child_that_has_none() {
         // The exact shape that defeated a non-hierarchical read: the delegated
         // `scan.service/idle` cgroup carries no limit, the unit above it does.
-        let tree = TempTree::new("parent");
+        let tree = TempTree::new();
         tree.write("scan.service", "memory.max", "128849018880");
         tree.write("scan.service/idle", "memory.max", "max");
         let got = cgroup_limit_under(&tree.path(""), &tree.path("scan.service/idle"));
@@ -394,7 +374,7 @@ mod tests {
 
     #[test]
     fn the_most_restrictive_ancestor_wins() {
-        let tree = TempTree::new("min");
+        let tree = TempTree::new();
         tree.write("", "memory.max", "100");
         tree.write("a", "memory.max", "50");
         tree.write("a/b", "memory.max", "900");
@@ -406,7 +386,7 @@ mod tests {
 
     #[test]
     fn memory_high_is_a_ceiling_too() {
-        let tree = TempTree::new("high");
+        let tree = TempTree::new();
         tree.write("a", "memory.max", "900");
         tree.write("a", "memory.high", "17");
         assert_eq!(
@@ -417,7 +397,7 @@ mod tests {
 
     #[test]
     fn unlimited_everywhere_is_no_limit() {
-        let tree = TempTree::new("unlimited");
+        let tree = TempTree::new();
         tree.write("", "memory.max", "max");
         tree.write("a", "memory.max", "max");
         assert_eq!(cgroup_limit_under(&tree.path(""), &tree.path("a")), None);
