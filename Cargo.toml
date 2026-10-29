@@ -316,7 +316,7 @@ opt-level = 2
 [profile.dev.package.regalloc2]
 opt-level = 3
 
-[profile.dev.package.serde_yaml]
+[profile.dev.package.serde-saphyr]
 opt-level = 3
 
 [lints]
@@ -358,5 +358,5 @@ tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 # tops out at 0.26.11 — so this patch is load-bearing for resolution, not only
 # for the fix, and cleave/filefacts carry an identical block for their own
 # standalone builds. Remove all three once a release carries it.
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
