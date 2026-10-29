@@ -135,6 +135,7 @@ pub struct ScanConfig {
     zip_passwords: crate::ArchivePasswords,
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
+    sidecars: bool,
 }
 
 /// The Rizin limit for an [`cleave::AnalysisOptions`]: the configured one, or
@@ -203,6 +204,7 @@ impl ScanConfig {
             // config runs a full scan (slow mode), so server/fs paths are unaffected.
             mode: crate::Mode::Slow,
             bloom: None,
+            sidecars: false,
         })
     }
 
@@ -357,6 +359,23 @@ impl ScanConfig {
         self.mode = mode;
         self.bloom = Some(lookup);
         self
+    }
+
+    /// Treat a collector's capture record (`<file>.forage.json` beside
+    /// `<file>`) found by a directory walk as bookkeeping (`--enable-sidecar`):
+    /// still analyzed, but shown only when it raises something and filed on
+    /// hopper only when hostile. Off, such a record is an ordinary file.
+    #[must_use]
+    pub const fn with_sidecars(mut self, enabled: bool) -> Self {
+        self.sidecars = enabled;
+        self
+    }
+
+    /// Whether capture records are treated as bookkeeping; see
+    /// [`Self::with_sidecars`].
+    #[must_use]
+    pub const fn sidecars(&self) -> bool {
+        self.sidecars
     }
 
     /// The scan execution mode (defaults to [`crate::Mode::Slow`]).

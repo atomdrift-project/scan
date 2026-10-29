@@ -35,7 +35,7 @@ pub(crate) trait Bundle {
     /// What `dir` holds, if an install completed there.
     fn installed(dir: &Path) -> Option<Self::Installed>;
     /// Read and validate the remote manifest.
-    fn fetch(client: &Client) -> Result<Self::Remote>;
+    fn fetch(http: &Http) -> Result<Self::Remote>;
     /// Whether `have`, installed in `dir`, is already what `remote` offers.
     fn is_current(dir: &Path, have: &Self::Installed, remote: &Self::Remote) -> bool;
     /// Why installing `remote` over `have` would go backwards, if it would.
@@ -46,7 +46,7 @@ pub(crate) trait Bundle {
     fn rollback(have: &Self::Installed, remote: &Self::Remote) -> Option<String>;
     /// Write `remote` into the empty `staging`, which then replaces `dir`
     /// whole. A bundle that fails validation here never goes live.
-    fn stage(staging: &Path, client: &Client, remote: &Self::Remote) -> Result<()>;
+    fn stage(staging: &Path, http: &Http, remote: &Self::Remote) -> Result<()>;
     /// `remote` as a line names it.
     fn describe(remote: &Self::Remote) -> String;
     /// `have` as a line names it.
@@ -76,8 +76,8 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
         say(&why);
         return Ok(false);
     }
-    let client = client(quiet && B::installed(dir).is_some())?;
-    let remote = B::fetch(&client)?;
+    let http = client(quiet && B::installed(dir).is_some())?;
+    let remote = B::fetch(&http)?;
     let current = |have: &Option<B::Installed>| {
         !force
             && have
@@ -117,7 +117,7 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
         B::NAME,
         B::describe(&remote)
     ));
-    installer.install(|staging| B::stage(staging, &client, &remote))?;
+    installer.install(|staging| B::stage(staging, &http, &remote))?;
     settled(
         &remote,
         format!(
@@ -168,18 +168,46 @@ const QUICK_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 /// The largest single file any bundle publishes, with ample headroom.
 const MAX_FILE_BYTES: u64 = 4 << 30;
+/// How long a patient fetch keeps retrying a transient failure (a dropped
+/// connection, 408, 429, 5xx) before the update fails.
+const RETRY_BUDGET: Duration = Duration::from_secs(120);
+
+/// An HTTP client, and how long a transient failure of a request made with it
+/// may be retried.
+#[derive(Debug)]
+pub(crate) struct Http {
+    client: Client,
+    retry: Duration,
+}
+
+impl Http {
+    /// A client whose requests are tried once: for callers that must not
+    /// stall, such as a background notice check.
+    pub(crate) fn once(client: Client) -> Self {
+        Self {
+            client,
+            retry: Duration::ZERO,
+        }
+    }
+}
 
 /// The HTTP client for one update run, shared by its manifest and bundle
-/// fetches. `quick` fails fast when the bucket is unreachable; a first install
-/// or an explicit update stays patient so a slow first fetch still completes.
-fn client(quick: bool) -> Result<Client> {
+/// fetches. `quick` fails fast when the bucket is unreachable and never
+/// retries; a first install or an explicit update stays patient, so a slow
+/// first fetch still completes and a transient failure is retried within
+/// [`RETRY_BUDGET`].
+fn client(quick: bool) -> Result<Http> {
     // The bucket is https; a redirect must not take a manifest or a bundle
     // off it onto cleartext.
     let mut builder = Client::builder().timeout(TIMEOUT).https_only(true);
     if quick {
         builder = builder.connect_timeout(QUICK_CONNECT_TIMEOUT);
     }
-    builder.build().context("building update http client")
+    let client = builder.build().context("building update http client")?;
+    Ok(Http {
+        client,
+        retry: if quick { Duration::ZERO } else { RETRY_BUDGET },
+    })
 }
 
 /// The URL of `path` in the update bucket.
@@ -189,9 +217,9 @@ pub(crate) fn url(path: &str) -> String {
 
 /// GET a manifest. An HTTP error status is an error whose chain carries the
 /// [`reqwest::Error`], so a caller can test for a 404.
-pub(crate) fn manifest(client: &Client, url: &str) -> Result<String> {
+pub(crate) fn manifest(http: &Http, url: &str) -> Result<String> {
     let mut text = Vec::new();
-    copy_capped(client, url, MAX_MANIFEST_BYTES, &mut text)?;
+    copy_capped(http, url, MAX_MANIFEST_BYTES, &mut text)?;
     String::from_utf8(text).with_context(|| format!("{url} is not valid UTF-8"))
 }
 
@@ -200,17 +228,12 @@ pub(crate) fn manifest(client: &Client, url: &str) -> Result<String> {
 /// the digest comes from is unsigned.
 // SIGNING: manifests are unsigned. A signature check belongs in `manifest`,
 // the one way every manifest — and so every digest checked here — enters.
-pub(crate) fn download(
-    client: &Client,
-    url: &str,
-    sha256: &str,
-    out: &mut impl Write,
-) -> Result<()> {
+pub(crate) fn download(http: &Http, url: &str, sha256: &str, out: &mut impl Write) -> Result<()> {
     let mut hashed = Hashed {
         out,
         digest: Sha256::new(),
     };
-    copy_capped(client, url, MAX_FILE_BYTES, &mut hashed)?;
+    copy_capped(http, url, MAX_FILE_BYTES, &mut hashed)?;
     let got = format!("{:x}", hashed.digest.finalize());
     if got != sha256 {
         bail!("sha256 mismatch for {url}: got {got}, manifest says {sha256}");
@@ -219,18 +242,23 @@ pub(crate) fn download(
 }
 
 /// [`download`] into a new file at `path`, flushed before it returns.
-pub(crate) fn download_to(client: &Client, url: &str, sha256: &str, path: &Path) -> Result<()> {
+pub(crate) fn download_to(http: &Http, url: &str, sha256: &str, path: &Path) -> Result<()> {
     let mut file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    download(client, url, sha256, &mut file)?;
+    download(http, url, sha256, &mut file)?;
     file.flush()
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn copy_capped(client: &Client, url: &str, max: u64, out: &mut impl Write) -> Result<()> {
+/// Stream `url` into `out`, refusing more than `max` bytes.
+///
+/// A transient failure before the body starts — a dropped connection, 408,
+/// 429, 5xx — is retried with jittered exponential backoff, honouring
+/// Retry-After, within `http`'s retry budget. Nothing has been written to
+/// `out` by then, so a retry cannot corrupt it; a failure mid-body is final.
+fn copy_capped(http: &Http, url: &str, max: u64, out: &mut impl Write) -> Result<()> {
     tracing::debug!("fetching {url}");
-    let resp = client
-        .get(url)
-        .send()
+    let _span = tracing::info_span!("bundle_fetch", url).entered();
+    let resp = crate::retry::send("bundle fetch", http.retry, |_| http.client.get(url))
         .and_then(reqwest::blocking::Response::error_for_status)
         .with_context(|| format!("GET {url}"))?;
     let copied =
@@ -562,7 +590,7 @@ mod tests {
         fn installed(dir: &Path) -> Option<u32> {
             fs::read_to_string(dir.join("version")).ok()?.parse().ok()
         }
-        fn fetch(_client: &Client) -> Result<u32> {
+        fn fetch(_http: &Http) -> Result<u32> {
             Ok(PUBLISHED.get())
         }
         fn is_current(_dir: &Path, have: &u32, remote: &u32) -> bool {
@@ -571,7 +599,7 @@ mod tests {
         fn rollback(have: &u32, remote: &u32) -> Option<String> {
             (remote < have).then(|| format!("{remote} is older than {have}"))
         }
-        fn stage(staging: &Path, _client: &Client, remote: &u32) -> Result<()> {
+        fn stage(staging: &Path, _http: &Http, remote: &u32) -> Result<()> {
             Ok(fs::write(staging.join("version"), remote.to_string())?)
         }
         fn describe(remote: &u32) -> String {
@@ -657,12 +685,15 @@ mod tests {
     fn a_manifest_past_the_cap_is_refused() {
         let cap = usize::try_from(MAX_MANIFEST_BYTES).unwrap();
         let (url, server) = serve_once(vec![b'#'; cap + 1]);
-        let err = manifest(&Client::new(), &url).unwrap_err();
+        let err = manifest(&Http::once(Client::new()), &url).unwrap_err();
         assert!(format!("{err:#}").contains("larger than"), "{err:#}");
         server.join().unwrap();
 
         let (url, server) = serve_once(vec![b'#'; cap]);
-        assert_eq!(manifest(&Client::new(), &url).unwrap().len(), cap);
+        assert_eq!(
+            manifest(&Http::once(Client::new()), &url).unwrap().len(),
+            cap
+        );
         server.join().unwrap();
     }
 }

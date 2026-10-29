@@ -767,3 +767,43 @@ fn a_batch_reports_its_deepest_source() {
     assert!(Source::Bloom < Source::Replica && Source::Primary < Source::Analysis);
     assert_eq!(HeaderValue::from(Source::Replica), "scan:replica");
 }
+
+/// A URL's lookup answers from the bytes it last served, through the same
+/// `decide` the analyze preflight uses: a registry tarball (an immutable PURL)
+/// and an ordinary URL alike, while fresh. Unseen URLs stay `unanalyzed`.
+#[tokio::test]
+async fn a_url_lookup_answers_from_the_bytes_it_last_served() -> anyhow::Result<()> {
+    use crate::lookup::Verdict;
+
+    let (_router, state) = super::super::assemble(super::super::ServerConfig::default())?;
+    let index = crate::lookup::global().expect("verdict index enabled");
+    let sha = "e7".repeat(32);
+    index.put(&Verdict {
+        sha256: sha.clone(),
+        lvl: Level::At(0),
+        eng: "local".into(),
+        at: "2026-10-29T00:00:00Z".into(),
+        purl: None,
+        why: None,
+        hits: Vec::new(),
+    });
+    for url in [
+        "https://registry.npmjs.org/url-alias-test/-/url-alias-test-1.0.0.tgz",
+        "https://example.com/url-alias-test.tgz",
+    ] {
+        index.alias_url(url, &sha);
+        let key = Key::parse(None, None, Some(url)).expect("valid url");
+        let (decided, source) = decide(&state, &key, 25, false).await;
+        assert!(decided.is_answerable(), "{url}: answered from the index");
+        assert_eq!(decided.sha256.as_deref(), Some(sha.as_str()), "{url}");
+        assert_eq!(source, Source::Index, "{url}");
+    }
+    let unseen =
+        Key::parse(None, None, Some("https://example.com/never-analyzed.tgz")).expect("valid url");
+    let (decided, _) = decide(&state, &unseen, 25, false).await;
+    assert!(
+        !decided.is_answerable(),
+        "an unseen URL is analyzed, not guessed"
+    );
+    Ok(())
+}

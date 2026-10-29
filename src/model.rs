@@ -311,6 +311,10 @@ impl Model {
         // caller's `-l` — the JSON envelope stays cacheable across levels. The
         // active level enters only the final verdict derivation, via the
         // level-independent sweep over `policies.grid` / `general_grid`.
+        // Pinned before anything is read: a bundle swapped in mid-load then
+        // fails the pin, rather than its specialists being scored against
+        // the thresholds read from the bundle it replaced.
+        let pin = Arc::new(BundlePin::new(model_dir));
         let cfg = EnsembleConfig::new(
             BundleConfig::load(model_dir)?.unwrap_or_default(),
             DEFAULT_SEVERITY_LEVEL,
@@ -341,7 +345,6 @@ impl Model {
         );
         let mut policies = policies?;
         let general = general?;
-        let pin = Arc::new(BundlePin::new(model_dir));
         let (filegroups, filetypes) = rayon::join(
             || {
                 load_specialists(

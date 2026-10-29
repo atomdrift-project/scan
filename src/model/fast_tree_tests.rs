@@ -156,3 +156,20 @@ fn only_a_multiply_by_one_passes() {
     with_factor(1.0).expect("a multiply by one is a pass-through");
     assert!(with_factor(2.0).is_err());
 }
+
+/// An attribute the fast evaluator does not read is one it would not apply:
+/// such a model is left to tract rather than scored without it.
+#[test]
+fn an_unknown_attribute_is_left_to_tract() {
+    let mut graph = fixture_graph();
+    FastTreeBackend::from_graph(&graph).expect("the fixture is accepted");
+    tree_node(&mut graph).attribute.push(AttributeProto {
+        name: "base_values_as_tensor".into(),
+        ..AttributeProto::default()
+    });
+    let error = FastTreeBackend::from_graph(&graph).expect_err("refused");
+    assert!(
+        error.to_string().contains("base_values_as_tensor"),
+        "{error}"
+    );
+}

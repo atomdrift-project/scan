@@ -84,10 +84,16 @@ impl Analyzer {
     /// Returns an error if the supplied thresholds are invalid (suspicious
     /// must be ≤ hostile, both in `[0, 1]`).
     ///
+    /// Manual thresholds replace the operating level, as `--threshold-*` does
+    /// on the CLI: under a level the verdict comes from the level sweep and
+    /// would never read them.
+    ///
     /// Reloads the model under the new thresholds, so call it once, at setup.
     pub fn with_thresholds(mut self, thresholds: Thresholds) -> Result<Self> {
-        self.config = self.rebuild_config(Some(thresholds), self.config.slow_rule_ms())?;
-        self.model = Model::load(&self.model_dir, Some(thresholds), self.config.level())?;
+        self.config = self
+            .rebuild_config(Some(thresholds), self.config.slow_rule_ms())?
+            .with_level(None);
+        self.model = Model::load(&self.model_dir, Some(thresholds), None)?;
         Ok(self)
     }
 

@@ -62,22 +62,22 @@ pub(super) fn render_mostly_readable(rendered: &str) -> bool {
     // DLLs — and that is a judgment about a mostly-readable archive, not about
     // hex it cannot see. A sample that really is one packed binary still has a
     // single opaque member and is still refused.
-    let mut readable_members = 0usize;
-    let mut total_members = 0usize;
+    //
+    // A member votes only with at least two context lines. Otherwise one packed
+    // binary beside two one-line stub files (`__init__.py`) would read as a
+    // mostly-readable archive, and a vote costs an attacker a single line. When
+    // no member renders that much there is nothing to outweigh, and every
+    // member votes.
+    const MIN_VOTING_LINES: usize = 2;
+    // (escaped-byte lines, context lines) per member.
+    let mut members: Vec<(usize, usize)> = Vec::new();
     let mut binary = 0usize;
     let mut lines = 0usize;
-    let close = |binary: usize, lines: usize, readable: &mut usize, total: &mut usize| {
-        if lines == 0 {
-            return;
-        }
-        *total += 1;
-        if binary * 2 < lines {
-            *readable += 1;
-        }
-    };
     for line in rendered.lines() {
         if is_member_header(line) {
-            close(binary, lines, &mut readable_members, &mut total_members);
+            if lines > 0 {
+                members.push((binary, lines));
+            }
             binary = 0;
             lines = 0;
             continue;
@@ -90,8 +90,18 @@ pub(super) fn render_mostly_readable(rendered: &str) -> bool {
             binary += 1;
         }
     }
-    close(binary, lines, &mut readable_members, &mut total_members);
-    total_members == 0 || readable_members * 2 >= total_members
+    if lines > 0 {
+        members.push((binary, lines));
+    }
+    let votes = |min_lines: usize| {
+        let voting = members.iter().filter(|&&(_, lines)| lines >= min_lines);
+        let (readable, total) =
+            voting.fold((0usize, 0usize), |(readable, total), &(binary, lines)| {
+                (readable + usize::from(binary * 2 < lines), total + 1)
+            });
+        (total > 0).then_some(readable * 2 >= total)
+    };
+    votes(MIN_VOTING_LINES).or_else(|| votes(1)).unwrap_or(true)
 }
 
 /// A member header line: `path\ttype size count`, the row cleave draws above each

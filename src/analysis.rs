@@ -79,6 +79,7 @@ impl<'a> Analysis<'a> {
         let mut opts = cleave::AnalysisOptions {
             slow_rule_ms: self.slow_rule_ms,
             rizin_timeout: crate::engine::rizin_timeout(),
+            rizin_retry_timeout: crate::engine::rizin_retry_timeout(),
             cancellation: self.cancellation.cloned(),
             phase: self.phase.map(RequestPhase::tracker).cloned(),
             ..Default::default()
@@ -88,13 +89,18 @@ impl<'a> Analysis<'a> {
     }
 }
 
+/// The context an analysis failure is wrapped in, ahead of the artifact's
+/// label. The label is caller-chosen text (an upload's filename, a package
+/// name), so whoever classifies the failure skips this layer.
+pub(crate) const ANALYSIS_CONTEXT: &str = "cleave analysis of ";
+
 /// Analyze the file at `path`. Runs on a blocking thread.
 pub fn classify_file(path: &Path, analysis: Analysis<'_>) -> Result<ScanResult> {
     analysis.mark("cleave:init");
     let opts = analysis.options();
     analysis.mark("cleave:analyze");
     let report = cleave::analyze_file(path, &opts)
-        .with_context(|| format!("cleave analysis of {}", analysis.label))?;
+        .with_context(|| format!("{ANALYSIS_CONTEXT}{}", analysis.label))?;
     finish(report, analysis, Some(path), None)
 }
 
@@ -120,7 +126,7 @@ pub fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<Scan
         Some(lane) => lane.pool.install(analyze),
         None => analyze(),
     }
-    .with_context(|| format!("cleave analysis of {label}"))?;
+    .with_context(|| format!("{ANALYSIS_CONTEXT}{label}"))?;
     finish(report, analysis, None, Some(retained))
 }
 

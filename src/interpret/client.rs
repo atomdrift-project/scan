@@ -499,8 +499,8 @@ pub(super) fn chat_once(
             priority = None;
             resp = post(priority).map_err(transport)?;
         }
-        // 5xx is the endpoint's problem (unhealthy); 4xx is ours (bad request or
-        // auth). On a 4xx the body is the whole diagnosis — an over-budget
+        // 5xx, 408 and 429 are the endpoint's problem (unhealthy); any other
+        // 4xx is ours (bad request or auth). On a 4xx the body is the whole diagnosis — an over-budget
         // prompt, an unknown model and a rejected key all arrive as a bare
         // 400/404/401, and the endpoint explained which in the body.
         let status = resp.status();
@@ -510,7 +510,12 @@ pub(super) fn chat_once(
                 "LLM endpoint returned {status}: {:?}",
                 body_snippet(raw.trim())
             );
-            let e = if status.is_server_error() {
+            // 408 and 429 are the endpoint shedding load, not our request
+            // being wrong: count them against its health like a 5xx.
+            let e = if status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
                 CallError::Transport(e)
             } else {
                 CallError::BadReply(e)

@@ -29,9 +29,8 @@ use serde::{Deserialize, Serialize};
 mod queue;
 
 use crate::engine::ScanResultEnvelope;
-use crate::hopper::{
-    Route, backoff, bearer, endpoints, error_chain, fuzz, is_permanent, parse_retry_after,
-};
+use crate::hopper::{Route, bearer, endpoints, error_chain, is_permanent};
+use crate::retry::{backoff, fuzz, parse_retry_after};
 
 /// Hopper bounds the decompressed result body at 512 MiB (`maxResultBodyBytes`
 /// in hopper's api.go); a larger document is truncated mid-stream and rejected
@@ -107,11 +106,18 @@ const HOPPER_LANE_RENEW: &str = "renew";
 /// Total wall-clock budget for renewing one result on hopper.
 ///
 /// Hopper sheds result submissions with 503 + Retry-After when its ingestion
-/// slots are saturated, and that saturation is driven by the worker fleet's
-/// backlog — it can persist for many minutes. A budget of a few attempts over
-/// seconds is not a retry so much as a coin flip: against a saturated hopper it
-/// loses every renewal it is given.
-const RENEW_BUDGET: Duration = Duration::from_secs(15 * 60);
+/// slots are saturated, so a budget of a few attempts over seconds is not a
+/// retry so much as a coin flip. But results renew one at a time on one
+/// thread, and the CLI waits for the queue to drain before it exits: against a
+/// hopper that is down rather than busy, every queued result spends this whole
+/// budget, so it is a minute, not the length of an outage.
+const RENEW_BUDGET: Duration = Duration::from_secs(60);
+
+/// The least time one renewal attempt is given. Each attempt may run only
+/// until the budget ends, so the last cannot outlast it by a whole request
+/// timeout; but one started a moment before the end still gets long enough
+/// to land.
+const RENEW_MIN_ATTEMPT: Duration = Duration::from_secs(10);
 
 /// Hopper's `validWorkerName` cap (`maxWorkerNameLen` in api.go).
 const MAX_WORKER_NAME_LEN: usize = 64;
@@ -973,9 +979,11 @@ impl Hopper {
         // the list. A decode failure is not retried elsewhere — the next address
         // runs the same build and would answer the same way.
         for url in self.known.each() {
-            let resp = bearer(self.http.post(url), self.token)
-                .json(&KnownRequest { sha256: shas })
-                .send();
+            let resp = crate::retry::send(
+                "hopper known probe",
+                crate::hopper::LOOKUP_RETRY_BUDGET,
+                |_| bearer(self.http.post(url), self.token).json(&KnownRequest { sha256: shas }),
+            );
             match resp {
                 Ok(resp) if resp.status().is_success() => {
                     return match resp.json::<KnownResponse>() {
@@ -1085,7 +1093,9 @@ impl Hopper {
                     None => break,
                 }
             }
+            let remaining = RENEW_BUDGET.saturating_sub(started.elapsed());
             let mut request = bearer(self.http.post(self.result.at(attempt)), self.token)
+                .timeout(remaining.max(RENEW_MIN_ATTEMPT))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 // Claim hopper's reserved lane: this renewal is one-shot, and the
                 // caller is already holding the verdict in its cache.
@@ -1278,19 +1288,15 @@ fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
     true
 }
 
-/// [`backoff`] within the renewal budget, or `None` once the budget is spent.
-/// Never sleeps past the budget: a sleep that outlives it would turn the
-/// ceiling into a lie and delay the give-up log.
+/// [`backoff`] within the renewal budget, or `None` once the budget is spent;
+/// see [`crate::retry::delay_within`].
 fn renew_delay(
     attempt: usize,
     retry_after: Option<Duration>,
     elapsed: Duration,
     fuzz: f64,
 ) -> Option<Duration> {
-    let remaining = RENEW_BUDGET
-        .checked_sub(elapsed)
-        .filter(|left| !left.is_zero())?;
-    Some(backoff(attempt, retry_after, fuzz).min(remaining))
+    crate::retry::delay_within(RENEW_BUDGET, attempt, retry_after, elapsed, fuzz)
 }
 
 #[cfg(test)]

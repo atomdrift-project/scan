@@ -40,7 +40,12 @@ impl EnsembleConfig {
             .iter()
             .filter_map(|entry| {
                 let threshold = *entry.hostile.thresholds.get("general")?;
-                Some((entry.level, threshold))
+                // Outside [0, 1] is the "never fires" sentinel (or garbage).
+                // Calibration would clip it back into reach, so drop it here,
+                // as the route-policy loader does.
+                (0.0..=1.0)
+                    .contains(&threshold)
+                    .then_some((entry.level, threshold))
             })
             .collect();
         general_grid.sort_by_key(|&(level, _)| level);

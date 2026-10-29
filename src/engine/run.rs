@@ -158,7 +158,11 @@ fn scan_partitioned(
             registry: registry_map.zip(sha).and_then(|(map, sha)| map.get(sha)),
             fetch: None,
         };
-        session.record(&Target::new(origin, named), analyzed, None);
+        let target = Target {
+            sidecar: !named && session.config.sidecars() && is_attached_sidecar(path),
+            ..Target::new(origin, named)
+        };
+        session.record(&target, analyzed, None);
     };
 
     // A single artifact has no file-count bar, so its static analysis —
@@ -583,7 +587,14 @@ impl<'a> Session<'a> {
         self.advance();
         let Some(class) = crate::remote::classification(verdict.fires_at, self.config.level())
         else {
-            tracing::warn!(label, sha, "remote verdict has no level; not counted");
+            // Already taken out of local analysis, so it is answered by nothing:
+            // an error, never a silent gap that lets the scan exit clean.
+            tracing::error!(
+                label,
+                sha,
+                "remote verdict has no level; counted as an error"
+            );
+            self.tally.errors.fetch_add(1, Ordering::Relaxed);
             return;
         };
         self.tally.count(class);
@@ -647,18 +658,32 @@ impl<'a> Session<'a> {
         // interpret are machine/LLM payload formats: they emit every scanned
         // file. Severe static findings also admit a terminal result, even when
         // the model's verdict is benign; `--show` selects their severity.
-        let shown = matches!(
-            self.config.format(),
-            OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-        ) || result
-            .bloom_mark
-            .is_some_and(BloomMark::forces_terminal_display)
-            || self.config.filter().shows(result.classification)
-            || findings_match_filter(
-                self.config.filter(),
-                &result.top_findings,
-                &result.embedded_files,
+        let (sidecar_shown, sidecar_filed) = if target.sidecar {
+            let policy = sidecar_policy(result.classification, result.has_severe_findings());
+            tracing::debug!(
+                path = %target.origin.path.display(),
+                classification = ?result.classification,
+                shown = policy.0,
+                filed = policy.1,
+                "capture record analyzed as a sidecar",
             );
+            policy
+        } else {
+            (true, true)
+        };
+        let shown = sidecar_shown
+            && (matches!(
+                self.config.format(),
+                OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
+            ) || result
+                .bloom_mark
+                .is_some_and(BloomMark::forces_terminal_display)
+                || self.config.filter().shows(result.classification)
+                || findings_match_filter(
+                    self.config.filter(),
+                    &result.top_findings,
+                    &result.embedded_files,
+                ));
         if shown {
             self.write_result(|| emit_result(&result, self.config));
         }
@@ -666,7 +691,9 @@ impl<'a> Session<'a> {
         // the handoff; the upload itself runs on the uploader's thread. Only
         // successful results are sent — an error envelope has an empty file
         // type, which hopper treats as a delete.
-        if let (Some(uploader), Some(hopper_url)) = (&self.uploader, self.config.hopper()) {
+        if sidecar_filed
+            && let (Some(uploader), Some(hopper_url)) = (&self.uploader, self.config.hopper())
+        {
             renew(
                 uploader,
                 hopper_url,
@@ -723,19 +750,44 @@ impl<'a> Session<'a> {
     /// End the scan: clear the bar, finish hopper renewals, print the summary.
     ///
     /// # Errors
-    /// Stdout closed under the scan, which therefore stopped early.
+    /// Stdout closed under the scan before anything was flagged, or Ctrl-C
+    /// stopped it: either way it stopped early. An interrupted scan must not read as a clean one — the
+    /// files it never reached are in no tally — so it is an
+    /// [`io::ErrorKind::Interrupted`] error, after the summary of what it did
+    /// finish.
     fn finish(self) -> Result<ScanSummary> {
         if let Some(progress) = &self.progress {
             progress.finish();
         }
         drop(self.uploader);
+        let summary = self.tally.summary(self.started);
         if self.broken_pipe.load(Ordering::Relaxed) {
+            // The reader went away (`atomscan … | head`), so nothing more is
+            // printed. A verdict already reached still decides the exit status:
+            // under `pipefail` a hostile file must not read as success because
+            // the consumer stopped reading.
+            if summary.hostile > 0 || summary.suspicious > 0 {
+                tracing::info!(
+                    hostile = summary.hostile,
+                    suspicious = summary.suspicious,
+                    "stdout closed; exiting on the verdicts already reached",
+                );
+                return Ok(summary);
+            }
             return Err(io::Error::from(io::ErrorKind::BrokenPipe))
                 .context("writing scan results to stdout");
         }
-        let summary = self.tally.summary(self.started);
         if self.config.format() == OutputFormat::Terminal {
             crate::output::print_summary(&summary);
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            tracing::warn!(
+                analyzed = summary.total_files,
+                errors = summary.errors,
+                "scan interrupted before every file was analyzed",
+            );
+            return Err(io::Error::from(io::ErrorKind::Interrupted))
+                .context("scan interrupted before every file was analyzed");
         }
         Ok(summary)
     }
@@ -757,6 +809,18 @@ fn findings_match_filter(
         })
 }
 
+/// What an attached capture record's result does under `--enable-sidecar`:
+/// `(shown, filed on hopper)`. The record is bookkeeping, not a sample, so a
+/// clean one is neither; it is shown when it raises anything — a suspicious or
+/// hostile verdict, or a severe static finding — and filed only when hostile.
+const fn sidecar_policy(class: Classification, severe_findings: bool) -> (bool, bool) {
+    let hostile = matches!(class, Classification::Hostile);
+    (
+        hostile || matches!(class, Classification::Suspicious) || severe_findings,
+        hostile,
+    )
+}
+
 /// One file of a CLI scan, and what the scan knows about it besides its report.
 #[derive(Clone, Copy)]
 struct Target<'a> {
@@ -764,6 +828,9 @@ struct Target<'a> {
     /// The operator named it on the command line, so it is analyzed on its own
     /// merits and never answered from a bloom bless (see `named_target_opts`).
     named: bool,
+    /// A capture record found by a walk under `--enable-sidecar`; see
+    /// [`sidecar_policy`].
+    sidecar: bool,
     /// Set when the bytes are a registry-metadata document standing in for a
     /// package that could not be fetched; see [`super::HopperRoute`].
     fallback_purl: Option<&'a str>,
@@ -774,6 +841,7 @@ impl<'a> Target<'a> {
         Self {
             origin,
             named,
+            sidecar: false,
             fallback_purl: None,
         }
     }
@@ -1092,20 +1160,18 @@ fn discover_files(dir: &Path) -> Vec<PathBuf> {
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
         .map(|e| e.path().to_path_buf())
-        .filter(|p| !is_attached_sidecar(p))
         .collect()
 }
 
 /// Whether `path` is a collector's capture record (`<artifact>.forage.json`)
 /// sitting beside the artifact it describes.
 ///
-/// A directory walk skips those. The record is bookkeeping *about* the file next
-/// to it, not something anyone shipped: analyzing it spends a verdict on it, and
-/// with `--hopper` files it as a sample in its own right. The name alone proves
-/// nothing — a script can hide behind it — so only a small JSON object that
-/// states the digest of the bytes it describes is skipped; JSON is inert, so
-/// skipping it hides no code. Naming one directly on the command line still
-/// scans it.
+/// Under `--enable-sidecar` a directory walk treats those as bookkeeping
+/// (see [`sidecar_policy`]). They are never skipped: whoever wrote the
+/// artifact may have written the record too, and a payload inside it is still
+/// analyzed. The name alone proves nothing — a script can hide behind it — so
+/// only a small JSON object that states a digest qualifies. Naming one
+/// directly on the command line scans it like any file.
 fn is_attached_sidecar(path: &Path) -> bool {
     /// Larger than any capture record hopper accepts.
     const MAX_RECORD_BYTES: u64 = 1 << 20;
@@ -1385,11 +1451,13 @@ mod tests {
         assert_eq!(named.slow_rule_ms, walk.slow_rule_ms);
     }
 
-    /// A directory of collected samples is the normal input, and its sidecars
-    /// describe the artifacts beside them — they are not themselves samples.
-    /// A file merely *named* like one is still scanned.
+    /// A directory walk finds every file, capture records included: a record
+    /// may carry a payload, so nothing is skipped unanalyzed. Which of them are
+    /// sidecars is decided per file, and only under `--enable-sidecar`: a
+    /// small JSON record beside the artifact it names. A file merely *named*
+    /// like one is an ordinary file.
     #[test]
-    fn directory_walk_skips_attached_sidecars_only() {
+    fn directory_walk_finds_sidecars_and_tells_them_apart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = format!(r#"{{"artifact":{{"sha256":"{}"}}}}"#, "ab".repeat(32));
         for (name, body) in [
@@ -1414,14 +1482,41 @@ mod tests {
             found,
             vec![
                 "evil-1.0.0.tgz".to_string(),
+                "evil-1.0.0.tgz.forage.json".to_string(),
                 "lib.so".to_string(),
-                // Named like a record, but a script: hiding it would hide code.
                 "lib.so.forage.json".to_string(),
                 "notes.json".to_string(),
-                // Nothing on disk claims this one, so it is scanned like any
-                // other file rather than silently trusted.
                 "orphan.tgz.forage.json".to_string(),
             ]
         );
+        let sidecar = |name: &str| super::is_attached_sidecar(&dir.path().join(name));
+        assert!(
+            sidecar("evil-1.0.0.tgz.forage.json"),
+            "a record beside its artifact"
+        );
+        // Named like a record, but a script.
+        assert!(!sidecar("lib.so.forage.json"));
+        // Nothing on disk is described by it.
+        assert!(!sidecar("orphan.tgz.forage.json"));
+        assert!(!sidecar("notes.json"));
+        assert!(!sidecar("evil-1.0.0.tgz"));
+    }
+
+    /// A sidecar is bookkeeping: a clean one is neither shown nor filed, one
+    /// that raises anything is shown, and only a hostile one is filed on
+    /// hopper as a sample.
+    #[test]
+    fn a_sidecar_is_shown_when_it_raises_something_and_filed_only_when_hostile() {
+        use super::sidecar_policy;
+        assert_eq!(
+            sidecar_policy(Classification::Benign, false),
+            (false, false)
+        );
+        assert_eq!(sidecar_policy(Classification::Benign, true), (true, false));
+        assert_eq!(
+            sidecar_policy(Classification::Suspicious, false),
+            (true, false)
+        );
+        assert_eq!(sidecar_policy(Classification::Hostile, false), (true, true));
     }
 }

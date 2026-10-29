@@ -15,7 +15,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
 
 use burton::{Filter, Manifest, SUPPORTED_VERSIONS};
 
@@ -90,8 +89,8 @@ impl Bundle for Bloom {
         installed_manifest(dir)
     }
 
-    fn fetch(client: &Client) -> Result<Published> {
-        fetch_manifest(client)
+    fn fetch(http: &bundle::Http) -> Result<Published> {
+        fetch_manifest(http)
     }
 
     fn is_current(_dir: &Path, have: &Manifest, remote: &Published) -> bool {
@@ -107,8 +106,8 @@ impl Bundle for Bloom {
         })
     }
 
-    fn stage(staging: &Path, client: &Client, remote: &Published) -> Result<()> {
-        stage(staging, client, remote)
+    fn stage(staging: &Path, http: &bundle::Http, remote: &Published) -> Result<()> {
+        stage(staging, http, remote)
     }
 
     fn describe(remote: &Published) -> String {
@@ -133,7 +132,7 @@ impl Bundle for Bloom {
 /// 5xx, DNS — is a real failure and is returned as one; treating it as "not
 /// published here" would let one slow request silently downgrade a client to an
 /// older format and leave it there.
-fn fetch_manifest(client: &Client) -> Result<Published> {
+fn fetch_manifest(http: &bundle::Http) -> Result<Published> {
     let mut tried: Vec<String> = Vec::new();
     for version in SUPPORTED_VERSIONS {
         // Namespaced under `bloom/` and selecting the on-wire format this build
@@ -141,7 +140,7 @@ fn fetch_manifest(client: &Client) -> Result<Published> {
         // and new clients never read each other's artifacts.
         let prefix = format!("bloom/v{version}");
         let url = bundle::url(&format!("{prefix}/{SIDECAR}"));
-        match bundle::manifest(client, &url) {
+        match bundle::manifest(http, &url) {
             Ok(text) => {
                 let manifest: Manifest = toml::from_str(&text)
                     .with_context(|| format!("parsing bloom manifest {url}"))?;
@@ -168,7 +167,7 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 
 /// Download, verify, and validate every filter into `staging`, then write the
 /// manifest beside them as the sidecar.
-fn stage(staging: &Path, client: &Client, remote: &Published) -> Result<()> {
+fn stage(staging: &Path, http: &bundle::Http, remote: &Published) -> Result<()> {
     let Published { manifest, prefix } = remote;
     for (stem, entry) in &manifest.filter {
         // A version this build cannot read is a real stop, not something to
@@ -191,7 +190,7 @@ fn stage(staging: &Path, client: &Client, remote: &Published) -> Result<()> {
         }
         let path = staging.join(&entry.file);
         let url = bundle::url(&format!("{prefix}/{}", entry.file));
-        bundle::download_to(client, &url, &entry.sha256, &path)?;
+        bundle::download_to(http, &url, &entry.sha256, &path)?;
 
         // It must load (FORMAT_VERSION gate) and its header identity must match
         // the file name the manifest gave it.

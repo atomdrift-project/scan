@@ -795,9 +795,30 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze) -> Response {
     analyze_bytes(state, req, Some(&filename), sample.bytes, sample.sha256).await
 }
 
-/// Analyze an exact URL, fetched verbatim.
+/// Analyze an exact URL, fetched verbatim, unless the bytes it last served
+/// still answer for it (see `analyze_purl`, whose rule this follows).
 async fn analyze_url(state: &Arc<AppState>, req: &V1Analyze, url: String) -> Response {
     let request_id = req.request_id;
+    if !req.q.force && !req.q.refresh {
+        let key = Key {
+            url: Some(url.clone()),
+            ..Key::default()
+        };
+        let (decided, source) = decide(state, &key, req.budget, req.q.fresh).await;
+        let decided = decided.with_url(Some(&url));
+        if decided.is_answerable() {
+            tracing::info!(
+                id = request_id,
+                url = %url,
+                ms = req.elapsed_ms(),
+                "--> POST /v1/analyze (answered from what we already knew; no slot spent)"
+            );
+            let mut resp = answered(decided, source, req.elapsed_ms());
+            resp.extensions_mut().insert(Subject::url(&url));
+            return resp;
+        }
+        tracing::info!(id = request_id, url = %url, "no verdict held; analyzing");
+    }
     if let Err(refusal) = state.admit_request(request_id).await {
         return refused(req, &refusal);
     }
@@ -1365,6 +1386,14 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1Query) -> Result<Response,
             "Several sha256 values name several artifacts; send them without ?purl= or ?url=.",
         ));
     }
+    // A digest pairs with one PURL; beside several it would name none of
+    // them, and answering by PURL alone would silently drop it.
+    if !shas.is_empty() && purls.len() > 1 {
+        return Err(ApiError::bad_request(
+            "multiple_locators",
+            "A sha256 pairs with one purl; send several purls without ?sha256=.",
+        ));
+    }
     if urls.iter().any(|url| !valid_http_url(url)) {
         return Err(ApiError::bad_request(
             "invalid_url",
@@ -1392,6 +1421,10 @@ async fn v1_lookup_inner(state: &Arc<AppState>, q: &V1Query) -> Result<Response,
                 "Only one exact url may be looked up per request.",
             ));
         }
+        // Answered by its digest, when one came with it. A URL alone is
+        // answered by the bytes it last served: for good when it parses into
+        // an immutable PURL, otherwise only within the index's
+        // MUTABLE_ALIAS_TTL of that fetch.
         let key = Key::parse(sha, None, Some(url))?;
         let (decided, source) = decide(state, &key, budget, q.fresh).await;
         return Ok(sourced(Json(decided.with_url(Some(url))), source));
@@ -1560,7 +1593,7 @@ fn held(index: &crate::lookup::Index, key: &Key, corpus: bool) -> Option<crate::
     let by_purl = || key.purl.as_deref().and_then(|p| index.get_purl(p));
     match key.sha.as_deref() {
         Some(sha) => pick_verdict(index.get_sha(sha), by_purl, sha),
-        None => by_purl(),
+        None => by_purl().or_else(|| key.url.as_deref().and_then(|u| index.get_url(u))),
     }
 }
 
@@ -1699,7 +1732,15 @@ async fn decide_unheld(
     // the real level, the real findings and the sentence a person reads. Only
     // when it holds nothing does the filter's own claim stand in.
     let Some(corpus) = state.corpus.as_ref() else {
-        return (filters_or_unanalyzed(), Source::Bloom);
+        // Credit the filters only when they answered; an `unanalyzed` row
+        // was answered by nothing.
+        return match V1Decision::bloom(bloom, sha, purl, budget) {
+            Some(decided) => (decided.with_url(url), Source::Bloom),
+            None => (
+                V1Decision::unanalyzed(sha, purl).with_url(url),
+                Source::None,
+            ),
+        };
     };
     let (reached, source) = corpus
         .known_with_source(sha, purl, /* fresh = */ false)

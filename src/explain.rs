@@ -109,7 +109,7 @@ impl ShapImportance {
             .with_context(|| format!("loading the feature spec beside {}", path.display()))?;
         let shap = Self::bind(file, spec.feature_names()).inspect_err(|e| {
             if !SHAP_MISMATCH_WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("ignoring {}: {e}", path.display());
+                tracing::warn!("rejecting {}: {e}", path.display());
             }
         })?;
         tracing::info!("loaded {} SHAP importance features", shap.features.len());

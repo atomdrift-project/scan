@@ -11,7 +11,6 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::{self, Bundle};
@@ -165,9 +164,9 @@ impl Bundle for Models {
         installed(dir)
     }
 
-    fn fetch(client: &Client) -> Result<Release> {
+    fn fetch(http: &bundle::Http) -> Result<Release> {
         let url = bundle::url("versions.toml");
-        let text = bundle::manifest(client, &url)?;
+        let text = bundle::manifest(http, &url)?;
         let mut manifest: Manifest =
             toml::from_str(&text).with_context(|| format!("parsing manifest {url}"))?;
         // This build's own `[stable]` pointer, else `latest`.
@@ -200,11 +199,11 @@ impl Bundle for Models {
 
     /// Unpack the verified `.tar.zst`, prove every route loads, and record
     /// the sidecar.
-    fn stage(staging: &Path, client: &Client, remote: &Release) -> Result<()> {
+    fn stage(staging: &Path, http: &bundle::Http, remote: &Release) -> Result<()> {
         let artifact = &remote.artifact;
         let mut tarball = tempfile::tempfile().context("creating a download file")?;
         bundle::download(
-            client,
+            http,
             &bundle::url(&artifact.file),
             &artifact.sha256,
             &mut tarball,
@@ -223,6 +222,10 @@ impl Bundle for Models {
                     artifact.file
                 )
             })?;
+        // Every scan and server start refuses a stale or unreadable SHAP file,
+        // so a bundle carrying one must never go live.
+        crate::explain::ShapImportance::load(staging)
+            .with_context(|| format!("staged bundle {} has unusable SHAP data", artifact.file))?;
 
         let meta = Installed {
             commit: artifact.commit.clone(),

@@ -91,6 +91,18 @@ hopper it answers from the index alone.
 One artifact answers with one object; repeated keys answer with a list, in
 the order asked.
 
+A digest names its bytes forever. A name does only when it cannot come to
+mean other bytes: a published npm, crates.io, Go, NuGet or Maven release, or a
+commit. Every other name — a gem, a PyPI release, a git tag, a version-less
+PURL — is answered from this server's index for 30 minutes after the analysis
+that last resolved it, then resolved again. A `?url=` is judged by the PURL it
+parses into when it is a registry download (`registry.npmjs.org`,
+`static.crates.io`, …), so a published tarball's URL answers like its PURL.
+A PyPI file's URL (`files.pythonhosted.org`) is immutable too, because PyPI
+never replaces or reuses a filename, though its release by PURL is not. Any
+other URL is a mutable name. `POST /v1/analyze?url=` answers from the same
+index before it fetches anything, as `?purl=` does; `force=1` fetches anyway.
+
 `X-Scan-Source` names the layer that answered: `scan:index`, `scan:bloom`,
 `scan:replica`, `scan:primary`, or `none` when nothing could. A list reports
 the most expensive layer any row reached, in that order.

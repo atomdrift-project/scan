@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use burton::{Filter, Manifest};
-use reqwest::blocking::Client;
 
 use crate::bundle::{self, Bundle};
 
@@ -142,9 +141,9 @@ impl Bundle for Nsrl {
         Release::parse(std::fs::read_to_string(dir.join(SIDECAR)).ok()?).ok()
     }
 
-    fn fetch(client: &Client) -> Result<Release> {
+    fn fetch(http: &bundle::Http) -> Result<Release> {
         Release::parse(bundle::manifest(
-            client,
+            http,
             &bundle::url(&format!("{PREFIX}/{SIDECAR}")),
         )?)
     }
@@ -177,8 +176,8 @@ impl Bundle for Nsrl {
         })
     }
 
-    fn stage(staging: &Path, client: &Client, remote: &Release) -> Result<()> {
-        stage(staging, client, &bundle::url(PREFIX), remote)
+    fn stage(staging: &Path, http: &bundle::Http, remote: &Release) -> Result<()> {
+        stage(staging, http, &bundle::url(PREFIX), remote)
     }
 
     fn describe(remote: &Release) -> String {
@@ -200,12 +199,12 @@ fn release_name([year, month, patch]: [u32; 3]) -> String {
 
 /// Download, verify, and validate both filters into `staging` from `base`,
 /// then write the manifest beside them, and prove the whole bundle opens.
-fn stage(staging: &Path, client: &Client, base: &str, remote: &Release) -> Result<()> {
+fn stage(staging: &Path, http: &bundle::Http, base: &str, remote: &Release) -> Result<()> {
     for (stem, entry) in &remote.manifest.filter {
         // `validate_manifest` pinned the name to `<stem>-<sha256>.adbl`.
         let path = staging.join(&entry.file);
         let url = format!("{base}/{}", entry.file);
-        bundle::download_to(client, &url, &entry.sha256, &path)?;
+        bundle::download_to(http, &url, &entry.sha256, &path)?;
         let filter = Filter::load(std::fs::read(&path)?).context("invalid NSRL filter")?;
         if filter.stem() != *stem
             || filter.version() != entry.format_version
@@ -278,7 +277,7 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         let err = stage(
             staging.path(),
-            &Client::new(),
+            &bundle::Http::once(reqwest::blocking::Client::new()),
             &base,
             &release("2026-09-01", "2026.09.1"),
         )

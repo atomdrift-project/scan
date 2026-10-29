@@ -33,7 +33,10 @@ fn fetch(url: &str) -> Result<Manifest> {
         .build()
         .context("building update-check HTTP client")?;
     // Size-capped, like every other manifest read.
-    Manifest::parse(&crate::bundle::manifest(&client, url)?)
+    Manifest::parse(&crate::bundle::manifest(
+        &crate::bundle::Http::once(client),
+        url,
+    )?)
 }
 
 /// On-disk record of the last notice check (successful or failed).

@@ -145,7 +145,14 @@ impl ApiError {
                 "The artifact could not be retrieved.",
             );
         }
-        match classify_analysis_error(&format!("{error:#}")) {
+        // Classified on what went wrong, never on the label: an upload named
+        // `corrupt.zip` must not turn an internal failure into a 422.
+        let causes: Vec<String> = error
+            .chain()
+            .map(ToString::to_string)
+            .filter(|cause| !cause.starts_with(crate::analysis::ANALYSIS_CONTEXT))
+            .collect();
+        match classify_analysis_error(&causes.join(": ")) {
             StatusCode::UNSUPPORTED_MEDIA_TYPE => Self::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_artifact",
@@ -441,6 +448,19 @@ mod tests {
             !body.to_string().contains("/tmp"),
             "the error chain leaked: {body}"
         );
+    }
+
+    /// The label is the caller's text: an upload named for a failure class
+    /// must not make an internal failure read as that class.
+    #[tokio::test]
+    async fn a_filename_cannot_choose_the_error_class() {
+        use anyhow::Context as _;
+
+        let fault = Err::<(), _>(anyhow::anyhow!("model evaluation failed"))
+            .context("cleave analysis of corrupt-truncated.zip")
+            .unwrap_err();
+        let body = body_of(ApiError::from_analysis(&fault).into_response()).await;
+        assert_eq!(body["error"]["code"], "internal");
     }
 
     /// A panic message is a bug of ours, not a malformed upload.
