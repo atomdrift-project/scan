@@ -178,7 +178,7 @@ pub(crate) fn classify_report(
     let mut scored = score(&prepared, &req)?;
     scored.inject_backrefs(&mut prepared.compact);
     let top_findings =
-        extract_top_findings(root_findings(&prepared.compact), &scored.decision.class);
+        extract_top_findings(root_findings(&prepared.compact), scored.decision.class);
     let dependency_results = grade_dependencies(
         std::mem::take(&mut prepared.fetch.dependencies),
         &prepared.fetch.registries,
@@ -1465,7 +1465,7 @@ pub fn count_findings(report: &CompactReport) -> FindingCounts {
 #[must_use]
 pub fn extract_top_findings(
     findings: &[CompactTrait],
-    classification: &Classification,
+    classification: Classification,
 ) -> Vec<TopFinding> {
     let min_crit = match classification {
         Classification::Hostile => Criticality::Hostile,

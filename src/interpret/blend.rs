@@ -145,6 +145,10 @@ pub struct MlVerdict {
 
 /// A class as its word: the `llm` section spells classes out, where `ml`
 /// carries the ordinal.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` passes the field by reference"
+)]
 pub(super) fn label<S: serde::Serializer>(
     class: &Classification,
     serializer: S,

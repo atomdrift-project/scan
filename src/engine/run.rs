@@ -592,7 +592,7 @@ impl<'a> Session<'a> {
         let shown = matches!(
             self.config.format(),
             OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-        ) || self.config.filter().shows(&class);
+        ) || self.config.filter().shows(class);
         if !shown || self.broken_pipe.load(Ordering::Relaxed) {
             return;
         }
@@ -648,7 +648,7 @@ impl<'a> Session<'a> {
         ) || result
             .bloom_mark
             .is_some_and(BloomMark::forces_terminal_display)
-            || self.config.filter().shows(&result.classification)
+            || self.config.filter().shows(result.classification)
             || findings_match_filter(
                 self.config.filter(),
                 &result.top_findings,
@@ -969,7 +969,7 @@ pub(crate) fn bloom_gate(
     // Known-good/unscanned are benign-tier: print the per-file line only when
     // benign output is requested, so a large directory scan isn't spammed. The
     // aggregate tally always reports them in the summary regardless.
-    let show_quiet = format == OutputFormat::Json || config.filter().shows(&Classification::Benign);
+    let show_quiet = format == OutputFormat::Json || config.filter().shows(Classification::Benign);
     // Tally for end-of-scan observability. `unscanned` only matters for Unknown.
     crate::bloom_repo::record(decision, fast && decision == BloomDecision::Unknown);
     match decision {

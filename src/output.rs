@@ -222,7 +222,7 @@ fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
 /// hostile cutoffs, so the suspicious band uses the same "distance to 1.0"
 /// formula as the hostile band — an acceptable approximation for the
 /// band-internal color ramp.
-fn band_progress(probability: f32, classification: &Classification, threshold: f32) -> f32 {
+fn band_progress(probability: f32, classification: Classification, threshold: f32) -> f32 {
     match classification {
         Classification::Hostile | Classification::Suspicious => {
             ((probability - threshold) / (1.0 - threshold).max(f32::EPSILON)).clamp(0.0, 1.0)
@@ -234,7 +234,7 @@ fn band_progress(probability: f32, classification: &Classification, threshold: f
 /// Color gradient within each classification band.
 fn indicator_colors(
     probability: f32,
-    classification: &Classification,
+    classification: Classification,
     threshold: f32,
 ) -> (Rgb, Rgb, Rgb) {
     let t = band_progress(probability, classification, threshold);
@@ -318,7 +318,7 @@ fn display_confidence(level: Level) -> Option<u8> {
 }
 
 /// Color percentage text to match the classification band.
-fn colored_pct(probability: f32, classification: &Classification, threshold: f32) -> String {
+fn colored_pct(probability: f32, classification: Classification, threshold: f32) -> String {
     let pct = format!(
         "{:>4}",
         format!(
@@ -334,7 +334,7 @@ fn colored_pct(probability: f32, classification: &Classification, threshold: f32
 /// marker exists, otherwise the rescaled threshold-relative percentage.
 fn colored_conf_or_pct(
     probability: f32,
-    classification: &Classification,
+    classification: Classification,
     threshold: f32,
     level: Level,
 ) -> String {
@@ -352,7 +352,7 @@ fn colored_conf_or_pct(
 /// the hue must match it exactly; confidence nuance lives in the percentage.
 /// (The band-interior gradient appears only in `ps`'s wordless two-block
 /// indicator, where hue is the sole carrier.)
-fn class_color(classification: &Classification) -> Rgb {
+fn class_color(classification: Classification) -> Rgb {
     let p = palette();
     match classification {
         Classification::Hostile => p.hostile,
@@ -362,7 +362,7 @@ fn class_color(classification: &Classification) -> Rgb {
 }
 
 /// The verdict word stamped on cards and badges.
-const fn verdict_word(classification: &Classification) -> &'static str {
+const fn verdict_word(classification: Classification) -> &'static str {
     match classification {
         Classification::Hostile => "HOSTILE",
         Classification::Suspicious => "SUSPECT",
@@ -381,7 +381,7 @@ fn rail(indent: usize, marker: &str, plain: &str) -> String {
 }
 
 /// Classification label colored to match the band.
-fn colored_label(classification: &Classification, p: &Palette) -> String {
+fn colored_label(classification: Classification, p: &Palette) -> String {
     match classification {
         Classification::Hostile => fg(p.hostile, "hostile"),
         Classification::Suspicious => fg(p.suspicious, "suspicious"),
@@ -398,7 +398,7 @@ fn colored_label(classification: &Classification, p: &Palette) -> String {
 /// `HOSTILE[100%]` when color is disabled (piped). Returns the stamp and its
 /// visible width (for aligning lines beneath it).
 pub(crate) fn terminal_badge(
-    classification: &Classification,
+    classification: Classification,
     probability: f32,
     threshold: f32,
     level: Level,
@@ -670,7 +670,7 @@ pub(crate) fn human_size(bytes: u64) -> String {
 /// running the terminal width, with the fixed-width verdict stamp embedded near
 /// the left edge. Color-mode only — plain output frames nothing.
 pub(crate) fn terminal_rule(
-    classification: &Classification,
+    classification: Classification,
     probability: f32,
     threshold: f32,
     level: Level,
@@ -720,7 +720,7 @@ pub(crate) fn terminal_artifact_line(
 /// Provenance belongs in the relationship (`dependency from package.json`),
 /// while URL, hash, and traits occupy one aligned child column.
 pub(crate) fn terminal_reference_branch(
-    verdict: Option<(&Classification, f32)>,
+    verdict: Option<(Classification, f32)>,
     subject: &str,
     source: &str,
     body: &str,
@@ -809,7 +809,7 @@ pub(crate) fn terminal_reference_hash_row(sha256: &str, file_type: &str, size: u
 /// member list. Plain (piped) mode drops the border and indents two spaces,
 /// keeping every line grep-able.
 pub(crate) fn terminal_card(
-    classification: &Classification,
+    classification: Classification,
     name: &str,
     file_type: &str,
     size: u64,
@@ -869,7 +869,7 @@ pub(crate) fn terminal_card(
 /// border: the branch itself communicates containment and keeps sibling
 /// payloads visually connected.
 pub(crate) fn terminal_embedded_branch(
-    classification: &Classification,
+    classification: Classification,
     name: &str,
     file_type: &str,
     size: u64,
@@ -919,11 +919,11 @@ pub fn print_ps_result(result: &ScanResult, has_progress: bool, extra: bool) {
     // Shift both blocks across the verdict band so threshold-adjacent results
     // remain distinct from high-confidence results in the same class.
     let (left, right, _) =
-        indicator_colors(result.probability, &result.classification, result.threshold);
+        indicator_colors(result.probability, result.classification, result.threshold);
     let blocks = format!("{}{}", fg(left, BLOCK), fg(right, BLOCK));
     let pct = colored_conf_or_pct(
         result.probability,
-        &result.classification,
+        result.classification,
         result.threshold,
         result.level,
     );
@@ -939,7 +939,7 @@ pub fn print_ps_result(result: &ScanResult, has_progress: bool, extra: bool) {
         format!("{} +{} more", first.join(", "), pids.len() - 4)
     };
     let pid_display = fg(p.dim, &format!("[pids: {pid_str}]"));
-    let label = colored_label(&result.classification, p);
+    let label = colored_label(result.classification, p);
 
     let deleted_marker = if deleted {
         format!(" {}", fg(p.hostile_finding, "(deleted)"))

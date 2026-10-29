@@ -282,7 +282,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 if matches!(
                     config.format(),
                     OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-                ) || config.filter().shows(&result.classification)
+                ) || config.filter().shows(result.classification)
                 {
                     let print = || {
                         emit_result(&result, config, progress.is_some(), &stdout);
