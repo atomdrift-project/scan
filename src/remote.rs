@@ -47,6 +47,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Whole-request ceiling for a remote analysis, which streams progress.
 const ANALYZE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a remote analysis keeps retrying transient failures before the
+/// artifact is reported as failed. Under `remote` there is no local analysis
+/// to fall back to, so it is the longest any call waits.
+const ANALYZE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
 /// `--analyze`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -257,6 +261,19 @@ pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
         );
         return None;
     }
+    // A verdict stored against a coordinate stands in for a fetch only when
+    // the coordinate can name no other bytes: not a version-less or ranged
+    // PURL (whatever is latest now), not a gem or a young PyPI release. The
+    // rest are fetched, and asked about again by digest.
+    if !crate::fetch::immutable_coordinate(purl, None) {
+        tracing::debug!(
+            event = "remote.withheld",
+            kind = "purl",
+            reason = "mutable",
+            purl
+        );
+        return None;
+    }
     let mut hits = precheck.purls(&[purl.to_string()]);
     let hit = hits.remove(purl)?;
     match hit.standing {
@@ -290,12 +307,9 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     };
     let http = http().context("no isotope13 HTTP client")?;
     let url = format!("{API_URL}/v1/analyze");
-    let request = http
-        .post(&url)
-        .timeout(ANALYZE_TIMEOUT)
-        .bearer_auth(token.secret());
-    let request = match upload {
-        Upload::Purl(purl) => request.query(&[("purl", purl)]),
+    // Held as `Bytes` so a retry resends the body without copying it.
+    let (purl, body): (Option<&str>, Option<bytes::Bytes>) = match upload {
+        Upload::Purl(purl) => (Some(purl), None),
         Upload::File(path) => {
             // The cap bounds the read itself: a file that grows after a size
             // check, or a device or FIFO reporting no length, cannot be
@@ -310,9 +324,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
                     path.display()
                 );
             }
-            request
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(bytes)
+            (None, Some(bytes.into()))
         }
         Upload::Bytes(bytes) => {
             if bytes.len() as u64 > MAX_UPLOAD_BYTES {
@@ -321,13 +333,27 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
                     bytes.len()
                 );
             }
-            request
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(bytes)
+            (None, Some(bytes.into()))
         }
     };
     let started = std::time::Instant::now();
-    let resp = request.send().with_context(|| format!("POST {url}"))?;
+    // A permanent 4xx, or an answer that has begun streaming, is final.
+    let resp = crate::retry::send("isotope13 analyze", ANALYZE_RETRY_BUDGET, |_| {
+        let mut request = http
+            .post(&url)
+            .timeout(ANALYZE_TIMEOUT)
+            .bearer_auth(token.secret());
+        if let Some(purl) = purl {
+            request = request.query(&[("purl", purl)]);
+        }
+        if let Some(body) = &body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone());
+        }
+        request
+    })
+    .with_context(|| format!("POST {url}"))?;
     let status = resp.status();
     if !status.is_success() {
         // Bounded and escaped: the body is the remote's, and this error is

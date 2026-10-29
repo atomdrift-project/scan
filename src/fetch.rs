@@ -176,22 +176,25 @@ const PYPI_RELEASE_CLOSED_SECS: u64 = 15 * 86_400;
 /// to replace a published version (npm, crates.io, the Go checksum database,
 /// NuGet, Maven Central releases), a PyPI release past
 /// [`PYPI_RELEASE_CLOSED_SECS`] (`age_secs` is the release's age, `None` when
-/// unknown), or a version that is itself a commit hash. Everywhere else the
+/// unknown), or a VCS coordinate whose version is itself a commit hash. Only
+/// there is a hex version a commit: a 40-digit PyPI version is an ordinary
+/// (still open) release, and a 64-hex container tag is just a tag — a real
+/// digest is spelled `sha256:…`. Everywhere else the
 /// same coordinate can name new bytes, so nothing stored against it may stand
 /// in for a fetch: git tags, gems, container tags, distro packages, a Maven
 /// `-SNAPSHOT`, a young PyPI release, anything served from a non-default
 /// repository.
-fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
+pub(crate) fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
     let Some(parsed) = fletch::purl::Purl::parse(purl).ok() else {
         return false;
     };
     let Some(version) = parsed.version() else {
         return false;
     };
-    let pinned = ["download_url", "vcs_url", "repository_url"]
-        .iter()
-        .all(|q| parsed.qualifier(q).is_none());
-    let commit = matches!(version.len(), 40 | 64) && version.bytes().all(|b| b.is_ascii_hexdigit());
+    let pinned = default_source(&parsed);
+    let commit = matches!(parsed.typ(), "github" | "gitlab" | "bitbucket")
+        && matches!(version.len(), 40 | 64)
+        && version.bytes().all(|b| b.is_ascii_hexdigit());
     let fixed_registry = match parsed.typ() {
         "npm" | "cargo" | "golang" | "nuget" => true,
         "maven" => !version.ends_with("-SNAPSHOT"),
@@ -199,6 +202,38 @@ fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
         _ => false,
     };
     pinned && pins_exact_version(purl) && (commit || fixed_registry)
+}
+
+/// Whether `purl` names one file whose bytes can never change: an
+/// [`immutable_coordinate`], or a single PyPI file (`file_name`) of an exact
+/// version. PyPI never lets a filename be replaced or reused, even after
+/// deletion, though a young release can still gain *other* files.
+///
+/// Only for a cache keyed by that exact file, such as a URL's alias. The
+/// corpus, the bloom filters and isotope13 key a PURL by its release and drop
+/// `file_name`, so there a young release must stay mutable: one file's verdict
+/// must not vouch for a different file added to it later.
+pub(crate) fn immutable_file(purl: &str) -> bool {
+    if immutable_coordinate(purl, None) {
+        return true;
+    }
+    let Some(parsed) = fletch::purl::Purl::parse(purl).ok() else {
+        return false;
+    };
+    parsed.typ() == "pypi"
+        && parsed
+            .qualifier("file_name")
+            .is_some_and(|name| !name.is_empty())
+        && default_source(&parsed)
+        && pins_exact_version(purl)
+}
+
+/// Whether `parsed` is fetched from its type's default registry: no qualifier
+/// points it at other bytes or another index.
+fn default_source(parsed: &fletch::purl::Purl) -> bool {
+    ["download_url", "vcs_url", "repository_url"]
+        .iter()
+        .all(|q| parsed.qualifier(q).is_none())
 }
 
 /// The sha256 a registry lists for the exact file a fetch of `purl` would

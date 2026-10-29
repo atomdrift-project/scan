@@ -76,6 +76,29 @@ impl std::fmt::Debug for FastTreeBackend {
     }
 }
 
+/// The `TreeEnsembleClassifier` attributes [`FastTreeBackend::from_graph`]
+/// reads, plus the ones that cannot change a score: the class labels only name
+/// the classes it counts, and `nodes_hitrates` is a branch-frequency hint.
+const KNOWN_ATTRIBUTES: &[&str] = &[
+    "base_values",
+    "class_ids",
+    "class_nodeids",
+    "class_treeids",
+    "class_weights",
+    "classlabels_int64s",
+    "classlabels_strings",
+    "nodes_falsenodeids",
+    "nodes_featureids",
+    "nodes_hitrates",
+    "nodes_missing_value_tracks_true",
+    "nodes_modes",
+    "nodes_nodeids",
+    "nodes_treeids",
+    "nodes_truenodeids",
+    "nodes_values",
+    "post_transform",
+];
+
 /// Whether `name` is an initializer holding the single value `1.0`.
 pub(super) fn is_constant_one(graph: &tract_onnx::pb::GraphProto, name: &str) -> bool {
     graph
@@ -177,6 +200,19 @@ impl FastTreeBackend {
     /// [`ensemble_node`]. Anything else is left to tract.
     pub(super) fn from_graph(graph: &tract_onnx::pb::GraphProto) -> Result<Self> {
         let node = ensemble_node(graph)?;
+        // An attribute this evaluator does not read is one it does not apply:
+        // `base_values_as_tensor` from a newer exporter would silently score
+        // without the base values tract adds. Only a known one passes.
+        if let Some(unknown) = node
+            .attribute
+            .iter()
+            .find(|attr| !KNOWN_ATTRIBUTES.contains(&attr.name.as_str()))
+        {
+            anyhow::bail!(
+                "TreeEnsembleClassifier attribute {} is one the fast evaluator does not apply",
+                unknown.name
+            );
+        }
         let n_features = onnx_input_feature_count(graph)?;
         let n_classes = onnx_class_count(node)?;
         let nodes_featureids = attr_usizes(node, "nodes_featureids")?;
@@ -204,11 +240,18 @@ impl FastTreeBackend {
         if tree_ids.first().copied() != Some(0) || leaf_tree_ids.first().copied() != Some(0) {
             anyhow::bail!("TreeEnsembleClassifier tree ids must start at 0");
         }
-        let n_trees = tree_ids
+        let last_tree = tree_ids
             .last()
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier has no tree ids"))?
-            + 1;
+            .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier has no tree ids"))?;
+        // Every tree has at least one node, so a larger id is corrupt — and
+        // would otherwise size an allocation (or overflow `+ 1`) before any
+        // other check could refuse it.
+        anyhow::ensure!(
+            last_tree < n_nodes,
+            "TreeEnsembleClassifier tree id {last_tree} exceeds its {n_nodes} nodes"
+        );
+        let n_trees = last_tree + 1;
         if leaf_tree_ids.last().copied() != Some(n_trees - 1) {
             anyhow::bail!("TreeEnsembleClassifier node/leaf tree counts mismatch");
         }

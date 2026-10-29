@@ -58,6 +58,7 @@ atomscan ./package/ || echo "flagged — block this upload"
 | `2`  | At least one **suspicious** file, none hostile.   |
 | `3`  | An error occurred, nothing hostile or suspicious. |
 | `4`  | The rule set was incomplete — see below.          |
+| `130`| Interrupted (Ctrl-C) before every file was analyzed. |
 
 The most severe verdict wins: one hostile file in a tree returns `1` no
 matter what else is in it. A typical policy blocks on `1`, sends `2` to a

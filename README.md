@@ -86,6 +86,7 @@ Exit codes make CI integration trivial:
 - `3`: analysis error
 - `4`: the rule set was incomplete — the scan ran with fewer rules than the
   trait set defines, so anything short of hostile proves nothing. Re-run it.
+- `130`: interrupted (Ctrl-C) before every file was analyzed
 
 ## How it works
 

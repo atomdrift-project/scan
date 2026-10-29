@@ -1,5 +1,5 @@
-//! Verdict index: what we already know about a sha256 or a PURL, in the compact
-//! form the lookup routes answer with.
+//! Verdict index: what we already know about a sha256, a PURL or a URL, in the
+//! compact form the lookup routes answer with.
 //!
 //! The expensive artifact of an analysis is the cleave report, and that is
 //! already cached twice over: cleave memoizes the top-level report by content
@@ -20,10 +20,18 @@
 //! serving a verdict the current detector would no longer give. Disabled by
 //! `SCAN_NO_ANALYSIS_CACHE=1`, which
 //! degrades every lookup to "unknown" rather than to an error.
+//!
+//! A digest names its bytes forever. A name does only when it cannot come to
+//! mean other bytes — `crate::fetch::immutable_coordinate` — and a URL is
+//! judged by the PURL it parses into, when it parses into one. Every other
+//! name (a gem, a young PyPI release, a git tag, any other URL) answers from
+//! here for [`MUTABLE_ALIAS_TTL`] after it was last resolved, and is resolved
+//! again after that.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +40,11 @@ use crate::model::Level;
 /// Findings kept per verdict. The wire view serves the worst few; the rest are
 /// headroom so the projection can widen without re-analyzing everything.
 pub const MAX_STORED_HITS: usize = 10;
+
+/// How long a mutable name — one whose bytes can change under it — answers
+/// from the index after the analysis that last resolved it. Immutable names
+/// keep their alias for the life of the ruleset namespace.
+pub const MUTABLE_ALIAS_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Criticality floor for a stored finding: 3 notable, 4 suspicious, 5 hostile.
 /// Anything below is baseline noise that no consumer gates on.
@@ -460,13 +473,62 @@ impl Index {
     }
 
     /// The verdict for a PURL, resolved through the alias index. `None` when
-    /// the PURL is unparseable, unseen, or its artifact has since been pruned.
+    /// the PURL is unparseable, unseen, mutable and last resolved more than
+    /// [`MUTABLE_ALIAS_TTL`] ago, or its artifact has since been pruned.
     pub fn get_purl(&self, purl: &str) -> Option<Verdict> {
+        self.get_purl_at(purl, crate::civil::now_secs())
+    }
+
+    fn get_purl_at(&self, purl: &str, now: u64) -> Option<Verdict> {
         let key = purl_key(purl)?;
-        let sha = std::fs::read_to_string(self.alias_path(&key)).ok()?;
+        let immutable = crate::fetch::immutable_coordinate(purl, None);
+        self.resolve_alias(&self.alias_path(&key), immutable, now)
+    }
+
+    /// The verdict for the bytes last analyzed from `url`. A URL that parses
+    /// into an immutable PURL (a registry tarball) keeps its alias; any other
+    /// answers for [`MUTABLE_ALIAS_TTL`] after it was last fetched.
+    pub fn get_url(&self, url: &str) -> Option<Verdict> {
+        self.get_url_at(url, crate::civil::now_secs())
+    }
+
+    fn get_url_at(&self, url: &str, now: u64) -> Option<Verdict> {
+        self.resolve_alias(&self.url_alias_path(url), url_is_immutable(url), now)
+    }
+
+    /// Record that `url` served the bytes `sha256` names, now.
+    pub fn alias_url(&self, url: &str, sha256: &str) {
+        let Some(sha) = normalize_sha(sha256) else {
+            return;
+        };
+        let line = alias_line(&sha, crate::civil::now_secs());
+        if let Err(e) = self.write_atomic(&self.url_alias_path(url), line.as_bytes()) {
+            tracing::debug!(sha256 = %sha, error = %e, "verdict index url alias write failed");
+        }
+    }
+
+    /// Follow the alias at `path` to its verdict. A mutable name's alias
+    /// stands only within [`MUTABLE_ALIAS_TTL`] of when it was written; one
+    /// written before aliases carried a time has none, and so has expired.
+    fn resolve_alias(&self, path: &Path, immutable: bool, now: u64) -> Option<Verdict> {
+        let alias = std::fs::read_to_string(path).ok()?;
+        let mut fields = alias.split_whitespace();
+        let sha = fields.next()?;
+        let resolved_at = fields.next().and_then(|at| at.parse::<u64>().ok());
+        let fresh =
+            resolved_at.is_some_and(|at| now.saturating_sub(at) <= MUTABLE_ALIAS_TTL.as_secs());
+        if !immutable && !fresh {
+            tracing::debug!(
+                alias = %path.display(),
+                resolved_at,
+                ttl_s = MUTABLE_ALIAS_TTL.as_secs(),
+                "mutable name's alias has expired; it must be resolved again",
+            );
+            return None;
+        }
         // An alias outliving its verdict (evicted by the cache sweeper) reads
         // as a miss, which is the honest answer.
-        self.get_sha(sha.trim())
+        self.get_sha(sha)
     }
 
     /// Store a verdict, plus a PURL alias when the artifact was fetched as one.
@@ -489,19 +551,21 @@ impl Index {
         let Some(sha) = normalize_sha(&verdict.sha256) else {
             return;
         };
-        if !overwrite && self.get_sha(&sha).is_some() {
-            return;
+        if overwrite || self.get_sha(&sha).is_none() {
+            let Ok(json) = serde_json::to_vec(verdict) else {
+                return;
+            };
+            if let Err(e) = self.write_atomic(&self.verdict_path(&sha), &json) {
+                tracing::debug!(sha256 = %sha, error = %e, "verdict index write failed");
+                return;
+            }
+            self.memo().put(sha.clone(), Some(verdict.clone()));
         }
-        let Ok(json) = serde_json::to_vec(verdict) else {
-            return;
-        };
-        if let Err(e) = self.write_atomic(&self.verdict_path(&sha), &json) {
-            tracing::debug!(sha256 = %sha, error = %e, "verdict index write failed");
-            return;
-        }
-        self.memo().put(sha.clone(), Some(verdict.clone()));
-        // The alias is written after the verdict it points at, so a PURL never
-        // resolves to a sha whose record is not yet readable. And only for a
+        // The alias is rewritten even when the verdict stood: this analysis
+        // resolved the name again, which restarts a mutable name's
+        // MUTABLE_ALIAS_TTL. It is written after the verdict it points at, so
+        // a PURL never resolves to a sha whose record is not yet readable. And
+        // only for a
         // PURL that names the whole release: one whose `file_name`, `kind` or
         // subpath selected a single artifact of it is a verdict about that
         // artifact, and filed under the bare coordinate it would answer for
@@ -510,7 +574,10 @@ impl Index {
             && fletch::purl::normalize(purl)
                 .is_some_and(|full| fletch::purl::identity(purl).is_some_and(|bare| bare == full))
             && let Some(key) = purl_key(purl)
-            && let Err(e) = self.write_atomic(&self.alias_path(&key), sha.as_bytes())
+            && let Err(e) = self.write_atomic(
+                &self.alias_path(&key),
+                alias_line(&sha, crate::civil::now_secs()).as_bytes(),
+            )
         {
             tracing::debug!(sha256 = %sha, error = %e, "verdict index alias write failed");
         }
@@ -527,6 +594,14 @@ impl Index {
         self.dir.join(format!("{key}.purl"))
     }
 
+    /// A URL's alias, named by the digest of the URL so no caller text becomes
+    /// a path component.
+    fn url_alias_path(&self, url: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        self.dir
+            .join(format!("{:x}.url", Sha256::digest(url.trim().as_bytes())))
+    }
+
     /// Write via a uniquely named temp file and rename, so a reader never sees
     /// a half-written entry and concurrent writers — in this process or another
     /// sharing the cache directory — never collide. A failed write removes its
@@ -538,6 +613,22 @@ impl Index {
         tmp.persist(path)?;
         Ok(())
     }
+}
+
+/// An alias file's contents: the digest it resolves to, and when (Unix
+/// seconds, UTC) the name was resolved to it.
+fn alias_line(sha: &str, now: u64) -> String {
+    format!("{sha} {now}")
+}
+
+/// Whether a URL's bytes can never change: only when it parses into a PURL
+/// naming an immutable file, such as a registry's tarball for a published
+/// version or a PyPI file. The alias is keyed by the URL, so it is that exact
+/// file, which is what lets a PyPI file count where its release would not.
+/// `fletch::purl::url_to_purl` recognizes registry hosts only, so a look-alike
+/// path elsewhere stays an ordinary, mutable URL.
+fn url_is_immutable(url: &str) -> bool {
+    fletch::purl::url_to_purl(url.trim()).is_some_and(|purl| crate::fetch::immutable_file(&purl))
 }
 
 /// Lowercased digest, or `None` when the input is not 64 hex characters.
@@ -725,6 +816,154 @@ mod tests {
         // case variations resolve to the same artifact.
         assert!(idx.get_purl("PKG:NPM/left-pad@1.3.0").is_some());
         assert!(idx.get_purl("pkg:npm/right-pad@1.3.0").is_none());
+    }
+
+    /// When a mutable name has expired: one second past the TTL from now.
+    fn past_ttl() -> u64 {
+        crate::civil::now_secs() + MUTABLE_ALIAS_TTL.as_secs() + 1
+    }
+
+    /// Store `sha` and alias it under `purl`.
+    fn put_as(idx: &Index, sha: &str, purl: &str) {
+        let mut v = verdict(sha);
+        v.purl = Some(purl.to_string());
+        idx.put(&v);
+    }
+
+    /// A published npm version can never name other bytes, so its alias
+    /// answers however long ago it was resolved.
+    #[test]
+    fn an_immutable_purl_alias_never_expires() {
+        let (_dir, idx) = temp_index();
+        let sha = "1".repeat(64);
+        put_as(&idx, &sha, "pkg:npm/left-pad@1.3.0");
+        let hit = idx.get_purl_at("pkg:npm/left-pad@1.3.0", past_ttl());
+        assert_eq!(hit.map(|v| v.sha256), Some(sha));
+    }
+
+    /// A gem version can be yanked and pushed again, so its alias answers only
+    /// within the TTL of the analysis that resolved it — including the very
+    /// edge of it — and is resolved again after.
+    #[test]
+    fn a_mutable_purl_alias_answers_within_the_ttl_only() {
+        let (_dir, idx) = temp_index();
+        let sha = "2".repeat(64);
+        let purl = "pkg:gem/rails@7.1.0";
+        put_as(&idx, &sha, purl);
+        assert!(idx.get_purl(purl).is_some(), "fresh: answered");
+        let edge = crate::civil::now_secs() + MUTABLE_ALIAS_TTL.as_secs() - 5;
+        assert!(
+            idx.get_purl_at(purl, edge).is_some(),
+            "inside the TTL: answered"
+        );
+        assert!(
+            idx.get_purl_at(purl, past_ttl()).is_none(),
+            "past the TTL: resolved again"
+        );
+        // A young PyPI release can still gain files, and an index has no age
+        // for it, so it is mutable too.
+        let pypi = "pkg:pypi/requests@2.32.3";
+        put_as(&idx, &"3".repeat(64), pypi);
+        assert!(idx.get_purl_at(pypi, past_ttl()).is_none());
+    }
+
+    /// Analyzing a mutable name again re-resolves it, restarting its TTL, even
+    /// though the verdict for the same bytes stands as first written.
+    #[test]
+    fn reanalysis_restarts_a_mutable_alias() {
+        let (_dir, idx) = temp_index();
+        let sha = "4".repeat(64);
+        let purl = "pkg:gem/rails@7.1.1";
+        // An alias from before aliases carried a time: mutable, so expired.
+        std::fs::write(idx.alias_path(&purl_key(purl).expect("key")), &sha).expect("write");
+        assert!(
+            idx.get_purl(purl).is_none(),
+            "an untimed mutable alias has expired"
+        );
+        put_as(&idx, &sha, purl);
+        assert!(idx.get_purl(purl).is_some(), "re-resolved: answered again");
+    }
+
+    /// An untimed alias for an immutable name still answers: nothing it could
+    /// point at has changed.
+    #[test]
+    fn an_untimed_immutable_alias_still_answers() {
+        let (_dir, idx) = temp_index();
+        let sha = "5".repeat(64);
+        idx.put(&verdict(&sha));
+        let purl = "pkg:cargo/serde@1.0.200";
+        std::fs::write(idx.alias_path(&purl_key(purl).expect("key")), &sha).expect("write");
+        assert!(idx.get_purl_at(purl, past_ttl()).is_some());
+    }
+
+    /// A URL that parses into an immutable PURL is judged as that PURL: a
+    /// registry tarball keeps its alias. One that parses into a mutable PURL,
+    /// or into none, expires like any mutable name.
+    #[test]
+    fn a_url_is_judged_by_the_purl_it_parses_into() {
+        let (_dir, idx) = temp_index();
+        let sha = "6".repeat(64);
+        idx.put(&verdict(&sha));
+        for (url, immutable) in [
+            // npm and crates.io never replace a published version.
+            (
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                true,
+            ),
+            (
+                "https://registry.npmjs.org/@scope/pkg/-/pkg-2.0.0.tgz",
+                true,
+            ),
+            (
+                "https://static.crates.io/crates/serde/serde-1.0.200.crate",
+                true,
+            ),
+            // A commit pins a GitHub archive; a tag does not.
+            (
+                "https://codeload.github.com/o/r/tar.gz/0123456789abcdef0123456789abcdef01234567",
+                true,
+            ),
+            ("https://codeload.github.com/o/r/tar.gz/v1.0.0", false),
+            // A PyPI file can never be replaced or its name reused, so its
+            // URL keeps its alias, wheel or sdist, though its release can
+            // still gain other files.
+            (
+                "https://files.pythonhosted.org/packages/ab/cd/requests-2.32.3-py3-none-any.whl",
+                true,
+            ),
+            (
+                "https://files.pythonhosted.org/packages/ab/cd/requests-2.32.3.tar.gz",
+                true,
+            ),
+            // A gem version can be yanked and pushed again.
+            ("https://rubygems.org/downloads/rails-7.1.0.gem", false),
+            // A registry-shaped path on another host is not that registry.
+            ("https://evil.example/left-pad/-/left-pad-1.3.0.tgz", false),
+            // And an ordinary URL names whatever its server sends now.
+            ("https://example.com/app.tgz", false),
+        ] {
+            idx.alias_url(url, &sha);
+            assert!(idx.get_url(url).is_some(), "{url}: fresh, answered");
+            assert_eq!(
+                idx.get_url_at(url, past_ttl()).is_some(),
+                immutable,
+                "{url}: past the TTL"
+            );
+        }
+        assert!(idx.get_url("https://example.com/never-seen.tgz").is_none());
+    }
+
+    /// A URL alias names its file by digest: no caller text becomes a path.
+    #[test]
+    fn a_url_alias_cannot_escape_the_index() {
+        let (dir, idx) = temp_index();
+        let sha = "7".repeat(64);
+        idx.put(&verdict(&sha));
+        let url = "https://example.com/../../../../etc/passwd";
+        idx.alias_url(url, &sha);
+        assert!(idx.get_url(url).is_some());
+        let alias = idx.url_alias_path(url);
+        assert_eq!(alias.parent(), Some(dir.path().join("v").as_path()));
     }
 
     #[test]

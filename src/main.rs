@@ -414,7 +414,8 @@ where
         }
         if text.len() > 1 && text.starts_with('-') {
             // A flag's value is not an operand, even when it looks like one.
-            if takes_next_value(&flags, text) {
+            let next = tokens.as_slice().first().and_then(|next| next.to_str());
+            if takes_next_value(&flags, text, next) {
                 tokens.next();
             }
         } else if operand.is_none() {
@@ -442,11 +443,18 @@ where
     rewritten
 }
 
-/// Whether clap reads the token after `flag` as its value: a long flag that
-/// takes one, unless given as `--flag=value` or only with `=`, or a short
-/// cluster ending in one with nothing attached (`-f json`, not `-fjson`).
-fn takes_next_value(flags: &[&clap::Arg], flag: &str) -> bool {
-    let takes = |arg: &&clap::Arg| arg.get_action().takes_values() && !arg.is_require_equals_set();
+/// Whether clap reads `next`, the token after `flag`, as its value: a long flag
+/// that takes one, unless given as `--flag=value` or only with `=`, or a short
+/// cluster ending in one with nothing attached (`-f json`, not `-fjson`). A
+/// flag whose value is optional (`--llm`) leaves a following flag alone, as
+/// clap does.
+fn takes_next_value(flags: &[&clap::Arg], flag: &str, next: Option<&str>) -> bool {
+    let next_is_flag = next.is_some_and(|next| next.len() > 1 && next.starts_with('-'));
+    let takes = |arg: &&clap::Arg| {
+        arg.get_action().takes_values()
+            && !arg.is_require_equals_set()
+            && !(next_is_flag && arg.get_num_args().is_some_and(|n| n.min_values() == 0))
+    };
     if let Some(long) = flag.strip_prefix("--") {
         return !long.contains('=')
             && flags
@@ -524,6 +532,13 @@ enum Commands {
         /// Also settable via the `SCAN_REGISTRY_MAP` env var.
         #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
         registry_map: Option<PathBuf>,
+
+        /// Treat collector capture records (`<file>.forage.json` beside
+        /// `<file>`) found while walking a directory as bookkeeping: still
+        /// analyzed, but shown only when suspicious or hostile, and uploaded
+        /// to hopper only when hostile. Without it they scan like any file.
+        #[arg(long)]
+        enable_sidecar: bool,
     },
 
     /// Scan executables of all running processes
@@ -775,9 +790,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse_from(with_default_subcommand(std::env::args_os()));
     match run(cli) {
         Ok(code) => code,
-        // The reader went away (`atomscan … | head`): nothing is listening
-        // for the verdict or for an error, so stop quietly.
+        // The reader went away (`atomscan … | head`) before anything was
+        // flagged: nothing is listening for an error, so stop quietly. (A
+        // flagged scan returns its summary instead, and exits on its verdict.)
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
+        // Ctrl-C stopped the scan: the conventional 128 + SIGINT, so a script
+        // never mistakes a partial scan for a clean one.
+        Err(e) if is_interrupted(&e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::from(130)
+        }
         // What `main() -> Result` printed, so scripts see the same text.
         Err(e) => {
             eprintln!("Error: {e:?}");
@@ -792,6 +814,15 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Whether `e` reports a scan stopped by Ctrl-C.
+fn is_interrupted(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
     })
 }
 
@@ -904,8 +935,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             paths,
             hopper,
             registry_map,
+            enable_sidecar,
         } => {
-            let config = scan_config(&global, interpret, fetch, hopper)?;
+            let config =
+                scan_config(&global, interpret, fetch, hopper)?.with_sidecars(enable_sidecar);
             scan_paths(&global, config, &paths, registry_map.as_deref())
         }
         Commands::Ps => {

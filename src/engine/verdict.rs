@@ -588,11 +588,22 @@ pub(super) fn apply_trait_floor(
 }
 
 /// Whether `candidate` should replace `current` as the dominant decision: the
-/// graver class wins, and a higher probability breaks a tie.
+/// graver class wins; within a class the tighter level (fires at fewer false
+/// positives) wins, and a higher probability breaks what remains.
+///
+/// Level before probability: probabilities from different routes, or a trait
+/// floor's confidence, are not on one scale, while the level is the file's
+/// place on the one grid every route shares. An L0 member must keep its
+/// container at L0, which is what stops an LLM from softening it.
 pub(super) fn decision_outranks(candidate: &Decision, current: &Decision) -> bool {
     match candidate.class.cmp(&current.class) {
         Ordering::Greater => true,
-        Ordering::Equal => candidate.probability > current.probability,
+        Ordering::Equal => match (candidate.level, current.level) {
+            (Level::At(c), Level::At(k)) if c != k => c < k,
+            (Level::At(_), Level::Clean) => true,
+            (Level::Clean, Level::At(_)) => false,
+            _ => candidate.probability > current.probability,
+        },
         Ordering::Less => false,
     }
 }

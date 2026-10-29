@@ -73,6 +73,14 @@ impl FlightKey {
             Artifact::Sha(_) | Artifact::Url(_) => None,
         }
     }
+
+    /// The URL this analysis fetched, when it was requested by one.
+    pub(super) fn url(&self) -> Option<&str> {
+        match &self.artifact {
+            Artifact::Url(url) => Some(url),
+            Artifact::Sha(_) | Artifact::Purl(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for FlightKey {

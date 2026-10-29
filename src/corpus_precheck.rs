@@ -472,7 +472,11 @@ impl Precheck {
         let Some(http) = self.http() else {
             return out;
         };
-        for chunk in shas.chunks(PURL_BATCH) {
+        // isotope13 answers a repeated `sha256` as a batch; hopper's lookup
+        // reads only the first, so every further digest in a chunk would go
+        // unanswered and be fetched and analyzed for nothing.
+        let batch = if self.is_isotope13() { PURL_BATCH } else { 1 };
+        for chunk in shas.chunks(batch) {
             if !self.breaker.allows(crate::civil::now_secs()) {
                 break;
             }

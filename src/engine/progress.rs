@@ -324,8 +324,11 @@ impl Spinner {
                 // through a deeply nested archive, where one file expands to
                 // thousands of members with nothing else to count. It undercounts
                 // members that begin and finish between two samples, so the count
-                // is prefixed `~`.
-                let mut seen: HashSet<String> = HashSet::new();
+                // is prefixed `~`. Members are kept as hashes, not paths: a
+                // count needs only identity, and a 100k-member image would
+                // otherwise hold every path for the life of the scan.
+                let hasher = std::hash::RandomState::new();
+                let mut seen: HashSet<u64> = HashSet::new();
                 let mut current = String::new();
                 while !flag.load(Ordering::Relaxed) {
                     let frame = SPINNER[tick % SPINNER.len()];
@@ -336,7 +339,7 @@ impl Spinner {
                     let members = cleave::breadcrumb::snapshot();
                     for crumb in &members {
                         if crumb.analyzer == "member" {
-                            seen.insert(crumb.target.clone());
+                            seen.insert(std::hash::BuildHasher::hash_one(&hasher, &crumb.target));
                         }
                     }
                     if let Some(oldest) = members.iter().find(|c| c.analyzer == "member") {

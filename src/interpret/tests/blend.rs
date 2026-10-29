@@ -461,6 +461,16 @@ fn readability_is_judged_per_member_not_per_line() {
     }
     assert!(!render_mostly_readable(&packed));
 
+    // One-line stubs cannot outvote a packed binary: they carry nothing for
+    // the LLM to read, and a vote must cost more than a line.
+    let mut padded = packed.clone();
+    for i in 0..2 {
+        padded.push_str(&format!(
+            "  stub{i}/__init__.py\tpython 1KB 1\n  import os\n"
+        ));
+    }
+    assert!(!render_mostly_readable(&padded));
+
     // Header detection: a tab-indented source line is not a member header.
     assert!(is_member_header("  pkg.whl/lib/native.dll\tpe 400KB 9"));
     assert!(!is_member_header("\tif x:\treturn 1"));

@@ -271,11 +271,28 @@ pub(super) const MAX_REGISTRY_LOOKUPS: usize = 5_000;
 /// is relative to each scan's clock, so [`Registry::with_age`] is applied per
 /// read); `None` is memoized too, so an unsupported ecosystem or an unresolved
 /// package isn't re-attempted for every file that names it. Lives for the
-/// process, fronting the on-disk blob cache.
-pub(super) fn registry_memo() -> &'static RwLock<lru::LruCache<String, Option<Registry>>> {
-    static MEMO: OnceLock<RwLock<lru::LruCache<String, Option<Registry>>>> = OnceLock::new();
+/// process, fronting the on-disk blob cache, but each entry only for
+/// [`REGISTRY_MEMO_TTL_SECS`].
+pub(super) fn registry_memo() -> &'static RwLock<lru::LruCache<String, Memoized>> {
+    static MEMO: OnceLock<RwLock<lru::LruCache<String, Memoized>>> = OnceLock::new();
     MEMO.get_or_init(|| RwLock::new(lru::LruCache::new(REGISTRY_MEMO_CAPACITY)))
 }
+
+/// One registry memo entry: the un-aged record (or the final "none"), and the
+/// scan clock when it was looked up.
+#[derive(Clone)]
+pub(super) struct Memoized {
+    pub(super) at: u64,
+    pub(super) record: Option<Registry>,
+}
+
+/// How long a memo entry stands in for the blob cache. The memo exists to
+/// spare a burst of scans naming the same dependencies the disk read and the
+/// JSON parse; held for the life of a server, it would also outlive
+/// `--registry-ttl` and keep serving a record whose version has since been
+/// yanked or security-held. Past this the blob cache answers again, under its
+/// own TTL.
+pub(super) const REGISTRY_MEMO_TTL_SECS: u64 = 30 * 60;
 
 /// Entries the registry memo keeps. Unbounded, one entry per distinct
 /// dependency locator a long-lived process ever resolved would grow to
@@ -321,14 +338,18 @@ pub(super) fn lookup_registries(
             if r.kind != RefKind::Dependency {
                 continue;
             }
-            match memo.peek(locator(r)) {
+            match memo
+                .peek(locator(r))
+                .filter(|hit| now.saturating_sub(hit.at) <= REGISTRY_MEMO_TTL_SECS)
+            {
                 // Stored un-aged; stamp the age signals from this scan's clock.
                 Some(hit) => {
-                    found[i] = hit.clone().map(|record| Lookup {
+                    found[i] = hit.record.clone().map(|record| Lookup {
                         record: record.with_age(now),
                         sources: None,
                     });
                 }
+                // Absent, or expired: the blob cache decides, under its TTL.
                 None => misses.push(i),
             }
         }
@@ -389,8 +410,8 @@ pub(super) fn lookup_registries(
         let mut memo = registry_memo()
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        for (key, value) in writes {
-            memo.put(key, value);
+        for (key, record) in writes {
+            memo.put(key, Memoized { at: now, record });
         }
     }
     found

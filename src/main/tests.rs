@@ -143,6 +143,18 @@ fn the_wide_default_covers_every_service_role() {
     );
 }
 
+/// `--llm` takes an optional value, so clap leaves a following flag alone;
+/// the shorthand scan must too, or it misreads that flag's value as a path and
+/// rewrites a line that names a subcommand.
+#[test]
+fn an_optional_value_flag_does_not_swallow_the_next_flag() {
+    let args = ["scan", "--llm", "-f", "json", "purl", "pkg:npm/x"];
+    let rewritten = with_default_subcommand(args);
+    assert_eq!(rewritten, args.map(std::ffi::OsString::from));
+    let with_value = with_default_subcommand(["scan", "--llm", "local", "/tmp/a"]);
+    assert_eq!(with_value[1], "fs", "{with_value:?}");
+}
+
 #[test]
 fn retired_follow_spellings_are_refused() {
     let parse = |args: &[&str]| Cli::try_parse_from(with_default_subcommand(args.iter().copied()));
@@ -270,10 +282,36 @@ fn shorthand_accepts_every_fs_flag() -> Result<()> {
             paths,
             hopper,
             registry_map,
+            enable_sidecar,
         } => {
             assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
             assert_eq!(hopper.as_deref(), Some("http://hopper:8081"));
             assert_eq!(registry_map, Some(PathBuf::from("/tmp/map.json")));
+            assert!(!enable_sidecar, "sidecar handling is opt-in");
+        }
+        other => anyhow::bail!("unexpected command: {other:?}"),
+    }
+    Ok(())
+}
+
+/// `--enable-sidecar` is a flag of the path scan, and the bare-path
+/// shorthand carries it like any other.
+#[test]
+fn enable_sidecar_is_a_path_scan_flag() -> Result<()> {
+    let cli = Cli::try_parse_from(with_default_subcommand([
+        "scan",
+        "--enable-sidecar",
+        "/tmp/a",
+    ]))
+    .context("parse should work")?;
+    match cli.command.context("fs subcommand expected")? {
+        Commands::Path {
+            paths,
+            enable_sidecar,
+            ..
+        } => {
+            assert_eq!(paths, vec![PathBuf::from("/tmp/a")]);
+            assert!(enable_sidecar);
         }
         other => anyhow::bail!("unexpected command: {other:?}"),
     }

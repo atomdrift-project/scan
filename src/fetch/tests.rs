@@ -513,6 +513,9 @@ fn only_immutable_coordinates_are_answered_by_name() {
         "pkg:npm/foo@1.2.3?download_url=https://evil.example/foo.tgz",
         "pkg:npm/foo@latest",
         "pkg:npm/foo",
+        // Hex-looking versions are commits only on a VCS host.
+        "pkg:pypi/foo@1111111111111111111111111111111111111111",
+        "pkg:docker/library/alpine@0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     ] {
         assert!(!immutable_coordinate(purl, None), "{purl}");
     }
@@ -531,6 +534,32 @@ fn only_immutable_coordinates_are_answered_by_name() {
         "pkg:gem/rails@7.1.0",
         Some(400 * day)
     ));
+}
+
+/// A PyPI file is immutable where the key is that exact file, though its
+/// young release is not; the release-keyed rule above must not move.
+#[test]
+fn a_pypi_file_is_immutable_only_as_a_file() {
+    let wheel = "pkg:pypi/requests@2.32.3?file_name=requests-2.32.3-py3-none-any.whl";
+    assert!(immutable_file(wheel));
+    assert!(
+        !immutable_coordinate(wheel, None),
+        "the corpus and bloom key by release: a young release stays mutable there"
+    );
+    for purl in [
+        // The release, not a file of it.
+        "pkg:pypi/requests@2.32.3",
+        // Another index's file is that index's promise, not PyPI's.
+        "pkg:pypi/requests@2.32.3?file_name=requests-2.32.3.tar.gz&repository_url=https://pypi.corp.example",
+        // No exact version.
+        "pkg:pypi/requests?file_name=requests-2.32.3.tar.gz",
+        // Other ecosystems follow the release rule.
+        "pkg:gem/rails@7.1.0",
+    ] {
+        assert!(!immutable_file(purl), "{purl}");
+    }
+    // Everything immutable as a release is immutable as a file.
+    assert!(immutable_file("pkg:npm/foo@1.2.3"));
 }
 
 /// A mutable coordinate resolves to the digest the registry lists for the

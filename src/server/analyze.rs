@@ -265,9 +265,10 @@ impl Leader {
     async fn file(&self, mut result: Box<ScanResult>) -> Outcome {
         let state = Arc::clone(&self.state);
         let purl = self.flight.key().purl().map(str::to_owned);
+        let url = self.flight.key().url().map(str::to_owned);
         let refresh = self.follow.refresh;
         let filed = tokio::task::spawn_blocking(move || {
-            index_verdict(&result, purl.as_deref(), refresh);
+            index_verdict(&result, purl.as_deref(), url.as_deref(), refresh);
             if let Some(uploader) = &state.uploader {
                 renew(uploader, &mut result, purl);
             }
@@ -364,7 +365,12 @@ fn llm_source(interpretation: Option<&crate::interpret::Interpretation>) -> Opti
 /// Record what an analysis found, so a later lookup of the same artifact is
 /// answerable without re-running it. Blocking: the index is files.
 /// Best-effort — a lookup that misses is a normal answer.
-pub(super) fn index_verdict(result: &ScanResult, purl: Option<&str>, refresh: bool) {
+pub(super) fn index_verdict(
+    result: &ScanResult,
+    purl: Option<&str>,
+    url: Option<&str>,
+    refresh: bool,
+) {
     let Some(index) = crate::lookup::global() else {
         return;
     };
@@ -373,6 +379,10 @@ pub(super) fn index_verdict(result: &ScanResult, purl: Option<&str>, refresh: bo
         index.replace(&verdict);
     } else {
         index.put(&verdict);
+    }
+    // After the verdict, so the alias never points at a record not yet there.
+    if let Some(url) = url {
+        index.alias_url(url, &result.sha256);
     }
 }
 
@@ -503,13 +513,23 @@ fn classify_purl(
         crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
     });
 
-    // A removed version, or a download that failed where the registry still
-    // has a record: analyze the registry's document instead.
+    // A removed version, or a release that is gone while the registry still
+    // has a record: analyze the registry's document instead. Any other
+    // failure — a size cap, a 5xx, a timeout — says nothing about the package,
+    // so it surfaces as that failure rather than as a verdict judged on
+    // metadata alone, exactly as `scan purl` does.
+    let gone = fetched.as_ref().is_err_and(|e| {
+        e.downcast_ref::<crate::fetch::Unretrievable>()
+            .is_some_and(crate::fetch::Unretrievable::gone)
+    });
     let fallback = registry
         .as_ref()
-        .filter(|reg| fetched.is_err() || reg.version_removed == Some(true))
+        .filter(|reg| gone || reg.version_removed == Some(true))
         .and_then(crate::fetch::registry_document);
     if let Some((name, bytes)) = fallback {
+        if let Err(error) = &fetched {
+            tracing::warn!(%purl, error = %format!("{error:#}"), "artifact gone; scanning registry metadata only");
+        }
         mark("purl:registry-document");
         let hopper_route =
             offer_registry_fallback(corpus, uploader, purl, &name, registry_provenance.as_ref());

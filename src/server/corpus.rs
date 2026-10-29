@@ -74,8 +74,9 @@ pub(crate) enum Reached {
     /// The corpus answered and holds nothing, or holds bytes nobody has
     /// analyzed. Either way there is no verdict — and nothing is wrong.
     Nothing,
-    /// No endpoint could be reached. Says nothing about the artifact, which is
-    /// the whole reason it is distinct from [`Self::Nothing`].
+    /// No endpoint could be reached, or the one that answered sent nothing
+    /// readable. Says nothing about the artifact, which is the whole reason it
+    /// is distinct from [`Self::Nothing`].
     Unreachable,
 }
 
@@ -515,11 +516,14 @@ impl Corpus {
             return match status {
                 200 => match response.json::<Record>().await {
                     Ok(record) => Some((Reached::Record(Box::new(record)), source)),
-                    // Reachable, but not speaking our protocol. Not a reason to try
-                    // the other endpoint, which is running the same build.
+                    // Reachable, but not speaking our protocol — a proxy's error
+                    // page, a schema we do not know. Not a reason to try the other
+                    // endpoint, which is running the same build; but no answer
+                    // either, so never `Nothing`, which would tell a gate the
+                    // artifact was never analyzed and let it fail open.
                     Err(error) => {
-                        tracing::warn!(endpoint = %base, %error, "corpus record did not parse");
-                        Some((Reached::Nothing, source))
+                        tracing::warn!(endpoint = %base, %error, "corpus record did not parse; answering unavailable");
+                        Some((Reached::Unreachable, source))
                     }
                 },
                 // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
@@ -533,6 +537,13 @@ impl Corpus {
                 // would strand every lookup on a replica whose token went stale.
                 401 | 403 => {
                     tracing::warn!(endpoint = %base, status, "corpus turned us away");
+                    None
+                }
+                // Still timing out or rate limiting after the retries: the
+                // endpoint never answered the question, so this is no more
+                // "nothing known" than a 5xx is.
+                408 | 429 => {
+                    tracing::warn!(endpoint = %base, status, "corpus still shedding after retries");
                     None
                 }
                 // Any other 4xx is this request being wrong, which the next
@@ -564,8 +575,12 @@ fn hopper_source(response: &reqwest::Response) -> Option<CorpusSource> {
     }
 }
 
+/// Exponential, with jitter in `[0.5, 1.5)` of the step so a fleet of scan
+/// servers does not retry a restarted hopper in lockstep.
 fn read_backoff(attempt: usize) -> Duration {
-    READ_BACKOFF.saturating_mul(1u32 << attempt.min(4))
+    READ_BACKOFF
+        .saturating_mul(1u32 << attempt.min(4))
+        .mul_f64(0.5 + crate::retry::fuzz())
 }
 
 /// Percent-encode a PURL for a query string. A PURL's own grammar carries `?`,
@@ -983,6 +998,20 @@ mod tests {
                 .await
                 .0,
             Reached::Nothing,
+        );
+    }
+
+    /// A 200 that is not a record — a proxy's error page — answered nothing.
+    /// Reading it as `Nothing` would tell a gate the artifact was never
+    /// analyzed, which is exactly the fail-open an outage must not cause.
+    #[tokio::test]
+    async fn an_unreadable_record_is_unavailable_not_unknown() {
+        let c = corpus(&endpoint("200 OK", "<html>gateway error</html>"));
+        assert_eq!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
+                .await
+                .0,
+            Reached::Unreachable,
         );
     }
 

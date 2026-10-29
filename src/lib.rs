@@ -52,6 +52,7 @@ pub mod pkg;
 pub mod provenance;
 pub mod ps;
 pub mod remote;
+mod retry;
 pub mod rules;
 pub mod runtime;
 pub mod server;
