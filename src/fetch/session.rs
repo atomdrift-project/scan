@@ -7,6 +7,11 @@
 )]
 use super::*;
 
+fn is_registry_security_hold_finding(id: &str) -> bool {
+    id.strip_prefix("metadata/registry::")
+        .is_some_and(|name| name == TRAIT_SECURITY_HOLD_RECORD || name == "registry-security-hold")
+}
+
 /// One group's references after selection and the age gate: the ones to
 /// fetch, and the registry records materialized for its dependencies.
 pub(super) struct GroupPlan {
@@ -206,7 +211,8 @@ pub(super) struct FetchSession {
     pub(super) current_hop: u8,
     pub(super) pending_error: Option<String>,
     pub(super) pending: Option<Arc<pending::Store>>,
-    pub(super) local_coverage: HashMap<(String, String), String>,
+    /// Locally supplied copies: source sha → locator → path.
+    pub(super) local_coverage: HashMap<String, HashMap<String, String>>,
     pub(super) unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
 }
 
@@ -430,7 +436,9 @@ impl FetchSession {
                     };
                     if reference.pinned_hash.is_some() {
                         self.local_coverage
-                            .insert((source.clone(), locator(reference).to_owned()), path);
+                            .entry(source.clone())
+                            .or_default()
+                            .insert(locator(reference).to_owned(), path);
                         return true;
                     }
                     self.out.records.push(skipped_record(
@@ -497,11 +505,19 @@ impl FetchSession {
             .iter()
             .flat_map(|(sha, refs)| {
                 refs.iter()
-                    .filter(|r| r.is_fetch_target() && self.policy.wants(r.kind))
+                    .filter(|r| self.policy.wants(r.kind))
                     .map(|r| self.pending_entry(sha, r, hop, reason))
             })
             .collect();
-        self.checkpoint(&entries, &[]);
+        // Every skip is reported, but only what `select` would take at `hop`
+        // is checkpointed: anything else is never fetched, so it would never
+        // be completed and would sit in the backlog forever.
+        let resumable: Vec<_> = entries
+            .iter()
+            .filter(|e| self.wanted(&e.reference, hop) && !self.dev_excluded(&e.reference))
+            .cloned()
+            .collect();
+        self.checkpoint(&resumable, &[]);
         for entry in entries {
             self.out.records.push(skipped_record(
                 &entry.source_sha,
@@ -621,11 +637,7 @@ impl FetchSession {
                 ));
                 continue;
             }
-            if !self.policy.include_dev_dependencies
-                && r.context
-                    .as_ref()
-                    .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
-            {
+            if self.dev_excluded(&r) {
                 self.out.records.push(skipped_record(
                     source_sha,
                     &r,
@@ -633,22 +645,26 @@ impl FetchSession {
                 ));
                 continue;
             }
-            if r.source == "ast-fetch-call"
-                && self.wanted(&r, hop)
-                && let Some(reason) = self.fetch_skip_reason(&r)
-            {
-                self.out.records.push(skipped_record(
-                    source_sha,
-                    &r,
-                    Coverage::Unavailable {
-                        reason: Some(format!("downloader URL excluded by policy ({reason})")),
-                    },
-                ));
+            if !self.wanted(&r, hop) {
                 continue;
             }
-            if self.wanted(&r, hop)
-                && self.fetchable(&r)
-                && !self.off_host(&r)
+            if let Some(reason) = self.fetch_skip_reason(&r) {
+                // A downloader the code calls is evidence, so its exclusion is
+                // recorded; any other unfetchable reference only logs.
+                if r.source == "ast-fetch-call" {
+                    self.out.records.push(skipped_record(
+                        source_sha,
+                        &r,
+                        Coverage::Unavailable {
+                            reason: Some(format!("downloader URL excluded by policy ({reason})")),
+                        },
+                    ));
+                } else {
+                    tracing::debug!(locator = %locator(&r), source = %r.source, "{reason}; fetch skipped");
+                }
+                continue;
+            }
+            if !self.off_host(&r)
                 && self.newest_version(&r, dropped_old)
                 && !self.superseded(&r)
                 && self.seen.insert(fetch_work_key(&r))
@@ -657,6 +673,14 @@ impl FetchSession {
             }
         }
         selected
+    }
+
+    /// Whether `r` is a development dependency this policy leaves out.
+    fn dev_excluded(&self, r: &Reference) -> bool {
+        !self.policy.include_dev_dependencies
+            && r.context
+                .as_ref()
+                .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
     }
 
     /// Whether this hop follows `r`, CI references only under `--ci`. Called
@@ -788,7 +812,7 @@ impl FetchSession {
     /// are trait-matched, and releases older than the age ceiling are dropped
     /// before the expensive fetch+scan of their bytes. Skips are reported, never
     /// silent.
-    pub(super) fn plan(&mut self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
+    pub(super) fn plan(&self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
         let (selected, registries) = age_gate(selected, &self.policy, self.res, self.now);
         // Reveal the kept (to-fetch) set as pending, so the tree shows the
         // dependencies it will actually scan up front. Aged-out deps are
@@ -830,6 +854,17 @@ impl FetchSession {
             })
             .map(|r| locator(r).to_owned())
             .collect();
+        // A coordinate whose bytes can change is asked about by the digest its
+        // registry lists today, never by name; see `precheck_resolved`. A
+        // release's age, where the age gate looked it up, can settle that.
+        let ages: HashMap<&str, u64> = plans
+            .iter()
+            .flat_map(|plan| &plan.registries)
+            .filter_map(|g| Some((locator(&g.reference), g.record.age_secs(self.now)?)))
+            .collect();
+        let (candidates, mutable): (Vec<String>, Vec<String>) = candidates
+            .into_iter()
+            .partition(|purl| immutable_coordinate(purl, ages.get(purl.as_str()).copied()));
         // Hopper is ours; isotope13 is told only public-registry coordinates.
         // The rest are fetched and asked about by digest.
         let candidates = if precheck.is_isotope13() {
@@ -848,18 +883,66 @@ impl FetchSession {
         } else {
             candidates
         };
-        if candidates.is_empty() {
-            return HashMap::new();
-        }
-        let hits = precheck.purls(&candidates);
+        let mut hits = if candidates.is_empty() {
+            HashMap::new()
+        } else {
+            precheck.purls(&candidates)
+        };
+        let by_digest = self.precheck_resolved(precheck, &mutable);
+        let resolved = by_digest.len();
+        hits.extend(by_digest);
         if !hits.is_empty() {
             tracing::info!(
                 skipped = hits.len(),
-                asked = candidates.len(),
+                asked = candidates.len() + mutable.len(),
+                by_digest = resolved,
                 "purl precheck: hopper verdicts stand; skipped fetch+analysis+upload"
             );
         }
         hits
+    }
+
+    /// The standing verdicts for mutable coordinates, asked about by the sha256
+    /// their registry lists for the exact file a fetch would download — the
+    /// one identity of theirs that cannot be repointed. Resolving reads the
+    /// registry document the age gate's lookup usually just cached, so it seldom
+    /// costs a request, and one it does cost a fetch would have paid anyway. A
+    /// coordinate with no listed digest (a git tag, a container tag) is fetched.
+    fn precheck_resolved(
+        &self,
+        precheck: &crate::corpus_precheck::Precheck,
+        purls: &[String],
+    ) -> HashMap<String, crate::corpus_precheck::PurlHit> {
+        use rayon::prelude::*;
+        if purls.is_empty() {
+            return HashMap::new();
+        }
+        let resolved: Vec<(&String, String)> = purls
+            .par_iter()
+            .filter_map(|purl| {
+                let sha = registry_digest(purl, &*self.res.net, &self.res.cache);
+                tracing::debug!(
+                    package = %purl,
+                    sha256 = sha.as_deref().unwrap_or("none listed; fetching"),
+                    "purl precheck: mutable coordinate resolved to its registry digest"
+                );
+                Some((purl, sha?))
+            })
+            .collect();
+        let shas: Vec<String> = resolved.iter().map(|(_, sha)| sha.clone()).collect();
+        let standings = precheck.shas(&shas);
+        resolved
+            .into_iter()
+            .filter_map(|(purl, sha)| {
+                let standing = standings.get(&sha)?.clone();
+                standing.skips_analysis().then(|| {
+                    (
+                        purl.clone(),
+                        crate::corpus_precheck::PurlHit { sha, standing },
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Fetch one group's selected references: dependencies and
@@ -932,7 +1015,8 @@ impl FetchSession {
         for l in &mut landed {
             if let Some(path) = self
                 .local_coverage
-                .get(&(source_sha.clone(), locator(&l.reference).to_owned()))
+                .get(&source_sha)
+                .and_then(|by_locator| by_locator.get(locator(&l.reference)))
             {
                 l.record.coverage.push(Coverage::Supplied {
                     path: path.clone(),
@@ -1161,6 +1245,8 @@ impl FetchSession {
             }
             self.merge_registry_record(report, &source_sha, gated, sub, &mut registry_findings);
         }
+        // `next` spans the whole hop; only what this group adds is new here.
+        let discovered_from = next.len();
         for (l, mut payload) in landed.iter_mut().zip(payloads) {
             if payload.is_none()
                 && delivered_bytes(&l.record)
@@ -1216,19 +1302,18 @@ impl FetchSession {
             }
         }
         self.checkpoint(&pending, &completed);
-        // Only what the gate would admit: a reference `fetchable` rejects is
-        // never fetched, so it would never be completed and would sit in the
-        // backlog forever.
-        let discovered: Vec<_> = next
+        // Only what `select` would admit on the next hop: a reference it drops
+        // is never fetched, so it would never be completed and would sit in
+        // the backlog forever.
+        let next_hop = self.current_hop.saturating_add(1);
+        let discovered: Vec<_> = next[discovered_from..]
             .iter()
             .flat_map(|(sha, refs)| {
                 refs.iter()
                     .filter(|r| {
-                        r.is_fetch_target() && self.policy.wants(r.kind) && self.fetchable(r)
+                        self.wanted(r, next_hop) && !self.dev_excluded(r) && self.fetchable(r)
                     })
-                    .map(|r| {
-                        self.pending_entry(sha, r, self.current_hop.saturating_add(1), "discovered")
-                    })
+                    .map(|r| self.pending_entry(sha, r, next_hop, "discovered"))
             })
             .collect();
         self.checkpoint(&discovered, &[]);
@@ -1270,7 +1355,7 @@ impl FetchSession {
             tally.0 += 1;
             if findings
                 .iter()
-                .any(|f| f.id.contains(TRAIT_SECURITY_HOLD_RECORD))
+                .any(|f| is_registry_security_hold_finding(&f.id))
             {
                 tally.1 += 1;
             }
@@ -1609,5 +1694,29 @@ pub(super) fn attribute_reference_outcomes(
                 "reference-outcome traits fired on a declaring file"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod security_hold_finding_tests {
+    use super::is_registry_security_hold_finding;
+
+    #[test]
+    fn recognizes_only_registry_hold_evidence() {
+        assert!(is_registry_security_hold_finding(
+            "metadata/registry::registry-security-hold"
+        ));
+        assert!(is_registry_security_hold_finding(
+            "metadata/registry::registry-security-hold-record"
+        ));
+        assert!(!is_registry_security_hold_finding(
+            "metadata/registry::registry-security-hold-record-impostor"
+        ));
+        assert!(!is_registry_security_hold_finding(
+            "other/registry::registry-security-hold-record"
+        ));
+        assert!(!is_registry_security_hold_finding(
+            "metadata/registry::deprecated"
+        ));
     }
 }

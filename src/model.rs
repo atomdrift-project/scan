@@ -341,10 +341,12 @@ impl Model {
         );
         let mut policies = policies?;
         let general = general?;
+        let pin = Arc::new(BundlePin::new(model_dir));
         let (filegroups, filetypes) = rayon::join(
             || {
                 load_specialists(
                     &model_dir.join("filegroups"),
+                    &pin,
                     &cfg.route_thresholds,
                     &policies,
                     &names,
@@ -354,6 +356,7 @@ impl Model {
             || {
                 load_specialists(
                     &model_dir.join("filetypes"),
+                    &pin,
                     &cfg.route_thresholds,
                     &policies,
                     &names,
@@ -411,6 +414,14 @@ impl Model {
             routes.calibrator(general.calibrator.as_ref(), route)
         });
         let routes = RouteSet { policies, ..routes };
+        // The general grid comes from the same raw `levels[]` table, and the
+        // fallback sweep compares it with calibrated probabilities too.
+        let mut general_grid = cfg.general_grid;
+        if let Some(cal) = general.calibrator.as_ref() {
+            for (_, threshold) in &mut general_grid {
+                *threshold = cal.apply(*threshold);
+            }
+        }
 
         tracing::info!(
             n_members = general.backend.n_members(),
@@ -430,7 +441,7 @@ impl Model {
             general,
             routes,
             active_level,
-            cfg.general_grid,
+            general_grid,
             cfg.grid_max,
         ))
     }
@@ -750,12 +761,6 @@ impl Model {
             threshold,
             level: Level::At(fired_level),
         }
-    }
-
-    /// Inference backend identifier (always `"onnx"`).
-    #[must_use]
-    pub const fn backend_kind(&self) -> &'static str {
-        "onnx"
     }
 
     /// Feature specification used to build input vectors.

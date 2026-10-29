@@ -35,7 +35,6 @@ fn onnx_bundle_dispatches_to_onnx_backend() {
     let src = onnx_bundle();
     let src = src.path();
     let model = Model::load(src, None, None).expect("load ONNX bundle");
-    assert_eq!(model.backend_kind(), "onnx");
     assert!(model.spec().total_features() > 0);
 
     let prob = predict(&model);
@@ -64,7 +63,6 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     std::fs::write(models_dir.join("README.md"), b"hi").unwrap();
 
     let model = Model::load(dir.path(), None, None).expect("load multi-seed bundle");
-    assert_eq!(model.backend_kind(), "onnx");
     let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 

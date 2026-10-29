@@ -874,3 +874,38 @@ fn openrouter_key_falls_back_to_tok_file() -> Result<()> {
     assert_eq!(cfg.api_key.as_deref(), Some("sk-from-file"));
     Ok(())
 }
+
+/// A flag's value is not a path: the shorthand inserts `fs` only when an
+/// operand clap would actually see is present, and leaves a named subcommand
+/// alone even when a value-taking flag comes first.
+#[test]
+fn the_shorthand_skips_flag_values() -> Result<()> {
+    let rewrites = |args: &[&str]| {
+        let rewritten = with_default_subcommand(args.iter().copied());
+        rewritten.get(1).is_some_and(|arg| arg == "fs") && rewritten.len() == args.len() + 1
+    };
+    assert!(!rewrites(&["scan", "--format", "json"]), "no path to scan");
+    assert!(
+        !rewrites(&["scan", "-l", "25"]),
+        "a short flag's value is no path"
+    );
+    assert!(!rewrites(&["scan", "--format", "json", "serve"]));
+    assert!(rewrites(&["scan", "--format=json", "/tmp/a"]));
+    assert!(rewrites(&["scan", "-l25", "/tmp/a"]));
+    assert!(
+        rewrites(&["scan", "--", "serve"]),
+        "after `--` it is a path"
+    );
+    assert!(!rewrites(&["scan", "--"]));
+
+    let cli = Cli::try_parse_from(with_default_subcommand([
+        "scan", "--format", "json", "/tmp/a",
+    ]))
+    .context("a path after a flag value should parse")?;
+    assert_eq!(cli.global.format, OutputFormat::Json);
+    match cli.command.context("a subcommand")? {
+        Commands::Path { paths, .. } => assert_eq!(paths, vec![PathBuf::from("/tmp/a")]),
+        other => anyhow::bail!("unexpected command: {other:?}"),
+    }
+    Ok(())
+}

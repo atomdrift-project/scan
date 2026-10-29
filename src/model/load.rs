@@ -356,6 +356,7 @@ pub(super) fn load_bundle(
 /// looked up under e.g. `"filegroups/native"`.
 pub(super) fn load_specialists(
     parent: &Path,
+    pin: &Arc<BundlePin>,
     route_thresholds: &HashMap<String, Thresholds>,
     route_policies: &RoutePolicies,
     names: &RouteNames,
@@ -423,6 +424,7 @@ pub(super) fn load_specialists(
                 id,
                 thresholds: route_t.unwrap_or_default(),
                 calibrator,
+                pin: Arc::clone(pin),
                 loaded: OnceLock::new(),
             },
         );
@@ -470,6 +472,37 @@ pub(super) struct Route {
     pub(super) calibrator: Option<IsotonicCalibrator>,
 }
 
+/// The installed bundle a model was loaded from.
+///
+/// A specialist is built on first use, which may be days after load, and an
+/// update swaps the whole bundle directory meanwhile. A specialist read from
+/// the new bundle would be scored against the old one's calibrators and
+/// policy thresholds, so it is refused instead until the next reload. A
+/// working tree without the install sidecar reads `None` throughout.
+#[derive(Debug)]
+pub(super) struct BundlePin {
+    dir: PathBuf,
+    commit: Option<String>,
+}
+
+impl BundlePin {
+    pub(super) fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            commit: Self::commit(dir),
+        }
+    }
+
+    fn commit(dir: &Path) -> Option<String> {
+        crate::model_update::installed(dir).map(|installed| installed.commit)
+    }
+
+    /// Whether the directory still holds the bundle that was loaded.
+    fn holds(&self) -> bool {
+        Self::commit(&self.dir) == self.commit
+    }
+}
+
 /// A specialist registered at load and built on first use.
 #[derive(Debug)]
 pub(super) struct LazyRoute {
@@ -479,6 +512,7 @@ pub(super) struct LazyRoute {
     pub(super) id: RouteId,
     pub(super) thresholds: Thresholds,
     pub(super) calibrator: Option<IsotonicCalibrator>,
+    pub(super) pin: Arc<BundlePin>,
     pub(super) loaded: OnceLock<RouteLoad>,
 }
 
@@ -491,7 +525,17 @@ pub(super) enum RouteLoad {
 impl LazyRoute {
     pub(super) fn load_once(&self) -> &RouteLoad {
         self.loaded.get_or_init(|| {
-            match load_specialist(&self.bundle_dir, &self.name, self.thresholds) {
+            // Checked after the read, so a swap that lands mid-read is caught.
+            let loaded =
+                load_specialist(&self.bundle_dir, &self.name, self.thresholds).and_then(|route| {
+                    anyhow::ensure!(
+                        self.pin.holds(),
+                        "the model bundle was replaced on disk after it was loaded; \
+                         reload to use the new one"
+                    );
+                    Ok(route)
+                });
+            match loaded {
                 Ok(route) => RouteLoad::Loaded(Arc::new(route)),
                 Err(error) => {
                     let message = format!("{error:#}");

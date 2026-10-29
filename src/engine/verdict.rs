@@ -57,7 +57,6 @@ pub const fn level_confidence(level: Level) -> Option<u8> {
         Level::At(50002) => Some(15),
         Level::At(n) if n > 50002 => Some(15),
         Level::At(n) if n > 25002 => Some(26),
-        Level::At(n) if n > 25000 => Some(28),
         Level::At(n) if n > 20000 => Some(29),
         Level::At(n) if n > 15000 => Some(33),
         Level::At(n) if n > 10000 => Some(38),
@@ -100,7 +99,7 @@ pub(super) fn softened_level(ml_level: Level, active_level: Option<u16>, grid_ma
     let Some(active) = active_level else {
         return Level::Manual;
     };
-    // No level to scale by (manual-threshold mode) falls back to the midpoint.
+    // ML placed nowhere to scale by (clean, or L0) falls back to the midpoint.
     let fraction = match ml_level {
         Level::At(lvl) if lvl > 0 && active > 0 => {
             (f64::from(lvl) / f64::from(active)).clamp(0.0, 1.0)
@@ -270,9 +269,9 @@ const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 3;
 /// Subsumes a count — n families need n findings — so this is the arm's only
 /// threshold.
 ///
-/// Set above [`TRAIT_FLOOR_HOSTILE_FAMILIES`] deliberately. The hostile arm has
-/// a confident crit-5 anchoring it; this arm has nothing but the breadth of its
-/// own evidence, so it has to be broader to make the same claim.
+/// Never below [`TRAIT_FLOOR_HOSTILE_FAMILIES`]: the hostile arm has a
+/// confident crit-5 anchoring it, while this arm has nothing but the breadth of
+/// its own evidence, so it must be at least as broad to make a claim.
 const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
 
 /// Trait-hierarchy depth that defines a family: `objectives/anti-static` rather
@@ -435,8 +434,8 @@ impl FloorDecision {
 
     /// The worse of two firings, for summarizing an archive by its members.
     ///
-    /// The graver class wins; between two of the same class, the better
-    /// corroborated one does.
+    /// The graver class wins; between two of the same class, the more confident
+    /// one does.
     #[must_use]
     pub fn worse_of(self, other: Self) -> Self {
         match self.class.cmp(&other.class) {
@@ -475,7 +474,7 @@ impl FloorDecision {
 /// boundaries used by ordinary and interpreted verdicts, so a level-only
 /// downstream consumer cannot reinterpret the override as another class.
 #[must_use]
-pub fn trait_floor(
+fn trait_floor(
     findings: &[CompactTrait],
     model_class: Classification,
     active_level: Option<u16>,

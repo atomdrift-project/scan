@@ -164,10 +164,15 @@ pub(super) fn resolved_purl(r: &Reference, reg: &Registry) -> Option<String> {
 /// is already in hand) and catches the range-declared references the pre-lookup
 /// probe cannot. Pairs with [`must_rescan`], which the pre-lookup path has to
 /// forgo — here the record exists, so a yanked version is still caught.
-pub(super) fn bloom_known_good_resolved(r: &Reference, reg: &Registry) -> bool {
-    resolved_purl(r, reg).is_some_and(|purl| {
-        crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(&purl).may_skip())
-    })
+///
+/// Only for a coordinate whose bytes cannot change ([`immutable_coordinate`]):
+/// a vouch for a git tag or a PyPI release says nothing about what it names now.
+pub(super) fn bloom_known_good_resolved(r: &Reference, reg: &Registry, now: u64) -> bool {
+    resolved_purl(r, reg)
+        .filter(|purl| immutable_coordinate(purl, reg.age_secs(now)))
+        .is_some_and(|purl| {
+            crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(&purl).may_skip())
+        })
 }
 
 /// Whether a reference is a known-good package coordinate per the loaded bloom
@@ -177,12 +182,14 @@ pub(super) fn bloom_known_good_resolved(r: &Reference, reg: &Registry) -> bool {
 /// the registry round-trip and the artifact fetch. That means the yank check
 /// [`must_rescan`] performs is *not* applied there — it needs a registry record
 /// this path deliberately never fetches. The trade is intentional: a vouched
-/// coordinate is not worth a network round-trip to re-confirm.
+/// coordinate is not worth a network round-trip to re-confirm. A mutable one
+/// ([`immutable_coordinate`]) is never vouched for by name.
 pub(super) fn bloom_known_good_purl(r: &Reference) -> bool {
     let RefLocator::Purl(purl) = &r.locator else {
         return false;
     };
-    crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(purl).may_skip())
+    immutable_coordinate(purl, None)
+        && crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(purl).may_skip())
 }
 
 /// Skip predicate for fetched-dependency analysis: skip any member cleave is
@@ -501,7 +508,8 @@ pub(super) fn age_gate(
                     .is_some_and(|max| record.age_secs(now).is_some_and(|age| age >= max))
                 {
                     Some(SkipReason::AgedOut)
-                } else if bloom_known_good_resolved(&r, &record) && !must_rescan(&record, now) {
+                } else if bloom_known_good_resolved(&r, &record, now) && !must_rescan(&record, now)
+                {
                     Some(SkipReason::KnownGood)
                 } else {
                     None

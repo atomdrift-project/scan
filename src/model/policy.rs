@@ -22,8 +22,8 @@ pub(super) struct EnsembleConfig {
     /// `"filegroups/<name>"`, `"filetypes/<name>"`.
     pub(super) route_thresholds: HashMap<String, Thresholds>,
     /// General route's hostile threshold at every level, ascending by level.
-    /// Drives the verdict sweep for filetypes with no route policy. Calibrated
-    /// space, matching the general route's emitted probability.
+    /// Drives the verdict sweep for filetypes with no route policy. Raw score
+    /// space as written; `Model::load_ensemble` calibrates it.
     pub(super) general_grid: Vec<(u16, f32)>,
     /// Largest level present in the `levels[]` grid. The suspicious cap is
     /// `capped_suspicious_level(grid_max)`.

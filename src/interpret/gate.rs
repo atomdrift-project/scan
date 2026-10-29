@@ -426,7 +426,7 @@ pub struct Admitted {
     pub(super) ml_class: Classification,
     pub(super) ml_prob: f32,
     pub(super) levels: LevelContext,
-    /// cleave surfaced a hostile finding, in the report or the render.
+    /// cleave's report carries a hostile finding.
     pub(super) hostile_finding: bool,
 }
 
@@ -454,7 +454,7 @@ pub fn admit(
     subject: &str,
 ) -> Option<Admitted> {
     // Gate: interpret when ML fired at or below the cutoff level, OR when cleave
-    // surfaced an elevated (suspicious/hostile) finding that ML scored below it —
+    // surfaced a hostile finding that ML scored below it —
     // that disagreement is exactly where a second opinion pays off, and it is how
     // an ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
     // LLM. Truly-clean files (no elevated finding, no calibrated ML signal) skip.
@@ -463,14 +463,13 @@ pub fn admit(
     // hostile call came from a member elevation carries the member's class but
     // its own raw score, which can sit far below the cutoff (windows-bindgen:
     // class hostile at level 0, prob 9e-6, and no elevated finding left in the
-    // render). Gating that out publishes a hostile verdict
-
-    // with no interpretation and no error trace; anything the scan itself calls
+    // render). Gating that out publishes a hostile verdict with no
+    // interpretation and no error trace; anything the scan itself calls
     // non-benign must reach the LLM.
     //
-    // `findings` is authoritative here and the render scan is only a backstop:
-    // admission is cheap and a miss is expensive, so either saying "elevated" is
-    // enough. See [`FindingSeverity`] for why the render alone was not.
+    // `findings` comes from the structured report, never the render; see
+    // [`FindingSeverity`] for why.
+    //
     // A raw-probability floor is a fourth admission, and it exists because the
     // level grid can be silent on a file the model is not actually comfortable
     // with. `ml_admits` needs a *fired* level, so a sample the calibration never
@@ -511,7 +510,7 @@ pub fn admit(
     if !benign_class {
         reasons.push("class");
     }
-    let placed = levels.ml_admits(cfg.min_level) || levels.ml_placed();
+    let placed = levels.ml_admits(cfg.min_level);
     // The size veto: see `DEFAULT_LLM_BENIGN_NOTABLE_CAP`. Only the Required
     // tier is subject to it; a level placement below is never withheld.
     let vetoed = cfg.benign_notable_cap > 0

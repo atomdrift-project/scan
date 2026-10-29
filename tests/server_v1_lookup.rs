@@ -121,6 +121,26 @@ async fn repeated_purl_answers_with_a_list() -> Result<()> {
     Ok(())
 }
 
+/// A lookup only reads layers, so a batch must never report `scan:analysis`:
+/// that header is what a caller's bill counts as work.
+#[tokio::test]
+async fn a_batch_lookup_never_claims_an_analysis() -> Result<()> {
+    let uri = format!(
+        "/v1/lookup?purl={}&purl={}",
+        encoded_purl(UNKNOWN),
+        encoded_purl("pkg:npm/scan-v1-fixture-other@0.0.0")
+    );
+    let req = loopback(Request::builder().uri(uri).body(Body::empty())?);
+    let res = app().await?.oneshot(req).await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let source = res
+        .headers()
+        .get("X-Scan-Source")
+        .context("a lookup names its source")?;
+    assert_ne!(source, "scan:analysis");
+    Ok(())
+}
+
 /// Several digests are several artifacts — a directory of files — asked in
 /// one request and answered as a list in the order asked.
 #[tokio::test]

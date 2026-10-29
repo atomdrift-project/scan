@@ -384,38 +384,56 @@ where
     let Some((program, rest)) = args.split_first() else {
         return args;
     };
-    // Everything after `--` is a value by definition, so a subcommand name can
-    // only appear before it.
-    let named = rest
-        .iter()
-        .take_while(|arg| *arg != "--")
-        .filter_map(|arg| arg.to_str());
     let command = Cli::command();
-    let subcommands: Vec<&str> = command
-        .get_subcommands()
-        .flat_map(|sub| std::iter::once(sub.get_name()).chain(sub.get_all_aliases()))
+    // The flags a shorthand line may carry: the globals, and `fs`'s own.
+    let flags: Vec<&clap::Arg> = command
+        .get_arguments()
+        .chain(
+            command
+                .find_subcommand(DEFAULT_SUBCOMMAND)
+                .into_iter()
+                .flat_map(clap::Command::get_arguments),
+        )
         .collect();
-    for arg in named {
-        if subcommands.contains(&arg)
-            || matches!(arg, "help" | "-h" | "--help" | "-V" | "--version")
-        {
+    let mut tokens = rest.iter();
+    let mut operand = None;
+    // Everything after `--` is a path by definition, never a subcommand.
+    let mut escaped_path = false;
+    while let Some(arg) = tokens.next() {
+        if arg == "--" {
+            escaped_path = tokens.next().is_some();
+            break;
+        }
+        let Some(text) = arg.to_str() else {
+            // Only a path can be other than UTF-8.
+            operand = operand.or(Some(arg));
+            continue;
+        };
+        if matches!(text, "-h" | "--help" | "-V" | "--version") {
             return args;
         }
+        if text.len() > 1 && text.starts_with('-') {
+            // A flag's value is not an operand, even when it looks like one.
+            if takes_next_value(&flags, text) {
+                tokens.next();
+            }
+        } else if operand.is_none() {
+            operand = Some(arg);
+        }
     }
-    // No operand means nothing to scan: let the top-level parser answer, which
-    // is what prints the help for a bare `atomscan`.
-    let mut operands = rest
-        .iter()
-        .skip_while(|arg| *arg != "--")
-        .skip(1)
-        .peekable();
-    let has_operand = operands.peek().is_some()
-        || rest
-            .iter()
-            .take_while(|arg| *arg != "--")
-            .any(|arg| !arg.as_encoded_bytes().starts_with(b"-"));
-    if !has_operand {
-        return args;
+    // The first operand is where clap looks for a subcommand. With none there
+    // is nothing to scan: the top-level parser answers, which is what prints
+    // the help for a bare `atomscan`.
+    let is_subcommand = |name: &str| {
+        name == "help"
+            || command
+                .get_subcommands()
+                .any(|sub| sub.get_name() == name || sub.get_all_aliases().any(|a| a == name))
+    };
+    match operand {
+        Some(first) if first.to_str().is_some_and(is_subcommand) => return args,
+        None if !escaped_path => return args,
+        _ => {}
     }
     let mut rewritten = Vec::with_capacity(args.len() + 1);
     rewritten.push(program.clone());
@@ -424,9 +442,32 @@ where
     rewritten
 }
 
-/// Resolve the hopper destination consistently for every scan mode. Most
-/// subcommands let clap populate their local `hopper` field from the
-/// environment, but bare-path shorthand bypasses subcommand parsing.
+/// Whether clap reads the token after `flag` as its value: a long flag that
+/// takes one, unless given as `--flag=value` or only with `=`, or a short
+/// cluster ending in one with nothing attached (`-f json`, not `-fjson`).
+fn takes_next_value(flags: &[&clap::Arg], flag: &str) -> bool {
+    let takes = |arg: &&clap::Arg| arg.get_action().takes_values() && !arg.is_require_equals_set();
+    if let Some(long) = flag.strip_prefix("--") {
+        return !long.contains('=')
+            && flags
+                .iter()
+                .any(|arg| arg.get_long() == Some(long) && takes(arg));
+    }
+    let shorts = flag.strip_prefix('-').unwrap_or(flag);
+    for (i, short) in shorts.char_indices() {
+        if flags
+            .iter()
+            .any(|arg| arg.get_short() == Some(short) && takes(arg))
+        {
+            return i + short.len_utf8() == shorts.len();
+        }
+    }
+    false
+}
+
+/// Resolve the hopper destination consistently for every scan mode. Clap fills
+/// a subcommand's `--hopper` from `SCAN_HOPPER`; this fallback covers the scan
+/// modes that have no such flag of their own.
 fn resolve_hopper(hopper: Option<String>) -> Option<String> {
     let hopper = resolve_hopper_value(hopper, scan::env::text(scan::env::SCAN_HOPPER));
     if let Some(raw) = hopper.as_deref() {
@@ -480,8 +521,8 @@ enum Commands {
         /// sidecar, a `{record,sources}` fletch envelope, or a legacy bare
         /// registry record. Complete inputs retain their raw provider data.
         /// A file absent from the map scans normally.
-        ///
-        #[arg(long, value_name = "FILE")]
+        /// Also settable via the `SCAN_REGISTRY_MAP` env var.
+        #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
         registry_map: Option<PathBuf>,
     },
 
@@ -846,8 +887,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cleave::rule_update::sign_in()?;
         }
         scan::auto_update::refresh_if_stale(
-            global.update,
-            global.no_update,
+            global.refresh(),
             global.mode,
             global.format == scan::OutputFormat::Terminal,
         )?;
@@ -912,12 +952,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?
             .with_extra(global.extra)
             .with_level(level)
-            .with_zip_passwords(global.zip_passwords.clone());
+            .with_zip_passwords(global.zip_passwords);
             scan::validate::run(&config, skip_traits)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Version => {
-            print_version(global.format);
+            print_version(global.format)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -1287,8 +1327,9 @@ fn check_rules(sources: &[scan::rules::Source], model_dir: Option<&Path>) -> Exi
 }
 
 /// `atomscan version`: this build, and the identity and size of every rule
-/// source it would scan with.
-fn print_version(format: scan::OutputFormat) {
+/// source it would scan with. A closed pipe is an error, not a panic.
+fn print_version(format: scan::OutputFormat) -> std::io::Result<()> {
+    use std::io::Write as _;
     let bloom = scan::bloom_repo::installed_manifest();
     let nsrl = scan::nsrl_repo::installed_manifest();
     if format == scan::OutputFormat::Json {
@@ -1332,8 +1373,7 @@ fn print_version(format: scan::OutputFormat) {
             "nsrl": nsrl,
             "nsrl_release": scan::nsrl_repo::installed_release(),
         });
-        println!("{version}");
-        return;
+        return writeln!(std::io::stdout(), "{version}");
     }
 
     use scan::output::SourceRow;
@@ -1444,7 +1484,7 @@ fn print_version(format: scan::OutputFormat) {
         bloom_count,
         rules,
         &rows,
-    );
+    )
 }
 
 /// The abbreviated commit hash and committer date (Unix seconds) of `HEAD` in

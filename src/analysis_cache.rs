@@ -41,7 +41,7 @@ pub(crate) struct Cached {
 /// (potentially large) report.
 #[derive(Serialize)]
 struct StoreRef<'a> {
-    sub: &'a Option<AnalysisReport>,
+    sub: Option<&'a AnalysisReport>,
     next: &'a [(String, Vec<Reference>)],
 }
 
@@ -96,10 +96,10 @@ impl AnalysisCache {
     pub(crate) fn put(
         &self,
         key: &str,
-        sub: &Option<AnalysisReport>,
+        sub: Option<&AnalysisReport>,
         next: &[(String, Vec<Reference>)],
     ) {
-        if sub.as_ref().is_some_and(incomplete) {
+        if sub.is_some_and(incomplete) {
             return;
         }
         let Ok(json) = serde_json::to_vec(&StoreRef { sub, next }) else {
@@ -343,7 +343,7 @@ mod tests {
             sha256: "sample".into(),
             architectures: None,
         });
-        warm.put("sample", &Some(report), &[]);
+        warm.put("sample", Some(&report), &[]);
         assert!(
             cache(&version()).get("sample").is_some(),
             "unchanged rules hit"
@@ -434,7 +434,7 @@ mod tests {
             dir: base.path().join("ns"),
         };
         // The namespace was pruned by another process after this one opened it.
-        cache.put("abc", &None, &[("k".to_string(), Vec::new())]);
+        cache.put("abc", None, &[("k".to_string(), Vec::new())]);
         let hit = cache.get("abc").unwrap();
         assert!(hit.sub.is_none());
         assert_eq!(hit.next.len(), 1);
@@ -463,7 +463,7 @@ mod tests {
             })
         };
 
-        cache.put("complete", &Some(report()), &[]);
+        cache.put("complete", Some(&report()), &[]);
         assert!(cache.get("complete").is_some());
         for gap in [
             EvaluationDeadline,
@@ -472,7 +472,7 @@ mod tests {
         ] {
             let cut_short = report();
             cut_short.analysis_gaps.record(gap);
-            cache.put(gap.label(), &Some(cut_short), &[]);
+            cache.put(gap.label(), Some(&cut_short), &[]);
             assert!(cache.get(gap.label()).is_none(), "{gap:?}");
         }
     }
@@ -525,7 +525,7 @@ mod historical_gap_tests {
         let sub = Some(report);
         let next = vec![];
         let bytes = serde_json::to_vec(&StoreRef {
-            sub: &sub,
+            sub: sub.as_ref(),
             next: &next,
         })
         .unwrap();

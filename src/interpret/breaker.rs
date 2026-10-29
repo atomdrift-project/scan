@@ -111,12 +111,28 @@ pub(super) const BREAKER_TRIP_AFTER: u32 = 3;
 
 #[derive(Default)]
 pub(super) struct BreakerState {
+    /// Transport failures since the endpoint last answered, probes included.
     pub(super) consecutive_failures: u32,
-    /// When the breaker opened; `None` while closed.
-    pub(super) opened_at: Option<Instant>,
+    /// `None` while closed.
+    pub(super) open: Option<Opened>,
+}
+
+/// An open breaker.
+pub(super) struct Opened {
+    /// When it opened, or when its last probe failed.
+    since: Instant,
     /// A half-open probe is in flight: other callers keep skipping until it
     /// reports back.
-    pub(super) probing: bool,
+    probing: bool,
+}
+
+impl Opened {
+    fn now() -> Self {
+        Self {
+            since: Instant::now(),
+            probing: false,
+        }
+    }
 }
 
 /// What the breaker says to do with an endpoint right now.
@@ -162,10 +178,10 @@ impl Breakers {
 
     pub(super) fn admit(&self, endpoint: &str) -> Admit {
         let cooldown = self.cooldown;
-        self.with_state(endpoint, |st| match st.opened_at {
+        self.with_state(endpoint, |st| match &mut st.open {
             None => Admit::Send,
-            Some(at) if !st.probing && at.elapsed() >= cooldown => {
-                st.probing = true;
+            Some(open) if !open.probing && open.since.elapsed() >= cooldown => {
+                open.probing = true;
                 Admit::Probe
             }
             Some(_) => Admit::Skip,
@@ -177,7 +193,7 @@ impl Breakers {
     /// is there. Returns whether this closed an open breaker.
     pub(super) fn answered(&self, endpoint: &str) -> bool {
         self.with_state(endpoint, |st| {
-            let was_open = st.opened_at.is_some();
+            let was_open = st.open.is_some();
             *st = BreakerState::default();
             was_open
         })
@@ -188,16 +204,17 @@ impl Breakers {
     pub(super) fn failed(&self, endpoint: &str) -> bool {
         self.with_state(endpoint, |st| {
             st.consecutive_failures += 1;
-            st.probing = false;
-            if st.opened_at.is_some() {
-                st.opened_at = Some(Instant::now());
-                return false;
+            match &mut st.open {
+                Some(open) => {
+                    *open = Opened::now();
+                    false
+                }
+                None if st.consecutive_failures >= BREAKER_TRIP_AFTER => {
+                    st.open = Some(Opened::now());
+                    true
+                }
+                None => false,
             }
-            if st.consecutive_failures >= BREAKER_TRIP_AFTER {
-                st.opened_at = Some(Instant::now());
-                return true;
-            }
-            false
         })
     }
 }

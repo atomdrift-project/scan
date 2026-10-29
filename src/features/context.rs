@@ -115,7 +115,7 @@ impl ExtractContext {
             let parts: Vec<&str> = tri_str.split(" + ").collect();
             if parts.len() == 3 {
                 let mut ids = [get_id(parts[0]), get_id(parts[1]), get_id(parts[2])];
-                ids.sort();
+                ids.sort_unstable();
                 trigram_id_lookup.insert((ids[0], ids[1], ids[2]), i);
             }
         }

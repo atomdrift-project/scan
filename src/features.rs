@@ -70,22 +70,17 @@ impl FeatureWriter<'_> {
     }
 }
 
-/// Feature spec version this build was compiled against.
-/// Must match the version in the loaded feature_spec.json.
+/// Newest feature spec version this build reads.
 ///
-/// v19 reads per-model trait_path_depth, preserving depth-3 defaults for older
-/// bundles. v18 grows the extended-metrics block by `ast_depth_capped` (collimator's
-/// ALWAYS_KEEP_METRICS allowlist keeps that rare anti-analysis signal past the
-/// frequency prune). The metric is read by name from the spec vocab, so older
-/// v16/v17 bundles still load — the extractor just doesn't place a slot they
-/// don't list.
-// v20 retains strongest tiered tokens; older models keep overflow-drop semantics.
+/// v21 requires `metric_transforms`. v20 retains the strongest tiered tokens
+/// (older models keep overflow-drop semantics). v19 reads per-model
+/// `trait_path_depth`, defaulting to depth 3. v18 adds `ast_depth_capped` to
+/// the extended metrics, which are read by name from the spec vocab.
 pub const EXPECTED_SPEC_VERSION: u32 = 21;
 
-/// Earliest spec version this build can still load. v16/v17 specs are
-/// loadable too: each newer version added feature families/columns the
-/// extractor produces, but the loader extracts known features and zeros out
-/// unknowns, so older bundles still work end-to-end.
+/// Earliest spec format this build parses. The real floor is the model ABI:
+/// an unset `abi_version` defaults to the spec version, so a v16/v17 spec
+/// loads only if it declares an ABI of at least [`MIN_MODEL_ABI_VERSION`].
 pub const MIN_LOADABLE_SPEC_VERSION: u32 = 16;
 /// Stable model ABI version shared with collimator.
 /// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.

@@ -374,10 +374,7 @@ impl Precheck {
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
         match &self.backend {
-            Backend::Hopper => match crate::hopper::token() {
-                Some(token) => request.bearer_auth(token),
-                None => request,
-            },
+            Backend::Hopper => crate::hopper::bearer(request, crate::hopper::token()),
             Backend::Isotope13(token) => request.bearer_auth(token.secret()),
         }
     }
@@ -583,16 +580,18 @@ impl Precheck {
         out
     }
 
-    /// Fold one batch answer into `out`. One purl answers with one object,
-    /// several with a list in the order asked; both are tolerated, and the
-    /// answer's own `purl` field is preferred over its position. Each item is
-    /// parsed on its own, so one malformed answer costs only its dependency.
+    /// Fold one batch answer into `out`, keyed by the purl as asked. A lone
+    /// purl's answer is about it whatever spelling hopper echoes back (it
+    /// canonicalizes); in a batch, unknown purls are omitted, so position means
+    /// nothing and an answer counts only when it names a purl that was asked.
+    /// Each item is parsed on its own, so one malformed answer costs only its
+    /// dependency.
     fn collect_hits(&self, asked: &[String], body: &[u8], out: &mut HashMap<String, PurlHit>) {
         let Some(items) = answer_items(body) else {
             tracing::debug!("purl precheck: unreadable lookup answer");
             return;
         };
-        for (i, item) in items.iter().enumerate() {
+        for item in &items {
             let Ok(mut answer) = serde_json::from_str::<Record>(item.get()) else {
                 continue;
             };
@@ -606,8 +605,12 @@ impl Precheck {
             else {
                 continue;
             };
-            let Some(purl) = purl.or_else(|| asked.get(i).cloned()) else {
-                continue;
+            let purl = match asked {
+                [only] => only.clone(),
+                _ => match purl.filter(|p| asked.contains(p)) {
+                    Some(purl) => purl,
+                    None => continue,
+                },
             };
             PURL_SKIPS.fetch_add(1, Ordering::Relaxed);
             out.insert(
@@ -658,11 +661,6 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
     }
 }
 
-/// isotope13's policy, pure for the same reason as [`standing_of`]: an
-/// analyzed verdict is adopted — the service's judgment is what an enriched
-/// scan asked for — except a clean one older than `max_age_s`, which is
-/// analyzed again rather than trusted past its freshness. Anything not
-/// `analyzed`, or with no level, is analyzed here.
 /// Most a record's `analyzed_at` may lie ahead of this clock (skew between
 /// hosts) and still count as when it was analyzed.
 const MAX_CLOCK_SKEW_S: u64 = 300;
@@ -674,6 +672,11 @@ fn fresh_at(at: u64, max_age_s: u64, now: u64) -> bool {
     at <= now.saturating_add(MAX_CLOCK_SKEW_S) && now.saturating_sub(at) <= max_age_s
 }
 
+/// isotope13's policy, pure for the same reason as [`standing_of`]: an
+/// analyzed verdict is adopted — the service's judgment is what an enriched
+/// scan asked for — except a clean one older than `max_age_s`, which is
+/// analyzed again rather than trusted past its freshness. Anything not
+/// `analyzed`, or with no level, is analyzed here.
 fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
     if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Standing::Analyze;
@@ -897,11 +900,32 @@ mod tests {
             .to_vec();
         let mut out = HashMap::new();
         precheck.collect_hits(&asked, body.as_bytes(), &mut out);
-        // Named by its own `purl`, then by position; an unusable sha and a
-        // malformed item each drop only themselves.
-        assert_eq!(out.len(), 2, "{:?}", out.keys().collect::<Vec<_>>());
-        assert_eq!(out["pkg:npm/b@1"].sha, sha.to_ascii_lowercase());
-        assert!(matches!(out["pkg:npm/x@1"].standing, Standing::SkipBenign));
+        // Hopper omits unknown purls from a batch, so position names nothing:
+        // an answer about a purl nobody asked, or naming none, pairs with no
+        // one. An unusable sha and a malformed item each drop only themselves.
+        assert!(out.is_empty(), "{:?}", out.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_answer_is_keyed_by_the_purl_as_asked() {
+        let precheck =
+            Precheck::new("http://unused", Duration::from_secs(86_400)).expect("a hopper");
+        let fresh = crate::engine::now_rfc3339();
+        let sha = "ab".repeat(32);
+        let answer = |purl: &str| {
+            format!(r#"{{"purl":"{purl}","sha256":"{sha}","fires_at":-1,"analyzed_at":"{fresh}"}}"#)
+        };
+        // A batch echoes each purl as the caller spelled it.
+        let asked = ["pkg:npm/a@1", "pkg:npm/b@1"].map(String::from).to_vec();
+        let mut out = HashMap::new();
+        let body = format!("[{}]", answer("pkg:npm/b@1"));
+        precheck.collect_hits(&asked, body.as_bytes(), &mut out);
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["pkg:npm/b@1"]);
+        // A lone purl comes back canonicalized; it still answers what was asked.
+        let asked = vec!["npm/c@1".to_string()];
+        let mut out = HashMap::new();
+        precheck.collect_hits(&asked, answer("pkg:npm/c@1").as_bytes(), &mut out);
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["npm/c@1"]);
     }
 
     #[test]

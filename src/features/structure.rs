@@ -367,9 +367,8 @@ pub(super) fn write_intent_gap_features(summary: &FindingSummary, w: &mut Featur
     {
         let traits = risky
             .iter()
-            .find(|(c, _)| c == target_cat)
-            .map(|(_, t)| *t)
-            .unwrap_or(&[]);
+            .find_map(|&(c, t)| (c == *target_cat).then_some(t))
+            .unwrap_or_default();
         let has_behavior = summary.sample_paths.iter().any(|(path, &max_ord)| {
             max_ord >= CRIT_SUSPICIOUS && traits.iter().any(|t| path.starts_with(t))
         });

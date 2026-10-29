@@ -181,8 +181,15 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         // still analyzed below.
         if let Some(lookup) = config.bloom()
             && let Some(digest) = burton::parse_sha256_hex(&group.sha256)
-            && let Some(n) =
-                crate::engine::bloom_gate_fresh(config, &group.path, lookup.decide_sha256(&digest))
+            && let Some(n) = crate::engine::bloom_gate_fresh(
+                config,
+                &group.path,
+                lookup.decide_sha256(&digest),
+                |label, verdict| {
+                    // As with every other `ps` line, a closed stream is not an error.
+                    let _ = crate::output::print_bloom_verdict(label, verdict, config.format());
+                },
+            )
         {
             benign.fetch_add(n, Ordering::Relaxed);
             if let Some(p) = &progress {

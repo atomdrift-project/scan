@@ -71,6 +71,16 @@ async fn an_exact_url_is_validated_and_cannot_mix_with_a_purl() -> Result<()> {
     Ok(())
 }
 
+/// Analyze names exactly one artifact: a second purl must be refused, never
+/// silently dropped in favor of the first.
+#[tokio::test]
+async fn a_second_purl_is_refused() -> Result<()> {
+    let (status, body) = post("/v1/analyze?purl=npm%2Fa%401.0.0&purl=npm%2Fb%401.0.0", "").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "too_many_packages");
+    Ok(())
+}
+
 /// A budget that is not a number must be refused rather than quietly replaced
 /// by the default, exactly as on /v1/lookup: one surface, one rule.
 #[tokio::test]

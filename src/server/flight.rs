@@ -2,7 +2,7 @@
 //!
 //! Two clients asking about the same artifact should cost one analysis, not
 //! two. Beamline already collapses duplicate lookups, but only within one
-//! Worker isolate: it runs many, and a client that retries after a `202`
+//! Worker isolate: it runs many, and a client that retries a cut-short stream
 //! usually lands on a different one, so the same sha can arrive here several
 //! times while the first analysis is still running. Each duplicate would take a
 //! slot of its own and push the server toward `429 At capacity` for work it is
@@ -71,16 +71,6 @@ impl FlightKey {
         match &self.artifact {
             Artifact::Purl(purl) => Some(purl),
             Artifact::Sha(_) | Artifact::Url(_) => None,
-        }
-    }
-}
-
-impl From<Artifact> for FlightKey {
-    /// `artifact` under the server's own policy.
-    fn from(artifact: Artifact) -> Self {
-        Self {
-            artifact,
-            follow: None,
         }
     }
 }
@@ -360,7 +350,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn key() -> FlightKey {
-        FlightKey::from(Artifact::Sha("a".repeat(64)))
+        FlightKey::new(Artifact::Sha("a".repeat(64)), 0, 0)
     }
 
     use axum::http::StatusCode;
@@ -394,7 +384,7 @@ mod tests {
     fn the_same_bytes_under_another_name_share_one_analysis() {
         let flights = Arc::new(Flights::default());
         let zip = flights.join(key());
-        let txt = flights.join(FlightKey::from(Artifact::Sha("a".repeat(64))));
+        let txt = flights.join(FlightKey::new(Artifact::Sha("a".repeat(64)), 0, 0));
         assert!(zip.leads());
         assert!(!txt.leads(), "the same bytes follow the run already going");
         assert_eq!(flights.census().analyses, 1);
@@ -404,9 +394,11 @@ mod tests {
     fn a_different_key_is_a_different_flight() {
         let flights = Arc::new(Flights::default());
         let a = flights.join(key());
-        let b = flights.join(FlightKey::from(Artifact::Purl(
-            "pkg:npm/left-pad@1.3.0".into(),
-        )));
+        let b = flights.join(FlightKey::new(
+            Artifact::Purl("pkg:npm/left-pad@1.3.0".into()),
+            0,
+            0,
+        ));
         assert!(a.leads());
         assert!(b.leads());
         assert_eq!(flights.census().analyses, 2);

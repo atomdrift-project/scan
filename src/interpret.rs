@@ -565,7 +565,13 @@ pub fn interpret_admitted(
         // which endpoint answered originally is not recorded, and the verdict
         // is the list's, not one host's.
         return Some(blended(
-            &cfg.model, ml_class, ml_prob, grade, v.reason, ev, true,
+            cfg.model.clone(),
+            ml_class,
+            ml_prob,
+            grade,
+            v.reason,
+            ev,
+            true,
         ));
     }
 
@@ -606,12 +612,12 @@ pub fn interpret_admitted(
                     tracing::debug!(path = %path.display(), error = format!("{e:#}"), "LLM verdict not cached");
                 }
             }
-            Some(blended(&model, ml_class, ml_prob, grade, reason, ev, false))
+            Some(blended(model, ml_class, ml_prob, grade, reason, ev, false))
         }
         Err(e) => {
             // A transport failure marks the endpoint unhealthy so the next file
             // gates on recovery instead of hammering a dead socket; a bad reply
-            // leaves health alone (the server answered). Either way the pass was
+            // marks it healthy (the server answered). Either way the pass was
             // attempted, so surface the failure in the `llm` JSON `error` and log
             // it. Failures are never cached — a transient outage should retry.
             HEALTH.set(!matches!(e, CallError::Transport(_)));

@@ -195,7 +195,7 @@ impl Payloads<'_> {
         if let Some(ac) = self.acache
             && sub.is_some()
         {
-            ac.put(&cache_key, &sub, &next_from_bytes);
+            ac.put(&cache_key, sub.as_ref(), &next_from_bytes);
         }
 
         Some(Analyzed {
@@ -533,7 +533,6 @@ pub(super) fn apply_package_composites(
         Ok(0) => {}
         // Per-package and routine on any registry-metadata scan: one line per
         // artifact drowns a daemon's log. The grafted composites themselves
-
         // show up in the report, which is where they matter.
         Ok(n) => tracing::debug!(
             grafted = n,
@@ -580,11 +579,12 @@ pub fn fetched_url(rec: &FetchRecord) -> Option<&str> {
 }
 
 /// A filename for a fetched payload: the final URL's basename, else the
-/// content hash. Drives cleave's extension-based type detection.
+/// content hash. Drives cleave's extension-based type detection, so the query
+/// and fragment go first: a `/` inside them is the server's, not the path's.
 pub(super) fn payload_name(rec: &FetchRecord) -> String {
     fetched_url(rec)
-        .and_then(|url| url.rsplit('/').next())
-        .and_then(|s| s.split(['?', '#']).next())
+        .and_then(|url| url.split(['?', '#']).next())
+        .and_then(|path| path.rsplit('/').next())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| rec.content_sha256.clone())

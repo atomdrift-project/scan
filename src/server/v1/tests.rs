@@ -108,7 +108,7 @@ async fn a_pending_analysis_streams_progress_before_its_decision() -> anyhow::Re
 
     let purl = "pkg:npm/stream-fixture@1.0.0";
     let flights = Arc::new(super::super::flight::Flights::default());
-    let attachment = flights.join(FlightKey::from(Artifact::Purl(purl.into())));
+    let attachment = flights.join(FlightKey::new(Artifact::Purl(purl.into()), 0, 0));
     let publisher = flights.publisher(attachment.flight());
     let request = V1Analyze {
         request_id: 1,
@@ -123,11 +123,9 @@ async fn a_pending_analysis_streams_progress_before_its_decision() -> anyhow::Re
         url: None,
         path: None,
     };
-    let named = Named {
-        key: Some(purl.into()),
-        asked: Some(purl.into()),
-        subject: purl.into(),
-        is_url: false,
+    let named = Named::Purl {
+        key: purl.into(),
+        asked: purl.into(),
     };
     let response =
         tokio::time::timeout(Duration::from_secs(1), answer(&request, attachment, named))
@@ -739,20 +737,33 @@ fn a_reason_qualifies_but_does_not_become_a_verdict() {
 fn a_streamed_uploads_progress_carries_its_phase() {
     let flights = Arc::new(super::super::flight::Flights::default());
     let sha = "c".repeat(64);
-    let leader = flights.join(FlightKey::from(Artifact::Sha(sha.clone())));
-    let follower = flights.join(FlightKey::from(Artifact::Sha(sha.clone())));
+    let leader = flights.join(FlightKey::new(Artifact::Sha(sha.clone()), 0, 0));
+    let follower = flights.join(FlightKey::new(Artifact::Sha(sha.clone()), 0, 0));
     let phase = crate::analysis::RequestPhase::with_label("req#3 upload-3");
     leader.flight().set_phase(phase.clone());
     phase.set("cleave:analyze");
 
-    let named = Named {
-        key: None,
-        asked: None,
-        subject: sha.clone(),
-        is_url: false,
+    let named = Named::Upload {
+        sha256: sha.clone(),
     };
     let frame = progress_frame(&follower, &named, Instant::now());
     assert_eq!(frame["state"], "analyzing");
     assert_eq!(frame["phase"], "cleave:analyze");
     assert_eq!(frame["sha256"], sha, "an upload is named by its digest");
+}
+
+/// A batch bills as its most expensive row, on beamline's scale. A row that
+/// reached nothing must not mask one that was answered, and work is never
+/// claimed by rows that only read a layer.
+#[test]
+fn a_batch_reports_its_deepest_source() {
+    let deepest = |rows: &[Source]| rows.iter().copied().max().unwrap_or(Source::None);
+    assert_eq!(
+        deepest(&[Source::Index, Source::None, Source::Primary, Source::Bloom]),
+        Source::Primary
+    );
+    assert_eq!(deepest(&[Source::None, Source::Index]), Source::Index);
+    assert_eq!(deepest(&[Source::None, Source::None]), Source::None);
+    assert!(Source::Bloom < Source::Replica && Source::Primary < Source::Analysis);
+    assert_eq!(HeaderValue::from(Source::Replica), "scan:replica");
 }
