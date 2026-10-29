@@ -82,7 +82,7 @@ publish = false
 # stop doing anything and cleave logs `allocator="system"`. The flag was here
 # until 88baea5 (2026-08-20) dropped it by accident, on a rationale that did not
 # hold; leaving it off is the correct end state, so do not add it back.
-cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
+cleave = { git = "https://github.com/atomdrift-project/cleave.git", rev = "c358b54d914e43ccce5f1205cfa59ca3880b7721" }
 # fletch finds and fetches the external references cleave surfaces, so scan can
 # pull staged payloads and supply-chain dependencies into the same report.
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }

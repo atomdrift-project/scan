@@ -531,6 +531,7 @@ pub(super) fn undeclared_npm_imports(
 }
 
 pub(super) fn attribute_undeclared_npm_imports(report: &mut AnalysisReport, worklist: &[Group]) {
+    let mut sources = Vec::new();
     for (sha, refs) in undeclared_npm_imports(report, worklist) {
         let Some(file) = report.files.iter_mut().find(|f| f.sha256 == sha) else {
             continue;
@@ -547,13 +548,15 @@ pub(super) fn attribute_undeclared_npm_imports(report: &mut AnalysisReport, work
                 .filter_map(|r| r.offset.map(|offset| filefacts::Span::new(offset, 1)))
                 .collect(),
         )]);
-        if let Err(e) = cleave::graft_located_reference_outcome_traits(
-            report,
-            &sha,
-            &AnalysisOptions::default(),
-            &spans,
-        ) {
-            tracing::warn!(%sha, "undeclared import trait pass failed: {e:#}");
-        }
+        sources.push((sha, spans));
+    }
+    let sources: Vec<_> = sources
+        .iter()
+        .map(|(sha, spans)| (sha.as_str(), spans))
+        .collect();
+    if let Err(e) =
+        cleave::graft_reference_outcomes_batch(report, &sources, &AnalysisOptions::default())
+    {
+        tracing::warn!("undeclared import trait pass failed: {e:#}");
     }
 }

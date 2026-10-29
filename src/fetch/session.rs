@@ -1670,30 +1670,33 @@ pub(super) fn attribute_reference_outcomes(
     // Trait evaluation already ran, before the follow phase that produced these
     // facts. Re-run it for just the files whose facts changed, so the rules that
     // read `references.*` get their pass.
-    for sha in touched {
-        let spans = by_source
-            .get(sha.as_str())
-            .map(|t| {
-                BTreeMap::from([(
-                    "references.unavailable_command_count".to_string(),
-                    t.unavailable_command_spans.clone(),
-                )])
-            })
-            .unwrap_or_default();
-        match cleave::graft_located_reference_outcome_traits(
-            report,
-            &sha,
-            &AnalysisOptions::default(),
-            &spans,
-        ) {
-            Ok(0) => {}
-            Err(e) => tracing::warn!(sha = %sha, "reference-outcome pass failed: {e:#}"),
-            Ok(n) => tracing::debug!(
-                grafted = n,
-                sha = %sha,
-                "reference-outcome traits fired on a declaring file"
-            ),
-        }
+    let sources: Vec<_> = touched
+        .into_iter()
+        .map(|sha| {
+            let spans = by_source
+                .get(sha.as_str())
+                .map(|t| {
+                    BTreeMap::from([(
+                        "references.unavailable_command_count".to_string(),
+                        t.unavailable_command_spans.clone(),
+                    )])
+                })
+                .unwrap_or_default();
+            (sha, spans)
+        })
+        .collect();
+    let sources: Vec<_> = sources
+        .iter()
+        .map(|(sha, spans)| (sha.as_str(), spans))
+        .collect();
+    match cleave::graft_reference_outcomes_batch(report, &sources, &AnalysisOptions::default()) {
+        Ok(0) => {}
+        Err(e) => tracing::warn!("reference-outcome pass failed: {e:#}"),
+        Ok(n) => tracing::debug!(
+            grafted = n,
+            sources = sources.len(),
+            "reference-outcome traits fired"
+        ),
     }
 }
 
