@@ -75,8 +75,8 @@ impl<'a> Analysis<'a> {
         // Part of cleave's analysis cache key, not only a retention setting:
         // every daemon analysis must set it the same way, or the first one
         // caches under a different key than the rest.
-        cleave::set_compact_member_retention(true);
         let mut opts = cleave::AnalysisOptions {
+            compact_members: true,
             slow_rule_ms: self.slow_rule_ms,
             rizin_timeout: crate::engine::rizin_timeout(),
             rizin_retry_timeout: crate::engine::rizin_retry_timeout(),

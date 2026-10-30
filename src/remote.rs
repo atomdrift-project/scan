@@ -107,12 +107,11 @@ pub fn mode() -> Analyze {
 /// The subscription token, asking for one (and saving it, once the rules
 /// channel has honoured it) when there is none.
 fn token() -> Result<cleave::enriched::Token> {
-    if let Some((token, _)) = cleave::enriched::token().map_err(anyhow::Error::msg)? {
+    if let Some((token, _)) = cleave::enriched::token()? {
         return Ok(token);
     }
     cleave::rule_update::enrich()?;
-    cleave::enriched::token()
-        .map_err(anyhow::Error::msg)?
+    cleave::enriched::token()?
         .map(|(token, _)| token)
         .context("isotope13 token was accepted but could not be read back")
 }

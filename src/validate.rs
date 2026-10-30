@@ -99,14 +99,13 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // The cache key includes the traits revision, so current trait edits still
     // invalidate stale reports without forcing every pre-commit run to rescan
     // the whole cleave fixture tree. The cache override is put back when this
-    // returns; compact member retention is the mode every scan entry point
-    // sets for the process, so it stays.
+    // returns.
     let _cache = CacheOverride::force_enabled();
-    cleave::set_compact_member_retention(true); // compact projection only
     let mut options = cleave::AnalysisOptions {
-        disable_yara: true,
-        disable_radare2: true,
-        disable_upx: true,
+        compact_members: true, // compact projection only
+        yara: false,
+        rizin: false,
+        upx: false,
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()
     };

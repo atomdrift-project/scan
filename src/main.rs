@@ -880,7 +880,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
     // A held token picks the Enriched rules tree and `--enriched` insists on
     // it: decided before anything resolves one.
-    cleave::enriched::resolve(global.enriched).map_err(anyhow::Error::msg)?;
+    cleave::enriched::resolve(global.enriched)?;
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another scan run.

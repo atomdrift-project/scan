@@ -228,8 +228,8 @@ impl FetchSession {
             capture_deps,
             zip_passwords,
         } = follow;
-        cleave::set_compact_member_retention(true); // compact projection only
         let mut opts = AnalysisOptions {
+            compact_members: true, // compact projection only
             skip_predicate: dep_skip_predicate(),
             rizin_timeout: crate::engine::rizin_timeout(),
             rizin_retry_timeout: crate::engine::rizin_retry_timeout(),
@@ -261,7 +261,7 @@ impl FetchSession {
             res,
             precheck: crate::corpus_precheck::armed(),
             registry_opts: AnalysisOptions {
-                disable_yara: true,
+                yara: false,
                 ..opts.clone()
             },
             opts,
