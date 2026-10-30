@@ -760,7 +760,6 @@ impl<'a> Session<'a> {
             progress.finish();
         }
         drop(self.uploader);
-        cleave::flush_analysis_cache();
         let summary = self.tally.summary(self.started);
         if self.broken_pipe.load(Ordering::Relaxed) {
             // The reader went away (`atomscan … | head`), so nothing more is
