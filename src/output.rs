@@ -963,12 +963,9 @@ fn print_detail_lines(result: &ScanResult, p: &Palette) {
                     .or_else(|| base.strip_prefix("well-known/"))
                     .or_else(|| base.strip_prefix("metadata/"))
                     .unwrap_or(base);
-                let crit = |c: cleave::Criticality| u32::from(c.rank());
                 match f.crit {
-                    c if c == crit(cleave::Criticality::Hostile) => fg(p.hostile_finding, name),
-                    c if c == crit(cleave::Criticality::Suspicious) => {
-                        fg(p.suspicious_finding, name)
-                    }
+                    cleave::Criticality::Hostile => fg(p.hostile_finding, name),
+                    cleave::Criticality::Suspicious => fg(p.suspicious_finding, name),
                     _ => name.to_string(),
                 }
             })

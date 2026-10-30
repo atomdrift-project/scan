@@ -359,6 +359,16 @@ fn publish_bloom_filters(mode: scan::Mode) -> Option<std::sync::Arc<scan::bloom_
     })
 }
 
+/// `config` with the per-file sha256 known-good/known-bad short-circuit, for
+/// scans that discover their own files (a walk, the process table). Slow mode
+/// consults no filters.
+fn with_bloom_filters(config: scan::ScanConfig, mode: scan::Mode) -> scan::ScanConfig {
+    match publish_bloom_filters(mode) {
+        Some(lookup) => config.with_bloom(mode, lookup),
+        None => config,
+    }
+}
+
 /// The subcommand a bare `atomscan <path>` stands for.
 const DEFAULT_SUBCOMMAND: &str = "fs";
 
@@ -942,15 +952,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             scan_paths(&global, config, &paths, registry_map.as_deref())
         }
         Commands::Ps => {
-            let mut config = scan_config(&global, interpret, fetch, None)?;
-            // Per-binary known-good/known-bad short-circuit (by executable sha256).
-            if let Some(lookup) = publish_bloom_filters(global.mode) {
-                config = config.with_bloom(global.mode, lookup);
-            }
+            let config =
+                with_bloom_filters(scan_config(&global, interpret, fetch, None)?, global.mode);
             Ok(finish_scan(&scan::ps::run(&config)?))
         }
+        // `sys` is `ps` plus a walk of staging directories; both phases want
+        // the filters a plain `ps` or `fs` gets.
         Commands::Sys => {
-            let config = scan_config(&global, interpret, fetch, None)?;
+            let config =
+                with_bloom_filters(scan_config(&global, interpret, fetch, None)?, global.mode);
             Ok(finish_scan(&scan::sys::run(&config)?))
         }
         // `url` and `purl` name one artifact, so neither gets `with_bloom`: the
@@ -1154,17 +1164,14 @@ fn scan_config(
 /// `atomscan path`: scan files and directories.
 fn scan_paths(
     global: &GlobalArgs,
-    mut config: scan::ScanConfig,
+    config: scan::ScanConfig,
     paths: &[PathBuf],
     registry_map: Option<&Path>,
 ) -> Result<ExitCode> {
-    // Per-file SHA-256 known-good/known-bad short-circuit, for the files found
-    // by walking a directory the operator named. A path named directly on the
-    // command line is always analyzed — see `engine::named_target_opts`. Slow
-    // mode skips it entirely.
-    if let Some(lookup) = publish_bloom_filters(global.mode) {
-        config = config.with_bloom(global.mode, lookup);
-    }
+    // Applies to the files found by walking a directory the operator named; a
+    // path named directly on the command line is always analyzed — see
+    // `engine::named_target_opts`.
+    let config = with_bloom_filters(config, global.mode);
     // `--registry-map <file>`: a JSON object {sha256: provenance}. Preserve each
     // complete value and derive the normalized record beside it, so map-backed
     // scans have the same provider data as live and hopper-backed scans. Entries

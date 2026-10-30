@@ -61,7 +61,7 @@ impl Analyzer {
         // level-independent (the lowest-firing-level sweep), so consumers wanting
         // a different cutoff reinterpret `level` rather than reloading the model.
         let model = Model::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
-        let shap = ShapImportance::load(&model_dir)?;
+        let shap = ShapImportance::load_or_warn(&model_dir);
         // Library callers always get the full cleave report attached to the
         // ScanResult (`OutputFormat::Json`); humans calling the CLI go
         // through `engine::run` directly, which builds its own config.

@@ -352,3 +352,32 @@ async fn force_analyzes_even_when_a_verdict_is_held() -> Result<()> {
     );
     Ok(())
 }
+
+/// `fresh=1` is a read-after-write request, so it must reach hopper as one:
+/// skipping only the bloom filters would still trust a lagging replica's 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_is_forwarded_to_the_corpus() -> Result<()> {
+    for (fresh, query) in [(true, "&fresh=1"), (false, "")] {
+        let (base, asked) = stub_corpus(Holds::Nothing).await?;
+        let app = app_with_corpus(Some(&base)).await?;
+        let req = common::loopback(
+            Request::builder()
+                .uri(format!(
+                    "/v1/lookup?purl=npm%2Fscan-fresh-fixture%400.0.0{query}"
+                ))
+                .body(Body::empty())?,
+        );
+        let (status, body) = common::status_and_json(app.oneshot(req).await?).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let queries = asked.queries.lock().await.clone();
+        assert_eq!(queries.len(), 1, "the corpus was not asked exactly once");
+        assert_eq!(
+            queries[0].contains("fresh=1"),
+            fresh,
+            "fresh={fresh} sent {:?} to the corpus",
+            queries[0],
+        );
+    }
+    Ok(())
+}

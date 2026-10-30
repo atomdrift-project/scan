@@ -90,6 +90,9 @@ impl ShapImportance {
     ///
     /// A bundle without a SHAP file is `Ok(None)`: most ship none.
     ///
+    /// This is the strict form, for gating a bundle before it goes live. A
+    /// scan wants [`Self::load_or_warn`].
+    ///
     /// # Errors
     /// When the file or its feature spec cannot be read, or it was not
     /// computed against that spec — a stale file (an older model) would
@@ -107,13 +110,20 @@ impl ShapImportance {
             serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
         let spec = FeatureSpec::load(&dir.join("feature_spec.json"))
             .with_context(|| format!("loading the feature spec beside {}", path.display()))?;
-        let shap = Self::bind(file, spec.feature_names()).inspect_err(|e| {
-            if !SHAP_MISMATCH_WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("rejecting {}: {e}", path.display());
-            }
-        })?;
-        tracing::info!("loaded {} SHAP importance features", shap.features.len());
+        let shap = Self::bind(file, spec.feature_names())
+            .with_context(|| format!("binding {}", path.display()))?;
+        tracing::info!(features = shap.features.len(), "loaded SHAP importances");
         Ok(Some(shap))
+    }
+
+    /// [`Self::load`] for a scan: an unusable SHAP file only costs the
+    /// explanations, never the verdicts, so it is reported and set aside.
+    #[must_use]
+    pub fn load_or_warn(model_dir: &Path) -> Option<Self> {
+        Self::load(model_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "SHAP explanations disabled");
+            None
+        })
     }
 
     /// Resolve `file`'s features to slots in `feature_names`, which must be
@@ -256,6 +266,17 @@ mod tests {
         assert_eq!(shap.explain(&[0.0, 1.0, 0.0]).len(), 1);
         // A vector from another feature space gives none at all.
         assert!(shap.explain(&[1.0, 1.0]).is_empty());
+    }
+
+    /// A bundle carrying an unusable SHAP file is refused by the strict load
+    /// (the updater's gate) but scanned without explanations by a scan.
+    #[test]
+    fn an_unusable_shap_file_only_disables_explanations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("general")).unwrap();
+        std::fs::write(dir.path().join("general/shap_importance.json"), "not json").unwrap();
+        assert!(ShapImportance::load(dir.path()).is_err());
+        assert!(ShapImportance::load_or_warn(dir.path()).is_none());
     }
 
     #[test]

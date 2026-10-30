@@ -1246,7 +1246,7 @@ async fn load_resources(state: Arc<AppState>) {
     });
 
     match tokio::join!(model_task, shap_task, yara_task) {
-        (Ok(Ok(model)), Ok(Ok(shap)), Ok(Ok(()))) => {
+        (Ok(Ok(model)), Ok(shap), Ok(Ok(()))) => {
             let spec_version = model.spec().version();
             let features = model.spec().total_features();
             let shap_loaded = shap.is_some();
@@ -1261,24 +1261,23 @@ async fn load_resources(state: Arc<AppState>) {
         }
         (Ok(Err(e)), _, _) => state.fail_startup(format!("failed to load model: {e:#}")),
         (Err(e), _, _) => state.fail_startup(format!("model load task panicked: {e}")),
-        (_, Ok(Err(e)), _) => state.fail_startup(format!("failed to load SHAP data: {e:#}")),
         (_, Err(e), _) => state.fail_startup(format!("shap load task panicked: {e}")),
         (_, _, Ok(Err(e))) => state.fail_startup(format!("traits unavailable: {e}")),
         (_, _, Err(e)) => state.fail_startup(format!("yara warmup task panicked: {e}")),
     }
 }
 
-/// SHAP importances; `None` when the bundle ships none. A file that is
-/// present but unreadable or stale is bad model metadata, so startup fails.
-fn load_shap(model_dir: &std::path::Path) -> anyhow::Result<Option<ShapImportance>> {
+/// SHAP importances; `None` when the bundle ships none or its file is
+/// unusable — explanations are optional, so neither stops the server.
+fn load_shap(model_dir: &std::path::Path) -> Option<ShapImportance> {
     let t = Instant::now();
-    let shap = ShapImportance::load(model_dir)?;
+    let shap = ShapImportance::load_or_warn(model_dir);
     tracing::info!(
         work_ms = t.elapsed().as_millis(),
         loaded = shap.is_some(),
         "SHAP data"
     );
-    Ok(shap)
+    shap
 }
 
 /// Periodically log long-running in-flight requests. Never cancels or

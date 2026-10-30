@@ -34,12 +34,12 @@ impl AppState {
     /// Blocking. On failure the previous model stays in service.
     fn reload_bundle(&self) -> anyhow::Result<Reloaded> {
         let start = Instant::now();
-        // The model and SHAP load before anything is swapped: a bundle that
+        // The model and SHAP load before anything is swapped: a model that
         // fails to load leaves the server exactly as it was, rather than
         // running new traits against the old model.
         let config = &self.config;
         let model = Model::load(&config.model_dir, config.thresholds, config.level)?;
-        let shap = super::load_shap(&config.model_dir)?;
+        let shap = super::load_shap(&config.model_dir);
         // Traits next, and the model is installed only after them, so the new
         // model runs against fresh rules.
         let traits_reloaded = match cleave::reload_capability_mapper() {

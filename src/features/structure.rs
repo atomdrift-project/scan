@@ -347,22 +347,18 @@ pub(super) fn write_logic_gap_features(
 pub(super) fn write_intent_gap_features(summary: &FindingSummary, w: &mut FeatureWriter<'_>) {
     let intent_signal = summary
         .sample_paths
-        .contains_key("metadata/package/documentation")
-        || summary.sample_paths.contains_key("metadata/package/help");
+        .contains_key("metadata/package/documentation");
+    // `filesystem` is persistence alone: the deployed models were trained that
+    // way. Widening it to `micro-behaviors/fs` changes the feature, so it waits
+    // for a retrain, in lockstep with collimator.
     let risky: &[(&str, &[&str])] = &[
-        (
-            "network",
-            &["objectives/network", "micro-behaviors/network"],
-        ),
-        (
-            "filesystem",
-            &["objectives/persistence", "micro-behaviors/filesystem"],
-        ),
+        ("network", &["micro-behaviors/network"]),
+        ("filesystem", &["objectives/persistence"]),
         (
             "execution",
             &["objectives/execution", "micro-behaviors/process/create"],
         ),
-        ("crypto", &["objectives/crypto", "micro-behaviors/crypto"]),
+        ("crypto", &["micro-behaviors/crypto"]),
     ];
     for (target_cat, name) in INTENT_GAP_CATEGORIES
         .iter()
