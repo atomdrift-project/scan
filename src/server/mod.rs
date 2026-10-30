@@ -1228,9 +1228,10 @@ async fn load_resources(state: Arc<AppState>) {
         // it before reporting ready: a server that answers `/_/health` with
         // "ok" while failing every analysis on a missing traits directory is
         // worse than one that never starts.
-        let traits = cleave::traits_repo::try_resolve()?;
+        let traits = cleave::traits_repo::try_resolve().map_err(|e| format!("{e:#}"))?;
         tracing::info!(dir = %traits.display(), "cleave traits resolved");
         let opts = cleave::AnalysisOptions {
+            compact_members: true,
             slow_rule_ms,
             ..Default::default()
         };

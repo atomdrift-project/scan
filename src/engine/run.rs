@@ -408,8 +408,8 @@ pub fn scan_file(
 fn analysis_options(config: &ScanConfig) -> AnalysisOptions {
     // Part of cleave's analysis cache key, not only a retention setting: every
     // analysis must set it the same way.
-    cleave::set_compact_member_retention(true);
     let mut opts = AnalysisOptions {
+        compact_members: true,
         slow_rule_ms: config.slow_rule_ms(),
         rizin_timeout: super::rizin_timeout(),
         rizin_retry_timeout: super::rizin_retry_timeout(),

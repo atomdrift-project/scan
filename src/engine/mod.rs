@@ -457,7 +457,7 @@ pub struct FindingCounts {
 /// one-shot scan gigabytes of peak RSS and tens of seconds of CPU, and gives a
 /// long-lived server no first-request or throughput gain, only more peak RSS.
 pub fn prefetch_cleave_resources() {
-    cleave::prefetch_shared_resources_with(true, false);
+    cleave::prefetch_shared_resources(true);
 }
 
 /// The current time as an RFC 3339 string in UTC (`2026-10-01T13:02:22Z`).

@@ -143,8 +143,8 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     // Scan each unique binary.
     let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
-    cleave::set_compact_member_retention(true); // compact projection only
     let mut cleave_opts = cleave::AnalysisOptions {
+        compact_members: true, // compact projection only
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
         // The ps-only caps (see `PS_RIZIN_MAX_BYTES`) are per analysis, so the
