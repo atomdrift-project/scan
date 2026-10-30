@@ -276,8 +276,10 @@ pub struct DepResult {
 pub struct TopFinding {
     /// Finding identifier (e.g. "objectives/evasion/process::injection").
     pub id: String,
-    /// Criticality ordinal (0=filtered .. 5=hostile).
-    pub crit: u32,
+    /// Criticality; serialized as its [`cleave::Criticality::rank`]
+    /// (0=filtered .. 5=hostile).
+    #[serde(serialize_with = "serialize_rank")]
+    pub crit: cleave::Criticality,
     /// Cleave-assigned confidence in `[0.0, 1.0]`.
     pub conf: f32,
     /// Human-readable description of the finding.
@@ -288,11 +290,18 @@ impl From<&CompactTrait> for TopFinding {
     fn from(f: &CompactTrait) -> Self {
         Self {
             id: f.id.clone(),
-            crit: u32::from(f.criticality),
+            crit: super::compact_crit(f),
             conf: f.confidence,
             desc: f.description.clone(),
         }
     }
+}
+
+fn serialize_rank<S: serde::Serializer>(
+    crit: &cleave::Criticality,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u8(crit.rank())
 }
 
 /// Every member evaluation a scan produced, keyed by cleave node id — the
@@ -539,12 +548,12 @@ impl ScanResult {
             || self
                 .top_findings
                 .iter()
-                .any(|finding| finding.crit >= crate::features::CRIT_SUSPICIOUS)
+                .any(|finding| finding.crit >= cleave::Criticality::Suspicious)
             || self.embedded_files.values().any(|member| {
                 member
                     .top_findings
                     .iter()
-                    .any(|finding| finding.crit >= crate::features::CRIT_SUSPICIOUS)
+                    .any(|finding| finding.crit >= cleave::Criticality::Suspicious)
             })
     }
 

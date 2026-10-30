@@ -362,7 +362,12 @@ fn warn_nonbenign(
         thresholds.hostile,
     );
     for finding in findings {
-        eprintln!("  l{} {}  {}", finding.crit, finding.id, finding.desc);
+        eprintln!(
+            "  l{} {}  {}",
+            finding.crit.rank(),
+            finding.id,
+            finding.desc
+        );
     }
 }
 

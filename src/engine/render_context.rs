@@ -1122,7 +1122,11 @@ pub(super) fn render_saved_interpret(
     };
     let index = ReportIndex::new(report);
     let rendered = render_interpret_context(&primary, fetched, report, &index);
-    Ok(recategorize_annotations(&rendered))
+    // The live path sanitizes before it rewrites; so must a replay, or it is
+    // not the payload the model saw.
+    Ok(recategorize_annotations(
+        &crate::interpret::sanitize_context(&rendered),
+    ))
 }
 
 #[cfg(test)]

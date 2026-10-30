@@ -477,18 +477,28 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The `ml.v` envelope schema this build writes.
 pub(crate) const SCHEMA_VERSION: &str = "7";
 
-/// A compact finding's criticality. The compact form stores
-/// [`cleave::Criticality::rank`]; this reads it back.
-fn compact_crit(finding: &cleave::types::CompactTrait) -> cleave::Criticality {
+/// The criticality a [`cleave::Criticality::rank`] encodes, or `None` for a
+/// byte no rank produces. Decoded through `rank` itself, so the two cannot
+/// disagree; `Exception` shares rank 0 with `Filtered` and reads back as it.
+pub(crate) fn crit_from_rank(rank: u8) -> Option<cleave::Criticality> {
     use cleave::Criticality;
-    match finding.criticality {
-        0 => Criticality::Filtered,
-        1 => Criticality::Component,
-        2 => Criticality::Baseline,
-        3 => Criticality::Notable,
-        4 => Criticality::Suspicious,
-        _ => Criticality::Hostile,
-    }
+    [
+        Criticality::Filtered,
+        Criticality::Component,
+        Criticality::Baseline,
+        Criticality::Notable,
+        Criticality::Suspicious,
+        Criticality::Hostile,
+    ]
+    .into_iter()
+    .find(|crit| crit.rank() == rank)
+}
+
+/// A compact finding's criticality. The compact form stores
+/// [`cleave::Criticality::rank`]; a byte outside that range — a corrupt stored
+/// report — carries no signal, so it reads as `Filtered`, never as a verdict.
+fn compact_crit(finding: &cleave::types::CompactTrait) -> cleave::Criticality {
+    crit_from_rank(finding.criticality).unwrap_or(cleave::Criticality::Filtered)
 }
 
 /// The delimiter cleave writes between archive layers in a report path
@@ -527,6 +537,30 @@ pub fn render_saved_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rank cleave can write reads back as the criticality that wrote it,
+    /// and a byte outside the ladder is no criticality at all — least of all
+    /// `Hostile`, which a fall-through arm used to make it.
+    #[test]
+    fn ranks_round_trip_and_out_of_range_is_none() {
+        use cleave::Criticality;
+        for crit in [
+            Criticality::Filtered,
+            Criticality::Component,
+            Criticality::Baseline,
+            Criticality::Notable,
+            Criticality::Suspicious,
+            Criticality::Hostile,
+        ] {
+            assert_eq!(crit_from_rank(crit.rank()), Some(crit));
+        }
+        assert_eq!(
+            crit_from_rank(Criticality::Exception.rank()),
+            Some(Criticality::Filtered)
+        );
+        assert_eq!(crit_from_rank(6), None);
+        assert_eq!(crit_from_rank(u8::MAX), None);
+    }
 
     #[test]
     fn is_all_only_when_every_class_shown() {

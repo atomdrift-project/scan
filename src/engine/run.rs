@@ -61,7 +61,7 @@ pub fn run_with(
 /// The model and SHAP table `config` names.
 fn load_model(config: &ScanConfig) -> Result<(Model, Option<ShapImportance>)> {
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-    let shap = ShapImportance::load(config.model_dir())?;
+    let shap = ShapImportance::load_or_warn(config.model_dir());
     Ok((model, shap))
 }
 
@@ -804,8 +804,8 @@ fn findings_match_filter(
     root.iter()
         .chain(members.values().flat_map(|member| &member.top_findings))
         .any(|finding| {
-            (filter.hostile && finding.crit >= crate::features::CRIT_HOSTILE)
-                || (filter.suspicious && finding.crit == crate::features::CRIT_SUSPICIOUS)
+            (filter.hostile && finding.crit == cleave::Criticality::Hostile)
+                || (filter.suspicious && finding.crit == cleave::Criticality::Suspicious)
         })
 }
 
@@ -1356,7 +1356,7 @@ mod tests {
     fn static_dependency_findings_survive_benign_verdict_display_filter() {
         let finding = super::super::TopFinding {
             id: "objectives/impact/test::issue".into(),
-            crit: 4,
+            crit: cleave::Criticality::Suspicious,
             conf: 0.99,
             desc: "Dependency issue".into(),
         };
@@ -1396,13 +1396,13 @@ mod tests {
             &Default::default()
         ));
         let finding = &mut members.get_mut(&1).unwrap().top_findings[0];
-        finding.crit = 3;
+        finding.crit = cleave::Criticality::Notable;
         assert!(!findings_match_filter(
             DisplayFilter::alerts_only(),
             &[],
             &members
         ));
-        members.get_mut(&1).unwrap().top_findings[0].crit = 5;
+        members.get_mut(&1).unwrap().top_findings[0].crit = cleave::Criticality::Hostile;
         assert!(findings_match_filter(hostile_only, &[], &members));
     }
 

@@ -91,12 +91,14 @@ pub const MIN_MODEL_ABI_VERSION: u32 = 18;
 /// Minimum finding confidence for inclusion (matches collimator MIN_CONFIDENCE).
 const MIN_CONFIDENCE: f64 = 0.65;
 
-/// Criticality ordinals as a compact report carries them
-/// ([`cleave::Criticality::rank`]).
-pub(crate) const CRIT_BASELINE: u32 = cleave::Criticality::Baseline as u32;
-pub(crate) const CRIT_NOTABLE: u32 = cleave::Criticality::Notable as u32;
-pub(crate) const CRIT_SUSPICIOUS: u32 = cleave::Criticality::Suspicious as u32;
-pub(crate) const CRIT_HOSTILE: u32 = cleave::Criticality::Hostile as u32;
+/// Criticality ordinals as a compact report carries them: the values of
+/// [`cleave::Criticality::rank`], which features use as numbers. Not the enum
+/// discriminants, which cleave does not promise to keep;
+/// `criticality_ordinals_match_cleave_ranks` pins these to `rank`.
+pub(crate) const CRIT_BASELINE: u32 = 2;
+pub(crate) const CRIT_NOTABLE: u32 = 3;
+pub(crate) const CRIT_SUSPICIOUS: u32 = 4;
+pub(crate) const CRIT_HOSTILE: u32 = 5;
 
 /// The path of a trait id — `objectives/exec/shell` of
 /// `objectives/exec/shell::bash` — or the whole id when it names no rule.

@@ -1742,9 +1742,7 @@ async fn decide_unheld(
             ),
         };
     };
-    let (reached, source) = corpus
-        .known_with_source(sha, purl, /* fresh = */ false)
-        .await;
+    let (reached, source) = corpus.known_with_source(sha, purl, fresh).await;
     let decided = match reached {
         Reached::Record(record) => V1Decision::corpus(&record, sha, purl, budget).with_url(url),
         // The corpus holds nothing either. A filter claim is the last thing we

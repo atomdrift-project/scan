@@ -105,7 +105,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Load the model before hashing every running executable, so a broken
     // bundle is reported at once rather than after the slowest step.
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
-    let shap = ShapImportance::load(config.model_dir())?;
+    let shap = ShapImportance::load_or_warn(config.model_dir());
 
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);

@@ -34,6 +34,9 @@ pub(super) const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
     (
         "javascript",
         &[
+            // Names no trait, so this feature is 1 for every JavaScript file.
+            // Deployed specs carry it by this name; replace it only at a
+            // retrain, in lockstep with collimator.
             "micro-behaviors/javascript/async",
             "metadata/package/versioning",
         ],
