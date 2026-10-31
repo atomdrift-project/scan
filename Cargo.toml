@@ -272,6 +272,8 @@ strip = "none"
 debug = 2
 
 [profile.dev]
+# `false` still permits local Thin LTO in optimized crates.
+lto = "off"
 debug = "line-tables-only"
 
 # Dependencies at opt-level 1 in dev builds. Two reasons, one of them a hard
