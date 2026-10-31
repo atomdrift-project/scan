@@ -135,7 +135,7 @@
 //! derives it consumer-side as a **level-table lookup**: the suspicious
 //! threshold is the hostile threshold at level
 //! `min(max_grid_level, SUSPICIOUS_LEVEL_CEILING)` (the looser-budget row in
-//! the same `levels[]` table). Manual `--threshold-hostile <val>` (no `-l`)
+//! the same `levels[]` table). A manual hostile threshold (no level)
 //! skips the derivation: the `Thresholds` struct carries
 //! `suspicious == hostile`, so `classify` only ever returns Benign or Hostile.
 //!

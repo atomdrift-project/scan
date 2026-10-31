@@ -1,35 +1,23 @@
 use super::{
-    Cli, Commands, MaxRssPolicy, default_cli_follow_policy, is_expected_yara_cache_mismatch,
-    resolve_hopper_value, with_default_subcommand,
+    Cli, Commands, MaxRssPolicy, default_cli_follow_policy, fetch_policy,
+    is_expected_yara_cache_mismatch, resolve_hopper_value, with_default_subcommand,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
 use scan::OutputFormat;
-use scan::cli::{DEFAULT_RIZIN_TIMEOUT_SECS, LlmEnv};
+use scan::cli::LlmEnv;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 #[test]
-fn nsrl_uses_the_normal_rules_update_without_an_extra_flag() {
+fn update_rules_takes_no_flags_of_its_own() {
     let cli = Cli::try_parse_from(["atomscan", "update-rules"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Some(Commands::UpdateRules {
-            models_only: false,
-            check: false
-        })
-    ));
-    let cli = Cli::try_parse_from(["atomscan", "update-rules", "--check"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Some(Commands::UpdateRules {
-            models_only: false,
-            check: true
-        })
-    ));
-    assert!(Cli::try_parse_from(["atomscan", "update-rules", "--nsrl"]).is_err());
+    assert!(matches!(cli.command, Some(Commands::UpdateRules)));
+    for flag in ["--nsrl", "--check", "--models-only"] {
+        assert!(Cli::try_parse_from(["atomscan", "update-rules", flag]).is_err());
+    }
 }
 
 #[test]
@@ -177,72 +165,33 @@ fn retired_follow_spellings_are_refused() {
 }
 
 #[test]
-fn rizin_timeout_defaults_to_ten_minutes_and_is_overridable() -> Result<()> {
-    let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
-        .context("default timeout should parse")?;
-    assert_eq!(
-        default.global.rizin_timeout_secs,
-        DEFAULT_RIZIN_TIMEOUT_SECS
-    );
-
-    let overridden = Cli::try_parse_from(with_default_subcommand([
-        "scan",
-        "--rizin-timeout-secs",
-        "42",
-        "/tmp/a",
-    ]))
-    .context("timeout override should parse")?;
-    assert_eq!(overridden.global.rizin_timeout_secs, 42);
-    assert!(
-        Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "--rizin-timeout-secs",
-            "0",
-            "/tmp/a"
-        ]))
-        .is_err(),
-        "zero would disable the hard deadline and must be rejected"
-    );
-    Ok(())
-}
-
-#[test]
-fn dependency_platform_scope_follows_scanner_role() -> Result<()> {
-    let default = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
+fn dependency_scope_follows_scanner_role() -> Result<()> {
+    let cli = Cli::try_parse_from(with_default_subcommand(["scan", "/tmp/a"]))
         .context("default should parse")?;
+    let interactive = fetch_policy(&cli.global, cli.command.as_ref().context("a command")?);
     assert!(
-        default
-            .global
-            .host_platform_only(default.command.as_ref().is_some_and(Commands::is_daemon)),
+        interactive.host_platform_only,
         "interactive scans optimize for the current host"
+    );
+    assert!(
+        !interactive.transitive_deps,
+        "interactive scans stop declared dependencies at the first hop"
     );
     assert!(
         scan::fetch::FetchPolicy::default().host_platform_only,
         "library and CLI defaults must agree"
     );
-    let compatible = Cli::try_parse_from(with_default_subcommand([
-        "scan",
-        "--fetch-all-platforms",
-        "/tmp/a",
-    ]))
-    .context("all-platforms opt-in should parse")?;
-    assert!(!compatible.global.host_platform_only(false));
-
-    let host_only = Cli::try_parse_from(with_default_subcommand([
-        "scan",
-        "--fetch-host-platform-only",
-        "/tmp/a",
-    ]))
-    .context("host-only opt-out should parse")?;
-    assert!(host_only.global.host_platform_only(true));
 
     let daemon = Cli::try_parse_from(["scan", "serve"]).context("serve should parse")?;
-    let role = daemon.command.as_ref().is_some_and(Commands::is_daemon);
-    assert!(role);
+    let served = fetch_policy(
+        &daemon.global,
+        daemon.command.as_ref().context("a command")?,
+    );
     assert!(
-        !daemon.global.host_platform_only(role),
+        !served.host_platform_only,
         "serve scans on behalf of other hosts"
     );
+    assert!(served.transitive_deps, "serve populates the corpus");
     Ok(())
 }
 
@@ -531,18 +480,6 @@ fn level_flag_parses_and_shortcuts_removed() -> Result<()> {
     assert!(
         Cli::try_parse_from(with_default_subcommand(["scan", "-l", "25001", "/tmp/a"])).is_err()
     );
-    // --level still conflicts with explicit thresholds.
-    assert!(
-        Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "-l",
-            "10",
-            "--threshold-hostile",
-            "0.5",
-            "/tmp/a"
-        ]))
-        .is_err()
-    );
     // The numeric shortcuts and their aliases were removed.
     assert!(Cli::try_parse_from(with_default_subcommand(["scan", "-5", "/tmp/a"])).is_err());
     assert!(Cli::try_parse_from(with_default_subcommand(["scan", "--loose", "/tmp/a"])).is_err());
@@ -578,21 +515,6 @@ fn concurrency_flags_reject_zero() {
     assert!(Cli::try_parse_from(["atomscan", "serve", "--workers", "0"]).is_err());
 }
 
-#[test]
-fn severity_level_flags_conflict_with_each_other_and_manual_thresholds() {
-    assert!(Cli::try_parse_from(with_default_subcommand(["scan", "-1", "-9", "/tmp/a"])).is_err());
-    assert!(
-        Cli::try_parse_from(with_default_subcommand([
-            "scan",
-            "-9",
-            "--threshold-hostile",
-            "0.90",
-            "/tmp/a"
-        ]))
-        .is_err()
-    );
-}
-
 /// The LLM environment as a test wants it: token files under `home`'s
 /// `.tok`, or none, and no `SCAN_LLM*` variables — whatever the process
 /// running the tests has set.
@@ -625,17 +547,19 @@ fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
         "unexpected error: {err}"
     );
 
+    let keyed = LlmEnv {
+        key: Some("sk-test".into()),
+        ..env
+    };
     let missing_model = Cli::try_parse_from(with_default_subcommand([
         "atomscan",
         "--llm",
         "openrouter",
-        "--llm-key",
-        "sk-test",
         "/tmp/a",
     ]))?;
     let cfg = missing_model
         .global
-        .interpret_config_with(&env)?
+        .interpret_config_with(&keyed)?
         .context("openrouter without a pinned model should default to auto")?;
     assert_eq!(cfg.model, scan::interpret::OPENROUTER_DEFAULT_MODEL);
 
@@ -645,13 +569,11 @@ fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
         "openrouter",
         "--llm-model",
         "qwen/qwen3.8-27b",
-        "--llm-key",
-        "sk-test",
         "/tmp/a",
     ]))?;
     let cfg = cli
         .global
-        .interpret_config_with(&env)?
+        .interpret_config_with(&keyed)?
         .context("openrouter with model+key should enable interpret")?;
     assert_eq!(cfg.base_url, scan::interpret::OPENROUTER_BASE_URL);
     assert_eq!(cfg.model, "qwen/qwen3.8-27b");
@@ -661,15 +583,16 @@ fn openrouter_alias_requires_key_and_defaults_model() -> Result<()> {
 
 #[test]
 fn llm_flags_are_global_on_serve() -> Result<()> {
-    let env = llm_env(None);
+    let env = LlmEnv {
+        key: Some("sk-test".into()),
+        ..llm_env(None)
+    };
     let serve = Cli::try_parse_from([
         "atomscan",
         "--llm",
         "openrouter",
         "--llm-model",
         "qwen/qwen3.8-27b",
-        "--llm-key",
-        "sk-test",
         "serve",
     ])?;
     assert_eq!(serve.global.llm.as_deref(), Some("openrouter"));
@@ -827,22 +750,16 @@ fn llm_key_falls_back_to_tok_llm_file() -> Result<()> {
         .context("~/.tok/llm should supply the key")?;
     assert_eq!(cfg.api_key.as_deref(), Some("sk-vllm-file"));
 
-    // An explicit key still wins over the file.
-    let cli = Cli::try_parse_from(with_default_subcommand([
-        "atomscan",
-        "--llm",
-        "http://interpret:8000/v1",
-        "--llm-model",
-        "Qwen/Qwen3.8-27B",
-        "--llm-key",
-        "sk-flag",
-        "/tmp/a",
-    ]))?;
+    // `SCAN_LLM_KEY` still wins over the file.
+    let keyed = LlmEnv {
+        key: Some("sk-env".into()),
+        ..env
+    };
     let cfg = cli
         .global
-        .interpret_config_with(&env)?
+        .interpret_config_with(&keyed)?
         .context("explicit key")?;
-    assert_eq!(cfg.api_key.as_deref(), Some("sk-flag"));
+    assert_eq!(cfg.api_key.as_deref(), Some("sk-env"));
     Ok(())
 }
 

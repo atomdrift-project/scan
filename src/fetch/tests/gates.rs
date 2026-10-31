@@ -382,7 +382,7 @@ fn lenient_version_cmp_orders_release_schemes() {
 /// spellings that turn it off both reach the "no deadline" branch that
 /// `orchestrate` tests for.
 #[test]
-fn fetch_timeout_defaults_on_and_has_two_off_switches() {
+fn fetch_timeout_defaults_on() {
     assert_eq!(FetchPolicy::default().max_duration, DEFAULT_FETCH_TIMEOUT);
     assert_eq!(DEFAULT_FETCH_TIMEOUT, Duration::from_secs(300));
     // A selection never disturbs the ceilings around it.
@@ -390,13 +390,6 @@ fn fetch_timeout_defaults_on_and_has_two_off_switches() {
         FetchPolicy::parse_follow("all").unwrap().max_duration,
         DEFAULT_FETCH_TIMEOUT
     );
-    assert!(parse_duration("0").unwrap().is_zero());
-    assert!(
-        Instant::now()
-            .checked_add(parse_duration("never").unwrap())
-            .is_none()
-    );
-    assert_eq!(parse_duration("5m").unwrap(), DEFAULT_FETCH_TIMEOUT);
 }
 
 #[test]

@@ -97,7 +97,7 @@ pub(crate) fn write_tiny(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<
 }
 
 /// One-line LLM verdict, colored by the blended outcome. Shown under the ML
-/// verdict in terminal output when `--interpret` produced a result. `color` is
+/// verdict in terminal output when `--llm` produced a result. `color` is
 /// false for `--format tiny` (LLM-facing output is never colored).
 pub(crate) fn format_llm_line(llm: &Interpretation, color: bool) -> String {
     use colored::Colorize;

@@ -64,8 +64,8 @@ A consumer reads it as:
   result to suspicious because cleave found confident severe traits.
 - `lvl == -1` (sentinel) → the file fires at **no** grid level. Nothing
   short of disabling the model would flag it — it is clean.
-- `lvl == null` → manual `--threshold-hostile` / `--threshold-suspicious`
-  were supplied, so no level table applies.
+- `lvl == null` → a library caller supplied manual probability cutoffs, so
+  no level table applies.
 
 `conf` is the same `lvl` rendered as a deliberately pessimistic integer
 percentage for humans and APIs that need a confidence-style field. It
@@ -206,7 +206,7 @@ Two kinds answer without one, and say so with `source`:
 
 - `"source": "bloom"` — the known-good/known-bad filters decided it
   (`verdict`, `scanned`).
-- `"source": "remote"` — under `--enriched`, isotope13 already held a verdict
+- `"source": "remote"` — under `--uplink`, Atomdrift Uplink already held a verdict
   for these bytes (or this package), and it stands in place of local analysis:
 
 ```json
@@ -280,7 +280,7 @@ references, or update rules. `--format tiny` and `terminal` render cleave's
 corresponding context views; they do not synthesize an ML verdict. Use `-` as
 the input path to read one JSON document from stdin.
 
-With `--llm` (and the usual `--llm-model`/`--llm-key`/`SCAN_LLM*` settings),
+With `--llm` (and the usual `--llm-model`/`SCAN_LLM*` settings),
 `render` sends the interpret render to the LLM with the live grading prompt and
 prints `{"grade","model","reason"}` instead: the grade alone, with no ML
 admission gate or blend, for checking that a saved report grades as its live

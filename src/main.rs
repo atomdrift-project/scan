@@ -605,23 +605,11 @@ enum Commands {
         hopper: Option<String>,
     },
 
-    /// Update models (and optionally cleave traits)
-    UpdateRules {
-        /// Only update models; skip cleave traits update
-        #[arg(long)]
-        models_only: bool,
-
-        /// Check for updates without applying them
-        #[arg(long)]
-        check: bool,
-    },
+    /// Update models, cleave traits, and the known-file filters
+    UpdateRules,
 
     /// Validate the model bundle and benign fixture corpus
-    Validate {
-        /// Skip trait-dependent fixture inference; validate model layout only
-        #[arg(long)]
-        skip_traits: bool,
-    },
+    Validate,
 
     /// Run as an HTTP classification server
     Serve(ServeArgs),
@@ -672,13 +660,6 @@ struct ServeArgs {
     /// file is a startup error — never a silent drop to unauthenticated.
     #[arg(long, value_name = "PATH")]
     token_file: Option<PathBuf>,
-
-    /// Path to a writable cleave traits directory (overrides CLEAVE_TRAITS_DIR).
-    /// Use when running as a restricted user whose $HOME is not writable
-    /// (e.g. macOS system accounts where $HOME=/var/empty). Traits are
-    /// cloned automatically if the directory does not yet exist.
-    #[arg(long)]
-    traits_dir: Option<PathBuf>,
 
     /// The hopper this server reads from and files to.
     ///
@@ -878,19 +859,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
         tracing::info!(
             endpoint = %cfg.base_url,
             model = %cfg.model,
-            min_level = cfg
-                .min_level
-                .map_or_else(
-                    || scan::interpret::DEFAULT_MIN_LEVEL_LABEL.to_string(),
-                    |n| n.to_string()
-                ),
             "LLM interpretation enabled",
         );
     }
 
-    // A held token picks the Enriched rules tree and `--enriched` insists on
+    // A held token picks the Uplink rules tree and `--uplink` insists on
     // it: decided before anything resolves one.
-    cleave::enriched::resolve(global.enriched)?;
+    cleave::enriched::resolve(global.uplink)?;
+    if !global.uplink && scan::env::uplink_opted_out() {
+        cleave::enriched::set_enabled(false);
+    }
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another scan run.
@@ -907,13 +885,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
     );
 
     // Warn about missing analysis tools for commands that will run cleave.
-    if command.is_scan() || command.is_daemon() || matches!(command, Commands::Validate { .. }) {
+    if command.is_scan() || command.is_daemon() || matches!(command, Commands::Validate) {
         scan::tools::warn_missing();
     }
     // Interactive commands get a once-a-day, zero-telemetry update notice. The
     // long-running daemons are excluded — they refresh on restart and shouldn't
     // print transient notices into their logs — and so is `validate`.
-    if !command.is_daemon() && !matches!(command, Commands::Validate { .. }) {
+    if !command.is_daemon() && !matches!(command, Commands::Validate) {
         scan::update_check::maybe_notify(false);
     }
     // Default-on refresh: bring rules + models (+ bloom) current when the local
@@ -922,7 +900,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     // daemons refresh on restart, and `version`/`update-rules` manage updates
     // themselves.
     if command.is_scan() {
-        // `--enriched` needs a token before the refresh below would ask for
+        // `--uplink` needs a token before the refresh below would ask for
         // one mid-download; asked here, once.
         if cleave::enriched::required() {
             cleave::rule_update::sign_in()?;
@@ -932,7 +910,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             global.mode,
             global.format == scan::OutputFormat::Terminal,
         )?;
-        // Where artifacts are judged, settled once the rules are: an enriched
+        // Where artifacts are judged, settled once the rules are: an uplink
         // scan that needed a token has been asked for it by now, and one whose
         // token was refused has fallen back to open source, and asks nothing.
         scan::remote::resolve(global.analyze, cleave::enriched::enabled())?;
@@ -980,23 +958,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(finish_scan(&scan::pkg::run_pkg(&purl, &config)?))
         }
         Commands::Serve(args) => serve(&global, args, interpret, fetch),
-        Commands::UpdateRules { models_only, check } => Ok(update_rules(
-            models_only,
-            check,
-            global.model_dir.as_deref(),
-        )),
-        Commands::Validate { skip_traits } => {
-            let model_dir = scan::cli::resolve_model_dir(global.model_dir.clone())?;
-            let level = operating_level(&global, &model_dir);
-            let config = scan::ScanConfig::new(
-                model_dir,
-                scan::OutputFormat::Terminal,
-                global.thresholds(),
-            )?
-            .with_extra(global.extra)
-            .with_level(level)
-            .with_zip_passwords(global.zip_passwords);
-            scan::validate::run(&config, skip_traits)?;
+        Commands::UpdateRules => Ok(update_rules()),
+        Commands::Validate => {
+            let model_dir = scan::cli::resolve_model_dir(None)?;
+            let level = scan::cli::operating_level(global.level, false, &model_dir);
+            let config = scan::ScanConfig::new(model_dir, scan::OutputFormat::Terminal, None)?
+                .with_extra(global.extra)
+                .with_level(level)
+                .with_zip_passwords(global.zip_passwords);
+            scan::validate::run(&config)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Version => {
@@ -1009,24 +979,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
 /// Settle the process's settings from its flags, and start the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
     scan::settings::configure(scan::settings::Settings {
-        rizin_timeout: Some(Duration::from_secs(global.rizin_timeout_secs)),
-        rizin_retry_timeout: global.rizin_retry_timeout_secs.map(Duration::from_secs),
-        // Every mode, interactive scan and server alike, honors
-        // `--fetch-max-size` and `--registry-ttl`.
-        fetch: scan::fetch::Settings {
-            max_fetch_bytes: global.fetch_max_size,
-            registry_ttl: global.registry_ttl,
-        },
+        rizin_timeout: Some(Duration::from_secs(scan::cli::DEFAULT_RIZIN_TIMEOUT_SECS)),
         // A hard cap across one invocation. The daemons scan unboundedly many
-        // jobs over their lifetime, so each job is bounded by
-        // `--fetch-max-file-*` instead.
+        // jobs over their lifetime, so each job is bounded by the fetch
+        // policy's per-file ceilings instead.
         fetch_total: (!command.is_daemon()).then_some(scan::settings::FetchTotal {
-            fetches: global.fetch_max_total_fetches,
-            bytes: global.fetch_max_total_size,
+            fetches: scan::fetch::DEFAULT_MAX_TOTAL_FETCHES,
+            bytes: scan::fetch::DEFAULT_MAX_TOTAL_SIZE,
         }),
-        fetch_backlog: global.fetch_pending.clone(),
-        cache_dir: None,
         theme: theme(global, command),
+        ..Default::default()
     })?;
     // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
     // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
@@ -1131,13 +1093,6 @@ fn fetch_policy(global: &GlobalArgs, command: &Commands) -> scan::fetch::FetchPo
     )
 }
 
-/// The operating point for a run against `model_dir`; see
-/// [`scan::cli::operating_level`].
-fn operating_level(global: &GlobalArgs, model_dir: &Path) -> Option<u16> {
-    let manual = global.threshold_suspicious.is_some() || global.threshold_hostile.is_some();
-    scan::cli::operating_level(global.level, manual, model_dir)
-}
-
 /// The configuration every interactive scan runs with.
 fn scan_config(
     global: &GlobalArgs,
@@ -1147,18 +1102,16 @@ fn scan_config(
 ) -> Result<scan::ScanConfig> {
     // Resolved only here: `update-rules` and `version` don't need it, and
     // resolving triggers the auto-clone.
-    let model_dir = scan::cli::resolve_model_dir(global.model_dir.clone())?;
-    let level = operating_level(global, &model_dir);
-    Ok(
-        scan::ScanConfig::new(model_dir, global.format, global.thresholds())?
-            .with_filter(global.display_filter())
-            .with_extra(global.extra)
-            .with_level(level)
-            .with_interpret(interpret)
-            .with_fetch(fetch)
-            .with_zip_passwords(global.zip_passwords.clone())
-            .with_hopper(resolve_hopper(hopper)),
-    )
+    let model_dir = scan::cli::resolve_model_dir(None)?;
+    let level = scan::cli::operating_level(global.level, false, &model_dir);
+    Ok(scan::ScanConfig::new(model_dir, global.format, None)?
+        .with_filter(global.display_filter())
+        .with_extra(global.extra)
+        .with_level(level)
+        .with_interpret(interpret)
+        .with_fetch(fetch)
+        .with_zip_passwords(global.zip_passwords.clone())
+        .with_hopper(resolve_hopper(hopper)))
 }
 
 /// `atomscan path`: scan files and directories.
@@ -1260,9 +1213,9 @@ fn serve(
             .map_or(0, std::num::NonZeroU64::get),
     );
     // `resolve` also refreshes rules on restart. That is the step that
-    // populates a `--traits-dir` pointing at an empty state directory on a
-    // fresh deploy — without it the server starts, reports healthy, and fails
-    // every analysis on a traits path that never got created.
+    // installs the traits on a fresh deploy — without it the server starts,
+    // reports healthy, and fails every analysis on a tree that never got
+    // created.
     let config = scan::server::Startup {
         bind: args.bind,
         max_size_mb: args.max_size_mb,
@@ -1274,10 +1227,9 @@ fn serve(
         hopper: hopper.clone(),
         analysis_timeout_secs: args.analysis_timeout,
         rules: scan::rules::RulesStartup {
-            model_dir: global.model_dir.clone(),
+            model_dir: None,
             level: global.level,
-            thresholds: global.thresholds(),
-            traits_dir: args.traits_dir,
+            thresholds: None,
             refresh: global.refresh(),
             slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
             interpret,
@@ -1305,21 +1257,14 @@ fn serve(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `atomscan update-rules`: check for, or apply, rule updates. Traits and
+/// `atomscan update-rules`: bring every rule source up to date. Traits and
 /// models failing is an error; the bloom and NSRL filters only let a scan skip
 /// work, so their failure is a warning.
-fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> ExitCode {
-    use scan::rules::Source;
-    let sources: &[Source] = if models_only {
-        &[Source::Models]
-    } else {
-        &Source::ALL
-    };
-    if check {
-        return check_rules(sources, model_dir);
-    }
+fn update_rules() -> ExitCode {
     let mut code = ExitCode::SUCCESS;
-    for (source, e) in scan::rules::refresh(sources, model_dir, false, false).failures() {
+    for (source, e) in
+        scan::rules::refresh(&scan::rules::Source::ALL, None, false, false).failures()
+    {
         if source.optional() {
             eprintln!(
                 "Warning: {} update failed (non-fatal): {e:#}",
@@ -1328,39 +1273,6 @@ fn update_rules(models_only: bool, check: bool, model_dir: Option<&Path>) -> Exi
         } else {
             eprintln!("Error updating {}: {e:#}", source.name());
             code = ExitCode::FAILURE;
-        }
-    }
-    code
-}
-
-/// `atomscan update-rules --check`: report what each source would install.
-fn check_rules(sources: &[scan::rules::Source], model_dir: Option<&Path>) -> ExitCode {
-    use scan::rules::Source;
-    let mut code = ExitCode::SUCCESS;
-    for &source in sources {
-        let checked = match source {
-            Source::Traits => scan::traits_repo::check_updates(),
-            Source::Models => model_dir
-                .map_or_else(scan::models_repo::install_target, |dir| {
-                    Ok(dir.to_path_buf())
-                })
-                .and_then(|dir| scan::model_update::check(&dir)),
-            Source::Bloom => {
-                scan::bloom_repo::install_dir().and_then(|dir| scan::bloom_update::check(&dir))
-            }
-            Source::Nsrl => {
-                scan::nsrl_repo::install_dir().and_then(|dir| scan::nsrl_repo::check(&dir))
-            }
-        };
-        match checked {
-            Ok(()) => {}
-            Err(e) if source.optional() => {
-                eprintln!("Warning: {} check failed: {e:#}", source.name());
-            }
-            Err(e) => {
-                eprintln!("Error checking {} updates: {e:#}", source.name());
-                code = ExitCode::FAILURE;
-            }
         }
     }
     code
@@ -1552,7 +1464,3 @@ fn git_head(dir: &Path) -> Option<(String, i64)> {
 #[cfg(test)]
 #[path = "main/tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "main/dependency_audit_cli_tests.rs"]
-mod dependency_audit_cli_tests;

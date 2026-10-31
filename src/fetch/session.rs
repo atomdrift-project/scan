@@ -748,7 +748,7 @@ impl FetchSession {
     /// Native-binary dependencies built for another platform are dropped before
     /// they're ever fetched — the host variant is scanned, its linux/windows
     /// siblings never run here. Off unless the policy asks for it
-    /// (`--fetch-all-platforms` audits every platform).
+    /// (`serve` audits every platform).
     pub(super) fn off_host(&self, r: &Reference) -> bool {
         let off_host = self.policy.host_platform_only && off_host_platform(r, self.host);
         if off_host {
@@ -756,7 +756,7 @@ impl FetchSession {
                 package = %locator(r),
                 host_os = self.host.0,
                 host_arch = self.host.1,
-                "dependency pinned to another platform; skipped (--fetch-all-platforms to include)"
+                "dependency pinned to another platform; skipped"
             );
         }
         off_host
@@ -1049,9 +1049,9 @@ impl FetchSession {
         if refs.is_empty() {
             return (Vec::new(), String::new());
         }
-        let (flag, limit) = match class {
-            FetchClass::Deps => ("--fetch-max-file-fetches", self.policy.max_file_fetches),
-            FetchClass::Urls => ("--fetch-max-urls", self.policy.max_url_fetches),
+        let (kind, limit) = match class {
+            FetchClass::Deps => ("dependency", self.policy.max_file_fetches),
+            FetchClass::Urls => ("URL", self.policy.max_url_fetches),
         };
         let want = self.budget.want(class);
         let grant = TOTAL_BUDGET.reserve(want);
@@ -1060,7 +1060,7 @@ impl FetchSession {
         } else {
             usize::MAX
         };
-        let notice = fetch_count_budget_notice(flag, limit, total_limited);
+        let notice = fetch_count_budget_notice(kind, limit, total_limited);
         // The callback fires as each download lands (from a pool worker, so
         // it's `Sync`), flipping that row to "analyzing" the moment its bytes
         // arrive rather than when the whole concurrent batch returns.

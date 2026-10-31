@@ -322,7 +322,7 @@ fn blend_never_moves_more_than_one_step_or_a_third_of_the_range() {
 
 #[test]
 fn ml_benign_plus_llm_hostile_always_reaches_suspicious() {
-    // The case `--interpret` exists for: ML missed it entirely. An ML false
+    // The case `--llm` exists for: ML missed it entirely. An ML false
     // negative sits at `Level::Clean` by definition, so a proximity gate on the
     // suspicious boundary would make it unreachable — the escalation must not
     // depend on where ML happened to place a file it got wrong.

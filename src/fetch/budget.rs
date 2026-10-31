@@ -14,7 +14,7 @@ pub(super) struct Allowance {
     pub(super) bytes: u64,
 }
 
-/// The per-execution fetch budget (`--fetch-max-total-*`), shared by every
+/// The per-execution fetch budget, shared by every
 /// fetch phase in the process. Concurrent scans draw on it, so a fetch reserves
 /// its allowance before touching the network and refunds what it did not use:
 /// two scans can never both spend the last of it. Left unlimited in long-lived
@@ -81,9 +81,9 @@ pub(crate) fn set_total_budget(max_fetches: usize, max_bytes: u64) {
 }
 
 /// What one scanned artifact may still fetch, across all of its hops and
-/// declaring files: `--fetch-max-file-fetches` live dependency/package
-/// fetches, `--fetch-max-urls` live URL fetches, and `--fetch-max-file-size`
-/// bytes. Cache hits are free and uncounted, so a warm re-run is never
+/// declaring files: live dependency/package fetches, live URL fetches, and
+/// bytes, each a [`FetchPolicy`](super::FetchPolicy) per-file ceiling. Cache
+/// hits are free and uncounted, so a warm re-run is never
 /// throttled; references past a cap become `BudgetExceeded`, never silently
 /// dropped.
 #[derive(Debug, Clone, Copy)]
@@ -148,16 +148,16 @@ pub fn payloads_analyzed_total() -> u64 {
 /// is normally the limiting value; a smaller process-wide remainder takes
 /// precedence so the notice names the budget that actually stopped the work.
 pub(super) fn fetch_count_budget_notice(
-    per_file_flag: &str,
+    per_file_kind: &str,
     per_file_limit: usize,
     total_remaining: usize,
 ) -> String {
     if total_remaining < per_file_limit {
-        format!(
-            "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches={total_remaining})"
-        )
+        format!("Skipping remaining fetches, hit this run's fetch budget ({total_remaining} left)")
     } else {
-        format!("Skipping remaining fetches, hit fetch budget ({per_file_flag}={per_file_limit})")
+        format!(
+            "Skipping remaining fetches, hit the per-file {per_file_kind} budget ({per_file_limit})"
+        )
     }
 }
 

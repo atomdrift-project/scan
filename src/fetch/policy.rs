@@ -59,100 +59,44 @@ pub fn default_service_follow_policy() -> FetchPolicy {
     }
 }
 
-/// 1024-based size units, the basis for every `--fetch-max-*-size` ceiling.
+/// 1024-based size units, the basis for every byte ceiling.
 pub(super) const MIB: u64 = 1024 * 1024;
 pub(super) const GIB: u64 = 1024 * MIB;
 
-/// Default size ceiling for a single fetched artifact (`--fetch-max-size`) —
+/// Default size ceiling for a single fetched artifact —
 /// mirrors fletch's [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (256 MiB). A
 /// response larger than this is abandoned, so one artifact can't dominate a run.
 pub const DEFAULT_MAX_FETCH_SIZE: u64 = 256 * MIB;
 
-/// Default ceiling on *live* non-URL fetches triggered by a single scanned file
-/// (`--fetch-max-file-fetches`). Cache hits don't count, so a warm re-run is
+/// Default ceiling on *live* non-URL fetches triggered by a single scanned
+/// file. Cache hits don't count, so a warm re-run is
 /// never throttled; this bounds the dependency/package fan-out one crafted file
 /// can trigger.
 pub const DEFAULT_MAX_FILE_FETCHES: usize = 100;
 
 /// Default ceiling on *live* opportunistic URL fetches triggered by a single
-/// scanned file (`--fetch-max-urls`). Cache hits don't count, so a warm re-run
-/// is never throttled.
+/// scanned file. Cache hits don't count, so a warm re-run is never throttled.
 pub const DEFAULT_MAX_URL_FETCHES: usize = 4;
 
-/// Default ceiling on total bytes fetched on behalf of a single scanned file
-/// (`--fetch-max-file-size`).
+/// Default ceiling on total bytes fetched on behalf of a single scanned file.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
 
-/// Default wall-clock ceiling on one artifact's whole fetch phase
-/// (`--fetch-timeout`). The count and byte budgets bound how *much* a scan
+/// Default wall-clock ceiling on one artifact's whole fetch phase. The count
+/// and byte budgets bound how *much* a scan
 /// pulls but not how *long* pulling takes: a wide tree of slow registries can
 /// hold a scan open for as long as it likes while every count budget still has
 /// room. Five minutes is well past what a healthy tree needs and short enough
 /// that a wedged one still returns a verdict. `0` disables the cap.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default ceiling on *live* fetches across one whole execution
-/// (`--fetch-max-total-fetches`). Lifted in long-lived server modes, where each
-/// job is bounded by the per-file caps instead.
+/// Default ceiling on *live* fetches across one whole execution. Lifted in
+/// long-lived server modes, where each job is bounded by the per-file caps
+/// instead.
 pub const DEFAULT_MAX_TOTAL_FETCHES: usize = 1000;
 
-/// Default ceiling on total bytes fetched across one whole execution
-/// (`--fetch-max-total-size`). Lifted in long-lived server modes.
+/// Default ceiling on total bytes fetched across one whole execution. Lifted
+/// in long-lived server modes.
 pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 10 * GIB;
-
-/// Parse a byte size with an optional 1024-based unit suffix — `K`, `M`, `G`, or
-/// `T`, case-insensitive, with an optional trailing `B` (`40M`, `40MB`, and
-/// `40m` are equal). A bare number is bytes (`10240`). Powers every
-/// `--fetch-max-*-size` flag, so an operator writes the natural unit and the
-/// conversion happens once.
-///
-/// # Errors
-/// Returns a human-readable message when the number is missing, unparseable, or
-/// the result overflows `u64`.
-pub fn parse_bytes(s: &str) -> Result<u64, String> {
-    let lowered = s.trim().to_ascii_lowercase();
-    // Drop an optional trailing `b` so `40mb` == `40m` == `40`, then peel a unit
-    // suffix off the number — `strip_suffix` keeps us off byte indexing.
-    let body = lowered.strip_suffix('b').unwrap_or(&lowered);
-    let units = [('k', 1024_u64), ('m', MIB), ('g', GIB), ('t', 1024 * GIB)];
-    let (number, mult) = units
-        .iter()
-        .find_map(|&(suffix, mult)| body.strip_suffix(suffix).map(|n| (n, mult)))
-        .unwrap_or((body, 1));
-    let n: u64 = number
-        .trim()
-        .parse()
-        .map_err(|e| format!("invalid size {s:?}: {e} (examples: 40M, 2G, 10240)"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| format!("size {s:?} is too large"))
-}
-
-/// Parse a duration with an optional unit suffix — `s`, `m`, `h`, or `d`
-/// (case-insensitive); a bare number is seconds (`90` == `90s`). The words
-/// `never`/`inf`/`forever` mean "cache indefinitely" ([`Duration::MAX`]), for an
-/// offline/air-gapped run that must not revalidate. Powers `--registry-ttl`.
-///
-/// # Errors
-/// Returns a human-readable message when the number is missing, unparseable, or
-/// the result overflows.
-pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    let lowered = s.trim().to_ascii_lowercase();
-    if matches!(lowered.as_str(), "never" | "inf" | "infinite" | "forever") {
-        return Ok(Duration::MAX);
-    }
-    let units = [('s', 1_u64), ('m', 60), ('h', 3600), ('d', 86_400)];
-    let (number, mult) = units
-        .iter()
-        .find_map(|&(suffix, mult)| lowered.strip_suffix(suffix).map(|n| (n, mult)))
-        .unwrap_or((lowered.as_str(), 1));
-    let n: u64 = number
-        .trim()
-        .parse()
-        .map_err(|e| format!("invalid duration {s:?}: {e} (examples: 90s, 30m, 4h, 2d, never)"))?;
-    n.checked_mul(mult)
-        .map(Duration::from_secs)
-        .ok_or_else(|| format!("duration {s:?} is too large"))
-}
 
 /// Which discovered references to follow, plus how many hops to traverse.
 ///
@@ -198,23 +142,23 @@ pub struct FetchPolicy {
     /// URLs and command-mentioned packages are never age-gated, since their risk
     /// isn't tied to a registry release date.
     pub max_dep_age_days: u32,
-    /// Ceiling on *live* fetches triggered by a single scanned file
-    /// (`--fetch-max-file-fetches`). Cache hits are always served and never
+    /// Ceiling on *live* fetches triggered by a single scanned file. Cache
+    /// hits are always served and never
     /// counted, so this caps only the cold-cache dependency/package fan-out,
     /// never a warm re-run. `0` disables these fetches entirely.
     pub max_file_fetches: usize,
     /// Ceiling on *live* opportunistic raw-URL fetches triggered by a single
-    /// scanned file (`--fetch-max-urls`). Cache hits are always served and
+    /// scanned file. Cache hits are always served and
     /// never counted. `0` disables opportunistic URL fetching while leaving
     /// declared dependencies and command-mentioned packages unaffected.
     pub max_url_fetches: usize,
-    /// Wall-clock ceiling on the whole fetch phase for one scanned artifact
-    /// (`--fetch-timeout`). Checked at group boundaries, so a group already
+    /// Wall-clock ceiling on the whole fetch phase for one scanned artifact.
+    /// Checked at group boundaries, so a group already
     /// downloading finishes rather than being torn mid-transfer; references not
     /// reached by then are simply not followed. [`Duration::ZERO`] disables it.
     pub max_duration: Duration,
-    /// Ceiling on total bytes fetched on behalf of a single scanned file
-    /// (`--fetch-max-file-size`). The sweep stops once retrieved bytes cross it.
+    /// Ceiling on total bytes fetched on behalf of a single scanned file. The
+    /// sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
     /// Follow declared dependencies past the **first** hop — the dependencies
     /// of a fetched dependency, and so on to `depth`.

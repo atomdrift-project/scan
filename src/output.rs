@@ -1207,7 +1207,7 @@ pub fn print_bloom_verdict(
     )
 }
 
-/// Write one artifact isotope13 judged (`--enriched`), in place of a local
+/// Write one artifact Atomdrift Uplink judged (`--uplink`), in place of a local
 /// result.
 ///
 /// JSON gets a record shaped like the bloom one — `"source": "remote"` says

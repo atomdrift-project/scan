@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validate / tune the `--interpret` render template on a labelled corpus.
+"""Validate / tune the `--llm` render template on a labelled corpus.
 
 One command: capture every file's LLM render (`atomscan -f interpret`, one
-scan per file — no `--interpret`, no LLM calls needed for capture), then sweep
+scan per file — no `--llm`, no LLM calls needed for capture), then sweep
 the render templates offline against the LLM endpoint and score each against
 hand-labelled ground truth.
 
@@ -20,7 +20,7 @@ verbatim (annotations + prose kept), with a system prompt that frames each
 description as a fallible interpretation (false positives possible, verify
 against the source). The other templates here are offline experiment arms kept
 for comparison; `SYSTEM_PROMPT` in `src/interpret.rs` is the canonical prompt —
-a final `atomscan --interpret` scan is the authoritative check (it has matched
+a final `atomscan --llm` scan is the authoritative check (it has matched
 this harness exactly). See docs/interpret-tuning.md.
 
 Labels file: TSV `relpath <TAB> ideal <TAB> acceptable`, one row per sample.
@@ -270,7 +270,7 @@ def load_renders(dump_dir, corpus):
     return renders
 
 def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
-    """Render every corpus file the way a live `--interpret` query would, caching
+    """Render every corpus file the way a live `--llm` query would, caching
     each under its content hash. `--follow=none`: a fetched dependency is network
     state, so its render differs run to run — the exact thing an A/B must hold
     fixed. Registry provenance (`--registry-map`) changes the render materially —
@@ -347,7 +347,7 @@ def ask(endpoint, model, system, user, timeout, key=None):
     return hit.group(1)[0].lower() if hit else "?"
 
 def main():
-    ap = argparse.ArgumentParser(description="Validate/tune the --interpret render template.")
+    ap = argparse.ArgumentParser(description="Validate/tune the --llm render template.")
     ap.add_argument("--corpus", required=True, help="directory of samples to score")
     ap.add_argument("--labels", help="TSV ground-truth labels (relpath<TAB>ideal<TAB>acceptable)")
     ap.add_argument("--endpoint", default=os.environ.get("SCAN_LLM", "http://localhost:8000/v1"))

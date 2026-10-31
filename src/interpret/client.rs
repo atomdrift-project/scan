@@ -655,10 +655,9 @@ pub(super) fn status_hint(status: reqwest::StatusCode, base_url: &str, keyed: bo
         }
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
             if keyed {
-                " — the endpoint rejected the key (--llm-key, SCAN_LLM_KEY, or ~/.tok/llm)"
-                    .to_string()
+                " — the endpoint rejected the key (SCAN_LLM_KEY or ~/.tok/llm)".to_string()
             } else {
-                " — the endpoint wants a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/llm".to_string()
+                " — the endpoint wants a key: SCAN_LLM_KEY or ~/.tok/llm".to_string()
             }
         }
         _ => String::new(),

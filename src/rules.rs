@@ -21,8 +21,6 @@ pub struct RulesStartup {
     pub level: Option<u16>,
     /// Manual probability cutoffs, bypassing the level grid.
     pub thresholds: Option<Thresholds>,
-    /// Traits bundle override (`--traits-dir`).
-    pub traits_dir: Option<PathBuf>,
     /// The startup refresh (`-u` / `--no-update`). [`Refresh::Skip`] also
     /// pins the rules for the whole run.
     pub refresh: Refresh,
@@ -45,12 +43,6 @@ impl RulesStartup {
     /// Returns an error when no model bundle is named and none can be
     /// installed.
     pub fn resolve(self) -> Result<Rules> {
-        // The override comes first: otherwise the refresh installs into the
-        // default directory while `--traits-dir` points at an empty one, and
-        // the server comes up healthy and fails every analysis.
-        if let Some(dir) = self.traits_dir.as_ref() {
-            cleave::traits_repo::set_override_dir(Some(dir.into()));
-        }
         refresh_rules_at_startup(self.refresh)?;
         let model_dir = crate::cli::resolve_model_dir(self.model_dir)?;
         let level = crate::cli::operating_level(self.level, self.thresholds.is_some(), &model_dir);
@@ -167,7 +159,7 @@ impl Refreshed {
             .filter_map(|(source, result)| result.as_ref().err().map(|e| (*source, e)))
     }
 
-    /// Why `--enriched` cannot be honoured, when the traits refresh says so.
+    /// Why `--uplink` cannot be honoured, when the traits refresh says so.
     #[must_use]
     pub fn enriched_refusal(&self) -> Option<&str> {
         self.failures()
@@ -220,11 +212,11 @@ pub fn refresh(
 /// starts on deploy or restart. Every failure but one is ridden out on the installed rules: a
 /// host in a disconnected environment must still start.
 ///
-/// This is also what fills a `--traits-dir` naming an empty directory on a
-/// fresh deploy; without it a server comes up healthy and fails every analysis.
+/// This is also what installs the traits on a fresh deploy; without it a
+/// server comes up healthy and fails every analysis.
 ///
 /// # Errors
-/// The one failure that is fatal: `--enriched` was asked for and the token is
+/// The one failure that is fatal: `--uplink` was asked for and the token is
 /// missing or refused. A daemon that came up anyway would serve rules nobody
 /// deployed it with.
 pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
@@ -241,7 +233,7 @@ pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
         );
     }
     match refreshed.enriched_refusal() {
-        Some(why) => anyhow::bail!("enriched rules unavailable: {why}"),
+        Some(why) => anyhow::bail!("uplink rules unavailable: {why}"),
         None => Ok(()),
     }
 }

@@ -36,9 +36,9 @@
 //! No `--hopper`, no precheck. Auth reuses the process's hopper bearer token
 //! (see [`crate::hopper::token`]).
 //!
-//! # isotope13
+//! # Atomdrift Uplink
 //!
-//! `--enriched` scans arm the same precheck against isotope13's API instead
+//! `--uplink` scans arm the same precheck against isotope13's API instead
 //! ([`configure_isotope13`]), with the subscription token. The wire is the
 //! same `/v1/lookup`; what changes is whose judgment it is. Hopper is a corpus
 //! of other runs, so only the same analyzer's verdict is ours. isotope13 is the
@@ -165,7 +165,7 @@ pub struct Precheck {
 enum Backend {
     /// The hopper this process submits to. Only a same-analyzer verdict is ours.
     Hopper,
-    /// isotope13's API under `--enriched`. Its analyzed verdicts are the answer.
+    /// isotope13's API under `--uplink`. Its analyzed verdicts are the answer.
     Isotope13(cleave::enriched::Token),
 }
 
@@ -173,7 +173,7 @@ enum Backend {
 /// process was pointed at is the one it asks.
 static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 
-/// Arm the precheck against isotope13's API, for an `--enriched` scan in
+/// Arm the precheck against isotope13's API, for an `--uplink` scan in
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
 pub fn configure_isotope13(token: cleave::enriched::Token) {
@@ -321,7 +321,7 @@ impl Precheck {
         })
     }
 
-    /// Whether this precheck asks isotope13 (`--enriched`) rather than hopper.
+    /// Whether this precheck asks isotope13 (`--uplink`) rather than hopper.
     pub fn is_isotope13(&self) -> bool {
         matches!(self.backend, Backend::Isotope13(_))
     }

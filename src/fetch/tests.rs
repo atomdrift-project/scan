@@ -761,14 +761,14 @@ fn the_streamed_log_states_each_distinct_row_once() {
 }
 
 #[test]
-fn budget_notice_names_the_limiting_count_flag() {
+fn budget_notice_names_the_limiting_count_budget() {
     assert_eq!(
-        fetch_count_budget_notice("--fetch-max-urls", 4, usize::MAX),
-        "Skipping remaining fetches, hit fetch budget (--fetch-max-urls=4)"
+        fetch_count_budget_notice("URL", 4, usize::MAX),
+        "Skipping remaining fetches, hit the per-file URL budget (4)"
     );
     assert_eq!(
-        fetch_count_budget_notice("--fetch-max-file-fetches", 100, 7),
-        "Skipping remaining fetches, hit fetch budget (--fetch-max-total-fetches=7)"
+        fetch_count_budget_notice("dependency", 100, 7),
+        "Skipping remaining fetches, hit this run's fetch budget (7 left)"
     );
 }
 
@@ -1305,32 +1305,6 @@ fn payload_name_prefers_url_basename_then_falls_back_to_hash() {
     // No usable basename → content hash.
     rec.resolved_url = Some("https://reg.test/".to_string());
     assert_eq!(payload_name(&rec), "abc123");
-}
-
-#[test]
-fn parse_bytes_reads_units_and_matches_cli_defaults() {
-    // Unit suffixes are 1024-based, case-insensitive, with an optional `B`.
-    assert_eq!(parse_bytes("40M"), Ok(40 * MIB));
-    assert_eq!(parse_bytes("40m"), Ok(40 * MIB));
-    assert_eq!(parse_bytes("40MB"), Ok(40 * MIB));
-    assert_eq!(parse_bytes("40mb"), Ok(40 * MIB));
-    assert_eq!(parse_bytes("2G"), Ok(2 * GIB));
-    assert_eq!(parse_bytes(" 1k "), Ok(1024));
-    assert_eq!(parse_bytes("512K"), Ok(512 * 1024));
-    // A bare number is bytes; a trailing `B` alone is bytes too.
-    assert_eq!(parse_bytes("10240"), Ok(10240));
-    assert_eq!(parse_bytes("4096B"), Ok(4096));
-    // Garbage, an empty number, or a lone unit are all errors.
-    assert!(parse_bytes("").is_err());
-    assert!(parse_bytes("abc").is_err());
-    assert!(parse_bytes("M").is_err());
-    assert!(parse_bytes("1.5G").is_err());
-
-    // The CLI default strings must parse to the matching constants, so the
-    // help text and the policy never drift apart.
-    assert_eq!(parse_bytes("256M"), Ok(DEFAULT_MAX_FETCH_SIZE));
-    assert_eq!(parse_bytes("2G"), Ok(DEFAULT_MAX_FILE_SIZE));
-    assert_eq!(parse_bytes("10G"), Ok(DEFAULT_MAX_TOTAL_SIZE));
 }
 
 fn report_of(files: &serde_json::Value) -> AnalysisReport {

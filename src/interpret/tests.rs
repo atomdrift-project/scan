@@ -869,7 +869,7 @@ fn an_open_breaker_skips_the_dead_primary_until_the_cooldown() {
     assert_eq!(live_h.join().expect("thread").len(), calls);
 }
 
-/// `--llm-min-level` bounds the level admission: a placement looser than the
+/// `min_level` bounds the level admission: a placement looser than the
 /// cutoff is not enough on its own, and unset admits any placement.
 #[test]
 fn min_level_bounds_the_level_admission() {

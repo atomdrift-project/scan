@@ -293,7 +293,7 @@ impl Evidence {
     ///   with no budget attached. Two detectors disagreeing is precisely the
     ///   signal that one should, so gating it would defeat the purpose: an ML
     ///   false negative sits at [`Level::Clean`] by definition, which no bounded steer
-    ///   can lift. That is the case `--interpret` exists to catch.
+    ///   can lift. That is the case `--llm` exists to catch.
     ///
     /// The one relaxation on the hostile side is an escalation corroborated by a
     /// cleave hostile finding — two independent detectors agreeing with ML as the
@@ -312,7 +312,7 @@ impl Evidence {
         //
         // It is not gated on the same proximity test as an escalation: that
         // would make the LLM's ability to correct a false positive shrink as ML
-        // grows more confidently wrong — backwards for the case `--interpret`
+        // grows more confidently wrong — backwards for the case `--llm`
         // exists to catch. Benign tools such as yt-dlp, gallery-dl, androguard,
         // crawl4ai and pyarmor can sit at L1 with a correct exoneration in the
         // same record.

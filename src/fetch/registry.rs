@@ -291,7 +291,7 @@ pub(super) struct Memoized {
 /// How long a memo entry stands in for the blob cache. The memo exists to
 /// spare a burst of scans naming the same dependencies the disk read and the
 /// JSON parse; held for the life of a server, it would also outlive
-/// `--registry-ttl` and keep serving a record whose version has since been
+/// the registry TTL and keep serving a record whose version has since been
 /// yanked or security-held. Past this the blob cache answers again, under its
 /// own TTL.
 pub(super) const REGISTRY_MEMO_TTL_SECS: u64 = 30 * 60;

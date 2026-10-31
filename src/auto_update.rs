@@ -35,8 +35,8 @@ struct Stamp {
 }
 
 /// Path to the stamp (`<cache_dir>/atomdrift/scan/rules-update.toml`), one per
-/// rules channel: the enriched tree goes stale on its own clock, and a host
-/// that switches to `--enriched` must not inherit the open-source tree's
+/// rules channel: the uplink tree goes stale on its own clock, and a host
+/// that switches to `--uplink` must not inherit the open-source tree's
 /// "checked an hour ago".
 fn stamp_path() -> Option<PathBuf> {
     let name = if cleave::enriched::enabled() {
@@ -73,7 +73,7 @@ fn write_stamp() {
 /// bucket can't cause a refresh storm.
 ///
 /// # Errors
-/// The one failure that is not best-effort: `--enriched` was asked for and the
+/// The one failure that is not best-effort: `--uplink` was asked for and the
 /// token is missing or refused. Scanning on with other rules would answer a
 /// question nobody asked.
 pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow::Result<()> {
@@ -136,7 +136,7 @@ pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow:
 struct Outcome {
     changed: bool,
     failed: bool,
-    /// Why `--enriched` cannot be honoured, when it cannot.
+    /// Why `--uplink` cannot be honoured, when it cannot.
     refused: Option<String>,
 }
 

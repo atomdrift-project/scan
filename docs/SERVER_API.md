@@ -18,7 +18,6 @@ require a bearer token on every route but `/_/health`.
 | `--token-file`        | none              | File holding the bearer token. See [Authentication](#authentication). |
 | `--allow-local-paths` | none              | Directory `?path=` may read from. Repeatable. See [Local files](#local-files). |
 | `--hopper`            | none              | Hopper base URL(s). Results are filed there, and lookups this server cannot answer are deferred to it. |
-| `--traits-dir`        | none              | Writable cleave traits directory. |
 | `--analysis-timeout`  | `2040`            | Per-request analysis budget in seconds; `0` disables. |
 
 Global flags (`--follow`, `--llm`, `--level`, …) apply as they do to a scan;
