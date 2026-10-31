@@ -1,11 +1,11 @@
-# `--interpret` prompt tuning
+# `--llm` prompt tuning
 
 How the LLM second-opinion render was tuned, and how to validate/tune it on a new
 batch of samples.
 
 ## The problem
 
-`--interpret` sends cleave's `tiny()` render to a local LLM for a trinary grade
+`--llm` sends cleave's `tiny()` render to a local LLM for a trinary grade
 (benign/suspicious/hostile), blended with the ML verdict. That render annotates
 each finding with a prose description — `# SEV LINE:COL desc`. Presented at face
 value, the model tended to **parrot the description** instead of reading the
@@ -120,11 +120,11 @@ identical, so the rule was doing no work there at all.
 
 ## The adjustment algorithm (gate + blend)
 
-Beyond the prompt, these tuning points govern whether `--interpret` delivers the
+Beyond the prompt, these tuning points govern whether `--llm` delivers the
 right verdict:
 
-1. **The gate — the calibrated level axis, not a probability.** `--interpret` runs
-   when ML fires at or below `--llm-min-level` OR cleave surfaced a
+1. **The gate — the calibrated level axis, not a probability.** `--llm` runs
+   when ML fires at or below the gate's level cutoff (`min_level`) OR cleave surfaced a
    suspicious/hostile finding (the *elevated-finding bypass*) OR the scan's own
    class is non-benign. The cutoff defaults to the model's **grid ceiling**
    (`LevelContext::ml_admits` resolves `None` to `grid_max`), so ML admits any file
@@ -395,7 +395,7 @@ version history in front of the model and benign without it; the low-hint arms
 call it hostile too. The one miss every arm shares, a VS Code extension with no
 registry record and only notable-level metadata findings, is a baseline blind
 spot rather than a render effect. The same corpus was then scanned for real
-(`atomscan --interpret`, old binary vs new, 3 runs each, no analysis cache) as
+(`atomscan --llm`, old binary vs new, 3 runs each, no analysis cache) as
 the authoritative check: **7/8 → 7/8, every grade identical across all six
 runs, no flapping**, with the same single miss — at 14% fewer prompt tokens
 over the corpus (up to 49% on a small package, where `raw` was most of the
@@ -413,7 +413,7 @@ sidecars — identity comes from `--registry-map`, built with
 The harness is `hacks/interpret-tune/tune.py`; the workflow is:
 
 1. Capture the LLM render per file with `atomscan -f interpret` (no
-   `--interpret` / LLM calls needed), or let `tune.py` do it for you.
+   `--llm` / LLM calls needed), or let `tune.py` do it for you.
 2. Hand-label each file's ideal grade (reverse-engineer binaries; be honest about
    files whose verdict lives in an unavailable payload — mark them borderline).
 3. Sweep the experiment arms offline against the LLM endpoint

@@ -1,7 +1,7 @@
 //! The command-line flags every Atomdrift Scan front-end shares.
 //!
 //! [`GlobalArgs`] holds the `global = true` options of the `atomscan` binary —
-//! the LLM, follow/fetch, threshold, display and model-refresh knobs that apply
+//! the LLM, follow, display and model-refresh knobs that apply
 //! to every subcommand. It lives in the library, not in `src/main.rs`, so a
 //! second binary that re-exposes `serve` can `#[command(flatten)]` the
 //! same declarations instead of restating them. Restating them is how two
@@ -126,8 +126,9 @@ pub fn resolve_model_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
 /// In priority order: the explicit `-l/--level`, the bundle's own
 /// `default_severity_level` (so a bundle calibrated at L50 deploys at L50 with
 /// no rebuild), then [`crate::model::DEFAULT_SEVERITY_LEVEL`]. Manual
-/// `--threshold-*` cutoffs bypass the level grid entirely, so there is no
-/// level to report then and the answer is `None`.
+/// probability cutoffs (a library caller's [`crate::model::Thresholds`])
+/// bypass the level grid entirely, so there is no level to report then and
+/// the answer is `None`.
 #[must_use]
 pub fn operating_level(
     level: Option<u16>,
@@ -196,25 +197,26 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_update: bool,
 
-    /// Insist on isotope13 Enriched: the latest rules, the moment they clear
-    /// QA, and remote verdicts (see `--analyze`). A computer that holds a
-    /// token (`ISOTOPE13_TOKEN`, or the one saved when it was connected) uses
-    /// them without this flag. With it, a computer that holds none is
-    /// connected — a terminal shows a code to approve at dash.isotope13.io —
-    /// and a refused token stops the scan instead of falling back to the
-    /// open-source rules. Also settable via `ATOMDRIFT_ENRICHED=1`; `=0`
-    /// keeps the open-source rules.
-    #[arg(long, global = true, env = "ATOMDRIFT_ENRICHED", value_parser = clap::builder::FalseyValueParser::new())]
-    pub enriched: bool,
+    /// Insist on Atomdrift Uplink: zero-hour rules the moment they clear QA,
+    /// remote dependency and hash verdicts (see `--analyze`), and a default
+    /// hosted LLM endpoint (raw files stay local unless `--analyze=remote`).
+    /// A computer that holds a token (`ISOTOPE13_TOKEN`, or the one saved when
+    /// it was connected) uses Uplink without this flag. With it, a computer
+    /// that holds none is connected — a terminal shows a code to approve at
+    /// dash.isotope13.io — and a refused token stops the scan instead of
+    /// falling back to the open-source rules. Also settable via
+    /// `ATOMDRIFT_UPLINK=1`; `=0` keeps the open-source rules.
+    #[arg(long, global = true, env = "ATOMDRIFT_UPLINK", value_parser = clap::builder::FalseyValueParser::new())]
+    pub uplink: bool,
 
-    /// Where artifacts are judged. `auto` (the default) asks isotope13 for a
-    /// verdict it already holds — sending only the SHA-256 of local files of
-    /// 1 MiB or more, and the PURLs of packages on mainstream public registries — and analyzes
-    /// locally whatever it does not know; it needs isotope13 Enriched (a
-    /// token, or `--enriched`), and without it is the same as `local`.
-    /// `local` never asks, and is the reproducible mode. `remote` sends
-    /// everything to isotope13 for analysis, uploading local files' contents,
-    /// and needs isotope13 Enriched.
+    /// Where artifacts are judged. `auto` (the default) asks Atomdrift Uplink
+    /// for a verdict it already holds — sending only the SHA-256 of local
+    /// files of 1 MiB or more, and the PURLs of packages on mainstream public
+    /// registries — and analyzes locally whatever it does not know; it needs
+    /// Atomdrift Uplink (a token, or `--uplink`), and without it is the same
+    /// as `local`. `local` never asks, and is the reproducible mode. `remote`
+    /// sends everything to Uplink for analysis, uploading local files'
+    /// contents, and needs Atomdrift Uplink.
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub analyze: crate::remote::Analyze,
 
@@ -226,10 +228,6 @@ pub struct GlobalArgs {
     #[arg(long, global = true, conflicts_with = "light")]
     pub dark: bool,
 
-    /// Override model directory (default: auto-resolved from models repo)
-    #[arg(long, global = true)]
-    pub model_dir: Option<PathBuf>,
-
     /// Output format
     #[arg(short, long, global = true, default_value = "terminal")]
     pub format: OutputFormat,
@@ -240,26 +238,6 @@ pub struct GlobalArgs {
     #[arg(long, global = true, default_value = "balanced")]
     pub mode: crate::Mode,
 
-    /// Hard wall-clock limit for each Rizin subprocess, in seconds. On expiry
-    /// Atomscan kills and reaps Rizin before releasing the analysis worker; on
-    /// Unix it also kills the complete process group.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SECS",
-        default_value_t = DEFAULT_RIZIN_TIMEOUT_SECS,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub rizin_timeout_secs: u64,
-
-    /// Override suspicious threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long, global = true)]
-    pub threshold_suspicious: Option<f32>,
-
-    /// Override hostile threshold (0.0-1.0); omit to use model's recommendation
-    #[arg(long, global = true)]
-    pub threshold_hostile: Option<f32>,
-
     /// Tune thresholds for false-positive level N (0-25000, FP per 100M benigns): higher = more sensitive, noisier. Bundle decides which levels are calibrated.
     #[arg(
         short = 'l',
@@ -267,7 +245,6 @@ pub struct GlobalArgs {
         value_name = "N",
         value_parser = clap::value_parser!(u16).range(0..=25000),
         global = true,
-        conflicts_with_all = ["threshold_suspicious", "threshold_hostile"],
     )]
     pub level: Option<u16>,
 
@@ -283,17 +260,12 @@ pub struct GlobalArgs {
     #[arg(long, global = true, hide = true)]
     pub extra: bool,
 
-    /// [deprecated] Legacy on-switch for LLM interpretation; superseded by
-    /// `--llm`.
-    #[arg(long, global = true, hide = true)]
-    pub interpret: bool,
-
     /// [optional] Enable additional LLM interpretation of analyzed samples: a
     /// second opinion blended with the ML verdict (stored in the `llm` JSON
     /// section and shown inline). Given with no value, uses a local model (an
     /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
-    /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from `--llm-key`,
-    /// `SCAN_LLM_KEY`, or `~/.tok/openrouter`; defaults to `openrouter/auto`
+    /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from
+    /// `SCAN_LLM_KEY` or `~/.tok/openrouter`; defaults to `openrouter/auto`
     /// unless `--llm-model` names one), or an explicit OpenAI-compatible base
     /// URL. Endpoints that require a bearer
     /// token take it from `~/.tok/llm` when that file exists. Comma-separate
@@ -316,70 +288,6 @@ pub struct GlobalArgs {
     /// (env: SCAN_LLM_MODEL)
     #[arg(long, global = true, value_name = "NAME")]
     pub llm_model: Option<String>,
-
-    /// LLM bearer token (env: SCAN_LLM_KEY). Defaults to `~/.tok/llm` when that
-    /// file exists (`~/.tok/openrouter` for OpenRouter); omit for an endpoint
-    /// that needs no key
-    #[arg(long, global = true, value_name = "KEY")]
-    pub llm_key: Option<String>,
-
-    /// Loosest FP level (0-25000, per 100M benigns) at which ML alone sends a
-    /// sample to the LLM; higher = more samples. Defaults to the model's grid
-    /// ceiling — anything ML flagged at any level. Files cleave flagged
-    /// suspicious/hostile are sent regardless of this cutoff.
-    #[arg(
-        long,
-        global = true,
-        alias = "interpret-min-level",
-        value_parser = clap::value_parser!(u16).range(0..=25000),
-        value_name = "N",
-    )]
-    pub llm_min_level: Option<u16>,
-
-    /// Raw ML probability at or above which a sample reaches the LLM, whatever
-    /// the calibrated level grid and cleave findings say.
-    ///
-    /// One of several independent admissions, so it can only send more, never
-    /// block. The default sits on an elbow: malicious admission is flat
-    /// across 0.46..0.57 while benign admission keeps falling through it.
-    /// Lowering it buys the overlap region at roughly 50 benign samples per
-    /// malicious one; raising it sheds about four benign per malicious.
-    #[arg(
-        long,
-        global = true,
-        alias = "interpret-min-prob",
-        value_name = "P",
-        default_value_t = crate::interpret::DEFAULT_LLM_MIN_PROB,
-    )]
-    pub llm_min_prob: f32,
-
-    /// Size veto for the LLM gate: an ML-benign sample with no hostile finding
-    /// and more than this many notable-or-above findings is not sent to the
-    /// LLM, unless it carries a strong gate trait or ML placed it on the level
-    /// grid. Big legitimate packages accumulate notable findings until some
-    /// admission fires, and the reader then moves nothing; on the benchmark
-    /// corpus a veto at 300 halves benign calls and keeps every correct
-    /// shift. `0` disables it.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = crate::interpret::DEFAULT_LLM_BENIGN_NOTABLE_CAP,
-    )]
-    pub llm_benign_notable_cap: usize,
-
-    /// Per-request LLM timeout, in seconds. Once it elapses the endpoint is
-    /// treated as a refusal and the next one in the `--llm` chain is tried.
-    ///
-    /// Applies to every mode and every hop in the chain; an OpenRouter hop
-    /// always gets at least 30.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SECS",
-        default_value_t = crate::interpret::DEFAULT_TIMEOUT_SECS
-    )]
-    pub llm_timeout: u64,
 
     /// Additional passwords to try for encrypted ZIP/7z archives. Repeat the
     /// option to provide more than one; cleave's common defaults remain active.
@@ -424,176 +332,11 @@ pub struct GlobalArgs {
         default_value_t = crate::fetch::DEFAULT_FETCH_DEPTH
     )]
     pub follow_depth: u8,
-
-    /// [EXPERIMENTAL] Skip fetching a declared dependency whose registry publish
-    /// date is older than this many days — the cheap provenance lookup runs
-    /// first, and only recent (freshest-risk) releases are pulled and scanned.
-    /// Applies to declared dependencies only; URLs are never age-gated. `0`
-    /// disables the gate (fetch every resolvable dependency). A dependency whose
-    /// age can't be determined is always fetched.
-    ///
-    /// Unset, the ceiling is a fresh-risk window
-    /// ([`scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS`]). Optional rather than
-    /// defaulted so each front-end supplies its own fallback.
-    #[arg(long, global = true, value_name = "DAYS")]
-    pub fetch_max_age: Option<u32>,
-
-    /// [EXPERIMENTAL] Fetch and scan native-binary dependencies for every
-    /// platform, not just the host's. This is automatic in `serve`, which
-    /// scans on behalf of other machines; interactive scans
-    /// stay host-only for latency unless this flag is passed.
-    #[arg(long, global = true, conflicts_with = "fetch_host_platform_only")]
-    pub fetch_all_platforms: bool,
-
-    /// [EXPERIMENTAL] Fetch only native-binary dependencies matching this
-    /// host's OS and architecture. This is the interactive default and an
-    /// explicit completeness opt-out for `serve`.
-    #[arg(long, global = true, conflicts_with = "fetch_all_platforms")]
-    pub fetch_host_platform_only: bool,
-
-    /// [EXPERIMENTAL] Follow declared dependencies past the first hop — the
-    /// dependencies of a fetched dependency, out to `--follow-depth`. This is
-    /// automatic in `serve`, which answers for other hosts;
-    /// an interactive scan stops declared dependencies at the first hop, since
-    /// the transitive tail costs a registry lookup each and is almost entirely
-    /// old releases the age gate then discards. URLs and command-mentioned
-    /// packages — the dropper chain — are followed at every hop either way.
-    ///
-    #[arg(long, global = true, conflicts_with = "fetch_direct_deps_only")]
-    pub fetch_transitive_deps: bool,
-
-    /// [EXPERIMENTAL] Follow declared dependencies for one hop only. This is the
-    /// interactive default and an explicit completeness opt-out for `serve`.
-    #[arg(long, global = true, conflicts_with = "fetch_transitive_deps")]
-    pub fetch_direct_deps_only: bool,
-
-    /// [EXPERIMENTAL] How long to trust cached *mutable* registry metadata before
-    /// revalidating. Accepts a unit suffix (`90s`, `30m`, `4h`, `2d`) — a bare
-    /// number is seconds; `never` caches indefinitely (offline/air-gapped). This
-    /// bounds the two mutable tiers: a pinned version's packument (whose yank
-    /// status can change after publish) and a `latest`/versionless lookup.
-    /// Unset keeps the defaults — 4h pinned, 1h unpinned. A released version's
-    /// immutable file list is never re-checked regardless.
-    #[arg(
-        long,
-        global = true,
-        value_name = "DUR",
-        value_parser = crate::fetch::parse_duration
-    )]
-    pub registry_ttl: Option<std::time::Duration>,
-
-    /// [EXPERIMENTAL] Size cap for a single downloaded artifact. Accepts a unit
-    /// suffix (`256M`, `2G`, `512K`); a bare number is bytes. A response larger
-    /// than this is abandoned, so one artifact can't dominate a run.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "256M",
-        value_parser = crate::fetch::parse_bytes
-    )]
-    pub fetch_max_size: u64,
-
-    /// Persist unfinished fetches and resume them when scanning the same content.
-    /// Increasing --follow-depth resumes saved deeper references.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub fetch_pending: Option<std::path::PathBuf>,
-
-    /// Include lockfile dependencies used exclusively for development or tests.
-    #[arg(long, global = true, action = clap::ArgAction::Set, default_value_t = true)]
-    pub fetch_dev_deps: bool,
-
-    /// Analyze all pinned dependency versions, including older releases.
-    #[arg(long, global = true)]
-    pub fetch_all_versions: bool,
-
-    /// Retry only native binaries whose disassembler timed out, once, with this
-    /// larger per-file deadline. Unset disables the extra attempt.
-    #[arg(long, global = true, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
-    pub rizin_retry_timeout_secs: Option<u64>,
-
-    /// [EXPERIMENTAL] Maximum number of *live* dependency/package fetches
-    /// triggered by a single scanned file. This is 100 by default. Cache hits
-    /// are always served and never counted, so a warm re-run is never throttled.
-    /// References past the cap are recorded as budget-exceeded, never silently
-    /// dropped.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_FILE_FETCHES
-    )]
-    pub fetch_max_file_fetches: usize,
-
-    /// [EXPERIMENTAL] Maximum number of *live* opportunistic raw-URL fetches
-    /// triggered by a single scanned file. This is 4 by default. URL references
-    /// declared as dependencies or command-mentioned packages use the larger
-    /// `--fetch-max-file-fetches` cap instead.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_URL_FETCHES
-    )]
-    pub fetch_max_urls: usize,
-
-    /// [EXPERIMENTAL] Maximum total bytes fetched on behalf of a single scanned
-    /// file. Accepts a unit suffix (`2G`); a bare number is bytes.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "2G",
-        value_parser = crate::fetch::parse_bytes
-    )]
-    pub fetch_max_file_size: u64,
-
-    /// [EXPERIMENTAL] Wall-clock ceiling on the fetch phase for a single
-    /// scanned artifact. Accepts a unit suffix (`90s`, `5m`, `1h`); a bare
-    /// number is seconds; `0` or `never` disables the cap. This is 5 minutes by
-    /// default. The count and size budgets bound how much a scan fetches, not
-    /// how long fetching takes — a wide tree of slow registries can hold a scan
-    /// open with every count budget still unspent. References not reached
-    /// before the cap are left unfollowed; whatever was already fetched is
-    /// analyzed and graded as usual.
-    #[arg(
-        long,
-        global = true,
-        value_name = "DUR",
-        default_value = "5m",
-        value_parser = crate::fetch::parse_duration
-    )]
-    pub fetch_timeout: std::time::Duration,
-
-    /// [EXPERIMENTAL] Maximum number of *live* fetches across the whole
-    /// execution — a hard ceiling over every scanned file combined. Lifted in
-    /// the long-lived `serve` mode, where the per-file caps bound
-    /// each job instead.
-    #[arg(
-        long,
-        global = true,
-        value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_MAX_TOTAL_FETCHES
-    )]
-    pub fetch_max_total_fetches: usize,
-
-    /// [EXPERIMENTAL] Maximum total bytes fetched across the whole execution.
-    /// Accepts a unit suffix (`10G`); a bare number is bytes. Lifted in
-    /// the long-lived `serve` mode.
-    #[arg(
-        long,
-        global = true,
-        value_name = "SIZE",
-        default_value = "10G",
-        value_parser = crate::fetch::parse_bytes
-    )]
-    pub fetch_max_total_size: u64,
 }
 
 impl GlobalArgs {
-    /// Build the LLM interpretation config from `--llm` (or the legacy
-    /// `--interpret`) and the `--llm-*` flags, falling back to env vars. `None`
-    /// when interpretation is not requested.
+    /// Build the LLM interpretation config from `--llm` and `--llm-model`,
+    /// falling back to env vars. `None` when interpretation is not requested.
     ///
     /// # Errors
     ///
@@ -615,28 +358,22 @@ impl GlobalArgs {
         &self,
         env: &LlmEnv,
     ) -> Result<Option<crate::interpret::InterpretConfig>> {
-        use crate::interpret::{
-            DEFAULT_BASE_URL, LlmEndpoint, is_openrouter_endpoint, llm_models, llm_targets,
-        };
+        use crate::interpret::{LlmEndpoint, is_openrouter_endpoint, llm_models, llm_targets};
         let flag_or = |flag: &Option<String>, env: &Option<String>| -> Option<String> {
             flag.clone()
                 .or_else(|| env.clone())
                 .filter(|s| !s.is_empty())
         };
         // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
-        // or the legacy `--interpret` flag turns the pass on.
-        let target = flag_or(&self.llm, &env.target);
-        if target.is_none() && !self.interpret {
+        // turns the pass on.
+        let Some(target) = flag_or(&self.llm, &env.target) else {
             return Ok(None);
-        }
+        };
         // Resolve the target to base URLs: `local` (also the bare-flag default)
         // maps to the local endpoint; `openrouter` is the public API; anything
         // else is an OpenAI-compatible base URL. A comma-separated target is a
         // failover chain, tried in order.
-        let targets = match target.as_deref() {
-            None => vec![DEFAULT_BASE_URL.to_string()],
-            Some(raw) => llm_targets(raw),
-        };
+        let targets = llm_targets(&target);
         if targets.is_empty() {
             anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
         }
@@ -644,14 +381,14 @@ impl GlobalArgs {
             flag_or(&self.llm_model, &env.model).as_deref(),
             targets.len(),
         );
-        // An explicit key wins, and applies to every endpoint in the chain —
+        // `SCAN_LLM_KEY` wins, and applies to every endpoint in the chain —
         // it is the operator naming one credential. Otherwise each endpoint
         // resolves its own, and only its own: `~/.tok/openrouter` for
         // OpenRouter, `~/.tok/llm` for everything else — our own vLLM requires
         // one, and a host that has the file authenticates without any flag.
         // Absent a file, the request goes out unauthenticated, which is still
         // right for an endpoint that wants no key.
-        let explicit_key = flag_or(&self.llm_key, &env.key);
+        let explicit_key = env.key.clone().filter(|s| !s.is_empty());
 
         // One endpoint must work; the rest are a cushion. So a config problem
         // is fatal when it is the only endpoint (a misconfigured `--llm` must
@@ -701,8 +438,7 @@ impl GlobalArgs {
                 );
             }
             if openrouter && api_key.is_none() {
-                let why =
-                    "OpenRouter requires a key: --llm-key, SCAN_LLM_KEY, or ~/.tok/openrouter";
+                let why = "OpenRouter requires a key: SCAN_LLM_KEY or ~/.tok/openrouter";
                 if single {
                     anyhow::bail!("{why}");
                 }
@@ -758,12 +494,15 @@ impl GlobalArgs {
             base_url: primary.base_url,
             model: primary.model,
             api_key: primary.api_key,
-            min_level: self.llm_min_level,
-            min_prob: self.llm_min_prob,
-            benign_notable_cap: self.llm_benign_notable_cap,
+            // The admission gate is not a flag: ML admits anything it placed
+            // on the level grid, and the probability floor and size veto sit
+            // at their measured defaults.
+            min_level: None,
+            min_prob: crate::interpret::DEFAULT_LLM_MIN_PROB,
+            benign_notable_cap: crate::interpret::DEFAULT_LLM_BENIGN_NOTABLE_CAP,
             // One budget per hop for every mode: a wedged endpoint is caught
             // by the connect timeout and the breaker, not by this.
-            timeout: std::time::Duration::from_secs(self.llm_timeout),
+            timeout: std::time::Duration::from_secs(crate::interpret::DEFAULT_TIMEOUT_SECS),
             // `SCAN_LLM_CONCURRENCY` overrides the in-flight cap; the default
             // scales with the box (see `interpret::default_max_concurrency`).
             max_concurrency: env
@@ -790,76 +529,26 @@ impl GlobalArgs {
         }
     }
 
-    /// Whether native-binary dependencies are fetched for this host only.
-    ///
-    /// `scans_for_other_hosts` is true for the corpus-facing role (`serve`),
-    /// which scans on behalf of other machines and so takes every
-    /// platform by default. The two flags conflict, so at most one arm can fire.
-    #[must_use]
-    pub fn host_platform_only(&self, scans_for_other_hosts: bool) -> bool {
-        self.fetch_host_platform_only || (!self.fetch_all_platforms && !scans_for_other_hosts)
-    }
-
-    /// Whether declared dependencies are followed past the first hop. Corpus-facing
-    /// modes take the transitive tail by default; an interactive scan stops at the
-    /// artifact's own declared dependencies. Either default is overridable, and the
-    /// two flags conflict, so at most one arm can fire.
-    #[must_use]
-    pub fn transitive_deps(&self, scans_for_other_hosts: bool) -> bool {
-        self.fetch_transitive_deps || (!self.fetch_direct_deps_only && scans_for_other_hosts)
-    }
-
-    /// Apply the follow/fetch knobs to `policy`.
-    ///
-    /// The selection comes from `--follow`; the hop count from `--follow-depth`,
-    /// the dependency age ceiling from `--fetch-max-age`, and the per-file ceilings
-    /// from `--fetch-max-file-*` (each its own flag/env). `default_max_age` is the
-    /// ceiling used when `--fetch-max-age` is unset. An explicit
-    /// selection is honored verbatim; the knobs always apply.
+    /// Apply the follow knobs to `policy`: the hop count from `--follow-depth`,
+    /// the dependency age ceiling, and the scanner's role. `serve` scans on
+    /// behalf of other hosts, so it takes every platform's native-binary
+    /// dependencies and the transitive tail; an interactive scan stays
+    /// host-only and stops declared dependencies at the first hop, since the
+    /// transitive tail costs a registry lookup each and is almost entirely old
+    /// releases the age gate then discards. An explicit selection is honored
+    /// verbatim, and the per-file ceilings are `policy`'s own.
     #[must_use]
     pub fn fetch_policy(
         &self,
         mut policy: crate::fetch::FetchPolicy,
-        default_max_age: u32,
+        max_dep_age_days: u32,
         scans_for_other_hosts: bool,
     ) -> crate::fetch::FetchPolicy {
         policy.depth = self.follow_depth;
-        policy.include_dev_dependencies = self.fetch_dev_deps;
-        policy.all_versions = self.fetch_all_versions;
-        policy.max_dep_age_days = self.fetch_max_age.unwrap_or(default_max_age);
-        policy.max_file_fetches = self.fetch_max_file_fetches;
-        policy.max_url_fetches = self.fetch_max_urls;
-        policy.max_file_bytes = self.fetch_max_file_size;
-        policy.max_duration = self.fetch_timeout;
-        policy.host_platform_only = self.host_platform_only(scans_for_other_hosts);
-        policy.transitive_deps = self.transitive_deps(scans_for_other_hosts);
+        policy.max_dep_age_days = max_dep_age_days;
+        policy.host_platform_only = !scans_for_other_hosts;
+        policy.transitive_deps = scans_for_other_hosts;
         policy
-    }
-
-    /// Manual probability cutoffs, when the operator named either.
-    ///
-    /// `None` is the ordinary path: the verdict comes from the model's level
-    /// grid — the per-file level sweep plus the active level's cutoffs — so no
-    /// explicit thresholds are loaded and `Model::load` keeps its
-    /// level-independent defaults.
-    ///
-    /// Given only `--threshold-hostile`, the suspicious cutoff collapses onto
-    /// it rather than being derived. The level-space lookup a suspicious band
-    /// needs wants a level table and a known level, and neither applies once an
-    /// operator picks a probability directly — so manual mode answers
-    /// hostile-versus-benign, which is what it is for.
-    #[must_use]
-    pub fn thresholds(&self) -> Option<crate::model::Thresholds> {
-        match (self.threshold_suspicious, self.threshold_hostile) {
-            (None, None) => None,
-            (suspicious, hostile) => {
-                let hostile = hostile.unwrap_or(crate::model::Thresholds::FALLBACK_HOSTILE);
-                Some(crate::model::Thresholds {
-                    suspicious: suspicious.unwrap_or(hostile),
-                    hostile,
-                })
-            }
-        }
     }
 
     /// The display filter selected by `--show`.

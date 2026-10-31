@@ -95,6 +95,23 @@ fn parse_flag(value: &str) -> Option<bool> {
     }
 }
 
+/// Whether `ATOMDRIFT_UPLINK` explicitly opted out (`0`, `false`, `no`, `off`),
+/// so `--uplink`'s env switch disables a held token even before cleave's own
+/// `ENABLE_ENV` advances in `Cargo.lock`.
+#[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place the environment is read"
+)]
+pub fn uplink_opted_out() -> bool {
+    std::env::var("ATOMDRIFT_UPLINK").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "n" | "f"
+        )
+    })
+}
+
 /// Refuse a flag or number that does not parse, rather than let it read as
 /// unset.
 ///

@@ -180,14 +180,25 @@ fn read_bytes(mut file: File) -> Vec<u8> {
 #[test]
 fn update_rules_installs_models_and_traits_from_r2() {
     let fixture = Fixture::new();
-    let models = fixture.root.path().join("r2-models");
+    // The fixture pins `SCAN_MODELS_DIR` at a hand-written bundle the updater
+    // leaves alone; unpinned, the models install into the data directory,
+    // wherever this platform keeps it.
     let mut cmd = fixture.command(&["update-rules"]);
-    cmd.arg("--model-dir").arg(&models);
+    cmd.env_remove("SCAN_MODELS_DIR");
     fixture.run(&mut cmd, 0, Duration::from_secs(600));
 
     // Fresh destinations and sidecars prove this fetched/installed bundles,
     // rather than merely succeeding after skipping a pinned directory.
-    let model_meta = models.join(".litmus-models.toml");
+    let model_meta = walkdir::WalkDir::new(fixture.root.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(walkdir::DirEntry::into_path)
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == ".litmus-models.toml")
+        })
+        .expect("R2 model installation sidecar");
+    let models = model_meta.parent().unwrap().to_path_buf();
     let trait_meta = fixture.traits.join(".cleave-rules.toml");
     let model_before = fs::read(&model_meta).expect("R2 model installation sidecar");
     let traits_before = fs::read(&trait_meta).expect("R2 traits installation sidecar");
@@ -211,17 +222,12 @@ fn update_rules_installs_models_and_traits_from_r2() {
             ))
     );
 
-    for extra in [
-        &["--check"][..],
-        &["--models-only", "--check"][..],
-        &["--models-only"][..],
-    ] {
-        let mut cmd = fixture.command(&["update-rules"]);
-        cmd.arg("--model-dir").arg(&models).args(extra);
-        fixture.run(&mut cmd, 0, Duration::from_secs(180));
-        assert_eq!(fs::read(&model_meta).unwrap(), model_before);
-        assert_eq!(fs::read(&trait_meta).unwrap(), traits_before);
-    }
+    // A second run finds everything current and reinstalls nothing.
+    let mut cmd = fixture.command(&["update-rules"]);
+    cmd.env_remove("SCAN_MODELS_DIR");
+    fixture.run(&mut cmd, 0, Duration::from_secs(180));
+    assert_eq!(fs::read(&model_meta).unwrap(), model_before);
+    assert_eq!(fs::read(&trait_meta).unwrap(), traits_before);
 }
 
 #[test]
@@ -277,8 +283,8 @@ fn ps_reports_a_missing_model_bundle() {
     let fixture = Fixture::new();
     let empty = fixture.root.path().join("empty-models");
     fs::create_dir(&empty).unwrap();
-    let mut cmd = fixture.command(&["ps", "--mode", "slow", "--model-dir"]);
-    cmd.arg(empty);
+    let mut cmd = fixture.command(&["ps", "--mode", "slow"]);
+    cmd.env("SCAN_MODELS_DIR", &empty);
     let output = fixture.run(&mut cmd, 1, Duration::from_secs(60));
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("feature_spec.json"));

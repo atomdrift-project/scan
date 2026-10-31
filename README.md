@@ -121,9 +121,6 @@ Unlike other malware scanners, Atomdrift allows you to adjust sensitivity in ter
 
 NOTE: For file formats where we don't have 100 million samples, the observed false-positive rate may be up to 5-6X the requested level. YMMV.
 
-Raw `--threshold-hostile` and `--threshold-suspicious` overrides are available
-for users who want to micromanage probability thresholds directly, but these numbers are not guaranteed to be stable, and these flags cannot be combined with `-l`.
-
 
 ### Optional local LLM (interpretation)
 
@@ -136,7 +133,7 @@ By default, atomscan sends the interpreted evidence (not the original file) to `
 
 No model is hardcoded: unless you pass `--llm-model`, atomscan asks the endpoint which models it serves and uses the largest one it lists. We recommend serving `Qwen/Qwen3.8-27B`.
 
-If the endpoint requires a bearer token, put it in `~/.tok/llm` (mode 0600) and atomscan sends it automatically; `--llm-key` and `SCAN_LLM_KEY` override that file.
+If the endpoint requires a bearer token, put it in `~/.tok/llm` (mode 0600) and atomscan sends it automatically; `SCAN_LLM_KEY` overrides that file.
 
 `--llm` also takes a comma-separated failover chain, tried in order — `--llm 'https://llm.isotope13.ai/v1,openrouter'` grades on your own endpoint and reaches for the billed one only when it cannot answer.
 
@@ -146,7 +143,7 @@ atomscan --llm http://model-host:8000/v1 --llm-model my-model ./project
 atomscan --llm openrouter --llm-model qwen/qwen3.8-27b ./project
 ```
 
-`--llm openrouter` talks to `https://openrouter.ai/api/v1`. The key comes from `--llm-key`, `SCAN_LLM_KEY`, or `~/.tok/openrouter` (first non-empty line). `--llm-model` defaults to `openrouter/auto` (OpenRouter's own auto-router) if omitted — the rest of the catalog is not auto-selected.
+`--llm openrouter` talks to `https://openrouter.ai/api/v1`. The key comes from `SCAN_LLM_KEY` or `~/.tok/openrouter` (first non-empty line). `--llm-model` defaults to `openrouter/auto` (OpenRouter's own auto-router) if omitted — the rest of the catalog is not auto-selected.
 
 Linux `make deploy` accepts the same names: `LLM=openrouter` (or `LLM_URL=openrouter`), and `LLM_MODEL=qwen/qwen3.8-27b` only to pin a model instead of `openrouter/auto`. The unit cannot read the operator home (`ProtectHome=true`), so the deploy script copies `~/.tok/openrouter` into the service state dir.
 

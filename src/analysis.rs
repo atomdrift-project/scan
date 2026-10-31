@@ -278,7 +278,7 @@ impl RequestPhase {
 pub struct ModelResources {
     pub model: Model,
     pub shap: Option<ShapImportance>,
-    /// LLM interpretation config (`--interpret`); `None` disables the pass.
+    /// LLM interpretation config (`--llm`); `None` disables the pass.
     pub interpret: Option<crate::interpret::InterpretConfig>,
     /// External-reference fetch policy; default (empty) disables fetching.
     pub fetch: crate::fetch::FetchPolicy,

@@ -75,7 +75,7 @@ pub struct ScanResult {
     /// Human result card for terminal output, or cleave's annotated context for
     /// the tiny/interpret formats. Built while the typed report is still in scope.
     pub rendered_context: String,
-    /// Optional LLM interpretation blended with the ML verdict (`--interpret`).
+    /// Optional LLM interpretation blended with the ML verdict (`--llm`).
     /// Serialized as the response `llm` section; `None` when interpretation was
     /// disabled or gated out.
     pub interpretation: Option<Interpretation>,
@@ -483,7 +483,7 @@ fn ml_files(
 pub struct ScanResultEnvelope {
     /// ML classification section.
     pub ml: MlSection,
-    /// LLM interpretation section (`--interpret`); omitted when not run.
+    /// LLM interpretation section (`--llm`); omitted when not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<Interpretation>,
     /// Raw cleave analysis report.
@@ -496,7 +496,7 @@ pub struct ScanResultEnvelope {
 pub struct ScanResultEnvelopeRef<'a> {
     /// ML classification section.
     pub ml: MlSection,
-    /// LLM interpretation section (`--interpret`); omitted when not run.
+    /// LLM interpretation section (`--llm`); omitted when not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<&'a Interpretation>,
     /// Raw cleave analysis report.

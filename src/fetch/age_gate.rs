@@ -463,7 +463,7 @@ pub(super) fn age_gate(
         .partition(|r| !bloom_known_good_purl(r));
     // Second local filter: a Go pseudo-version states its own commit date, so an
     // old module can be aged out without asking the proxy. Only applies when a
-    // ceiling is set — with `--fetch-max-age 0` nothing ages out, so there is
+    // ceiling is set — with a ceiling of 0 nothing ages out, so there is
     // nothing to short-circuit.
     let (mut selected, self_dated): (Vec<Reference>, Vec<Reference>) =
         selected.into_iter().partition(|r| {

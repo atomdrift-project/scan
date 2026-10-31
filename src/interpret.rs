@@ -42,12 +42,6 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// auto-router, which picks a suitable model per request rather than a fixed
 /// one we would otherwise have to hardcode from its large, billed catalog.
 pub const OPENROUTER_DEFAULT_MODEL: &str = "openrouter/auto";
-/// Documented `--llm-min-level` default: the model's own grid ceiling, so the
-/// literal here is only what the `--help` text prints. The gate resolves the
-/// real value from [`LevelContext::grid_max`] at call time — see
-/// `LevelContext::ml_admits` — which is why this is a doc constant and not a
-/// fallback.
-pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 /// Default per-request timeout, in seconds, for every mode and every endpoint
 /// in the `--llm` chain: each hop gets this long, then the next is tried
 /// (60s -> failover -> 60s).
@@ -62,7 +56,7 @@ pub const DEFAULT_MIN_LEVEL_LABEL: &str = "the model's grid ceiling";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Floor on the per-request timeout for an OpenRouter endpoint, in seconds.
 ///
-/// Guards an explicit `--llm-timeout` below the default. The origin is one
+/// Guards a configured per-request timeout below the default. The origin is one
 /// hop away; a hosted route is a different animal: the `auto` route picks a provider per
 /// call, cold providers take seconds to first token, and a 6k-token prompt
 /// takes 0.5–1.7s warm and far longer cold. Cutting it at the origin's
@@ -118,7 +112,7 @@ const HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// answers `/models` almost instantly; a hung socket shouldn't stall recovery.
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// System instruction for the live `--interpret` query. The render keeps
+/// System instruction for the live `--llm` query. The render keeps
 /// cleave's full `# SEV LOC desc` annotations, but each description is framed
 /// as the analyzer's fallible interpretation of a pattern match — the model is
 /// told false positives are possible and to verify every description against
@@ -185,7 +179,7 @@ impl std::fmt::Debug for LlmEndpoint {
 }
 
 /// Configuration for the interpretation pass. Present on a [`crate::ScanConfig`]
-/// only when `--interpret` is set.
+/// only when `--llm` is set.
 #[derive(Clone)]
 pub struct InterpretConfig {
     /// OpenAI-compatible base URL of the primary endpoint, e.g.

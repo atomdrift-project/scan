@@ -99,7 +99,7 @@ pub struct Verdict {
     /// The PURL this artifact was fetched as, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purl: Option<String>,
-    /// One-sentence rationale from the interpreter, when `--interpret` ran.
+    /// One-sentence rationale from the interpreter, when `--llm` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     /// Worst findings, most critical first, at most [`MAX_STORED_HITS`].

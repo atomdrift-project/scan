@@ -79,10 +79,9 @@ pub(crate) use pending::Store as Backlog;
 /// What the process's fetch client and blob cache are built with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
-    /// Ceiling on one fetched response, in bytes (`--fetch-max-size`); a larger
-    /// one is abandoned.
+    /// Ceiling on one fetched response, in bytes; a larger one is abandoned.
     pub max_fetch_bytes: u64,
-    /// Replaces both mutable registry-metadata TTLs (`--registry-ttl`). `None`
+    /// Replaces both mutable registry-metadata TTLs. `None`
     /// keeps fletch's tiered defaults; the immutable tier (a released version's
     /// file list) is never re-checked regardless.
     pub registry_ttl: Option<Duration>,

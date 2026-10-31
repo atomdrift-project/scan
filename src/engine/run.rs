@@ -263,7 +263,7 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
     // to guard against. Directory paths still prefetch (they do fan out).
     let (model, shap) = load_model(config)?;
     let session = Session::start(config, &model, shap.as_ref());
-    // isotope13 first, under `--enriched`: by digest in `auto`, by upload in
+    // Atomdrift Uplink first, under `--uplink`: by digest in `auto`, by upload in
     // `remote`. A registry document standing in for an unfetchable package is
     // never asked about — its bytes differ on every fetch.
     if fallback_purl.is_none() {
@@ -547,7 +547,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Hand files to isotope13 under `--enriched`, and return the ones left to
+    /// Hand files to Atomdrift Uplink under `--uplink`, and return the ones left to
     /// analyze here. `auto` answers the files it already judges; `remote` sends
     /// every file and leaves none; `local` keeps them all.
     fn judge_remotely(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {

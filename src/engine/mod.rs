@@ -294,7 +294,7 @@ impl ScanConfig {
         self
     }
 
-    /// Attach an LLM interpretation config (`--interpret`). `None` disables the
+    /// Attach an LLM interpretation config (`--llm`). `None` disables the
     /// pass; callers like `validate` always leave it unset.
     #[must_use]
     pub fn with_interpret(mut self, interpret: Option<crate::interpret::InterpretConfig>) -> Self {
@@ -302,7 +302,7 @@ impl ScanConfig {
         self
     }
 
-    /// LLM interpretation config, or `None` when `--interpret` was not set.
+    /// LLM interpretation config, or `None` when `--llm` was not set.
     #[must_use]
     pub fn interpret(&self) -> Option<&crate::interpret::InterpretConfig> {
         self.interpret.as_ref()

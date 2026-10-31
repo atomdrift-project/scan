@@ -1,4 +1,4 @@
-//! Where an artifact is judged under `--enriched`: here, or by isotope13.
+//! Where an artifact is judged under `--uplink`: here, or via Atomdrift Uplink.
 //!
 //! `--analyze=auto` asks isotope13 for verdicts it already holds and analyzes
 //! locally whatever it does not know. The asking goes through
@@ -55,33 +55,33 @@ const ANALYZE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 /// `--analyze`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Analyze {
-    /// Ask isotope13 first under `--enriched`; otherwise the same as `local`.
+    /// Ask Atomdrift Uplink first under `--uplink`; otherwise the same as `local`.
     #[default]
     Auto,
     /// Analyze everything here.
     Local,
-    /// Send everything to isotope13 for analysis.
+    /// Send everything to Atomdrift Uplink for analysis.
     Remote,
 }
 
 /// The mode this run resolved to, and the token `remote` uploads with.
 static RESOLVED: OnceLock<(Analyze, Option<cleave::enriched::Token>)> = OnceLock::new();
 
-/// Resolve `--analyze` against whether this run is Enriched (a held token,
-/// or `--enriched`), once, before any scan starts.
+/// Resolve `--analyze` against whether this run uses Atomdrift Uplink (a held
+/// token, or `--uplink`), once, before any scan starts.
 ///
 /// `auto` on an open-source run is `local`: no new traffic for anyone who did
-/// not ask for the service. On an Enriched run, `auto` arms the isotope13
+/// not ask for the service. On an Uplink run, `auto` arms the isotope13
 /// lookups and `remote` holds the token for uploads. A missing token is asked
 /// for here, on a terminal, and checked against the rules channel before it
 /// is used.
 ///
 /// # Errors
-/// `remote` on an open-source run, or an Enriched run with no usable token.
+/// `remote` on an open-source run, or an Uplink run with no usable token.
 pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
     let resolved = match (analyze, enriched) {
         (Analyze::Remote, false) => {
-            anyhow::bail!("--analyze=remote requires isotope13 Enriched: a token, or --enriched")
+            anyhow::bail!("--analyze=remote requires Atomdrift Uplink: a token, or --uplink")
         }
         (Analyze::Local, _) | (Analyze::Auto, false) => (Analyze::Local, None),
         (mode, true) => {

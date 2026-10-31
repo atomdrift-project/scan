@@ -43,7 +43,7 @@ pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
     let Some(purl) = fletch::purl::normalize(&prefixed) else {
         anyhow::bail!("not a package URL: {raw} (expected pkg:<type>/<name>[@version])");
     };
-    // isotope13 first, under `--enriched`: a package it already judges is
+    // Atomdrift Uplink first, under `--uplink`: a package it already judges is
     // answered without being fetched; under `remote` it fetches the package
     // itself. Anything else goes through the fetch below, whose bytes get a
     // second chance by digest.

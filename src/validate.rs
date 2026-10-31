@@ -19,7 +19,7 @@ const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
 /// tree. Full cleave trait-rule validation remains the job of `cleave validate`;
 /// running it here as a second uncached pass made this command too slow for a
 /// local deploy/pre-commit gate.
-pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
+pub fn run(config: &ScanConfig) -> Result<()> {
     // Model validation is trait-independent: load the model and every specialist
     // and reject a structurally incompatible bundle deterministically, before any
     // trait corpus is touched or any file is analyzed.
@@ -51,10 +51,9 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
     // The LLM admission gate names trait families and ids directly, so a
     // taxonomy move breaks it silently: the prefixes still compile, match
     // nothing, and quietly stop escalating the samples they were carrying.
-    // Check them against the installed tree whenever one resolves. Skipped
-    // along with the rest of the trait work under `--skip-traits`, and a no-op
+    // Check them against the installed tree whenever one resolves; a no-op
     // when no traits are installed — there is nothing to compare against.
-    if !skip_traits && let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
+    if let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
         let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
         if !problems.is_empty() {
             // A warning, not a failure. A stale prefix costs the coverage of
@@ -76,17 +75,6 @@ pub fn run(config: &ScanConfig, skip_traits: bool) -> Result<()> {
                 problems.join("; "),
             );
         }
-    }
-
-    if skip_traits {
-        let models_ver = crate::models_repo::version()
-            .map(|v| format!("  models: {v}"))
-            .unwrap_or_default();
-        eprintln!(
-            "validate ok:{models_ver}  model feature layout valid; \
-             benign fixture inference skipped"
-        );
-        return Ok(());
     }
 
     let targets = collect_targets()?;

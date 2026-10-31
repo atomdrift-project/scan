@@ -348,7 +348,7 @@ fn record(
 
 /// Where this result's LLM verdict came from, for the completion log line.
 ///
-/// `--interpret` dominates a request's wall time when it actually queries the
+/// `--llm` dominates a request's wall time when it actually queries the
 /// endpoint and costs nothing when the verdict is replayed from the prompt
 /// cache — a minute versus a tenth of a second on the same sample. Naming the
 /// source turns that difference from a timing anomaly into a fact on the line.

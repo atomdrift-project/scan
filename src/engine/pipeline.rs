@@ -100,7 +100,7 @@ impl<'a> ClassifyRequest<'a> {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OutputNeeds {
     /// Render `rendered_context` as the LLM query payload (`--format
-    /// interpret`): byte-for-byte the user message a live `--interpret` query
+    /// interpret`): byte-for-byte the user message a live `--llm` query
     /// sends (the sanitized tiny render), without the system prompt.
     /// Independent of `interpret`, which controls actually querying.
     pub llm_view: bool,
@@ -978,7 +978,7 @@ struct Interpreted {
     elapsed: Duration,
 }
 
-/// Build the LLM render and, when `--interpret` is on, get its opinion of the
+/// Build the LLM render and, when `--llm` is on, get its opinion of the
 /// verdict reached so far. Returns the caller's CPU admission before the
 /// network round trip.
 fn interpret(
@@ -1092,7 +1092,7 @@ fn render(
 ) -> String {
     if req.needs.llm_view {
         // `--format interpret`: byte-for-byte the user message the live
-        // `--interpret` query sends — the sanitized render with its annotations
+        // `--llm` query sends — the sanitized render with its annotations
         // recategorized, just without the system prompt. The recategorization is
         // applied here and in `interpret::interpret_admitted`, never in
         // `render_interpret_context` itself: `render_mostly_readable` reads that

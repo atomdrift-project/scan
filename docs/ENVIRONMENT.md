@@ -11,7 +11,7 @@ does not parse is a startup error, not a silent default.
 | --- | --- |
 | `SCAN_HOPPER` | `--hopper` |
 | `SCAN_FOLLOW` | `--follow` |
-| `ATOMDRIFT_ENRICHED` | `--enriched` (shared with cleave) |
+| `ATOMDRIFT_UPLINK` | `--uplink` (shared with cleave and isomer; legacy alias: `ATOMDRIFT_ENRICHED`) |
 
 ## LLM second opinion
 

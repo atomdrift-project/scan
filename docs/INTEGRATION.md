@@ -95,11 +95,6 @@ Choose by where a mistake hurts. A hard upload gate wants a strict level
 queue feeding human reviewers can run a high level like `-l 25000` and let
 people sort it out.
 
-If you would rather set the raw probability cutoffs yourself,
-`--threshold-hostile <0.0–1.0>` and `--threshold-suspicious <0.0–1.0>` do
-that directly. They replace `-l`; you use one approach or the other, not
-both.
-
 Whichever you pick is fixed when the process starts. A running server picks
 up a new setting with `POST /_/reload` — no restart.
 
@@ -118,15 +113,15 @@ result (`-1` means not flagged) and `ml.prob` for the score. The field names
 are short on purpose; [JSON.md](JSON.md) is the key. The envelope is stable
 within a major version.
 
-## A second opinion: `--interpret`
+## A second opinion: `--llm`
 
-`--interpret` sends non-trivial samples to a **local** LLM and blends its
+`--llm` sends non-trivial samples to a **local** LLM and blends its
 read into the verdict (kept in the `llm` JSON section). It talks to an
 OpenAI-compatible endpoint at `http://localhost:8000/v1` by default. Nothing
 leaves your network.
 
 ```bash
-atomscan --interpret ./pkg/
+atomscan --llm ./pkg/
 ```
 
 No model name is baked in. Unless you pin one with `--llm-model`, atomscan
@@ -137,14 +132,14 @@ the endpoint lists nothing, the scan stops with an error rather than guessing.
 We recommend `Qwen/Qwen3.8-27B` under vLLM; a Qwen3-class model works well
 generally, and ~9B is enough if that is what fits.
 
-Point it elsewhere with `--llm`, `--llm-model`, `--llm-key`. `--llm openrouter`
-uses `https://openrouter.ai/api/v1`; the key is `--llm-key`, `SCAN_LLM_KEY`, or
+Point it elsewhere with `--llm` and `--llm-model`. `--llm openrouter`
+uses `https://openrouter.ai/api/v1`; the key is `SCAN_LLM_KEY` or
 `~/.tok/openrouter`, and `--llm-model` defaults to `openrouter/auto`, OpenRouter's
 own router — nothing else from its billed catalog is ever guessed.
 
 An endpoint that requires a bearer token — ours does — is authenticated without
 any flag: put the token in `~/.tok/llm` (mode 0600, first non-empty line) and
-atomscan sends it on every request. `--llm-key` and `SCAN_LLM_KEY` override the
+atomscan sends it on every request. `SCAN_LLM_KEY` overrides the
 file. `~/.tok/llm` is *our* endpoint's credential and is never sent to
 OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
 endpoint answers 401, which costs the second opinion but not the scan: the
@@ -176,12 +171,10 @@ sends `openrouter/auto` to OpenRouter with `~/.tok/openrouter`; adding
 `--llm-model ',qwen/qwen3.8-27b'` would pin that second slot instead. A link
 that cannot be used (no key) is dropped with a warning while the rest carry on; only
 when *nothing* is usable does the scan stop, and a lone endpoint with a
-problem is still an error rather than a silent no-op. Control which samples
-qualify with `--llm-min-level`: a sample is sent when ML fires at or below that
-FP level — the model's own per-route cutoff — or when cleave surfaced a
-suspicious/hostile finding, whichever comes first. It defaults to the model's
-grid ceiling, so ML admits anything it flagged at any level; pass a lower `N` to
-tighten.
+problem is still an error rather than a silent no-op. Which samples qualify is
+not a flag: a sample is sent when ML flagged it at any calibrated level — the
+model's own per-route cutoff — or when cleave surfaced a suspicious/hostile
+finding, whichever comes first.
 
 ## Following references: `--follow` (experimental)
 

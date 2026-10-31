@@ -177,7 +177,7 @@ pub enum OutputFormat {
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See `crate::engine::write_tiny`.
     Tiny,
-    /// The LLM payload: byte-for-byte the user message a live `--interpret`
+    /// The LLM payload: byte-for-byte the user message a live `--llm`
     /// query sends — cleave's sanitized tiny render, finding annotations
     /// included — without the system prompt (which hedges the descriptions as
     /// fallible interpretations; frame them likewise downstream). Binary

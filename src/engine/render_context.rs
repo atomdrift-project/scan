@@ -1,4 +1,4 @@
-//! The package-aware render the LLM reads (`--interpret`,
+//! The package-aware render the LLM reads (`--llm`,
 //! `--format interpret`), and the fetched-subject selection the terminal
 //! render shares with it.
 
@@ -284,7 +284,7 @@ pub(super) struct Primary<'a> {
     pub(super) registry: Option<&'a RegistryProvenance>,
 }
 
-/// Render the package-aware user message used by `--interpret` and
+/// Render the package-aware user message used by `--llm` and
 /// `--format interpret`.
 ///
 /// Cleave's merged report contains the primary artifact, fetched artifacts, and
