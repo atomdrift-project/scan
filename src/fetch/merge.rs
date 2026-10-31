@@ -493,10 +493,11 @@ pub(super) fn merge_payload(
             continue;
         }
         if let Some(view) = &file.filefacts {
+            let values = filefacts::Values::from(view.values.clone());
             let mut refs = found(
                 find::references_from_facts(
                     report_file_type(&file.file_type),
-                    &view.values,
+                    &values,
                     &view.symbols,
                     &view.references,
                 ),

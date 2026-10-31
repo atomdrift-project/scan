@@ -62,9 +62,8 @@ pub(super) fn unresolved_downloader_records(
             continue;
         };
         let file_type = report_file_type(&file.file_type);
-        for call in
-            find::references_from_facts(file_type, &view.values, &view.symbols, &[]).unresolved
-        {
+        let values = filefacts::Values::from(view.values.clone());
+        for call in find::references_from_facts(file_type, &values, &view.symbols, &[]).unresolved {
             let location = call
                 .offset
                 .map_or_else(String::new, |offset| format!(" at byte {offset}"));
