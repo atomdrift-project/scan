@@ -143,8 +143,9 @@ pub(super) fn collect_references_from_input(
         // both from facts the report already carries — so every archive member,
         // not just the root, contributes its references without re-extraction.
         let file_type = report_file_type(&file.file_type);
+        let values = filefacts::Values::from(view.values.clone());
         let mut refs = found(
-            find::references_from_facts(file_type, &view.values, &view.symbols, &view.references),
+            find::references_from_facts(file_type, &values, &view.symbols, &view.references),
             &file.path,
         );
         // A co-located lockfile is authoritative; do not borrow pins from
