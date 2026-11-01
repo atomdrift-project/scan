@@ -5,3 +5,7 @@
 out/
 __pycache__/
 *.py[cod]
+# PGO profiles and counters (host-generated, ~100 MB): make pgo-train
+/build/pgo/
+# Side target dirs from build experiments (CARGO_TARGET_DIR=target-*)
+/target-*/

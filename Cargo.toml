@@ -366,3 +366,6 @@ tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 # standalone builds. Remove all three once a release carries it.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
+
+[patch."https://github.com/atomdrift-project/cleave.git"]
+cleave = { path = "../cleave" }
