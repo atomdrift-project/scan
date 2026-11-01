@@ -49,16 +49,19 @@ The envelope carries no `class` or `threshold`. Instead it reports a
 single number — `lvl` — that is a **property of the file and the model,
 not of your deploy setting**:
 
-> `lvl` is the lowest false-positive budget — in false positives per 100
-> million benign files — at which the model flags this file as hostile.
+> `lvl` is the lowest pool-adjusted false-positive level at which the model
+> flags this file as hostile.
+
+For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation. See the [shared level definition](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
 
 A consumer reads it as:
 
 - `lvl` in the calibrated grid (`0..=25000` today; consumers should
   tolerate `50000`) → the lowest level at which the file fires. Lower
-  means more obviously hostile: `l=2` fires even under an extremely
-  strict 2-FP-per-100M budget, while `lvl=500` is only caught once you
-  tolerate 500 (`lvl=50` == 0.5 FP/M, `lvl=1000` == 10 FP/M).
+  means it fires under a stricter calibrated allowance: `lvl=2` fires at
+  one FP plus an estimated additional 1/100M; `lvl=500` fires at one FP
+  plus an estimated additional 499/100M. These are targets, not guarantees
+  of future observed rates.
 - `lvl == 25001` or `lvl == 25002` → off-grid trait-floor override
   markers (`grid_max + 1/2`) where Atomdrift Scan manually raised a model-clean
   result to suspicious because cleave found confident severe traits.
