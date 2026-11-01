@@ -14,6 +14,7 @@ pub(crate) fn write(dir: &Path) -> io::Result<()> {
     let spec = serde_json::json!({
         "version": scan::features::EXPECTED_SPEC_VERSION,
         "abi_version": scan::features::EXPECTED_MODEL_ABI_VERSION,
+            "base_feature_abi": 21,
         "presence_vocab": ["metadata"],
         "feature_names": ["present:metadata"],
         "total_features": 1,

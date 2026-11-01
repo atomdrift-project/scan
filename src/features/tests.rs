@@ -331,6 +331,43 @@ fn archive_depths_are_relative_order_independent_and_cycle_safe() {
 }
 
 #[test]
+fn hostile_depth_weight_preserves_the_models_base_abi() -> Result<()> {
+    let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+        "v": "9",
+        "files": [
+            {"id": 10, "path": "outer.7z", "sha": "outer", "size": 1024, "risk": 5,
+             "depth": 2, "type": "7z", "traits": [
+                {"id": "objectives/execution::one", "crit": 5, "conf": 1.0},
+                {"id": "objectives/execution::ignored", "crit": 5, "conf": 0.1}
+            ]},
+            {"id": 20, "pid": 10, "path": "outer.7z!!member.exe", "sha": "member", "size": 512, "risk": 10,
+             "depth": 3, "type": "pe", "traits": [
+                {"id": "objectives/execution::two", "crit": 5, "conf": 1.0},
+                {"id": "objectives/execution::three", "crit": 5, "conf": 1.0}
+            ]}
+        ]
+    }))?;
+    for (abi, base, expected) in [(20, None, 8.0), (21, None, 2.0), (22, Some(20), 8.0)] {
+        let mut spec = anchor_spec(
+            vec![],
+            vec![],
+            vec![],
+            vec!["agg:hostile_depth_weight".into()],
+        );
+        spec.version = abi;
+        spec.abi_version = abi;
+        spec.base_feature_abi = base;
+        let context = ExtractContext::new(&spec);
+        assert_eq!(
+            context.try_extract(&report)?,
+            vec![expected],
+            "ABI {abi}, base {base:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn explicit_metric_transform_overrides_legacy_defaults() -> Result<()> {
     for (transform, expected) in [("identity", 9.0_f32), ("log1p_abs", 10.0_f32.ln())] {
         let mut file = tempfile::NamedTempFile::new()?;
@@ -551,6 +588,8 @@ fn test_standardize() {
     let spec = FeatureSpec {
         version: 16,
         abi_version: 16,
+        base_feature_abi: None,
+        keyword_vocabs: HashMap::new(),
         presence_vocab: vec![],
         filetype_vocab: vec![],
         element_vocab: vec![],
@@ -618,6 +657,8 @@ fn anchor_spec(
     FeatureSpec {
         version: 17,
         abi_version: 17,
+        base_feature_abi: None,
+        keyword_vocabs: HashMap::new(),
         presence_vocab,
         bigram_vocab,
         trigram_vocab,

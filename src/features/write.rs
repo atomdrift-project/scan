@@ -462,7 +462,15 @@ pub(super) fn write_file_tier_features(summaries: &[FileSummary], w: &mut Featur
     w.set("agg:file_hostile_count_log", hostile_files.ln_1p());
     w.set("agg:file_suspicious_count_log", suspicious_files.ln_1p());
     w.set("agg:file_notable_count_log", notable_files.ln_1p());
-    w.set("agg:hostile_depth_weight", 0.0);
+    // Legacy training uses the report's explicit nesting depths. ABI 21+
+    // overwrites this with relative depths in write_structural_extensions.
+    w.set(
+        "agg:hostile_depth_weight",
+        summaries
+            .iter()
+            .map(|s| f64::from(s.findings.hostile_finding_count) * f64::from(s.depth))
+            .sum::<f64>() as f32,
+    );
 }
 
 /// ATT&CK / MBC code counts and the objective-path co-occurrence counts.

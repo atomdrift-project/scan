@@ -199,7 +199,7 @@ pub struct Model {
     /// `inner.predict` everywhere we score with the general route. Mirrors
     /// the per-route calibrator on Route; backward compat = None.
     general_calibrator: Option<IsotonicCalibrator>,
-    /// Active deploy level (FP per 100M benigns) that drives the verdict and
+    /// Active deploy level (pool-adjusted FP scale) that drives the verdict and
     /// the envelope level marker. `None` in manual-threshold mode (`--threshold-*`)
     /// and on single-bundle deployments with no level grid; the sweep is then
     /// bypassed and the level serializes as `null`.
@@ -565,6 +565,7 @@ impl Model {
             )
         };
         let score_general = || -> Result<Scored> {
+            self.ctx.validate_keyword_inputs(parsed)?;
             let raw = self.inner.predict(general_features)?;
             let probability = self
                 .general_calibrator
@@ -581,6 +582,7 @@ impl Model {
             let Some((id, route)) = entry else {
                 return Ok(None);
             };
+            route.ctx.validate_keyword_inputs(parsed)?;
             let mut features = route.ctx.extract_from_parsed(parsed);
             route.spec.standardize(&mut features);
             let raw = route.backend.predict(&features)?;
@@ -599,11 +601,17 @@ impl Model {
         let general = score_general();
         let group_score = score_specialist(group.as_ref());
         let filetype_score = score_specialist(filetype.as_ref());
+        let additional = self.routes.additional_policy_routes(file_type);
+        let additional_scores = additional
+            .iter()
+            .map(|entry| score_specialist(Some(entry)))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut route_probs = Vec::with_capacity(3);
         let mut scores = Vec::with_capacity(3);
         for scored in [Some(general?), group_score?, filetype_score?]
             .into_iter()
+            .chain(additional_scores)
             .flatten()
         {
             route_probs.push(RouteProbability {
@@ -792,7 +800,8 @@ impl Model {
             let (type_key, group_key) = self.routes.specialist_keys(file_type);
             let group = group_key.and_then(|name| self.routes.filegroups.get(name));
             let filetype = self.routes.filetypes.get(&type_key);
-            for (_, route) in group.iter().chain(filetype.iter()) {
+            let additional = self.routes.additional_policy_routes(file_type);
+            for (_, route) in group.iter().chain(filetype.iter()).chain(additional.iter()) {
                 needs = needs.union(route.ctx.raw_needs());
             }
         }
@@ -806,7 +815,7 @@ impl Model {
         self.grid_max
     }
 
-    /// Active deploy level (`-l`, FP per 100M benigns): the single hostile
+    /// Active deploy level (`-l`, pool-adjusted FP scale): the single hostile
     /// threshold — a file is hostile iff its firing level is `<=` this. `None`
     /// in manual-threshold mode and on single-bundle deployments with no grid.
     #[must_use]

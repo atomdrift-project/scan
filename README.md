@@ -113,14 +113,19 @@ avoid downloading an already-known dependency.
 
 ## Tune the false-positive level
 
-Unlike other malware scanners, Atomdrift allows you to adjust sensitivity in terms of an acceptable false-positive level using the `-l` flag:
+Use `-l` to choose a pool-adjusted false-positive level:
 
-* `-l0`: tight, sets the confidence cutoff to a point where no false-positives have been observed.
-* `-l25`: the default shipping point: 25 false-positives per 100 million files.
-* `-l1000`: loose, roughly 1 false positive per 100,000 files.
+- `-l0`: zero observed calibration FPs; the strictest setting.
+- `-l1`: one FP in the benign calibration pool.
+- `-l25`: the default; one FP plus an estimated additional 24 per 100 million
+  benign files (approximately “one plus 25 per 100 million”).
+- `-l1000`: one FP plus an estimated additional 999 per 100 million benign files.
 
-NOTE: For file formats where we don't have 100 million samples, the observed false-positive rate may be up to 5-6X the requested level. YMMV.
+For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation.
 
+These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk.
+
+The shared definition is in [Collimator’s level contract](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md). Existing model thresholds and reported measurements are unchanged by this documentation correction.
 
 ### Optional local LLM (interpretation)
 

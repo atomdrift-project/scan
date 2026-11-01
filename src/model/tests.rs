@@ -909,6 +909,7 @@ fn raw_needs_cover_the_specialists_a_file_type_selects() -> Result<()> {
         let spec = serde_json::json!({
             "version": crate::features::EXPECTED_SPEC_VERSION,
             "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "base_feature_abi": 21,
             "presence_vocab": ["metadata"],
             "kv_vocab": kv_vocab,
             "feature_names": [feature],
@@ -938,6 +939,77 @@ fn raw_needs_cover_the_specialists_a_file_type_selects() -> Result<()> {
     Ok(())
 }
 
+/// Explicit policy inputs must be parsed and scored even when they are not
+/// the filetype's ordinary group, including inputs used only by another level.
+#[test]
+fn additional_policy_routes_are_scored_at_every_level() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    for (name, feature, kv) in [
+        ("general", "present:metadata", vec![]),
+        ("filegroups/previous", "kv:arch=x86", vec!["arch=x86"]),
+    ] {
+        let dir = root.path().join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("model.onnx"),
+            include_bytes!("../../tests/fixtures/cli-model.onnx"),
+        )?;
+        let spec = serde_json::json!({
+            "version": crate::features::EXPECTED_SPEC_VERSION,
+            "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "base_feature_abi": 21,
+            "presence_vocab": ["metadata"], "kv_vocab": kv,
+            "feature_names": [feature], "total_features": 1,
+            "standardized": false, "metric_transforms": {}
+        });
+        std::fs::write(dir.join("feature_spec.json"), serde_json::to_vec(&spec)?)?;
+    }
+    std::fs::write(
+        root.path().join("config.json"),
+        r#"{
+        "levels": [
+            {"level": 25, "hostile": {"thresholds": {"general": 1.0}}},
+            {"level": 50, "hostile": {"thresholds": {"general": 1.0}}}
+        ]
+    }"#,
+    )?;
+    // The auxiliary is a blend input at a non-default level only. No normal
+    // filegroup mapping or auxiliary threshold enables it accidentally.
+    std::fs::write(
+        root.path().join("route_policies.json"),
+        r#"{
+        "routes": {"filetypes/elf": {"filetype": "elf", "levels": [
+            {"level": 25, "hostile": {"best": {"thresholds": {"general": 1.01}}}},
+            {"level": 50, "hostile": {"best": {"thresholds": {}, "blend": {
+                "routes": ["general", "filegroups/previous"], "weights": [0.0, 1.0],
+                "intercept": 0.0, "threshold": 0.0, "transform": "logit"
+            }}}}
+        ]}}
+    }"#,
+    )?;
+    let model = Model::load(root.path(), None, Some(25))?;
+    assert_ne!(model.raw_needs(["elf"]), model.raw_needs(["python"]));
+    let mut report = cleave::types::CompactReport::default();
+    report.files.push(cleave::types::CompactFile {
+        file_type: "elf".into(),
+        ..Default::default()
+    });
+    let (decision, scores, skipped) = model.predict_report(&report)?;
+    assert_eq!(decision.level, Level::At(50));
+    assert_eq!(
+        scores
+            .iter()
+            .filter(|score| score.model == "az/previous")
+            .count(),
+        1
+    );
+    assert!(skipped.is_empty());
+    report.files[0].file_type = "python".into();
+    let (_, scores, _) = model.predict_report(&report)?;
+    assert_eq!(scores.len(), 1, "auxiliary must be scoped to the policy");
+    Ok(())
+}
+
 /// A file type with no route policy is swept against the general grid, and
 /// the probabilities it is compared with are calibrated, so the grid must be
 /// too. Here the raw cutoff 0.0 calibrates to 0.2.
@@ -953,6 +1025,7 @@ fn the_general_grid_is_swept_in_calibrated_space() -> Result<()> {
     let spec = serde_json::json!({
         "version": crate::features::EXPECTED_SPEC_VERSION,
         "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "base_feature_abi": 21,
         "presence_vocab": ["metadata"],
         "kv_vocab": [],
         "feature_names": ["present:metadata"],
@@ -1004,6 +1077,7 @@ fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
         let spec = serde_json::json!({
             "version": crate::features::EXPECTED_SPEC_VERSION,
             "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
+            "base_feature_abi": 21,
             "presence_vocab": ["metadata"],
             "kv_vocab": [],
             "feature_names": ["present:metadata"],
@@ -1036,5 +1110,50 @@ fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
         .validate_all_routes()
         .expect_err("a specialist from the replaced bundle must be refused");
     assert!(format!("{err:#}").contains("replaced"), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn description_inputs_are_checked_for_general_and_specialist_models() -> Result<()> {
+    for description_general in [true, false] {
+        let root = tempfile::tempdir()?;
+        for (name, description) in [
+            ("general", description_general),
+            ("filetypes/elf", !description_general),
+        ] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("model.onnx"),
+                include_bytes!("../../tests/fixtures/cli-model.onnx"),
+            )?;
+            let spec = if description {
+                serde_json::json!({"version":22,"abi_version":22,"base_feature_abi":20,
+                    "presence_vocab":["metadata"],"keyword_vocabs":{"descword":["http"]},
+                    "feature_names":["descword:http"],"total_features":1,"standardized":false})
+            } else {
+                serde_json::json!({"version":20,"abi_version":20,
+                    "presence_vocab":["metadata"],"feature_names":["present:metadata"],
+                    "total_features":1,"standardized":false})
+            };
+            std::fs::write(dir.join("feature_spec.json"), serde_json::to_vec(&spec)?)?;
+        }
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"levels":[{"level":25,"hostile":{"thresholds":{"general":0.99,"filetypes/elf":0.99}}}]}"#,
+        )?;
+        let model = Model::load(root.path(), None, Some(25))?;
+        let mut report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+            "v":"8","files":[{"id":0,"path":"test","type":"elf","sha":"fixture","size":10,
+                "traits":[{"id":"metadata/network::http","conf":1.0,"crit":2}]}]}))?;
+        assert!(model.predict_report(&report).is_err());
+        report.files[0].findings[0].description = "HTTP".into();
+        model.predict_report(&report)?;
+        if !description_general {
+            report.files[0].file_type = "python".into();
+            report.files[0].findings[0].description.clear();
+            model.predict_report(&report)?;
+        }
+    }
     Ok(())
 }

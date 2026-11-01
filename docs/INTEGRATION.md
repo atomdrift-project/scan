@@ -79,19 +79,19 @@ review a scan that did not fully happen.
 
 ## Set the false-positive level
 
-This is the dial you tune the gate with. You do not set "sensitivity" in the
-abstract — you set a **false-positive level**: how many benign files you will
-tolerate being flagged, per 100 million, calibrated for each file type.
+For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation.
+
+These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk. See the [shared level definition](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
 
 ```bash
-atomscan -l 0 ./pkg/       # zero false positives — strictest, fewest alerts
-atomscan ./pkg/            # default: level 50 (~0.5 flagged per million benign)
+atomscan -l 0 ./pkg/       # zero observed calibration FPs; strictest
+atomscan ./pkg/            # bundle default, normally L25: one FP + 24/100M extra
 atomscan -l 5000 ./pkg/    # any calibrated point on the 0–25000 grid
 atomscan -l 25000 ./pkg/   # most sensitive — catches more, cries wolf more
 ```
 
 Choose by where a mistake hurts. A hard upload gate wants a strict level
-(`-l 0`, `-l 1`) so it almost never blocks a legitimate package. A triage
+(`-l 0`, `-l 1`) to reduce false alerts. A triage
 queue feeding human reviewers can run a high level like `-l 25000` and let
 people sort it out.
 

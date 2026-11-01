@@ -108,8 +108,9 @@ impl Analyzer {
         Ok(self)
     }
 
-    /// Classify at the given operating level (false positives per 100M
-    /// benign files). `None` leaves the model's own thresholds in force.
+    /// Classify at the given pool-adjusted FP level: L0 allows zero observed
+    /// calibration FPs; positive L allows one FP plus an estimated (L-1)/100M.
+    /// `None` leaves the model's own thresholds in force.
     ///
     /// Reloads the model at the new level, so call it once, at setup.
     ///
