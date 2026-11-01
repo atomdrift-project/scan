@@ -125,6 +125,8 @@ For a pool of `N` benign files, L0 allows zero observed false positives. Every p
 
 These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk.
 
+Only detection regressions at L0 through L25 (inclusive) can block model acceptance. Changes above L25 remain reportable but do not block installation. Calibration FP allowances still apply at every level; empirical test FP overruns are reported and do not block installation by default.
+
 The shared definition is in [Collimator’s level contract](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md). Existing model thresholds and reported measurements are unchanged by this documentation correction.
 
 ### Optional local LLM (interpretation)
