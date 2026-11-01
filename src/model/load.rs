@@ -681,6 +681,20 @@ impl RouteSet {
         (key, group)
     }
 
+    /// Policy inputs beyond the standard filetype/filegroup specialists.
+    pub(super) fn additional_policy_routes(&self, file_type: &str) -> Vec<(RouteId, Arc<Route>)> {
+        let (type_key, group_key) = self.specialist_keys(file_type);
+        self.policies
+            .route_ids_for(file_type)
+            .into_iter()
+            .filter_map(|id| match RouteKind::parse(self.names.name(id))? {
+                RouteKind::Group(name) if Some(name) != group_key => self.filegroups.get(name),
+                RouteKind::Type(name) if name != type_key => self.filetypes.get(name),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The isotonic calibrator of a route, if it has one.
     pub(super) fn calibrator<'a>(
         &'a self,

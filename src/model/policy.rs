@@ -178,6 +178,34 @@ impl RoutePolicies {
         lookup_filetype(&self.grid, file_type).map(Vec::as_slice)
     }
 
+    /// All inputs needed by this file type's default policy and level sweep.
+    /// A policy can name routes beyond its ordinary filetype/filegroup pair.
+    pub(super) fn route_ids_for(&self, file_type: &str) -> Vec<RouteId> {
+        let severities = self
+            .policy_for(file_type)
+            .into_iter()
+            .flat_map(|policy| [&policy.hostile, &policy.suspicious])
+            .chain(
+                self.grid_for(file_type)
+                    .into_iter()
+                    .flatten()
+                    .map(|lp| &lp.hostile),
+            );
+        let mut routes: Vec<_> = severities
+            .flat_map(|severity| {
+                severity.thresholds.iter().map(|&(route, _)| route).chain(
+                    severity
+                        .blend
+                        .iter()
+                        .flat_map(|blend| blend.routes.iter().copied()),
+                )
+            })
+            .collect();
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
     /// Every policy severity, for load-time passes over the thresholds.
     pub(super) fn severities_mut(&mut self) -> impl Iterator<Item = &mut PolicySeverity> {
         self.by_filetype

@@ -601,11 +601,17 @@ impl Model {
         let general = score_general();
         let group_score = score_specialist(group.as_ref());
         let filetype_score = score_specialist(filetype.as_ref());
+        let additional = self.routes.additional_policy_routes(file_type);
+        let additional_scores = additional
+            .iter()
+            .map(|entry| score_specialist(Some(entry)))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut route_probs = Vec::with_capacity(3);
         let mut scores = Vec::with_capacity(3);
         for scored in [Some(general?), group_score?, filetype_score?]
             .into_iter()
+            .chain(additional_scores)
             .flatten()
         {
             route_probs.push(RouteProbability {
@@ -794,7 +800,8 @@ impl Model {
             let (type_key, group_key) = self.routes.specialist_keys(file_type);
             let group = group_key.and_then(|name| self.routes.filegroups.get(name));
             let filetype = self.routes.filetypes.get(&type_key);
-            for (_, route) in group.iter().chain(filetype.iter()) {
+            let additional = self.routes.additional_policy_routes(file_type);
+            for (_, route) in group.iter().chain(filetype.iter()).chain(additional.iter()) {
                 needs = needs.union(route.ctx.raw_needs());
             }
         }
