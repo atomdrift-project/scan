@@ -117,48 +117,105 @@ check-cargo:
 		exit 1; \
 	}
 
-# Profile-guided optimization. When the local profile exists (`make pgo-train`
-# writes it; it is untracked — ~100 MB and host-generated), release builds use
-# it: measured 2026-08-31 on the poppy worker benchmark, wall −8% / CPU −11%
-# with byte-identical output. Without the file the build is exactly as before.
-# rustc prints "no profile data available" warnings for cold functions under
-# profile-use; they are expected and harmless.
-PGO_PROFDATA ?= build/pgo/atomscan.profdata
-PGO_FLAGS = $(if $(wildcard $(PGO_PROFDATA)),-C profile-use=$(abspath $(PGO_PROFDATA)),)
+# --- Profile-guided optimization ---------------------------------------------
+# Optimized builds (`release`, `release-lto`) are profile-guided: the first one
+# trains a profile (`pgo-train`) and every later one reuses it until
+# `make pgo-train` runs again. Measured 2026-11-01 on a 16c/32t host, cold
+# cache, identical findings: a 672-file benign corpus CPU -7% / wall -6%, a
+# 2,454-file hostile corpus CPU -10% / wall -8% (2026-08-31, poppy worker
+# benchmark: wall -8% / CPU -11%). The profile must come from an instrumented
+# build of the SAME cargo profile it is applied to -- a thin-LTO profile
+# applied to the fat-LTO build measured slower than no profile at all -- so
+# each cargo profile keeps its own file, $(PGO_DIR)/atomscan-<profile>.profdata
+# (untracked: ~100 MB, host-generated).
+#
+# Training scans the rules repo's testdata beside this checkout (../traits-dev
+# or ../traits), or a shallow clone of https://github.com/atomdrift-project/traits
+# made into $(PGO_DIR)/traits when neither exists, plus scan's own tests/ and
+# testdata/. PGO_TRAIN_PATHS overrides the list. Needs rustup's llvm-tools
+# (`rustup component add llvm-tools`), found under ~/.rustup or named by
+# LLVM_PROFDATA.
+#
+# PGO=0 builds without a profile and without training. When training cannot
+# run (no corpus and no network to clone one, no llvm-profdata), optimized
+# builds say so and proceed unprofiled. rustc prints "no profile data
+# available" for functions the training never reached; those warnings are
+# expected and harmless.
+PGO ?= 1
+PGO_DIR ?= build/pgo
+TRAITS_TESTDATA ?= $(firstword $(wildcard ../traits-dev/testdata ../traits/testdata))
+PGO_TRAIN_CORPUS = $(if $(TRAITS_TESTDATA),$(TRAITS_TESTDATA),$(PGO_DIR)/traits/testdata)
+PGO_TRAIN_PATHS ?= $(PGO_TRAIN_CORPUS) tests testdata
+# The cargo profile `pgo-train` instruments (`release` or `release-lto`);
+# the optimized targets pass their own.
+PGO_PROFILE ?= release
+PGO_PROFDATA = $(PGO_DIR)/$(BINARY)-$(PGO_PROFILE).profdata
+PGO_RAW_DIR = $(PGO_DIR)/raw-$(PGO_PROFILE)
 
-release: check-cargo $(OUT_DIR)
-	@if [ -n "$(PGO_FLAGS)" ]; then echo "release: PGO enabled ($(PGO_PROFDATA))"; else echo "release: no PGO profile at $(PGO_PROFDATA) — run 'make pgo-train' to create one"; fi
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --locked --release
-	cp target/release/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
+# $(call pgo_build,<cargo profile>): train when the profile is missing, then
+# build with it and install the binary in $(OUT_DIR). The checks run in the
+# shell, not in make's $(wildcard): a profile written by the training
+# sub-make during this same run would be invisible to make's directory cache.
+# The sub-make stays on a recipe line of its own: make runs a line that
+# mentions $(MAKE) even under `-n`, so sharing that line with the cargo build
+# would turn a dry run into a real one. rustc and the instrumented binary
+# take native paths, so on Windows the MSYS form from `pwd` goes through
+# `cygpath -m`.
+define pgo_build
+	@if [ "$(PGO)" != 0 ] && [ ! -f "$(PGO_DIR)/$(BINARY)-$(1).profdata" ]; then \
+	  $(MAKE) --no-print-directory pgo-train PGO_PROFILE=$(1) \
+	    || echo "$(1): PGO training failed (see above); building without PGO" >&2; \
+	fi
+	@set -e; prof="$(PGO_DIR)/$(BINARY)-$(1).profdata"; flags=""; \
+	if [ "$(PGO)" != 0 ] && [ -f "$$prof" ]; then \
+	  abs="$$(pwd)/$$prof"; \
+	  if command -v cygpath >/dev/null 2>&1; then abs=$$(cygpath -m "$$abs"); fi; \
+	  flags="-C profile-use=$$abs"; echo "$(1): PGO enabled ($$prof)"; \
+	else \
+	  echo "$(1): building without PGO"; \
+	fi; \
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$${RUSTFLAGS:-} $$flags" cargo build --locked --profile $(1)
+	cp target/$(1)/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
+endef
+
+release: check-cargo $(OUT_DIR)
+	$(call pgo_build,release)
 
 # Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
 # over the default release profile. Use for container/tarball builds.
 release-lto: check-cargo $(OUT_DIR)
-	@if [ -n "$(PGO_FLAGS)" ]; then echo "release-lto: PGO enabled ($(PGO_PROFDATA))"; fi
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$$RUSTFLAGS $(PGO_FLAGS)" cargo build --locked --profile release-lto
-	cp target/release-lto/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
-	fi
+	$(call pgo_build,release-lto)
 
-# Regenerate the PGO profile: build an instrumented release, scan the training
-# corpus with it (analysis pipeline only, fetch off), merge the counters. The
-# training set defaults to the quarter-size worker benchmark corpus; any
-# representative directory works — PGO only needs the hot paths exercised.
-# Requires rustup's llvm-tools (`rustup component add llvm-tools`).
-PGO_TRAIN_PATH ?= $(BENCHMARK_ROOT)/poppy-q
+# Regenerate the PGO profile for $(PGO_PROFILE): build it instrumented, scan
+# every training path with it (analysis only, fetch off, ~2x slower than an
+# optimized scan), merge the counters. Any representative corpus works --
+# PGO only needs the hot paths exercised.
 pgo-train: check-cargo
-	@[ -e "$(PGO_TRAIN_PATH)" ] || { echo "error: training corpus not found: $(PGO_TRAIN_PATH) (set PGO_TRAIN_PATH)"; exit 1; }
-	@lp=$$(find ~/.rustup -name llvm-profdata | head -1); [ -n "$$lp" ] || { echo "error: llvm-profdata not found — run: rustup component add llvm-tools"; exit 1; }
-	rm -rf /tmp/scan-pgo-train && mkdir -p /tmp/scan-pgo-train build/pgo
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="-C profile-generate=/tmp/scan-pgo-train" cargo build --release
-	@echo "pgo-train: scanning $(PGO_TRAIN_PATH) with the instrumented binary (slow: ~2x)"
-	SCAN_FOLLOW=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 target/release/$(BINARY) -f json "$(PGO_TRAIN_PATH)" > /dev/null || true
-	$$(find ~/.rustup -name llvm-profdata | head -1) merge -o $(PGO_PROFDATA) /tmp/scan-pgo-train/*.profraw
-	@echo "✓ PGO profile: $(PGO_PROFDATA) — subsequent 'make release' builds use it"
+	@set -e; lp="$${LLVM_PROFDATA:-$$(find ~/.rustup -type f -name 'llvm-profdata*' 2>/dev/null | head -1)}"; \
+	[ -n "$$lp" ] || { echo "error: llvm-profdata not found — run: rustup component add llvm-tools (or set LLVM_PROFDATA)"; exit 1; }; \
+	if [ ! -d "$(PGO_TRAIN_CORPUS)" ] && [ "$(PGO_TRAIN_CORPUS)" = "$(PGO_DIR)/traits/testdata" ]; then \
+	  echo "pgo-train: no rules testdata beside this checkout; cloning atomdrift-project/traits into $(PGO_DIR)/traits"; \
+	  mkdir -p "$(PGO_DIR)" && git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$(PGO_DIR)/traits"; \
+	fi; \
+	found=0; for path in $(PGO_TRAIN_PATHS); do [ -e "$$path" ] && found=1; done; \
+	[ "$$found" = 1 ] || { echo "error: no training corpus found among: $(PGO_TRAIN_PATHS)"; exit 1; }; \
+	raw="$$(pwd)/$(PGO_RAW_DIR)"; prof="$$(pwd)/$(PGO_PROFDATA)"; \
+	if command -v cygpath >/dev/null 2>&1; then raw=$$(cygpath -m "$$raw"); prof=$$(cygpath -m "$$prof"); fi; \
+	rm -rf "$(PGO_RAW_DIR)" && mkdir -p "$(PGO_RAW_DIR)" "$(PGO_DIR)"; \
+	echo "pgo-train: instrumented '$(PGO_PROFILE)' build"; \
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$${RUSTFLAGS:-} -C profile-generate=$$raw" cargo build --locked --profile $(PGO_PROFILE); \
+	for path in $(PGO_TRAIN_PATHS); do \
+	  [ -e "$$path" ] || continue; \
+	  echo "pgo-train: scanning $$path with the instrumented binary"; \
+	  SCAN_FOLLOW=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 SCAN_NO_UPDATE_CHECK=1 \
+	    target/$(PGO_PROFILE)/$(BINARY) -f json --mode balanced --no-update --follow=none "$$path" > /dev/null || true; \
+	done; \
+	"$$lp" merge -o "$$prof" "$(PGO_RAW_DIR)"/*.profraw; \
+	rm -rf "$(PGO_RAW_DIR)"; \
+	echo "✓ PGO profile: $(PGO_PROFDATA) — '$(PGO_PROFILE)' builds use it until the next pgo-train"
 
 install: release
 	@set -e; \

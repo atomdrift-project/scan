@@ -269,17 +269,27 @@ const SMALL_HOST_CORES: usize = 8;
 
 /// The pool width for this host's shape, before any override.
 ///
-/// On a wide host, physical cores win: logical SMT siblings (32 on a 16-core
-/// host) oversubscribe archive-member analysis and run it slower than one
-/// thread per core. On a small SMT host the opposite holds: the pool is the only
-/// parallelism there is, and it idles whenever the one admitted archive is in a
-/// serial phase (tar/gzip read), so taking every logical CPU on a 4c/8t host
-/// finishes a batch about a fifth sooner at flat peak RSS with identical output.
-/// The wider pool is taken only where that class of sibling exists (see
+/// On a wide SMT host the pool takes the physical cores plus half again
+/// (24 on a 16c/32t host). Every logical sibling (32) oversubscribes
+/// archive-member analysis and runs it slower than that, while one thread
+/// per core leaves the siblings idle during the serial phases of the files
+/// in flight. Measured 2026-11-01 on a 16c/32t 9950X3D over a 672-file
+/// benign corpus (wall, cold cache, identical output): 16 threads 150-164 s,
+/// 20 threads 137 s, 24 threads 130-136 s, 28 threads 145 s, 32 threads
+/// 143 s; over a 2,454-file hostile corpus 16 threads 167-169 s, 24 threads
+/// 159 s. Peak RSS rose from 8.3 GB to 9.1 GB at 24.
+///
+/// On a small SMT host the pool is the only parallelism there is, and it
+/// idles whenever the one admitted archive is in a serial phase (tar/gzip
+/// read), so taking every logical CPU on a 4c/8t host finishes a batch about
+/// a fifth sooner at flat peak RSS with identical output. Either wider pool
+/// is taken only where that class of sibling exists (see
 /// [`smt_pool_vendor`]).
 fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool) -> Option<usize> {
     match (physical, logical) {
-        (Some(p), Some(l)) if p < SMALL_HOST_CORES && l > p && smt_vendor => Some(l),
+        (Some(p), Some(l)) if l > p && smt_vendor => {
+            Some(if p < SMALL_HOST_CORES { l } else { (p + p / 2).min(l) })
+        }
         (Some(p), _) => Some(p),
         (None, l) => l,
     }
@@ -314,7 +324,10 @@ mod pool_tests {
     fn small_smt_hosts_take_their_siblings_and_wide_hosts_do_not() {
         assert_eq!(pool_cores(Some(4), Some(8), true), Some(8));
         assert_eq!(pool_cores(Some(4), Some(8), false), Some(4));
-        assert_eq!(pool_cores(Some(16), Some(32), true), Some(16));
+        assert_eq!(pool_cores(Some(16), Some(32), true), Some(24));
+        assert_eq!(pool_cores(Some(16), Some(32), false), Some(16));
+        assert_eq!(pool_cores(Some(16), Some(20), true), Some(20));
+        assert_eq!(pool_cores(Some(8), Some(16), true), Some(12));
         assert_eq!(pool_cores(Some(4), Some(4), true), Some(4));
         assert_eq!(pool_cores(None, Some(6), true), Some(6));
         assert_eq!(pool_cores(None, None, true), None);
