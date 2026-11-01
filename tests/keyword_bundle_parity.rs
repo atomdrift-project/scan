@@ -53,16 +53,16 @@ fn collimator_bundles_match_features_and_probabilities() -> Result<()> {
                 }
             }
             let (decision, _, _) = model.predict_report(&case.report)?;
-            if (decision.probability - case.probability).abs() >= 1e-5 {
-                if let Some(expected) = &case.expected {
-                    let actual = extractor.try_extract(&case.report)?;
-                    for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
-                        if got != want {
-                            eprintln!(
-                                "differing input {}: Scan={got:?}, Python={want:?}",
-                                spec.feature_names()[index]
-                            );
-                        }
+            if (decision.probability - case.probability).abs() >= 1e-5
+                && let Some(expected) = &case.expected
+            {
+                let actual = extractor.try_extract(&case.report)?;
+                for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+                    if got != want {
+                        eprintln!(
+                            "differing input {}: Scan={got:?}, Python={want:?}",
+                            spec.feature_names()[index]
+                        );
                     }
                 }
             }
