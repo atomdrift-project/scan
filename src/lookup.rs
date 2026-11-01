@@ -89,7 +89,7 @@ pub struct Hit {
 pub struct Verdict {
     /// Content digest of the artifact this verdict is about.
     pub sha256: String,
-    /// `ml.lvl`: the tightest false-positive budget per 100M benigns at which
+    /// `ml.lvl`: the tightest pool-adjusted false-positive level at which
     /// this artifact grades hostile. Callers gate on this.
     pub lvl: Level,
     /// Scan build that produced the verdict.

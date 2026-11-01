@@ -238,7 +238,9 @@ pub struct GlobalArgs {
     #[arg(long, global = true, default_value = "balanced")]
     pub mode: crate::Mode,
 
-    /// Tune thresholds for false-positive level N (0-25000, FP per 100M benigns): higher = more sensitive, noisier. Bundle decides which levels are calibrated.
+    /// Choose FP level N (0-25000): L0 allows zero observed calibration FPs;
+    /// positive L allows one FP plus an estimated (L-1) per 100M benigns.
+    /// Higher = more sensitive. The bundle supplies calibrated thresholds.
     #[arg(
         short = 'l',
         long,

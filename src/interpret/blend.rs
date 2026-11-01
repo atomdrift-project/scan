@@ -285,7 +285,7 @@ impl Evidence {
     /// the same kind of claim:
     ///
     /// - Crossing into (or out of) hostile spends the deploy level's
-    ///   false-positive budget — `-l` *is* an FP-per-100M budget. Asserting a file
+    ///   false-positive budget — `-l` uses the shared pool-adjusted allowance. Asserting a file
     ///   belongs in that budget when ML placed it nowhere near is a calibration
     ///   claim one fallible opinion cannot back, so ML must already sit within a
     ///   steer of the line.

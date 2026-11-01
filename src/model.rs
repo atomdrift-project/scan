@@ -199,7 +199,7 @@ pub struct Model {
     /// `inner.predict` everywhere we score with the general route. Mirrors
     /// the per-route calibrator on Route; backward compat = None.
     general_calibrator: Option<IsotonicCalibrator>,
-    /// Active deploy level (FP per 100M benigns) that drives the verdict and
+    /// Active deploy level (pool-adjusted FP scale) that drives the verdict and
     /// the envelope level marker. `None` in manual-threshold mode (`--threshold-*`)
     /// and on single-bundle deployments with no level grid; the sweep is then
     /// bypassed and the level serializes as `null`.
@@ -815,7 +815,7 @@ impl Model {
         self.grid_max
     }
 
-    /// Active deploy level (`-l`, FP per 100M benigns): the single hostile
+    /// Active deploy level (`-l`, pool-adjusted FP scale): the single hostile
     /// threshold — a file is hostile iff its firing level is `<=` this. `None`
     /// in manual-threshold mode and on single-bundle deployments with no grid.
     #[must_use]

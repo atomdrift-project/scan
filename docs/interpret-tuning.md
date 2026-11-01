@@ -194,7 +194,8 @@ right verdict:
    But the two boundaries are not the same kind of claim, so they are not gated
    the same way (`Evidence::may_cross`):
 
-   - **The hostile boundary spends a budget.** `-l` *is* an FP-per-100M budget, so
+   - **The hostile boundary spends a budget.** `-l` uses the
+     [pool-adjusted FP allowance](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md), so
      asserting a file belongs inside it when ML placed it nowhere near is a
      calibration claim one fallible opinion cannot back. Crossing it — in either
      direction — requires ML to already sit within one steer of the line

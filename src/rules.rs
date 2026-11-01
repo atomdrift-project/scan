@@ -15,7 +15,7 @@ use crate::model::Thresholds;
 pub struct RulesStartup {
     /// Model bundle. `None` resolves the installed one.
     pub model_dir: Option<PathBuf>,
-    /// Operating point in false positives per 100M. `None` takes the bundle's
+    /// Pool-adjusted FP level (one FP plus (L-1)/100M above L0). `None` takes the bundle's
     /// own default, then [`crate::model::DEFAULT_SEVERITY_LEVEL`]. Ignored
     /// when `thresholds` is set, which bypasses the level grid entirely.
     pub level: Option<u16>,

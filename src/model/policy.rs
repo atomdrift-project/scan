@@ -775,7 +775,7 @@ pub(super) fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -
     None
 }
 
-/// Lowest level (FP per 100M benigns) at which a filetype's per-level hostile
+/// Lowest level (pool-adjusted FP scale) at which a filetype's per-level hostile
 /// policy fires, with the deciding `(probability, threshold)` at that level.
 ///
 /// `grid` is ascending by level. Hostile thresholds loosen as the level rises,
