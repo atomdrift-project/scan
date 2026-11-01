@@ -888,7 +888,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.2"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -976,7 +976,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2590,9 +2590,9 @@ dependencies = [
 
 [[package]]
 name = "iced-x86"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
 dependencies = [
  "lazy_static",
 ]
@@ -3210,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 
 [[package]]
 name = "lzxd"
@@ -4209,7 +4209,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 dependencies = [
  "flate2",
  "memchr",
@@ -4955,7 +4955,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -5587,7 +5587,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 
 [[package]]
 name = "tap"
@@ -7478,7 +7478,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#a00ae8fe22701a6ef5f2d0ec1b19697007dfd6f9"
+source = "git+https://github.com/atomdrift-project/cleave.git#65a216aac50920ac17e22dbecd94b8bbc9f2a298"
 
 [[package]]
 name = "yara-x"
