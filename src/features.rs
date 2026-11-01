@@ -72,11 +72,13 @@ impl FeatureWriter<'_> {
 
 /// Newest feature spec version this build reads.
 ///
-/// v21 requires `metric_transforms`. v20 retains the strongest tiered tokens
+/// v23 adds full-ID, pooled ID/description and decoded context words.
+/// v22 adds keywords over an explicit base feature ABI. v21 requires
+/// `metric_transforms`. v20 retains the strongest tiered tokens
 /// (older models keep overflow-drop semantics). v19 reads per-model
 /// `trait_path_depth`, defaulting to depth 3. v18 adds `ast_depth_capped` to
 /// the extended metrics, which are read by name from the spec vocab.
-pub const EXPECTED_SPEC_VERSION: u32 = 21;
+pub const EXPECTED_SPEC_VERSION: u32 = 23;
 
 /// Earliest spec format this build parses. The real floor is the model ABI:
 /// an unset `abi_version` defaults to the spec version, so a v16/v17 spec
@@ -108,6 +110,7 @@ pub(crate) fn trait_path(id: &str) -> &str {
 }
 
 mod context;
+mod keywords;
 mod names;
 mod report;
 mod spec;

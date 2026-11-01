@@ -1,0 +1,1576 @@
+[
+  {
+    "name": "byte-text-and-dedup",
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            },
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "s": "curl FETCH_token\u0100caf\u00c3\u00a9\u00ff"
+            },
+            {
+              "ln": 0,
+              "s": "curl FETCH_token\u0100caf\u00c3\u00a9\u00ff"
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            },
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "s": "curl FETCH_token\u0100caf\u00c3\u00a9\u00ff"
+            },
+            {
+              "ln": 0,
+              "s": "curl FETCH_token\u0100caf\u00c3\u00a9\u00ff"
+            }
+          ],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "legacy-z85-and-tail",
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            },
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            },
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            },
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            },
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "missing-description-retains-hierarchy",
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": []
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "low-confidence-still-reads-context",
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 0.1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 0.1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "legacy-slash-hierarchy",
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network/CURL-download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": []
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network/CURL-download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "window-boundaries",
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [],
+          "ctx": [
+            {
+              "ln": 0,
+              "s": "cur"
+            },
+            {
+              "ln": 8,
+              "s": "l"
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [],
+          "ctx": [
+            {
+              "ln": 0,
+              "s": "cur"
+            },
+            {
+              "ln": 8,
+              "s": "l"
+            }
+          ],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "missing-context",
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": []
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    }
+  },
+  {
+    "name": "pruned-context-source",
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "b": "v%8*davX!0lR7Naz!&{40aPCH.(rU"
+            }
+          ],
+          "pid": 0
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0
+    ],
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "58916f2e3092c44199db571b4a182593d945de30749f302ab1c53df4d5aaae38",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via"
+      ],
+      "total_features": 19,
+      "standardized": false
+    }
+  },
+  {
+    "name": "schema7-plain-text-import",
+    "spec": {
+      "version": 23,
+      "abi_version": 23,
+      "feature_layout_hash": "e51b210244758882ebf05b095e7792aa8b6b7d8b2a9cd95fb88ab30634c5b0f3",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "fullword": [
+          "behaviors",
+          "curl",
+          "download",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen"
+        ],
+        "ruletextword": [
+          "behaviors",
+          "curl",
+          "download",
+          "http",
+          "metadata",
+          "micro",
+          "network",
+          "post",
+          "unseen",
+          "via"
+        ],
+        "contextword": [
+          "caf",
+          "curl",
+          "fetch",
+          "token",
+          "unseen"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "fullword:behaviors",
+        "fullword:curl",
+        "fullword:download",
+        "fullword:metadata",
+        "fullword:micro",
+        "fullword:network",
+        "fullword:post",
+        "fullword:unseen",
+        "ruletextword:behaviors",
+        "ruletextword:curl",
+        "ruletextword:download",
+        "ruletextword:http",
+        "ruletextword:metadata",
+        "ruletextword:micro",
+        "ruletextword:network",
+        "ruletextword:post",
+        "ruletextword:unseen",
+        "ruletextword:via",
+        "contextword:caf",
+        "contextword:curl",
+        "contextword:fetch",
+        "contextword:token",
+        "contextword:unseen"
+      ],
+      "total_features": 24,
+      "standardized": false
+    },
+    "report": {
+      "v": "9",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "ln": 0,
+              "s": "curl FETCH_token\u0100caf\u00c3\u00a9\u00ef\u00bf\u00bd"
+            }
+          ]
+        }
+      ]
+    },
+    "training_report": {
+      "v": "7",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.py",
+          "type": "python",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro-behaviors/network::curl_download_post",
+              "desc": "Download via HTTP POST",
+              "conf": 1,
+              "crit": 2
+            }
+          ],
+          "ctx": [
+            {
+              "a": 0,
+              "l": 1,
+              "t": "curl FETCH_token\u0000caf\u00e9\ufffd"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0
+    ]
+  }
+]

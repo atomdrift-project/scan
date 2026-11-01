@@ -60,10 +60,11 @@ fn typed_reader_summarizes_every_file() {
             for (raw, finding) in summary.raw_findings.iter().zip(&file.findings) {
                 assert_eq!(raw.id, finding.id);
                 assert_eq!(raw.crit, u32::from(finding.criticality));
-                // The encoder omits `conf` at 0.5/0.0 and readers restore a
-                // missing `conf` as 1.0 — preserved deliberately, since it
-                // is what every deployed model was calibrated against.
-                assert_eq!(raw.conf, f64::from(finding.confidence));
+                // Collimator reads the decimal JSON emitted by Cleave.
+                // Compare against the real encoder, not a binary f32→f64 cast.
+                let wire: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(finding).unwrap()).unwrap();
+                assert_eq!(raw.conf, wire["conf"].as_f64().unwrap());
             }
         }
     }

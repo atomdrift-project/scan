@@ -551,6 +551,8 @@ fn test_standardize() {
     let spec = FeatureSpec {
         version: 16,
         abi_version: 16,
+        base_feature_abi: None,
+        keyword_vocabs: HashMap::new(),
         presence_vocab: vec![],
         filetype_vocab: vec![],
         element_vocab: vec![],
@@ -618,6 +620,8 @@ fn anchor_spec(
     FeatureSpec {
         version: 17,
         abi_version: 17,
+        base_feature_abi: None,
+        keyword_vocabs: HashMap::new(),
         presence_vocab,
         bigram_vocab,
         trigram_vocab,
