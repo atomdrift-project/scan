@@ -81,8 +81,8 @@ pub(crate) enum Severity {
 /// The two arguments share a scale and are different things, which is the
 /// distinction this whole layer turns on and the one the wire names carry:
 /// `fires_at` is measured — the tightest budget at which *this artifact* grades
-/// hostile — while `budget` is chosen, being how many false positives per 100
-/// million the caller will tolerate. Mirrors `verdict_for_level(fired_level,
+/// hostile — while `budget` is the caller's chosen pool-adjusted FP level
+/// (one FP plus an estimated (L-1)/100M for positive L). Mirrors `verdict_for_level(fired_level,
 /// level, ..)`, whose two parameters are that same pair.
 ///
 /// [`Level::Manual`] answers [`Decision::Unanalyzed`] rather than guessing: no
@@ -233,7 +233,7 @@ pub(super) struct V1Decision {
     pub(super) url: Option<String>,
     pub(super) sha256: Option<String>,
     pub(super) severity: Option<Severity>,
-    /// The tightest false-positive budget per 100 million benign files at which
+    /// The tightest pool-adjusted false-positive level at which
     /// this artifact grades hostile — lower being worse, and `-1` meaning it
     /// fires at none. A property of the file and the model: measured, never
     /// chosen, which is what separates it from the caller's own

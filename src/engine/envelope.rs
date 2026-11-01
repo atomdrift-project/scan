@@ -32,7 +32,7 @@ pub struct ScanResult {
     /// compared against to produce `classification`.
     pub threshold: f32,
     /// Level-independent envelope marker (`ml.lvl`): the lowest false-positive
-    /// level (FP per 100M benigns) at which this file's hostile decision fires.
+    /// level (pool-adjusted FP scale) at which this file's hostile decision fires.
     /// Independent of the deploy `-l`, so the envelope is identical across
     /// levels and cache-shareable — `-l` only moves the cutoffs that turn
     /// `level` into `classification`.

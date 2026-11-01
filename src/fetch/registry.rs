@@ -181,16 +181,27 @@ pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
 pub fn registry_with_sources(
     locator: &RefLocator,
 ) -> (Option<Registry>, Vec<fletch::fetch::RecordedSource>) {
-    let Some(res) = shared_resources() else {
-        return (None, Vec::new());
-    };
+    registry_lookup(locator).map_or((None, Vec::new()), |(record, sources)| {
+        (record.ok(), sources)
+    })
+}
+
+/// [`registry_with_sources`], keeping why there is no record, so a caller can
+/// tell a registry that has no such package ([`fletch::RegistryError::NotFound`])
+/// from one it could not ask. `None` when scan has no fetcher at all.
+#[must_use]
+pub fn registry_lookup(
+    locator: &RefLocator,
+) -> Option<(
+    Result<Registry, fletch::RegistryError>,
+    Vec<fletch::fetch::RecordedSource>,
+)> {
+    let res = shared_resources()?;
     let (record, sources) = fletch::registry::lookup_recorded(locator, &*res.net, &res.cache);
-    (
-        record
-            .ok()
-            .map(|reg| reg.with_age(crate::civil::now_secs())),
+    Some((
+        record.map(|reg| reg.with_age(crate::civil::now_secs())),
         sources,
-    )
+    ))
 }
 
 /// One-shot `pkg:`/`url`: graft the root artifact's own registry metadata into

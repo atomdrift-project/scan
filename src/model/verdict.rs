@@ -7,7 +7,7 @@
 )]
 use super::*;
 
-/// Current suspicious ceiling (FP per 100M benigns) for level-sweep decisions.
+/// Current suspicious ceiling (pool-adjusted FP scale) for level-sweep decisions.
 ///
 /// Set to L3000 — a deliberate EXPERIMENTAL widening (2026-07) to surface as much
 /// of the weak-signal tail as suspicious as the calibration curve supports. On
@@ -252,7 +252,7 @@ pub struct Decision {
     pub level: Level,
 }
 
-/// The lowest false-positive level (FP per 100M benigns) at which a file's
+/// The lowest pool-adjusted false-positive level at which a file's
 /// hostile decision fires: a property of the file and the model, never of a
 /// caller's budget.
 ///

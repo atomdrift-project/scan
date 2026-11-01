@@ -76,6 +76,10 @@ pub struct FeatureSpec {
     #[serde(default)]
     pub(super) abi_version: u32,
     #[serde(default)]
+    pub(super) base_feature_abi: Option<u32>,
+    #[serde(default)]
+    pub(super) keyword_vocabs: HashMap<String, Vec<String>>,
+    #[serde(default)]
     pub(super) presence_vocab: Vec<String>,
     #[serde(default)]
     pub(super) filetype_vocab: Vec<String>,
@@ -246,7 +250,31 @@ impl FeatureSpec {
         }
     }
 
+    pub(super) fn feature_semantics_abi(&self) -> u32 {
+        self.base_feature_abi.unwrap_or(self.abi_version)
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
+        if self.abi_version >= 22 {
+            anyhow::ensure!(
+                self.base_feature_abi
+                    .is_some_and(|v| (18..=21).contains(&v)),
+                "v22 requires a supported base_feature_abi (18..=21)"
+            );
+        } else {
+            anyhow::ensure!(
+                self.base_feature_abi.is_none() && self.keyword_vocabs.is_empty(),
+                "keyword extensions require ABI 22"
+            );
+        }
+        anyhow::ensure!(
+            self.keyword_vocabs
+                .keys()
+                .all(|s| matches!(s.as_str(), "ruleword" | "descword")
+                    || (self.abi_version >= 23
+                        && matches!(s.as_str(), "fullword" | "ruletextword" | "contextword"))),
+            "unknown keyword source"
+        );
         anyhow::ensure!(
             self.trait_path_depth > 0,
             "trait_path_depth must be positive"
@@ -262,7 +290,7 @@ impl FeatureSpec {
             );
         }
         anyhow::ensure!(
-            self.abi_version < 21 || self.metric_transforms.is_some(),
+            self.feature_semantics_abi() < 21 || self.metric_transforms.is_some(),
             "v21 feature spec requires metric_transforms"
         );
         if let Some(transforms) = &self.metric_transforms {
@@ -476,6 +504,17 @@ impl FeatureSpec {
         vocab(&mut names, "symbol:", &self.symbol_vocab);
         vocab(&mut names, "symbol_bi:", &self.symbol_bigram_vocab);
         vocab(&mut names, "symbol_tri:", &self.symbol_trigram_vocab);
+        for source in [
+            "ruleword",
+            "descword",
+            "fullword",
+            "ruletextword",
+            "contextword",
+        ] {
+            if let Some(words) = self.keyword_vocabs.get(source) {
+                vocab(&mut names, &format!("{source}:"), words);
+            }
+        }
         names
     }
 }

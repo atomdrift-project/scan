@@ -37,7 +37,7 @@ const MAX_INTERPRET_DEP_SUBJECTS: usize = 2;
 ///
 /// A dependency is ranked by the verdict scan already computed for it, on the
 /// same envelope every other verdict in this system uses: `level` is the lowest
-/// false-positive budget (FP per 100M benigns) at which its hostile decision
+/// pool-adjusted false-positive level at which its hostile decision
 /// still fires, so a *lower* level is the more confident call and a clean one
 /// fires at no level. Probability breaks ties within a level.
 ///
@@ -52,7 +52,7 @@ fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32
     let prob_key = |d: Decision| d.probability.max(0.0).to_bits();
     match verdict {
         // Negated so a level of 0 (fires even at the strictest budget) outranks
-        // a level of 3000 (fires only when 3000 FP per 100M is acceptable).
+        // a level of 3000 (one FP plus an estimated additional 2999/100M).
         Some(
             d @ Decision {
                 level: Level::At(level),

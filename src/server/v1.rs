@@ -35,8 +35,9 @@ pub(super) struct V1Query {
     purl: Vec<String>,
     url: Vec<String>,
     sha256: Vec<String>,
-    /// How many false positives per 100 million benign files the caller will
-    /// tolerate. Chosen by them, unlike `fires_at`, which is measured.
+    /// The caller's pool-adjusted FP level: L0 allows zero observed calibration
+    /// FPs; positive L allows one FP plus an estimated (L-1)/100M benigns.
+    /// Chosen by them, unlike `fires_at`, which is measured.
     false_positive_budget: Option<u16>,
     /// A budget that was sent but is not a number. Held rather than silently
     /// defaulted: a caller who meant to loosen their budget and got the strict

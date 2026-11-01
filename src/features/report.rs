@@ -83,6 +83,7 @@ pub(super) struct FileSummary {
     pub(super) symbols: Vec<String>,
     /// Findings reduced to the fields used for cross-file aggregation.
     pub(super) raw_findings: Vec<RawFinding>,
+    pub(super) keywords: keywords::FileKeywords,
 }
 
 /// Which optional feature families are active for this route, so
@@ -93,6 +94,10 @@ pub(crate) struct RawNeeds {
     pub(super) kv_shape: bool,
     pub(super) kv_split: bool,
     pub(super) symbol: bool,
+    pub(super) rule_keywords: bool,
+    pub(super) description_keywords: bool,
+    pub(super) full_rule_keywords: bool,
+    pub(super) context_keywords: bool,
 }
 
 impl RawNeeds {
@@ -104,6 +109,10 @@ impl RawNeeds {
             kv_shape: true,
             kv_split: true,
             symbol: true,
+            rule_keywords: true,
+            description_keywords: true,
+            full_rule_keywords: true,
+            context_keywords: true,
         }
     }
 
@@ -116,6 +125,10 @@ impl RawNeeds {
             kv_shape: self.kv_shape || other.kv_shape,
             kv_split: self.kv_split || other.kv_split,
             symbol: self.symbol || other.symbol,
+            rule_keywords: self.rule_keywords || other.rule_keywords,
+            description_keywords: self.description_keywords || other.description_keywords,
+            full_rule_keywords: self.full_rule_keywords || other.full_rule_keywords,
+            context_keywords: self.context_keywords || other.context_keywords,
         }
     }
 }
@@ -296,12 +309,24 @@ impl ParsedReport {
 impl FileSummary {
     /// Summarize one compact file entry.
     pub(super) fn from_compact(file: &cleave::types::CompactFile, needs: RawNeeds) -> Self {
+        // Python reads Cleave's shortest decimal JSON rendering of each f32,
+        // not its exact binary value promoted to f64. The latter both drops
+        // confidence 0.65 at the gate and perturbs soft-presence tree inputs.
+        // Cache the small set of distinct confidences within each file.
+        let mut confidences = HashMap::new();
         let raw_findings: Vec<RawFinding> = file
             .findings
             .iter()
             .map(|f| RawFinding {
                 id: f.id.clone(),
-                conf: f64::from(f.confidence),
+                conf: *confidences
+                    .entry(f.confidence.to_bits())
+                    .or_insert_with(|| {
+                        f.confidence
+                            .to_string()
+                            .parse::<f64>()
+                            .unwrap_or(f64::from(f.confidence))
+                    }),
                 crit: u32::from(f.criticality),
                 atk: f.attack.clone(),
                 mbc: f.mbc.clone(),
@@ -355,6 +380,7 @@ impl FileSummary {
             .collect();
 
         Self {
+            keywords: keywords::file_keywords(file, needs),
             id: Some(file.id),
             parent: file.parent,
             depth: file.depth,

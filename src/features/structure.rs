@@ -143,7 +143,7 @@ pub(super) fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
         .collect()
 }
 
-/// G15: structure relative to the graded artifact (legacy bundles keep zeros).
+/// G15: structure using absolute placement for legacy ABIs, relative for ABI 21.
 pub(super) fn write_structural_extensions(
     summaries: &[FileSummary],
     combined: &FindingSummary,
@@ -213,7 +213,7 @@ pub(super) fn write_structural_extensions(
     let depths = if relative {
         relative_depths(summaries)
     } else {
-        vec![0; summaries.len()]
+        summaries.iter().map(|s| s.depth).collect()
     };
     w.set(
         "struct:max_nesting_depth_log",
@@ -221,7 +221,15 @@ pub(super) fn write_structural_extensions(
     );
     w.set(
         "struct:inner_file_ratio",
-        depths.iter().filter(|&&d| d > 0).count() as f32 / summaries.len().max(1) as f32,
+        if relative {
+            depths.iter().filter(|&&d| d > 0).count()
+        } else {
+            summaries
+                .iter()
+                .filter(|s| s.parent.is_some() || s.depth > 0)
+                .count()
+        } as f32
+            / summaries.len().max(1) as f32,
     );
     if relative {
         w.set(
