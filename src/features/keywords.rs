@@ -1,8 +1,5 @@
 //! Model-local words from rule IDs, descriptions and decoded context windows.
-use super::{
-    Context, ExtractContext, FeatureWriter, HashSet, IndexedParallelIterator, MIN_CONFIDENCE,
-    ParallelIterator, ParsedReport, RawNeeds, Result,
-};
+use super::{ExtractContext, FeatureWriter, HashSet, MIN_CONFIDENCE, ParsedReport, RawNeeds, Result};
 
 fn words(text: &str) -> HashSet<String> {
     text.to_lowercase()
