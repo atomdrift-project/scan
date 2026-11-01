@@ -1,7 +1,8 @@
 # Reusable build matrix — the single definition of "what platforms we ship and
-# how". Called by ci.yml (thin LTO, ad-hoc macOS signature) and by release.yml
-# (fat LTO, plus whatever signing the `sign`/`notarize` inputs ask for). Keeping
-# one matrix means CI and release can't drift into building different things.
+# how". Called by ci.yml (thin LTO, ad-hoc macOS signature, no PGO) and by
+# release.yml (fat LTO, profile-guided, plus whatever signing the
+# `sign`/`notarize` inputs ask for). Keeping one matrix means CI and release
+# can't drift into building different things.
 #
 # See ci.yml for the hardening rationale that applies to both callers.
 
@@ -37,6 +38,18 @@ on:
           (fat LTO + one codegen unit, distribution builds).
         type: string
         default: release
+      pgo:
+        description: >-
+          Profile-guided optimization for the targets built on their own
+          architecture (Linux, macOS arm64, Windows): an instrumented build
+          scans the public rules testdata and the real build uses the
+          profile, as `make release` does. Measured 2026-11-01: CPU -7% to
+          -10% on scan corpora. Costs those jobs a second build plus the
+          training scan; cross-built and VM-built targets are never
+          profiled. A training failure is reported and the build proceeds
+          unprofiled.
+        type: boolean
+        default: true
       sign:
         description: >-
           Sign the macOS binaries with the Developer ID identity. Requires the
@@ -157,10 +170,33 @@ jobs:
           key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-${{ matrix.target }}-
 
+      # scripts/pgo-train.sh is what `make pgo-train` runs. The optimized build
+      # must use the same cargo profile the instrumented one did, so the
+      # profile is named by $PROFILE. Rules and models install themselves on
+      # the instrumented binary's first run. PGO_RUSTFLAGS reaches only the
+      # two steps that build with $PROFILE: the dev-profile unit tests would
+      # get hash-mismatch noise from it and nothing else.
+      - name: Train PGO profile
+        if: inputs.pgo && matrix.native
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          rustup component add llvm-tools
+          git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$RUNNER_TEMP/traits"
+          prof="$RUNNER_TEMP/pgo/atomscan-$PROFILE.profdata"
+          if sh scripts/pgo-train.sh -p "$PROFILE" -t "$TARGET" -o "$prof" "$RUNNER_TEMP/traits/testdata" tests testdata; then
+            if command -v cygpath >/dev/null 2>&1; then prof=$(cygpath -m "$prof"); fi
+            echo "PGO_RUSTFLAGS=-C profile-use=$prof" >> "$GITHUB_ENV"
+          else
+            echo "::warning::PGO training failed; building without a profile"
+          fi
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
         run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       # Keep the full integration suite separate: most cases require models.
@@ -173,6 +209,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
         run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       # --- macOS signing ------------------------------------------------------
@@ -1161,10 +1198,33 @@ jobs:
           key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-${{ matrix.target }}-
 
+      # scripts/pgo-train.sh is what `make pgo-train` runs. The optimized build
+      # must use the same cargo profile the instrumented one did, so the
+      # profile is named by $PROFILE. Rules and models install themselves on
+      # the instrumented binary's first run. PGO_RUSTFLAGS reaches only the
+      # two steps that build with $PROFILE: the dev-profile unit tests would
+      # get hash-mismatch noise from it and nothing else.
+      - name: Train PGO profile
+        if: inputs.pgo
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          rustup component add llvm-tools
+          git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$RUNNER_TEMP/traits"
+          prof="$RUNNER_TEMP/pgo/atomscan-$PROFILE.profdata"
+          if sh scripts/pgo-train.sh -p "$PROFILE" -t "$TARGET" -o "$prof" "$RUNNER_TEMP/traits/testdata" tests testdata; then
+            if command -v cygpath >/dev/null 2>&1; then prof=$(cygpath -m "$prof"); fi
+            echo "PGO_RUSTFLAGS=-C profile-use=$prof" >> "$GITHUB_ENV"
+          else
+            echo "::warning::PGO training failed; building without a profile"
+          fi
+
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
         run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       - name: Inspect
@@ -1177,6 +1237,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
+          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
         run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       - name: Smoke test
