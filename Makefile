@@ -133,8 +133,9 @@ check-cargo:
 # or ../traits), or a shallow clone of https://github.com/atomdrift-project/traits
 # made into $(PGO_DIR)/traits when neither exists, plus scan's own tests/ and
 # testdata/. PGO_TRAIN_PATHS overrides the list. Needs rustup's llvm-tools
-# (`rustup component add llvm-tools`), found under ~/.rustup or named by
-# LLVM_PROFDATA.
+# (`rustup component add llvm-tools`), found in the toolchain or named by
+# LLVM_PROFDATA. The training itself is scripts/pgo-train.sh, which the CI
+# build workflow runs too, so the two cannot drift.
 #
 # PGO=0 builds without a profile and without training. When training cannot
 # run (no corpus and no network to clone one, no llvm-profdata), optimized
@@ -150,7 +151,6 @@ PGO_TRAIN_PATHS ?= $(PGO_TRAIN_CORPUS) tests testdata
 # the optimized targets pass their own.
 PGO_PROFILE ?= release
 PGO_PROFDATA = $(PGO_DIR)/$(BINARY)-$(PGO_PROFILE).profdata
-PGO_RAW_DIR = $(PGO_DIR)/raw-$(PGO_PROFILE)
 
 # $(call pgo_build,<cargo profile>): train when the profile is missing, then
 # build with it and install the binary in $(OUT_DIR). The checks run in the
@@ -194,28 +194,9 @@ release-lto: check-cargo $(OUT_DIR)
 # optimized scan), merge the counters. Any representative corpus works --
 # PGO only needs the hot paths exercised.
 pgo-train: check-cargo
-	@set -e; lp="$${LLVM_PROFDATA:-$$(find ~/.rustup -type f -name 'llvm-profdata*' 2>/dev/null | head -1)}"; \
-	[ -n "$$lp" ] || { echo "error: llvm-profdata not found — run: rustup component add llvm-tools (or set LLVM_PROFDATA)"; exit 1; }; \
-	if [ ! -d "$(PGO_TRAIN_CORPUS)" ] && [ "$(PGO_TRAIN_CORPUS)" = "$(PGO_DIR)/traits/testdata" ]; then \
-	  echo "pgo-train: no rules testdata beside this checkout; cloning atomdrift-project/traits into $(PGO_DIR)/traits"; \
-	  mkdir -p "$(PGO_DIR)" && git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$(PGO_DIR)/traits"; \
-	fi; \
-	found=0; for path in $(PGO_TRAIN_PATHS); do [ -e "$$path" ] && found=1; done; \
-	[ "$$found" = 1 ] || { echo "error: no training corpus found among: $(PGO_TRAIN_PATHS)"; exit 1; }; \
-	raw="$$(pwd)/$(PGO_RAW_DIR)"; prof="$$(pwd)/$(PGO_PROFDATA)"; \
-	if command -v cygpath >/dev/null 2>&1; then raw=$$(cygpath -m "$$raw"); prof=$$(cygpath -m "$$prof"); fi; \
-	rm -rf "$(PGO_RAW_DIR)" && mkdir -p "$(PGO_RAW_DIR)" "$(PGO_DIR)"; \
-	echo "pgo-train: instrumented '$(PGO_PROFILE)' build"; \
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$${RUSTFLAGS:-} -C profile-generate=$$raw" cargo build --locked --profile $(PGO_PROFILE); \
-	for path in $(PGO_TRAIN_PATHS); do \
-	  [ -e "$$path" ] || continue; \
-	  echo "pgo-train: scanning $$path with the instrumented binary"; \
-	  SCAN_FOLLOW=none SCAN_NO_ANALYSIS_CACHE=1 CLEAVE_SKIP_CACHE=1 SCAN_NO_UPDATE_CHECK=1 \
-	    target/$(PGO_PROFILE)/$(BINARY) -f json --mode balanced --no-update --follow=none "$$path" > /dev/null || true; \
-	done; \
-	"$$lp" merge -o "$$prof" "$(PGO_RAW_DIR)"/*.profraw; \
-	rm -rf "$(PGO_RAW_DIR)"; \
-	echo "✓ PGO profile: $(PGO_PROFDATA) — '$(PGO_PROFILE)' builds use it until the next pgo-train"
+	@if [ ! -d "$(PGO_TRAIN_CORPUS)" ] && [ "$(PGO_TRAIN_CORPUS)" = "$(PGO_DIR)/traits/testdata" ]; then 	  echo "pgo-train: no rules testdata beside this checkout; cloning atomdrift-project/traits into $(PGO_DIR)/traits"; 	  mkdir -p "$(PGO_DIR)" && git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$(PGO_DIR)/traits"; 	fi
+	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS BINARY=$(BINARY) sh scripts/pgo-train.sh -p $(PGO_PROFILE) -o $(PGO_PROFDATA) $(PGO_TRAIN_PATHS)
+	@echo "✓ PGO profile: $(PGO_PROFDATA) — '$(PGO_PROFILE)' builds use it until the next pgo-train"
 
 install: release
 	@set -e; \

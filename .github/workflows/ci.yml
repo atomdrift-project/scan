@@ -133,4 +133,7 @@ jobs:
       contents: read
     with:
       profile: release
+      # Training doubles the native jobs' build time; release.yml (tag pushes
+      # and branch dry runs) builds profile-guided and exercises the step.
+      pgo: false
     # No secrets passed. CI never touches the signing identity.
