@@ -1,0 +1,938 @@
+[
+  {
+    "name": "binary-and-dedup",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl_download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1.0,
+              "crit": 2
+            },
+            {
+              "id": "metadata/network::curl_download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl_download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1.0,
+              "crit": 2
+            },
+            {
+              "id": "metadata/network::curl_download-post",
+              "desc": "Download via HTTP POST",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  {
+    "name": "legacy-leaf-and-unicode",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "legacy/path/CURL-download_post2",
+              "desc": "Caf\u00e9 \u0130HTTP kernel",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "legacy/path/CURL-download_post2",
+              "desc": "Caf\u00e9 \u0130HTTP kernel",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "confidence-boundary",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro/network::wget",
+              "desc": "script",
+              "conf": 0.65,
+              "crit": 2
+            },
+            {
+              "id": "metadata/network::curl",
+              "desc": "download",
+              "conf": 0.64,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "micro/network::wget",
+              "desc": "script",
+              "conf": 0.65,
+              "crit": 2
+            },
+            {
+              "id": "metadata/network::curl",
+              "desc": "download",
+              "conf": 0.64,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "missing-description",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": true
+  },
+  {
+    "name": "low-confidence-missing-description",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 0.5,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 0.5,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "pruned-description-source",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "2bd41d1b21a8819aff6f13497245e9f00b06c4002a1ac0044b5047291e41498c",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget"
+      ],
+      "total_features": 7,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::curl",
+              "desc": "",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "numeric-and-single-character",
+    "spec": {
+      "version": 22,
+      "abi_version": 22,
+      "feature_layout_hash": "6d276501fa1033226dff13ac42df767ad514e8e5b3bcff54b7838db10d6e7ffe",
+      "presence_vocab": [
+        "metadata"
+      ],
+      "filetype_vocab": [],
+      "element_vocab": [],
+      "bigram_vocab": [],
+      "ghost_vocab": [],
+      "skeleton_vocab": [],
+      "rare_element_vocab": [],
+      "trigram_vocab": [],
+      "metric_vocab": [],
+      "crit_unigram_vocab": [],
+      "crit_bigram_vocab": [],
+      "crit_trigram_vocab": [],
+      "attack_bigram_vocab": [],
+      "attack_trigram_vocab": [],
+      "mbc_bigram_vocab": [],
+      "mbc_trigram_vocab": [],
+      "tiered_bigram_vocab": [],
+      "tiered_trigram_vocab": [],
+      "tiered_quadgram_vocab": [],
+      "symbol_vocab": [],
+      "symbol_bigram_vocab": [],
+      "symbol_trigram_vocab": [],
+      "kv_vocab": [],
+      "mbc_id_vocab": [],
+      "trait_path_depth": 3,
+      "tiered_min_crit": [
+        3,
+        3,
+        3
+      ],
+      "tiered_branch_min_crit": {},
+      "keyword_vocabs": {
+        "ruleword": [
+          "curl",
+          "download",
+          "post",
+          "post2",
+          "unseen",
+          "wget"
+        ],
+        "descword": [
+          "caf",
+          "download",
+          "http",
+          "kernel",
+          "post",
+          "script",
+          "unseen",
+          "via"
+        ]
+      },
+      "base_feature_abi": 20,
+      "feature_names": [
+        "present:metadata",
+        "ruleword:curl",
+        "ruleword:download",
+        "ruleword:post",
+        "ruleword:post2",
+        "ruleword:unseen",
+        "ruleword:wget",
+        "descword:caf",
+        "descword:download",
+        "descword:http",
+        "descword:kernel",
+        "descword:post",
+        "descword:script",
+        "descword:unseen",
+        "descword:via"
+      ],
+      "total_features": 15,
+      "standardized": false
+    },
+    "report": {
+      "v": "8",
+      "files": [
+        {
+          "id": 0,
+          "path": "sample.class",
+          "type": "java_class",
+          "sha": "fixture",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::x_123_curl",
+              "desc": "1 x HTTP",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "pid": 0,
+          "path": "inner.class",
+          "type": "java_class",
+          "sha": "inner",
+          "size": 10,
+          "traits": [
+            {
+              "id": "metadata/network::x_123_curl",
+              "desc": "1 x HTTP",
+              "conf": 1.0,
+              "crit": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": false,
+    "expected": [
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+]

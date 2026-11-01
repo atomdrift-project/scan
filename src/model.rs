@@ -565,6 +565,7 @@ impl Model {
             )
         };
         let score_general = || -> Result<Scored> {
+            self.ctx.validate_keyword_inputs(parsed)?;
             let raw = self.inner.predict(general_features)?;
             let probability = self
                 .general_calibrator
@@ -581,6 +582,7 @@ impl Model {
             let Some((id, route)) = entry else {
                 return Ok(None);
             };
+            route.ctx.validate_keyword_inputs(parsed)?;
             let mut features = route.ctx.extract_from_parsed(parsed);
             route.spec.standardize(&mut features);
             let raw = route.backend.predict(&features)?;

@@ -27,6 +27,8 @@ pub(super) struct MetricSlot {
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
+    pub(super) strict_keyword_descriptions: bool,
+    pub(super) keyword_slots: HashMap<String, HashMap<String, usize>>,
     pub(super) ranked_ngrams: bool,
     pub(super) relative_structure: bool,
     pub(super) explicit_metrics: bool,
@@ -156,10 +158,27 @@ impl ExtractContext {
         let has_prefix = |prefix: &str| spec.feature_names.iter().any(|n| n.starts_with(prefix));
         let has_name = |name: &str| absolute_lookup.contains_key(name);
 
+        let keyword_slots = spec
+            .keyword_vocabs
+            .iter()
+            .filter_map(|(source, words)| {
+                let slots: HashMap<String, usize> = words
+                    .iter()
+                    .filter_map(|word| {
+                        absolute_lookup
+                            .get(&format!("{source}:{word}"))
+                            .map(|&slot| (word.clone(), slot))
+                    })
+                    .collect();
+                (!slots.is_empty()).then(|| (source.clone(), slots))
+            })
+            .collect();
         Self {
+            strict_keyword_descriptions: spec.abi_version < 23,
+            keyword_slots,
             trait_path_depth: spec.trait_path_depth,
-            ranked_ngrams: spec.abi_version >= 20,
-            relative_structure: spec.abi_version >= 21,
+            ranked_ngrams: spec.feature_semantics_abi() >= 20,
+            relative_structure: spec.feature_semantics_abi() >= 21,
             explicit_metrics: spec.metric_transforms.is_some(),
             metric_reference_year: spec.metric_reference_year,
             tiered_min_crit: spec.tiered_min_crit,
@@ -228,12 +247,18 @@ impl ExtractContext {
     }
 
     /// This route's active raw-subtree needs (which optional families it emits).
-    pub(crate) const fn raw_needs(&self) -> RawNeeds {
+    pub(crate) fn raw_needs(&self) -> RawNeeds {
         RawNeeds {
             kv: self.kv,
             kv_shape: self.kv_shape,
             kv_split: self.kv_split,
             symbol: self.symbols,
+            rule_keywords: self.keyword_slots.contains_key("ruleword"),
+            description_keywords: self.keyword_slots.contains_key("descword")
+                || self.keyword_slots.contains_key("ruletextword"),
+            full_rule_keywords: self.keyword_slots.contains_key("fullword")
+                || self.keyword_slots.contains_key("ruletextword"),
+            context_keywords: self.keyword_slots.contains_key("contextword"),
         }
     }
 
@@ -260,6 +285,7 @@ impl ExtractContext {
             lookup: &self.absolute_lookup,
         };
 
+        self.write_keyword_features(parsed, w);
         self.write_path_features(combined, parsed.sample_score, w); // G1, G2
         write_aggregate_features(parsed, w); // G3
         if self.optional_finding_features {
