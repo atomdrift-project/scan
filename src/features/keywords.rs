@@ -121,6 +121,8 @@ impl ExtractContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::features::FeatureSpec;
+    use std::collections::HashMap;
 
     #[test]
     fn keywords_match_python_fixture_and_preserve_base_abi() -> Result<()> {

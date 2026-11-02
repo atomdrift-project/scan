@@ -16,6 +16,8 @@ struct Case {
     report: cleave::types::CompactReport,
     probability: f32,
     #[serde(default)]
+    expected_error: Option<String>,
+    #[serde(default)]
     expected: Option<Vec<f32>>,
 }
 
@@ -36,6 +38,17 @@ fn collimator_bundles_match_features_and_probabilities() -> Result<()> {
         let spec = FeatureSpec::load(&bundle.directory.join("feature_spec.json"))?;
         let extractor = ExtractContext::new(&spec);
         for case in bundle.cases {
+            if let Some(expected_error) = &case.expected_error {
+                let error = extractor
+                    .try_extract(&case.report)
+                    .expect_err("fixture requires an input-contract rejection");
+                assert!(error.to_string().contains(expected_error));
+                let error = model
+                    .predict_report(&case.report)
+                    .expect_err("model must enforce the same input contract");
+                assert!(error.to_string().contains(expected_error));
+                continue;
+            }
             if let Some(expected) = &case.expected {
                 let actual = extractor.try_extract(&case.report)?;
                 assert_eq!(actual.len(), expected.len());
