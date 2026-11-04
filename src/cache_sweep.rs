@@ -393,7 +393,7 @@ fn stat_entry(path: PathBuf, is_dir: bool) -> Option<Entry> {
 }
 
 /// Recursive byte size of a directory entry. Only ever called on the small
-/// per-item directories stng's rizin cache uses (a handful of files each).
+/// per-item cache directories (a handful of files each).
 ///
 /// Recursion is gated on `file_type()`, which does NOT follow symlinks: a
 /// symlink is neither descended nor counted. That keeps a stray symlink loop

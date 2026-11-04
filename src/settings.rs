@@ -7,18 +7,12 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 /// The process's settings.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// Wall-clock limit on each Rizin run; `None` keeps cleave's default.
-    pub rizin_timeout: Option<Duration>,
-    /// The larger limit for one retry of a native file whose Rizin run timed
-    /// out; `None` does not retry.
-    pub rizin_retry_timeout: Option<Duration>,
     /// What the fetch client and blob cache are built with.
     pub fetch: crate::fetch::Settings,
     /// A ceiling on everything one execution fetches; `None` is unlimited, as

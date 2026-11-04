@@ -9,7 +9,7 @@ use std::fmt;
 /// An external analysis tool that was not found by filefacts' resolver.
 #[derive(Debug, Clone)]
 pub struct MissingTool {
-    /// The command name (e.g. `"rizin"`).
+    /// The command name (e.g. `"upx"`).
     pub name: &'static str,
     /// What this tool enables (e.g. `"binary disassembly"`).
     pub purpose: &'static str,
@@ -124,7 +124,6 @@ pub fn enrich_error(err: &anyhow::Error) -> Option<String> {
 }
 
 const TOOLS: &[(&str, &str)] = &[
-    ("rizin", "binary disassembly and import/export analysis"),
     ("upx", "UPX-packed executable detection"),
     ("innoextract", "Inno Setup installer extraction"),
 ];
@@ -139,7 +138,6 @@ fn install_hint(name: &str) -> &'static str {
     #[cfg(windows)]
     {
         match name {
-            "rizin" => "winget install --exact --id Rizin.Rizin",
             "upx" => "winget install --exact --id UPX.UPX",
             "innoextract" => "winget install --exact --id dscharrer.innoextract",
             "7z" => "winget install --exact --id 7zip.7zip",
@@ -150,7 +148,6 @@ fn install_hint(name: &str) -> &'static str {
     #[cfg(not(windows))]
     {
         match name {
-            "rizin" => "brew install rizin  |  pkg install rizin  |  https://rizin.re",
             "upx" => "brew install upx  |  apt-get install upx-ucl  |  apk add upx",
             "innoextract" => {
                 "brew install innoextract  |  apt-get install innoextract  |  apk add innoextract"
@@ -167,7 +164,7 @@ mod tests {
 
     #[test]
     fn install_hint_is_non_empty_for_every_supported_tool() {
-        for name in ["rizin", "upx", "innoextract", "7z"] {
+        for name in ["upx", "innoextract", "7z"] {
             assert!(!install_hint(name).is_empty());
         }
     }

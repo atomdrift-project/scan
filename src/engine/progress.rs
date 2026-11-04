@@ -17,7 +17,7 @@ pub(crate) const SPINNER: &[char] = &[
 
 /// Heartbeat redraw cadence. A background thread redraws on this interval so
 /// the spinner keeps animating — and the long-tail notice can appear — even
-/// while no file completes (a single slow rizin analysis can stall for minutes).
+/// while no file completes (a single slow analysis can stall for minutes).
 /// Shared with [`crate::deptree`], whose live tree animates on the same cadence.
 pub(crate) const PROGRESS_TICK: Duration = Duration::from_millis(125);
 

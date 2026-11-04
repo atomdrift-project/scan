@@ -90,9 +90,7 @@ fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 # the "worst pool wins" rule lives in one auditable place.
 burton = { git = "https://github.com/atomdrift-project/burton.git" }
 proclist = { git = "https://github.com/atomdrift-project/proclist.git" }
-# Direct handle on filefacts (already in the graph via cleave/fletch) so the
-# `ps` subcommand can tune rizin for low-latency live-process scanning:
-# native-arch-only, a tighter timeout, and a size gate on giant binaries.
+# Direct handle on filefacts types shared by cleave and fletch.
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 clap = { version = "4", features = ["derive", "env"] }
 # `rc`: a stored cleave report is an `Arc<RawValue>`, shared by every clone of

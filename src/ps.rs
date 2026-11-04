@@ -31,16 +31,6 @@ struct ProcessGroup {
     scan_path: PathBuf,
 }
 
-/// Rizin's size gate for a live-process scan.
-///
-/// Unlike a filesystem scan (where we want every architecture and tolerate
-/// minutes of deep analysis), `ps` is interactive and dominated by a few giant
-/// signed apps (Electron/Bun binaries can be 100–215 MB). Two caps keep it
-/// responsive without changing verdicts materially: this gate skips Rizin on
-/// the giants entirely, and native-arch-only analysis never pays full `aaa` on
-/// a universal binary's non-host slice, which never runs here.
-const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
-
 /// One group per distinct running binary: processes sharing an executable
 /// path are merged, then paths sharing a sha256. Also returns how many
 /// binaries could not be hashed, which are left out.
@@ -147,11 +137,6 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         compact_members: true, // compact projection only
         slow_rule_ms: config.slow_rule_ms(),
         cancellation: Some(Arc::clone(&cancellation)),
-        // The ps-only caps (see `PS_RIZIN_MAX_BYTES`) are per analysis, so the
-        // file scan `scan sys` runs next keeps the defaults.
-        rizin_timeout: crate::engine::rizin_timeout(),
-        rizin_max_bytes: Some(PS_RIZIN_MAX_BYTES),
-        rizin_native_arch_only: true,
         ..Default::default()
     };
     crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());

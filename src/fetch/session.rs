@@ -230,8 +230,6 @@ impl FetchSession {
         let mut opts = AnalysisOptions {
             compact_members: true, // compact projection only
             skip_predicate: dep_skip_predicate(),
-            rizin_timeout: crate::engine::rizin_timeout(),
-            rizin_retry_timeout: crate::engine::rizin_retry_timeout(),
             ..AnalysisOptions::default()
         };
         crate::engine::add_zip_passwords(&mut opts, zip_passwords);

@@ -33,10 +33,13 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
     if !needs.rule_keywords && !needs.description_keywords && !needs.full_rule_keywords {
         return result;
     }
+    // Match the f32 representation used by compact findings at the threshold.
+    #[allow(clippy::cast_possible_truncation)]
+    const COMPACT_MIN_CONFIDENCE: f32 = MIN_CONFIDENCE as f32;
     for finding in &file.findings {
         if finding.id.is_empty()
             || finding.confidence.is_nan()
-            || finding.confidence < MIN_CONFIDENCE as f32
+            || finding.confidence < COMPACT_MIN_CONFIDENCE
         {
             continue;
         }

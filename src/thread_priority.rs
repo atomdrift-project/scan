@@ -1,15 +1,7 @@
 //! Scheduling priority for the analysis pool's threads.
 //!
-//! The Rayon pool saturates every core, and the analysis it drives also spawns
-//! external CPU-bound helpers — rizin's `aaa` on a stripped ELF runs 10–30 s
-//! single-threaded — whose caller sits parked in the pool until they finish.
-//! Those helpers are on the critical path of the archive that owns them, yet
-//! they share cores as equals with every pool worker that could just as well
-//! run later, so a rizin pass that takes 26 s alone can stretch to ~50 s
-//! inside a saturated scan. Demoting the
-//! workers lets the scheduler hand such helpers a whole core the moment they
-//! become runnable; total pool throughput is unchanged because the demoted
-//! threads still own every idle cycle.
+//! Demoting Rayon workers lets external CPU-bound helpers make progress when
+//! the pool saturates the host, while workers still use idle CPU time.
 
 /// Run the calling thread one scheduling notch below where it is now.
 ///

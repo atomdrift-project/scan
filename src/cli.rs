@@ -33,9 +33,6 @@ use crate::OutputFormat;
 /// analysis stack warns at the same point rather than each picking a number.
 pub const DEFAULT_SLOW_RULE_MS: u64 = 4000;
 
-/// Default hard wall-clock limit for each Rizin subprocess, in seconds.
-pub const DEFAULT_RIZIN_TIMEOUT_SECS: u64 = 10 * 60;
-
 /// What a run does about its rules and models before it starts: the
 /// `-u`/`--update` and `--no-update` flags, settled into one value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

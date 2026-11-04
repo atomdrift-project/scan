@@ -19,7 +19,7 @@ How does Atomdrift get such great results? First, it covers more ground than any
 - 125,000+ detection rules covering malware on every platform from AIX to iOS to Windows
 - 15,000,000+ hashes for known good/badware
 - Integrated AST analysis using [tree-sitter](https://tree-sitter.github.io/)
-- Automated binary reverse engineering via [rizin](https://rizin.re/)
+- Automated binary reverse engineering via [binform](https://github.com/atomdrift-project/binform)
 
 Most importantly, rules are constantly refreshed using reinforcement learning against new samples, blogs, and technical articles, resulting in ~1000 updated rules daily.
 
@@ -44,13 +44,12 @@ make install
 ```
 
 If deeper binary analysis is required, you should also install
-[7-Zip](https://7-zip.org/), [rizin](https://rizin.re/), [upx](https://upx.github.io/), and [innoextract](https://github.com/dscharrer/innoextract).
+[7-Zip](https://7-zip.org/), [upx](https://upx.github.io/), and [innoextract](https://github.com/dscharrer/innoextract).
 
 On Windows, using winget:
 
 ```powershell
 winget install --exact --id 7zip.7zip
-winget install --exact --id Rizin.Rizin
 winget install --exact --id UPX.UPX
 winget install --exact --id dscharrer.innoextract
 ```
@@ -185,50 +184,12 @@ normal startup loads specialists on demand. These timings exclude trait loading,
 file analysis, and process/thread-pool startup, and repeated runs use the OS file
 cache. On Linux, `make profile-model-load` records a CPU profile with `perf`.
 
-For the complete VSIX throughput check on Linux, use an existing scanner and
-Rizin build:
-
-```sh
-sh scripts/bench-vsix.sh /var/tmp/vsix out/vsix-perf/rust-native-pgo/atomscan \
-  out/rizin-perf-static-pgo/bin/rizin out/vsix-perf/goal
-```
-
-This requires all five fresh-process scans to finish within 47 seconds, with
-one output per input and no errors or skips. It disables persistent analysis
-caches, retains compiled-rule caches and bounded in-process memoization, and
-writes every result and timing plus a series summary. `VSIX_RUNS`, `VSIX_LIMIT`,
-and `VSIX_NATIVE_CPUS` override the defaults of 5, 47, and `0,1`. Large native
-helpers use those CPUs; the scanner excludes their SMT siblings. The scheduling
-settings in the script can each be overridden through the environment.
-
-The preset uses 96 scan workers, 32 workers per large-file pool, a 4 GiB
-analysis memo, and delayed jemalloc page purging. On a 64-core Threadripper,
-for example, give the private large-file pools the faster CPU groups:
-
-```sh
-CLEAVE_LEAF_CPUS=2-7,24-39,56-63,66-71,88-103,120-127 \
-  sh scripts/bench-vsix.sh /var/tmp/vsix out/vsix-perf/rust-native-pgo/atomscan \
-  out/rizin-perf-static-pgo/bin/rizin out/vsix-perf/goal
-```
-
-That CPU mask is host-specific: omit or replace it on other machines.
-`CLEAVE_LEAF_CPUS` is opt-in on Linux and intersects each private worker's
-inherited affinity. It leaves the general scan pool's placement unchanged.
-
 `scripts/build-balanced-pgo.sh CORPUS OUTPUT_DIR [CARGO_CONFIG]` builds a scanner
 for the current CPU, trains it on cache-disabled analysis, and rebuilds
 with the resulting Rust profile. `PGO_TRAIN_SECONDS` optionally bounds training;
 an interrupted training run never counts as a passing benchmark. Set
 `PGO_USE_EXISTING=1` to rebuild from the retained profile, and `LLVM_PROFDATA` to the tool matching
 `rustc -vV`; use a Cargo config override when testing edited sibling dependencies.
-For Rizin, `RIZIN_NATIVE=1 RIZIN_PGO_TRAIN_DIR=DIR sh scripts/build-rizin-perf.sh`
-also enables native compilation and PGO. That training directory should contain
-extracted native binaries, such as the corpus's ELF and PE Go helpers.
-Set `RIZIN_STATIC=1` to link Rizin's own libraries
-statically, allowing LTO across their boundaries; system runtime libraries
-remain dynamic. These build scripts retain their output locally and do not
-replace installed tools.
-
 - [Integration guide](docs/INTEGRATION.md) — CLI, server, library, exit codes,
   and deployment choices
 - [JSON report schema](docs/JSON.md) — machine-readable output fields

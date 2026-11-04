@@ -979,7 +979,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
 /// Settle the process's settings from its flags, and start the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
     scan::settings::configure(scan::settings::Settings {
-        rizin_timeout: Some(Duration::from_secs(scan::cli::DEFAULT_RIZIN_TIMEOUT_SECS)),
         // A hard cap across one invocation. The daemons scan unboundedly many
         // jobs over their lifetime, so each job is bounded by the fetch
         // policy's per-file ceilings instead.
@@ -1249,9 +1248,6 @@ fn serve(
     eprintln!("Starting Atomdrift Scan server on http://{} ...", args.bind);
     let runtime = daemon_runtime()?;
     let served = runtime.block_on(scan::server::run(config));
-    // Runtime shutdown may abandon blocking analyses. Close child admission
-    // and kill live tool groups while their supervisors still exist.
-    cleave::kill_all_rizin_groups();
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     served?;
     Ok(ExitCode::SUCCESS)
