@@ -676,7 +676,11 @@ fn collimator_frozen_blend_decisions_match() -> Result<()> {
     assert!(!fixture.cases.is_empty());
     assert_eq!(fixture.routes.len(), fixture.weights.len());
     let mut names = RouteNames::default();
-    let routes: Vec<_> = fixture.routes.iter().map(|name| names.intern(name)).collect();
+    let routes: Vec<_> = fixture
+        .routes
+        .iter()
+        .map(|name| names.intern(name))
+        .collect();
     let mut blend = BlendPolicy {
         routes: routes.clone(),
         weights: fixture.weights,
@@ -691,7 +695,11 @@ fn collimator_frozen_blend_decisions_match() -> Result<()> {
             .map(|(&route, &probability)| RouteProbability { route, probability })
             .collect();
         blend.threshold = case.threshold;
-        assert_eq!(blend.fires(&scores), case.fires, "blend parity case {index}");
+        assert_eq!(
+            blend.fires(&scores),
+            case.fires,
+            "blend parity case {index}"
+        );
     }
     println!("{} frozen blend decisions matched", fixture.cases.len());
     Ok(())
@@ -1201,4 +1209,18 @@ fn description_inputs_are_checked_for_general_and_specialist_models() -> Result<
         }
     }
     Ok(())
+}
+
+#[test]
+fn sweep_preserves_minimum_with_nonmonotone_thresholds() {
+    let grid = general_policy_grid(&[(0, 0.9), (5, 0.4), (25, 0.8), (100, 0.1)]);
+    // Compare against the exhaustive decision rule at every threshold boundary.
+    for probability in [0.0, 0.1, 0.10001, 0.39999, 0.4, 0.5, 0.8, 0.9, 1.0] {
+        let scores = general_only(probability);
+        let exhaustive = grid
+            .iter()
+            .filter_map(|lp| lp.hostile.fire(&scores).map(|(p, t)| (lp.level, p, t)))
+            .min_by_key(|&(level, _, _)| level);
+        assert_eq!(sweep_policy_grid(&grid, &scores), exhaustive);
+    }
 }

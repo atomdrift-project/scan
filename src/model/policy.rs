@@ -780,22 +780,18 @@ pub(super) fn policy_decide(policy: &RoutePolicy, scores: &[RouteProbability]) -
 ///
 /// `grid` is ascending by level. Hostile thresholds loosen as the level rises,
 /// so once a file fires it keeps firing — the minimum firing level is the
-/// strictest budget that still flags it. Scanning every level and keeping the
-/// minimum stays correct even if a bundle's grid isn't perfectly monotone.
+/// strictest budget that still flags it. The first firing entry is the minimum
+/// even if thresholds are not monotone, since the loader sorts by level.
 /// Returns `None` when the file fires at no level (clean).
 pub(super) fn sweep_policy_grid(
     grid: &[LevelPolicy],
     scores: &[RouteProbability],
 ) -> Option<(u16, f32, f32)> {
-    let mut best: Option<(u16, f32, f32)> = None;
-    for lp in grid {
-        if let Some((p, t)) = lp.hostile.fire(scores)
-            && best.is_none_or(|(bl, _, _)| lp.level < bl)
-        {
-            best = Some((lp.level, p, t));
-        }
-    }
-    best
+    // The loader sorts by level. The first firing entry is therefore the
+    // minimum even when thresholds are not monotone. Stop before evaluating
+    // the remaining policies (including potentially expensive learned blends).
+    grid.iter()
+        .find_map(|lp| lp.hostile.fire(scores).map(|(p, t)| (lp.level, p, t)))
 }
 
 /// Map a file's lowest firing level to a verdict at the active deploy level.
