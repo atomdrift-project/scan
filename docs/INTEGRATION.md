@@ -202,7 +202,5 @@ deployment with `SCAN_FOLLOW` instead of the flag if that suits you better.
 
 The in-process Rust API is the most direct path and the least stable. Until
 1.0, minor releases may break it, so **pin a commit** of
-`github.com/atomdrift-project/scan`. Two things it asks of you: give `main` an
-8 MB rayon stack, and call `kill_all_rizin_groups()` at shutdown so
-disassembler subprocesses do not leak. It returns the same JSON envelope as
-every other path.
+`github.com/atomdrift-project/scan`. Give `main` an 8 MB rayon stack. It returns
+the same JSON envelope as every other path.

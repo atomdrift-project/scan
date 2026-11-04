@@ -92,7 +92,6 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     let mut options = cleave::AnalysisOptions {
         compact_members: true, // compact projection only
         yara: false,
-        rizin: false,
         upx: false,
         slow_rule_ms: config.slow_rule_ms(),
         ..Default::default()

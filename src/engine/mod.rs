@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -136,17 +136,6 @@ pub struct ScanConfig {
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
     sidecars: bool,
-}
-
-/// The Rizin limit for an [`cleave::AnalysisOptions`]: the configured one, or
-/// `None` (cleave's default); see [`crate::settings::Settings::rizin_timeout`].
-pub(crate) fn rizin_timeout() -> Option<Duration> {
-    crate::settings::get().rizin_timeout
-}
-
-/// The larger limit for retrying a native file whose Rizin run timed out.
-pub(crate) fn rizin_retry_timeout() -> Option<Duration> {
-    crate::settings::get().rizin_retry_timeout
 }
 
 pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords: &[String]) {

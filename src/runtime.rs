@@ -54,7 +54,7 @@ fn propagate_no_analysis_cache() {
 /// systemd starts every service at a soft `RLIMIT_NOFILE` of 1024 (the hard
 /// limit is 524288), and unlike Go, Rust's runtime never lifts it. A busy
 /// process holds several descriptors per in-flight analysis — the sample, its
-/// extracted members, rizin's pipes — so 1024 is a ceiling on concurrency that
+/// extracted members and external tool pipes — so 1024 is a ceiling on concurrency that
 /// nothing reports. At that ceiling every symptom shows up somewhere else: each
 /// file the process tries to open fails, so `traits_repo::version()` reads no
 /// sidecar (reports go out without `rev` and hopper cannot skip re-posts),
@@ -287,9 +287,11 @@ const SMALL_HOST_CORES: usize = 8;
 /// [`smt_pool_vendor`]).
 fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool) -> Option<usize> {
     match (physical, logical) {
-        (Some(p), Some(l)) if l > p && smt_vendor => {
-            Some(if p < SMALL_HOST_CORES { l } else { (p + p / 2).min(l) })
-        }
+        (Some(p), Some(l)) if l > p && smt_vendor => Some(if p < SMALL_HOST_CORES {
+            l
+        } else {
+            (p + p / 2).min(l)
+        }),
         (Some(p), _) => Some(p),
         (None, l) => l,
     }

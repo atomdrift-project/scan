@@ -104,10 +104,6 @@ fn cancel_all() -> Vec<&'static str> {
 fn interrupted() {
     let notices = cancel_all();
     if notices.is_empty() {
-        // Cleave runs each rizin in its own process group, so SIGINT on the
-        // terminal never reaches them — without an explicit kill here, every
-        // in-flight child would outlive us as an orphan.
-        cleave::kill_all_rizin_groups();
         std::process::exit(130);
     }
     for notice in notices {

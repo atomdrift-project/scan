@@ -144,7 +144,7 @@ pub(crate) fn entry_key(content_sha: &str, name: &str) -> String {
 
 /// Whether `report` or any file in it is missing results a later run may
 /// produce: rule evaluation ran out of time (findings depend on how loaded the
-/// machine was), Rizin did not finish, or a source parse was cut short.
+/// machine was) or a source parse was cut short.
 /// Caching it would serve the shortfall to every later scan of the same bytes.
 /// cleave's own cache makes the same call.
 fn incomplete(report: &AnalysisReport) -> bool {
@@ -152,7 +152,6 @@ fn incomplete(report: &AnalysisReport) -> bool {
     let incomplete = |gaps: &AnalysisGaps| {
         [
             AnalysisGap::EvaluationDeadline,
-            AnalysisGap::DisassemblyIncomplete,
             AnalysisGap::SourceParseIncomplete,
         ]
         .into_iter()
@@ -441,14 +440,12 @@ mod tests {
         assert!(cache.get("missing").is_none());
     }
 
-    /// A report cut short by the rule deadline, an unfinished Rizin run or an
+    /// A report cut short by the rule deadline or an
     /// interrupted source parse lacks results a later scan would have, so it
     /// must not be served to one.
     #[test]
     fn incomplete_analyses_are_not_stored() {
-        use cleave::types::AnalysisGap::{
-            DisassemblyIncomplete, EvaluationDeadline, SourceParseIncomplete,
-        };
+        use cleave::types::AnalysisGap::{EvaluationDeadline, SourceParseIncomplete};
         let base = tempfile::tempdir().unwrap();
         let cache = AnalysisCache {
             dir: base.path().to_path_buf(),
@@ -465,11 +462,7 @@ mod tests {
 
         cache.put("complete", Some(&report()), &[]);
         assert!(cache.get("complete").is_some());
-        for gap in [
-            EvaluationDeadline,
-            DisassemblyIncomplete,
-            SourceParseIncomplete,
-        ] {
+        for gap in [EvaluationDeadline, SourceParseIncomplete] {
             let cut_short = report();
             cut_short.analysis_gaps.record(gap);
             cache.put(gap.label(), Some(&cut_short), &[]);
@@ -521,7 +514,7 @@ mod historical_gap_tests {
         });
         report
             .analysis_gaps
-            .record(cleave::types::AnalysisGap::DisassemblyIncomplete);
+            .record(cleave::types::AnalysisGap::EvaluationDeadline);
         let sub = Some(report);
         let next = vec![];
         let bytes = serde_json::to_vec(&StoreRef {
@@ -529,9 +522,12 @@ mod historical_gap_tests {
             next: &next,
         })
         .unwrap();
+        let historical = String::from_utf8(bytes)
+            .unwrap()
+            .replace("evaluation-deadline", "disassembly-incomplete");
         std::fs::write(
             cache.path("content"),
-            zstd::encode_all(&bytes[..], 3).unwrap(),
+            zstd::encode_all(historical.as_bytes(), 3).unwrap(),
         )
         .unwrap();
         assert!(cache.get("content").is_none());
