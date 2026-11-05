@@ -661,6 +661,8 @@ pub(super) fn is_vendored_node_module(path: &str) -> bool {
 pub(super) struct LocalNpmPackages {
     pub(super) roots: HashSet<String>,
     pub(super) declarations: HashMap<String, (String, String)>,
+    // Exact-version members of explicit, captured Yarn workspaces.
+    pub(super) workspaces: Vec<HashMap<String, (String, String, bool)>>,
 }
 
 impl LocalNpmPackages {
@@ -738,10 +740,213 @@ impl LocalNpmPackages {
                 declarations.insert(root, (name.to_owned(), version.to_owned()));
             }
         }
+        // An exact literal Yarn workspace declaration is stronger evidence of
+        // local resolution than a same-named registry record. Only use complete
+        // members with captured source; ambiguous/globbed workspaces remain
+        // unresolved rather than silently suppressing a registry investigation.
+        let mut workspaces = Vec::new();
+        let archive_incomplete = report
+            .files
+            .first()
+            .is_some_and(|f| !f.analysis_gaps.is_empty());
+        let by_path: HashMap<_, _> = report
+            .files
+            .iter()
+            .map(|f| (f.path.replace('\\', "/"), f))
+            .collect();
+        let mut seen = HashSet::new();
+        let duplicates: HashSet<_> = report
+            .files
+            .iter()
+            .filter_map(|f| {
+                let path = f.path.replace('\\', "/");
+                (!seen.insert(path.clone())).then_some(path)
+            })
+            .collect();
+        for file in &report.files {
+            let path = file.path.replace('\\', "/");
+            if !(path.ends_with("/package.json") || path.ends_with("!!package.json"))
+                || !file.analysis_gaps.is_empty()
+                || duplicates.contains(&path)
+            {
+                continue;
+            }
+            let Some(view) = &file.filefacts else {
+                continue;
+            };
+            if view
+                .values
+                .get("private")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                continue;
+            }
+            if view
+                .values
+                .get("packageManager")
+                .is_some_and(|v| !v.as_str().is_some_and(|s| s.starts_with("yarn@")))
+            {
+                continue;
+            }
+            let Some(entries) = view
+                .values
+                .get("workspaces")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            // Do not ignore negative or wildcard patterns: an unsupported
+            // pattern could exclude a literal member or introduce ambiguity.
+            if entries.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .is_none_or(|entry| entry.contains(['*', '?', '[', ']', '!', '{', '}']))
+            }) {
+                continue;
+            }
+            let Some(root) = virtual_parent(&path) else {
+                continue;
+            };
+            // Yarn config can disable workspaces or replace resolution. The
+            // compact report does not yet retain its settings, so do not infer
+            // local resolution when such a config is captured in any ancestor.
+            let mut scope = Some(root.clone());
+            let mut has_yarn_config = false;
+            while let Some(dir) = scope {
+                if [".yarnrc", ".yarnrc.yml"].iter().any(|name| {
+                    safe_package_path(&dir, name).is_some_and(|p| by_path.contains_key(&p))
+                }) {
+                    has_yarn_config = true;
+                    break;
+                }
+                scope = virtual_parent(&dir);
+            }
+            if has_yarn_config {
+                continue;
+            }
+            let Some(lock) = safe_package_path(&root, "yarn.lock") else {
+                continue;
+            };
+            if !by_path
+                .get(&lock)
+                .is_some_and(|f| f.analysis_gaps.is_empty())
+                || duplicates.contains(&lock)
+            {
+                continue;
+            }
+            let mut members = HashMap::new();
+            for entry in entries {
+                let Some(entry) = entry.as_str() else {
+                    continue;
+                };
+                let Some(member) = safe_package_path(&root, entry) else {
+                    continue;
+                };
+                if duplicates.contains(&format!("{member}/package.json")) {
+                    continue;
+                }
+                let Some(manifest) = by_path.get(&format!("{member}/package.json")) else {
+                    continue;
+                };
+                let Some(info) = manifest
+                    .filefacts
+                    .as_ref()
+                    .and_then(|v| v.values.get("npm"))
+                else {
+                    continue;
+                };
+                let Some(name) = info.get("name").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let Some(version) = info.get("version").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let prefix = format!("{member}/");
+                let present = by_path.iter().any(|(p, _)| {
+                    p.starts_with(&prefix)
+                        && !is_vendored_node_module(p.strip_prefix(&prefix).unwrap_or(p))
+                        && p != &format!("{member}/package.json")
+                        && [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
+                            .iter()
+                            .any(|ext| p.ends_with(ext))
+                });
+                let incomplete = archive_incomplete || paths.iter().any(|p| p.starts_with(&prefix));
+                if present && manifest.analysis_gaps.is_empty() {
+                    members.insert(member, (name.to_owned(), version.to_owned(), incomplete));
+                }
+            }
+            if !members.is_empty() {
+                workspaces.push(members);
+            }
+        }
         Self {
             roots,
             declarations,
+            workspaces,
         }
+    }
+
+    /// Find local workspace resolution separately from analysis completeness.
+    /// A source member can be present with analysis gaps; that is still not a
+    /// registry package, but callers must surface `Coverage::Incomplete`.
+    pub(super) fn workspace_coverage(
+        &self,
+        report: &AnalysisReport,
+        source_sha: &str,
+        reference: &Reference,
+    ) -> Option<(String, bool)> {
+        if reference.kind != RefKind::Dependency {
+            return None;
+        }
+        let coordinate = Coordinate::of(locator(reference)).filter(|c| c.typ == "npm")?;
+        let version = coordinate.version?;
+        let package = npm_import_name(reference)?;
+        let sources: Vec<_> = report
+            .files
+            .iter()
+            .filter(|f| f.sha256 == source_sha)
+            .collect();
+        if sources.is_empty() {
+            return None;
+        }
+        let mut covered = Vec::new();
+        let mut incomplete = false;
+        for source in sources {
+            let normalized = source.path.replace('\\', "/");
+            let directory = virtual_parent(&normalized)?;
+            let mut ancestor = Some(directory.clone());
+            let mut shadowed = reference
+                .context
+                .as_ref()
+                .and_then(|c| c.installed_path.as_ref())
+                .is_some();
+            while let Some(dir) = ancestor {
+                if safe_package_path(&dir, &format!("node_modules/{package}"))
+                    .is_some_and(|candidate| self.roots.contains(&candidate))
+                {
+                    shadowed = true;
+                    break;
+                }
+                ancestor = virtual_parent(&dir);
+            }
+            if shadowed {
+                return None;
+            }
+            let local: Vec<_> = self
+                .workspaces
+                .iter()
+                .filter(|members| members.contains_key(&directory))
+                .flat_map(|members| members.iter())
+                .filter(|(_, (name, supplied, _))| name == &package && supplied == version)
+                .collect();
+            if local.len() != 1 {
+                return None;
+            }
+            covered.push(local[0].0.clone());
+            incomplete |= local[0].1.2;
+        }
+        Some((covered.join(", "), incomplete))
     }
 
     pub(super) fn declared_coverage(
