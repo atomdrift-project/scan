@@ -672,3 +672,190 @@ fn conflicting_pins_have_distinct_fetch_work_keys() {
     second.pinned_hash.as_mut().unwrap().value = "TWO".into();
     assert_ne!(fetch_work_key(&first), fetch_work_key(&second));
 }
+
+#[test]
+fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.tar");
+    let members: [(&str, &[u8]); 5] = [
+        (
+            "package.json",
+            br#"{"private":true,"workspaces":["app","server"]}"#,
+        ),
+        ("yarn.lock", b"# yarn lockfile v1\n"),
+        (
+            "app/package.json",
+            br#"{"name":"app","version":"1.0.0","dependencies":{"server":"0.0.0"}}"#,
+        ),
+        ("app/index.js", b"require('server');"),
+        (
+            "server/package.json",
+            br#"{"name":"server","version":"0.0.0","main":"index.js"}"#,
+        ),
+    ];
+    let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+    for (name, bytes) in members.into_iter().chain(std::iter::once((
+        "server/index.js",
+        &b"module.exports = 1;"[..],
+    ))) {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, name, bytes).unwrap();
+    }
+    archive.finish().unwrap();
+    let mut report = cleave::Engine::empty()
+        .with_compact_members(true)
+        .analyze_file(&path, &AnalysisOptions::default())
+        .unwrap();
+    report.finalize();
+    let report: AnalysisReport =
+        serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+    let app = report
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("!!app/package.json"))
+        .unwrap();
+    let groups = collect_references(&report, &path, CiRefs::Skip);
+    let reference = groups
+        .iter()
+        .filter(|(sha, _)| sha == &app.sha256)
+        .flat_map(|(_, refs)| refs)
+        .find(|r| locator(r) == "pkg:npm/server@0.0.0")
+        .unwrap();
+    let local = LocalNpmPackages::from_report(&report);
+    assert!(
+        local
+            .workspace_coverage(&report, &app.sha256, reference)
+            .is_some()
+    );
+    let mut different = reference.clone();
+    different.locator = RefLocator::Purl("pkg:npm/server@1.0.0".into());
+    assert!(
+        local
+            .workspace_coverage(&report, &app.sha256, &different)
+            .is_none()
+    );
+    let mut incomplete_report = report.clone();
+    let target = incomplete_report
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("!!server/index.js"))
+        .unwrap();
+    target
+        .analysis_gaps
+        .record(cleave::types::AnalysisGap::FlowGraphLimited);
+    let coverage = LocalNpmPackages::from_report(&incomplete_report)
+        .workspace_coverage(&incomplete_report, &app.sha256, reference)
+        .unwrap();
+    assert!(
+        coverage.1,
+        "a local package with analysis gaps must remain incomplete"
+    );
+    let mut pass = session(
+        &incomplete_report,
+        FetchPolicy::parse_follow("dependencies").unwrap(),
+        None,
+    );
+    pass.run(
+        &mut incomplete_report,
+        vec![(app.sha256.clone(), vec![reference.clone()])],
+    );
+    assert!(pass.out.records.iter().any(|record| {
+        record
+            .coverage
+            .iter()
+            .any(|c| matches!(c, Coverage::Supplied { .. }))
+            && record
+                .coverage
+                .iter()
+                .any(|c| matches!(c, Coverage::Incomplete))
+    }));
+    let mut no_code = report.clone();
+    no_code
+        .files
+        .retain(|f| !f.path.ends_with("!!server/index.js"));
+    assert!(
+        LocalNpmPackages::from_report(&no_code)
+            .workspace_coverage(&no_code, &app.sha256, reference)
+            .is_none()
+    );
+    let mut no_lock = report.clone();
+    no_lock.files.retain(|f| !f.path.ends_with("!!yarn.lock"));
+    assert!(
+        LocalNpmPackages::from_report(&no_lock)
+            .workspace_coverage(&no_lock, &app.sha256, reference)
+            .is_none()
+    );
+    let mut other_manager = report.clone();
+    let root = other_manager
+        .files
+        .iter_mut()
+        .find(|f| f.path.ends_with("!!package.json"))
+        .unwrap();
+    root.filefacts.as_mut().unwrap().values["packageManager"] = serde_json::json!("npm@10");
+    assert!(
+        LocalNpmPackages::from_report(&other_manager)
+            .workspace_coverage(&other_manager, &app.sha256, reference)
+            .is_none()
+    );
+    let mut configured = report.clone();
+    let mut config = configured
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("!!yarn.lock"))
+        .unwrap()
+        .clone();
+    config.path = config.path.replace("!!yarn.lock", "!!.yarnrc");
+    configured.files.push(config);
+    assert!(
+        LocalNpmPackages::from_report(&configured)
+            .workspace_coverage(&configured, &app.sha256, reference)
+            .is_none()
+    );
+    let mut excluded = report.clone();
+    let root = excluded
+        .files
+        .iter_mut()
+        .find(|f| f.path.ends_with("!!package.json"))
+        .unwrap();
+    root.filefacts.as_mut().unwrap().values["workspaces"] =
+        serde_json::json!(["app", "server", "!server"]);
+    assert!(
+        LocalNpmPackages::from_report(&excluded)
+            .workspace_coverage(&excluded, &app.sha256, reference)
+            .is_none()
+    );
+    let mut shadowed = report.clone();
+    let mut installed = shadowed
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("!!server/package.json"))
+        .unwrap()
+        .clone();
+    installed.path = installed.path.replace(
+        "!!server/package.json",
+        "!!app/node_modules/server/package.json",
+    );
+    shadowed.files.push(installed);
+    assert!(
+        LocalNpmPackages::from_report(&shadowed)
+            .workspace_coverage(&shadowed, &app.sha256, reference)
+            .is_none()
+    );
+    let mut duplicate = report.clone();
+    duplicate.files.push(
+        duplicate
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("!!server/package.json"))
+            .unwrap()
+            .clone(),
+    );
+    assert!(
+        LocalNpmPackages::from_report(&duplicate)
+            .workspace_coverage(&duplicate, &app.sha256, reference)
+            .is_none()
+    );
+}

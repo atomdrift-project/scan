@@ -427,7 +427,14 @@ impl FetchSession {
                     if !self.policy.wants_at(reference.kind, hop) {
                         return true;
                     }
-                    let Some(path) = local.declared_coverage(report, source, reference) else {
+                    let workspace = local.workspace_coverage(report, source, reference);
+                    let incomplete = workspace
+                        .as_ref()
+                        .is_some_and(|(_, incomplete)| *incomplete);
+                    let Some(path) = workspace
+                        .map(|(path, _)| path)
+                        .or_else(|| local.declared_coverage(report, source, reference))
+                    else {
                         return true;
                     };
                     if reference.pinned_hash.is_some() {
@@ -437,14 +444,18 @@ impl FetchSession {
                             .insert(locator(reference).to_owned(), path);
                         return true;
                     }
-                    self.out.records.push(skipped_record(
+                    let mut record = skipped_record(
                         source,
                         reference,
                         Coverage::Supplied {
                             path,
                             pin_verified: None,
                         },
-                    ));
+                    );
+                    if incomplete {
+                        record.coverage.push(Coverage::Incomplete);
+                    }
+                    self.out.records.push(record);
                     covered.push(self.pending_entry(source, reference, hop, "supplied code"));
                     false
                 });
