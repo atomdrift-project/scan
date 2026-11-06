@@ -483,8 +483,9 @@ impl ExtractContext {
                     }
                 }
             } else {
-                for (&(a, b), &idx) in &self.bigram_id_lookup {
-                    if [a, b].iter().all(|id| ids.binary_search(id).is_ok()) {
+                let fired = |id: &u32| ids.binary_search(id).is_ok();
+                for ((a, b), &idx) in &self.bigram_id_lookup {
+                    if fired(a) && fired(b) {
                         mark(idx);
                     }
                 }
@@ -497,7 +498,7 @@ impl ExtractContext {
     /// The limit bounds the pair and triple probes.
     fn sorted_path_ids(&self, s: &FileSummary, rank_limit: usize) -> Vec<u32> {
         let mut ids: Vec<u32> = ranked_ngram_paths(&s.raw_findings, rank_limit)
-            .iter()
+            .into_iter()
             .filter_map(|p| self.path_to_id.get(p).copied())
             .collect();
         ids.sort_unstable();
@@ -530,8 +531,9 @@ impl ExtractContext {
                     }
                 }
             } else {
-                for (&(a, b, c), &idx) in &self.trigram_id_lookup {
-                    if [a, b, c].iter().all(|id| ids.binary_search(id).is_ok()) {
+                let fired = |id: &u32| ids.binary_search(id).is_ok();
+                for ((a, b, c), &idx) in &self.trigram_id_lookup {
+                    if fired(a) && fired(b) && fired(c) {
                         mark(idx);
                     }
                 }

@@ -24,9 +24,9 @@ fn update_rules_takes_no_flags_of_its_own() {
 fn a_closed_pipe_anywhere_in_the_chain_exits_quietly() {
     let pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         .context("writing a result");
-    assert!(super::is_broken_pipe(&pipe));
+    assert!(super::caused_by(&pipe, std::io::ErrorKind::BrokenPipe));
     let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
-    assert!(!super::is_broken_pipe(&other));
+    assert!(!super::caused_by(&other, std::io::ErrorKind::BrokenPipe));
 }
 
 #[test]
@@ -394,9 +394,7 @@ fn path_subcommand_and_its_aliases_resolve() -> Result<()> {
             .command
             .with_context(|| format!("path expected via `{name}`"))?
         {
-            Commands::Path { paths, .. } => {
-                assert_eq!(paths, vec![PathBuf::from("/tmp/a")])
-            }
+            Commands::Path { paths, .. } => assert_eq!(paths, [PathBuf::from("/tmp/a")]),
             other => anyhow::bail!("unexpected command for `{name}`: {other:?}"),
         }
     }
@@ -433,7 +431,7 @@ fn serve_accepts_negative_max_rss_disable() -> Result<()> {
     match cli.command.context("serve subcommand expected")? {
         Commands::Serve(args) => {
             assert_eq!(args.bind, "127.0.0.1:49999".parse::<SocketAddr>()?);
-            assert_eq!(args.max_rss_gb, -1);
+            assert_eq!(args.max_rss_gb, MaxRssPolicy::Disabled);
         }
         other => anyhow::bail!("unexpected command: {other:?}"),
     }

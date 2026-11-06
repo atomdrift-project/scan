@@ -74,7 +74,7 @@ fn raise_open_file_limit() {
     // SAFETY: getrlimit/setrlimit read and write only the struct passed in.
     unsafe {
         let mut lim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) != 0 {
             return;
         }
         for target in [lim.rlim_max, 1 << 20, 10_240] {
@@ -85,7 +85,7 @@ fn raise_open_file_limit() {
                 rlim_cur: target,
                 rlim_max: lim.rlim_max,
             };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) == 0 {
                 return;
             }
         }
@@ -104,8 +104,8 @@ fn sigusr1_mask() -> libc::sigset_t {
     // writes to it, and both touch only this local.
     unsafe {
         let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGUSR1);
+        libc::sigemptyset(&raw mut mask);
+        libc::sigaddset(&raw mut mask, libc::SIGUSR1);
         mask
     }
 }
@@ -117,7 +117,8 @@ fn block_sigusr1() {
     let mask = sigusr1_mask();
     // SAFETY: `mask` is initialized and `pthread_sigmask` only reads it; a
     // null old-set pointer is allowed.
-    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) };
+    let rc =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut()) };
     if rc == 0 {
         SIGUSR1_BLOCKED.store(true, std::sync::atomic::Ordering::Release);
     } else {
@@ -181,7 +182,7 @@ fn spawn_sigusr1_thread() {
                 let mut sig: libc::c_int = 0;
                 // SAFETY: `mask` is initialized and holds only a signal every
                 // thread has blocked; `sig` is a valid out-pointer.
-                if unsafe { libc::sigwait(&mask, &mut sig) } != 0 {
+                if unsafe { libc::sigwait(&raw const mask, &raw mut sig) } != 0 {
                     continue;
                 }
                 crate::thread_dump::dump_all_threads();
@@ -387,7 +388,7 @@ mod tests {
         // SAFETY: getrlimit writes only the struct passed in.
         unsafe {
             let mut lim: libc::rlimit = std::mem::zeroed();
-            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim), 0);
             (lim.rlim_cur, lim.rlim_max)
         }
     }

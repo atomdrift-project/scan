@@ -115,7 +115,7 @@ fn stage(staging: &Path, http: &bundle::Http, manifest: &Manifest) -> Result<()>
     if let Some((stem, entry)) = manifest
         .filter
         .iter()
-        .find(|(stem, entry)| entry.file != format!("{stem}.adbl"))
+        .find(|(stem, entry)| entry.file.strip_suffix(".adbl") != Some(stem.as_str()))
     {
         bail!(
             "bloom filter {stem} is named {:?}; refusing to install",

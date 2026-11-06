@@ -148,7 +148,7 @@ pub(crate) fn send(
         tracing::warn!(
             what,
             attempt,
-            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            delay_ms = crate::duration_ms(delay),
             error = %failure,
             "transient failure; retrying",
         );

@@ -280,7 +280,10 @@ pub(super) async fn access_log(
     req.extensions_mut().insert(RequestId(id));
 
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
+    // The request path is caller text like any other: `http` admits UTF-8 in
+    // it, so a C1 control or a bidi override can arrive, and up to 64 KiB of
+    // it on a route that only 404s.
+    let path = sanitize(req.uri().path(), MAX_SUBJECT_LEN);
     let peer = req
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
@@ -456,6 +459,20 @@ mod tests {
     fn forwarded_rejects_anything_that_is_not_an_address() {
         let h = headers(&[("x-real-ip", "not-an-ip")]);
         assert_eq!(forwarded_for(&h), None);
+    }
+
+    /// The request path reaches the line through the same gate as every other
+    /// piece of caller text: `http` accepts UTF-8 there, C1 controls included.
+    #[test]
+    fn request_path_is_bounded_and_stripped() {
+        assert_eq!(
+            sanitize("/v1/\u{9b}2J\u{202e}x", MAX_SUBJECT_LEN),
+            "/v1/2Jx"
+        );
+        assert_eq!(
+            sanitize(&"/a".repeat(1000), MAX_SUBJECT_LEN).len(),
+            MAX_SUBJECT_LEN
+        );
     }
 
     /// A user agent is bounded and stripped of control characters before it is

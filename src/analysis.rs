@@ -282,6 +282,7 @@ impl RequestPhase {
             }
             let _ = write!(line, "{name}={ms}");
         }
+        drop(marks);
         line
     }
 }

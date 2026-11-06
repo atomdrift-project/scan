@@ -695,13 +695,13 @@ fn dependency_verdicts(
     // produced them under the analyzer this build runs), and a hostile one is
     // precisely what the backref exists to surface, so they are pinned the same
     // way and counted in the same elevation.
-    let adopted: Vec<(Decision, &String, &crate::corpus_precheck::Verdict)> = prepared
+    let adopted: Vec<(Decision, &str, &crate::corpus_precheck::Verdict)> = prepared
         .fetch
         .adopted
         .iter()
         .filter_map(|(sha, v)| {
             let d = adopted_decision(v.fires_at, model.active_level(), model.grid_max())?;
-            Some((d, sha, v))
+            Some((d, sha.as_str(), v))
         })
         .collect();
     if !adopted.is_empty() {
@@ -713,8 +713,8 @@ fn dependency_verdicts(
             if d.class < Classification::Suspicious {
                 return None;
             }
-            let declaration = declared.get(sha.as_str())?;
-            let file_type = type_of.get(sha.as_str()).copied().unwrap_or_default();
+            let declaration = declared.get(sha)?;
+            let file_type = type_of.get(sha).copied().unwrap_or_default();
             Some(declaration.backref(sha, file_type, d.class, adopted_detail(v)))
         }));
     }
@@ -1373,9 +1373,12 @@ fn inject_dependency_backref(
     declaring: &[usize],
     by_path: &HashMap<String, Vec<usize>>,
 ) {
+    // Only suspicious-or-worse dependencies are backreffed.
     let (crit, sev) = match backref.class {
-        Classification::Hostile => (cleave::Criticality::Hostile.rank(), "Malicious"),
-        _ => (cleave::Criticality::Suspicious.rank(), "Suspicious"),
+        Classification::Hostile => (Criticality::Hostile.rank(), "Malicious"),
+        Classification::Suspicious | Classification::Benign => {
+            (Criticality::Suspicious.rank(), "Suspicious")
+        }
     };
     let mut desc = format!(
         "{sev} dependency: {} | {}",
@@ -1533,11 +1536,10 @@ fn extract_top_findings(
         Classification::Hostile => Criticality::Hostile,
         Classification::Suspicious | Classification::Benign => Criticality::Suspicious,
     };
-    let at_least = |crit: Criticality| -> Vec<TopFinding> {
+    let at_least = |crit: Criticality| -> Vec<&CompactTrait> {
         findings
             .iter()
             .filter(|f| compact_crit(f) >= crit)
-            .map(TopFinding::from)
             .collect()
     };
     let mut relevant = at_least(min_crit);
@@ -1548,12 +1550,15 @@ fn extract_top_findings(
 
     // Strongest first (stable, so report order breaks ties), then one per
     // base ID: deduplicating first could keep a weaker sibling over a
-    // stronger one.
-    relevant.sort_by_key(|f| std::cmp::Reverse(f.crit));
+    // stronger one. Only the survivors are copied out.
+    relevant.sort_by_key(|f| std::cmp::Reverse(compact_crit(f)));
     let mut seen = HashSet::new();
-    relevant.retain(|f| seen.insert(crate::features::trait_path(&f.id).to_string()));
-    relevant.truncate(5);
     relevant
+        .into_iter()
+        .filter(|f| seen.insert(crate::features::trait_path(&f.id)))
+        .take(5)
+        .map(TopFinding::from)
+        .collect()
 }
 
 /// Structural-integrity counts for a compact report. All zero on a well-formed
@@ -1577,11 +1582,8 @@ struct ReportIntegrity {
 /// context. A `role:sidecar` must also name a parent (see [`ReportIntegrity`]).
 /// We can't repair these here, but a producer-side log turns each into a visible
 /// signal instead of a mystery on the rendering side.
-fn validate_report_references(
-    label: &str,
-    report: &cleave::types::compact::CompactReport,
-) -> ReportIntegrity {
-    let ids: std::collections::HashSet<u32> = report.files.iter().map(|f| f.id).collect();
+fn validate_report_references(label: &str, report: &CompactReport) -> ReportIntegrity {
+    let ids: HashSet<u32> = report.files.iter().map(|f| f.id).collect();
 
     let mut integ = ReportIntegrity::default();
     let mut ref_sample: Vec<String> = Vec::new();

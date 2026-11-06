@@ -222,9 +222,7 @@ fn scan_fixtures(
 }
 
 fn collect_targets() -> Result<Vec<PathBuf>> {
-    let mut targets = Vec::new();
-
-    for path in [
+    let mut targets: Vec<PathBuf> = [
         "/bin/ls",
         "/bin/cp",
         "/bin/sh",
@@ -233,13 +231,11 @@ fn collect_targets() -> Result<Vec<PathBuf>> {
         "/bin/sulogin",
         "/bin/gpgconf",
         "/usr/lib/systemd/system/arptables.service",
-    ] {
-        let p = PathBuf::from(path);
-        if !p.exists() {
-            continue;
-        }
-        targets.push(p);
-    }
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .filter(|path| path.exists())
+    .collect();
 
     if let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
         let dn_dir = traits_dir.join("testdata").join("does-nothing");
@@ -342,8 +338,8 @@ fn evaluate(
 
         match worst {
             Classification::Hostile => tally.hostile_fps += 1,
+            Classification::Suspicious => tally.suspicious_fps += 1,
             Classification::Benign => tally.passed += 1,
-            _ => tally.suspicious_fps += 1,
         }
     }
 

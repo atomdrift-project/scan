@@ -30,11 +30,11 @@ pub(crate) fn install() {
     }
     #[cfg(target_os = "freebsd")]
     tracing::info!(
-        narenas = ?read_ctl::<u32>(b"opt.narenas\0"),
-        dirty_decay_ms = ?read_ctl::<isize>(b"opt.dirty_decay_ms\0"),
-        muzzy_decay_ms = ?read_ctl::<isize>(b"opt.muzzy_decay_ms\0"),
-        retain = ?read_ctl::<bool>(b"opt.retain\0"),
-        profiling_compiled = ?read_ctl::<bool>(b"config.prof\0"),
+        narenas = ?read_ctl::<u32>(c"opt.narenas"),
+        dirty_decay_ms = ?read_ctl::<isize>(c"opt.dirty_decay_ms"),
+        muzzy_decay_ms = ?read_ctl::<isize>(c"opt.muzzy_decay_ms"),
+        retain = ?read_ctl::<bool>(c"opt.retain"),
+        profiling_compiled = ?read_ctl::<bool>(c"config.prof"),
         "native jemalloc startup options",
     );
 }
@@ -46,10 +46,10 @@ pub fn stats() -> Option<Stats> {
     {
         refresh_epoch()?;
         Some(Stats {
-            allocated: read_ctl(b"stats.allocated\0")?,
-            active: read_ctl(b"stats.active\0")?,
-            resident: read_ctl(b"stats.resident\0")?,
-            retained: read_ctl(b"stats.retained\0")?,
+            allocated: read_ctl(c"stats.allocated")?,
+            active: read_ctl(c"stats.active")?,
+            resident: read_ctl(c"stats.resident")?,
+            retained: read_ctl(c"stats.retained")?,
         })
     }
     #[cfg(not(target_os = "freebsd"))]
@@ -102,7 +102,7 @@ pub fn check_settings() {
             );
         }
 
-        let is_debug_build = read_ctl::<bool>(b"config.debug\0") == Some(true);
+        let is_debug_build = read_ctl::<bool>(c"config.debug") == Some(true);
         if let Some(junk) = junk_setting().filter(|setting| *setting != "false") {
             tracing::warn!(
                 opt_junk = junk,
@@ -138,19 +138,19 @@ mod freebsd {
 }
 
 #[cfg(target_os = "freebsd")]
-fn read_ctl<T: Copy>(name: &'static [u8]) -> Option<T> {
+fn read_ctl<T: Copy>(name: &std::ffi::CStr) -> Option<T> {
     use std::mem::{MaybeUninit, size_of};
     use std::ptr;
 
     let mut value = MaybeUninit::<T>::uninit();
     let mut length = size_of::<T>();
-    // SAFETY: `name` is a static NUL-terminated mallctl key, and `value` is a
+    // SAFETY: `name` is NUL-terminated by its type, and `value` is a
     // correctly sized, writable buffer described by `length`.
     let status = unsafe {
         freebsd::mallctl(
-            name.as_ptr().cast(),
+            name.as_ptr(),
             value.as_mut_ptr().cast(),
-            &mut length,
+            &raw mut length,
             ptr::null_mut(),
             0,
         )
@@ -172,10 +172,10 @@ fn refresh_epoch() -> Option<()> {
     // SAFETY: epoch is a documented writable usize mallctl value.
     let status = unsafe {
         freebsd::mallctl(
-            c"epoch".as_ptr().cast(),
+            c"epoch".as_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
-            (&mut epoch as *mut usize).cast(),
+            (&raw mut epoch).cast(),
             length,
         )
     };
@@ -185,7 +185,7 @@ fn refresh_epoch() -> Option<()> {
 /// The runtime value of `opt.junk` (`"true"`, `"false"`, `"alloc"`, `"free"`).
 #[cfg(target_os = "freebsd")]
 fn junk_setting() -> Option<&'static str> {
-    let value = read_ctl::<*const std::ffi::c_char>(b"opt.junk\0")?;
+    let value = read_ctl::<*const std::ffi::c_char>(c"opt.junk")?;
     if value.is_null() {
         return None;
     }

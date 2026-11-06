@@ -339,8 +339,7 @@ impl FastTreeBackend {
         }
 
         let mut base_values = optional_onnx_attr(node, "base_values")
-            .map(|attr| attr.floats.clone())
-            .unwrap_or_else(|| vec![0.0; n_classes]);
+            .map_or_else(Vec::new, |attr| attr.floats.clone());
         if base_values.is_empty() {
             base_values.resize(n_classes, 0.0);
         }

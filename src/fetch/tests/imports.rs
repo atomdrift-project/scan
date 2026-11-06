@@ -412,7 +412,7 @@ fn imports_use_only_nearest_manifest_declarations() {
     let result = declared_npm_imports_in_hop(&report, &groups);
     assert!(result[&sha('c')].contains_key("normalize-url"));
     assert!(result[&sha('e')].is_empty());
-    let mut ambiguous = report.clone();
+    let mut ambiguous = report;
     ambiguous.files[4].sha256 = sha('c');
     assert!(declared_npm_imports_in_hop(&ambiguous, &groups)[&sha('c')].is_empty());
 }

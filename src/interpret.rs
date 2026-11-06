@@ -432,12 +432,8 @@ impl InterpretConfig {
     /// it: which endpoint answers is not the caller's choice, so the whole list
     /// is the grader being cached.
     fn cache_model_id(&self) -> String {
-        if self.fallbacks.is_empty() {
-            return self.model.clone();
-        }
-        self.attempts()
-            .iter()
-            .map(|a| a.model)
+        std::iter::once(self.model.as_str())
+            .chain(self.fallbacks.iter().map(|e| e.model.as_str()))
             .collect::<Vec<_>>()
             .join("|")
     }

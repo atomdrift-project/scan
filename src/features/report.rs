@@ -37,7 +37,7 @@ pub(super) struct RawFinding {
 }
 
 /// Select base paths before filtering against a model vocabulary, as in training.
-pub(super) fn ranked_ngram_paths(findings: &[RawFinding], limit: usize) -> Vec<String> {
+pub(super) fn ranked_ngram_paths(findings: &[RawFinding], limit: usize) -> Vec<&str> {
     let mut scores: HashMap<&str, f64> = HashMap::new();
     for finding in findings {
         if finding.id.is_empty()
@@ -58,13 +58,14 @@ pub(super) fn ranked_ngram_paths(findings: &[RawFinding], limit: usize) -> Vec<S
             .and_modify(|v| *v = v.max(score))
             .or_insert(score);
     }
-    let mut paths: Vec<_> = scores.keys().copied().collect();
-    if paths.len() > limit {
-        paths.sort_unstable_by(|a, b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(b)));
-        paths.truncate(limit);
+    let mut ranked: Vec<(&str, f64)> = scores.into_iter().collect();
+    if ranked.len() > limit {
+        ranked.sort_unstable_by(|(a, sa), (b, sb)| sb.total_cmp(sa).then_with(|| a.cmp(b)));
+        ranked.truncate(limit);
     }
+    let mut paths: Vec<&str> = ranked.into_iter().map(|(path, _)| path).collect();
     paths.sort_unstable();
-    paths.into_iter().map(str::to_owned).collect()
+    paths
 }
 
 /// Pre-calculated data for a single file entry in a report.
@@ -328,7 +329,7 @@ impl FileSummary {
                         f.confidence
                             .to_string()
                             .parse::<f64>()
-                            .unwrap_or(f64::from(f.confidence))
+                            .unwrap_or_else(|_| f64::from(f.confidence))
                     }),
                 crit: u32::from(f.criticality),
                 atk: f.attack.clone(),

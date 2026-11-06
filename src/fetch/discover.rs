@@ -880,16 +880,10 @@ impl LocalNpmPackages {
     /// The walk stops at an archive's root (see [`virtual_parent`]), which it
     /// does check: a zipped app's `x.zip!!node_modules/` resolves its imports.
     pub(super) fn resolves(&self, source_path: &str, package: &str) -> bool {
-        let mut dir = virtual_parent(&source_path.replace('\\', "/"));
-        while let Some(current) = dir {
-            if safe_package_path(&current, &format!("node_modules/{package}"))
-                .is_some_and(|root| self.roots.contains(&root))
-            {
-                return true;
-            }
-            dir = virtual_parent(&current);
-        }
-        false
+        let package_dir = format!("node_modules/{package}");
+        ancestors(&source_path.replace('\\', "/")).any(|dir| {
+            safe_package_path(&dir, &package_dir).is_some_and(|root| self.roots.contains(&root))
+        })
     }
 }
 
@@ -1047,18 +1041,11 @@ fn yarn_workspaces(
         // Yarn config can disable workspaces or replace resolution. The
         // compact report does not yet retain its settings, so do not infer
         // local resolution when such a config is captured in any ancestor.
-        let mut scope = Some(root.clone());
-        let mut has_yarn_config = false;
-        while let Some(dir) = scope {
-            if [".yarnrc", ".yarnrc.yml"]
+        let has_yarn_config = ancestors(&path).any(|dir| {
+            [".yarnrc", ".yarnrc.yml"]
                 .iter()
                 .any(|name| safe_package_path(&dir, name).is_some_and(|p| by_path.contains_key(&p)))
-            {
-                has_yarn_config = true;
-                break;
-            }
-            scope = virtual_parent(&dir);
-        }
+        });
         if has_yarn_config {
             continue;
         }
@@ -1080,10 +1067,11 @@ fn yarn_workspaces(
             let Some(member) = safe_package_path(&root, entry) else {
                 continue;
             };
-            if duplicates.contains(&format!("{member}/package.json")) {
+            let manifest_path = format!("{member}/package.json");
+            if duplicates.contains(&manifest_path) {
                 continue;
             }
-            let Some(manifest) = by_path.get(&format!("{member}/package.json")) else {
+            let Some(manifest) = by_path.get(&manifest_path) else {
                 continue;
             };
             let Some(info) = manifest
@@ -1103,7 +1091,7 @@ fn yarn_workspaces(
             let present = by_path.iter().any(|(p, _)| {
                 p.starts_with(&prefix)
                     && !is_vendored_node_module(p.strip_prefix(&prefix).unwrap_or(p))
-                    && p != &format!("{member}/package.json")
+                    && *p != manifest_path
                     && [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
                         .iter()
                         .any(|ext| p.ends_with(ext))
@@ -1228,6 +1216,7 @@ pub(super) fn merge_into_root(groups: &mut Vec<Group>, root_sha: &str, hunted: V
 /// Scope follows the edge into a dependency tree: runtime imports of a
 /// development tool are still development-only work for the scanned artifact.
 pub(super) fn inherit_dependency_context(parent: &Reference, groups: &mut [Group]) {
+    use filefacts::DependencyScope;
     let Some(parent) = &parent.context else {
         return;
     };
@@ -1236,12 +1225,11 @@ pub(super) fn inherit_dependency_context(parent: &Reference, groups: &mut [Group
             let context = reference
                 .context
                 .get_or_insert(filefacts::DependencyContext {
-                    scope: filefacts::DependencyScope::Runtime,
+                    scope: DependencyScope::Runtime,
                     optional: false,
                     has_install_script: false,
                     installed_path: None,
                 });
-            use filefacts::DependencyScope;
             if parent.scope == DependencyScope::Ci
                 || (parent.scope == DependencyScope::Development
                     && context.scope != DependencyScope::Ci)

@@ -70,6 +70,16 @@ pub(crate) enum Keep {
 /// Measured in display columns, so wide characters count double and a fitted
 /// line never wraps. Returned whole when it already fits.
 pub(crate) fn elide(text: &str, width: usize, keep: Keep) -> String {
+    /// The leading chars of `chars` that fit in `columns`.
+    fn fit(chars: impl Iterator<Item = char>, columns: usize) -> Vec<char> {
+        let mut used = 0;
+        chars
+            .take_while(|c| {
+                used += c.width().unwrap_or(0);
+                used <= columns
+            })
+            .collect()
+    }
     if text.width() <= width {
         return text.to_owned();
     }
@@ -81,16 +91,6 @@ pub(crate) fn elide(text: &str, width: usize, keep: Keep) -> String {
         Keep::Tail => (0, budget),
         Keep::Ends => (budget / 2, budget - budget / 2),
     };
-    /// The leading chars of `chars` that fit in `columns`.
-    fn fit(chars: impl Iterator<Item = char>, columns: usize) -> Vec<char> {
-        let mut used = 0;
-        chars
-            .take_while(|c| {
-                used += c.width().unwrap_or(0);
-                used <= columns
-            })
-            .collect()
-    }
     let mut out: String = fit(text.chars(), head).into_iter().collect();
     out.push('\u{2026}');
     out.extend(fit(text.chars().rev(), tail).into_iter().rev());
@@ -578,10 +578,6 @@ fn severity_dots(criticality: cleave::Criticality) -> (String, usize) {
 /// Severity is encoded twice (dot count and color), while the evidence anchor
 /// sits in a quiet right column for fast triage and copy/paste.
 pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usize) -> String {
-    if traits.is_empty() {
-        return String::new();
-    }
-
     /// Widest a row grows: keeps the reading measure composed on very wide
     /// terminals, while a narrow one still caps it so a row never wraps.
     const MAX_ROW_WIDTH: usize = 160;
@@ -591,6 +587,9 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
     const MIN_WIDTH_FOR_LOCATION: usize = 28;
     /// Columns the description keeps when a location column is shown.
     const MIN_DESCRIPTION_WIDTH: usize = 20;
+    if traits.is_empty() {
+        return String::new();
+    }
     let width = terminal_width.min(MAX_ROW_WIDTH);
     let available = width.saturating_sub(ROW_PREFIX_WIDTH);
     let max_location = traits
@@ -1247,10 +1246,8 @@ pub(crate) fn print_summary(summary: &ScanSummary) {
             let s = format!("{} conflicted", bloom.conflicted);
             parts.push((ink.fg(p.warning, &s), s));
         }
-        {
-            let s = format_elapsed(summary.duration_ms);
-            parts.push((ink.fg(p.very_dim, &s), s));
-        }
+        let elapsed = format_elapsed(summary.duration_ms);
+        parts.push((ink.fg(p.very_dim, &elapsed), elapsed));
         let sep_colored = format!(" {} ", ink.fg(p.dot_sep, "\u{00b7}"));
         let colored_line: Vec<&str> = parts.iter().map(|(c, _)| c.as_str()).collect();
         let plain_len: usize =
@@ -1286,24 +1283,17 @@ pub(crate) fn summary_status_line(summary: &ScanSummary) -> String {
     let ink = Ink::stderr();
 
     if summary.total_files == 0 {
-        let (icon, msg) = if summary.errors > 0 {
-            (
-                ink.fg(p.warning, "!"),
-                format!(
-                    "no files scanned, {}",
-                    ink.fg(p.header_path, &format!("{} errors", summary.errors)),
-                ),
+        let msg = if summary.errors > 0 {
+            format!(
+                "no files scanned, {}",
+                ink.fg(p.header_path, &format!("{} errors", summary.errors)),
             )
         } else {
-            (
-                ink.fg(p.warning, "!"),
-                "no scannable files found".to_string(),
-            )
+            "no scannable files found".to_string()
         };
         return format!(
-            "{}  {}  {}",
-            icon,
-            msg,
+            "{}  {msg}  {}",
+            ink.fg(p.warning, "!"),
             ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
     }

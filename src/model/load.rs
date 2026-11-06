@@ -532,9 +532,15 @@ impl RouteSet {
         (key, group)
     }
 
-    /// Policy inputs beyond the standard filetype/filegroup specialists.
-    pub(super) fn additional_policy_routes(&self, file_type: &str) -> Vec<(RouteId, Arc<Route>)> {
-        let (type_key, group_key) = self.specialist_keys(file_type);
+    /// Policy inputs beyond the standard filetype/filegroup specialists, whose
+    /// keys `type_key` and `group_key` are [`Self::specialist_keys`] of
+    /// `file_type`.
+    pub(super) fn additional_policy_routes(
+        &self,
+        file_type: &str,
+        type_key: &str,
+        group_key: Option<&str>,
+    ) -> Vec<(RouteId, Arc<Route>)> {
         self.policies
             .route_ids_for(file_type)
             .into_iter()

@@ -815,3 +815,22 @@ async fn a_url_lookup_answers_from_the_bytes_it_last_served() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// A body declared larger than the limit is refused before it is read; one
+/// inside it comes back whole, with the digest of exactly those bytes.
+#[tokio::test]
+async fn a_body_is_bounded_and_hashed_as_it_arrives() {
+    let refused = read_body(axum::body::Body::from(vec![0u8; 16]), 15)
+        .await
+        .expect_err("over the limit");
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (bytes, sha) = read_body(axum::body::Body::from("hello"), 5)
+        .await
+        .expect("inside the limit");
+    assert_eq!(&bytes[..], b"hello");
+    assert_eq!(
+        sha,
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+}

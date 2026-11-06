@@ -252,12 +252,12 @@ pub(crate) const LOOKUP_RETRY_BUDGET: Duration = Duration::from_secs(15);
 /// guess.
 #[must_use]
 pub(crate) fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
-    let client = http()?;
     #[derive(serde::Deserialize)]
     struct LookupResponse {
         #[serde(default)]
         sha256: Option<String>,
     }
+    let client = http()?;
     let _span = tracing::info_span!("purl_lookup", purl).entered();
     for base in endpoints(hopper_url) {
         let url = format!("{base}/v1/lookup");

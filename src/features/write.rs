@@ -39,8 +39,9 @@ pub(super) struct FileRiskStats {
 /// G3: report-level aggregates.
 /// Optional finding features consume the retained raw fields without another parse.
 pub(super) fn write_optional_finding_features(parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
+    let mut key = String::new();
     for code in &parsed.mbc_codes {
-        w.set_token(&format!("mbc:{code}"), 1.0);
+        w.set_prefixed(&mut key, "mbc:", code, 1.0);
     }
     let needs_moments = [
         "agg:confidence_mean",
@@ -256,23 +257,24 @@ fn write_breadth_features(
         summary.hostile_category_breadth as f32 / category_denom,
     );
 
-    // 2-level breadth features.
-    let mut suspicious_2level: HashSet<String> = HashSet::new();
-    let mut hostile_2level: HashSet<String> = HashSet::new();
-    let mut objectives_2level: HashSet<String> = HashSet::new();
+    // 2-level breadth features: distinct `<top>/<second>` path heads.
+    let mut suspicious_2level: HashSet<(&str, &str)> = HashSet::new();
+    let mut hostile_2level: HashSet<(&str, &str)> = HashSet::new();
+    let mut objectives_2level: HashSet<(&str, &str)> = HashSet::new();
     for (path, &max_ord) in &summary.sample_paths {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() >= 2 {
-            let two_level = format!("{}/{}", parts[0], parts[1]);
-            if max_ord >= CRIT_SUSPICIOUS {
-                suspicious_2level.insert(two_level.clone());
-            }
-            if max_ord >= CRIT_HOSTILE {
-                hostile_2level.insert(two_level.clone());
-            }
-            if parts[0] == "objectives" && max_ord >= CRIT_BASELINE {
-                objectives_2level.insert(two_level);
-            }
+        let mut parts = path.split('/');
+        let (Some(top), Some(second)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let two_level = (top, second);
+        if max_ord >= CRIT_SUSPICIOUS {
+            suspicious_2level.insert(two_level);
+        }
+        if max_ord >= CRIT_HOSTILE {
+            hostile_2level.insert(two_level);
+        }
+        if top == "objectives" && max_ord >= CRIT_BASELINE {
+            objectives_2level.insert(two_level);
         }
     }
     w.set(
@@ -565,26 +567,25 @@ const CRIT_CATEGORIES: &[&str] = &[
 /// Sorted `tier:category[/sub]` tokens: each notable-or-above sample path in
 /// a [`CRIT_CATEGORIES`] category, cut to two levels, at its highest tier.
 pub(super) fn crit_category_tokens(summary: &FindingSummary) -> Vec<String> {
-    let mut max_crit: HashMap<String, u32> = HashMap::new();
+    // Keyed by `(category, sub)`: the path cut to two levels.
+    let mut max_crit: HashMap<(&str, Option<&str>), u32> = HashMap::new();
     for (path, &mo) in &summary.sample_paths {
         if mo < CRIT_NOTABLE {
             continue;
         }
-        let parts: Vec<&str> = path.split('/').collect();
-        if !CRIT_CATEGORIES.contains(&parts[0]) {
+        let mut parts = path.split('/');
+        let Some(category) = parts.next().filter(|c| CRIT_CATEGORIES.contains(c)) else {
             continue;
-        }
-        let key = if parts.len() >= 2 {
-            format!("{}/{}", parts[0], parts[1])
-        } else {
-            parts[0].to_string()
         };
-        let e = max_crit.entry(key).or_insert(0);
+        let e = max_crit.entry((category, parts.next())).or_insert(0);
         *e = (*e).max(mo);
     }
     let mut tokens: Vec<String> = max_crit
-        .iter()
-        .map(|(k, &c)| format!("{}:{k}", tier_prefix(c)))
+        .into_iter()
+        .map(|((category, sub), c)| match sub {
+            Some(sub) => format!("{}:{category}/{sub}", tier_prefix(c)),
+            None => format!("{}:{category}", tier_prefix(c)),
+        })
         .collect();
     tokens.sort();
     tokens

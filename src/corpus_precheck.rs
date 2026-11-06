@@ -178,7 +178,6 @@ const DEFAULT_MAX_AGE: Duration =
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
 pub(crate) fn configure_uplink(token: cleave::enriched::Token) {
-    let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck {
         lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
         max_age: DEFAULT_MAX_AGE,
@@ -189,7 +188,7 @@ pub(crate) fn configure_uplink(token: cleave::enriched::Token) {
         event = "remote.armed",
         url = %precheck.lookup_url,
         tid = %precheck.tid(),
-        max_age_days,
+        max_age_days = DEFAULT_MAX_AGE_DAYS,
         "Uplink lookups enabled: known artifacts are answered without local analysis"
     );
     *ARMED.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(precheck));
@@ -199,7 +198,6 @@ pub(crate) fn configure_uplink(token: cleave::enriched::Token) {
 /// where the uploader is built — the one place every `--hopper` mode passes
 /// through — so enablement follows `--hopper` with no second setting.
 pub(crate) fn configure(hopper_base_url: &str) {
-    let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck::new(hopper_base_url, DEFAULT_MAX_AGE);
     let mut armed = ARMED.write().unwrap_or_else(PoisonError::into_inner);
     if let Some(p) = &precheck
@@ -209,7 +207,7 @@ pub(crate) fn configure(hopper_base_url: &str) {
     {
         tracing::info!(
             url = %p.lookup_url,
-            max_age_days,
+            max_age_days = DEFAULT_MAX_AGE_DAYS,
             "corpus precheck enabled: matching-analyzer verdicts may be reused; fresh benign package coordinates may skip fetching"
         );
     }
@@ -384,8 +382,7 @@ impl Precheck {
         if status == reqwest::StatusCode::OK {
             return true;
         }
-        if matches!(self.backend, Backend::Uplink(_)) && matches!(status.as_u16(), 401 | 403 | 429)
-        {
+        if self.is_uplink() && matches!(status.as_u16(), 401 | 403 | 429) {
             let reason = if status.as_u16() == 429 {
                 "quota"
             } else {
@@ -1256,6 +1253,6 @@ mod tests {
         .expect("parse");
         assert_eq!(rec.fires_at, Level::Clean);
         assert!(rec.analyzed_at.is_some());
-        assert!(rec.findings.is_empty());
+        assert_eq!(rec.findings, []);
     }
 }

@@ -174,7 +174,11 @@ mod allocator {
     pub(super) unsafe fn route_tree_sitter() {}
 }
 
+#[path = "main/version.rs"]
+mod version;
+
 use anyhow::{Context, Result};
+use clap::builder::TypedValueParser as _;
 use clap::{CommandFactory, Parser, Subcommand};
 use scan::cli::GlobalArgs;
 use scan::interpret::InterpretConfig;
@@ -514,8 +518,13 @@ struct ServeArgs {
     /// 0 (default) auto-resolves to the process memory limit; -1 disables
     /// in-process throttling entirely (use when an external supervisor
     /// like systemd `MemoryMax=` already enforces a hard cap).
-    #[arg(long, default_value = "0", allow_hyphen_values = true)]
-    max_rss_gb: i64,
+    #[arg(
+        long,
+        default_value = "0",
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(i64).map(MaxRssPolicy::from_cli)
+    )]
+    max_rss_gb: MaxRssPolicy,
 
     /// Let `POST /v1/analyze?path=` scan files under DIR. Repeatable. Refused
     /// unless bound to 127.0.0.1, or both --allow-cidr and --token-file are set.
@@ -605,16 +614,10 @@ fn main() -> ExitCode {
         // The reader went away (`atomscan … | head`) before anything was
         // flagged: nothing is listening for an error, so stop quietly. (A
         // flagged scan returns its summary instead, and exits on its verdict.)
-        Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
+        Err(e) if caused_by(&e, std::io::ErrorKind::BrokenPipe) => ExitCode::SUCCESS,
         // Ctrl-C stopped the scan: the conventional 128 + SIGINT, so a script
         // never mistakes a partial scan for a clean one.
-        Err(e)
-            if e.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
-            }) =>
-        {
+        Err(e) if caused_by(&e, std::io::ErrorKind::Interrupted) => {
             eprintln!("Error: {e:#}");
             ExitCode::from(130)
         }
@@ -626,12 +629,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether `e` was caused by writing to a closed pipe.
-fn is_broken_pipe(e: &anyhow::Error) -> bool {
+/// Whether an I/O error of `kind` appears anywhere in `e`'s cause chain.
+fn caused_by(e: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
     e.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+            .is_some_and(|io| io.kind() == kind)
     })
 }
 
@@ -690,7 +693,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             publish_bloom_filters(global.mode);
             Ok(finish_scan(&scan::pkg::run_pkg(&purl, &config)?))
         }
-        Commands::Serve(args) => serve(&global, args, interpret, fetch),
+        Commands::Serve(args) => serve(global, args, interpret, fetch),
         Commands::UpdateRules => Ok(update_rules()),
         Commands::Validate => {
             let model_dir = scan::cli::resolve_model_dir(None)?;
@@ -703,7 +706,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Version => {
-            print_version(global.format)?;
+            version::print(global.format)?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -1005,13 +1008,13 @@ fn finish_scan(summary: &scan::ScanSummary) -> ExitCode {
 
 /// `atomscan serve`.
 fn serve(
-    global: &GlobalArgs,
+    global: GlobalArgs,
     args: ServeArgs,
     interpret: Option<InterpretConfig>,
     fetch: scan::fetch::FetchPolicy,
 ) -> Result<ExitCode> {
     let hopper = resolve_hopper(args.hopper);
-    let max_rss = MaxRssPolicy::from_cli(args.max_rss_gb);
+    let max_rss = args.max_rss_gb;
     log_max_rss_resolution(
         "server",
         max_rss,
@@ -1031,7 +1034,7 @@ fn serve(
         workers: args.workers,
         allow_cidr: args.allow_cidr,
         token_file: args.token_file,
-        hopper: hopper.clone(),
+        hopper,
         analysis_timeout_secs: args.analysis_timeout,
         rules: scan::rules::RulesStartup {
             model_dir: None,
@@ -1041,11 +1044,11 @@ fn serve(
             slow_rule_ms: scan::cli::DEFAULT_SLOW_RULE_MS,
             interpret,
             fetch,
-            zip_passwords: global.zip_passwords.clone().into(),
+            zip_passwords: global.zip_passwords.into(),
         },
     }
     .resolve()?;
-    if let Some(url) = hopper.as_deref() {
+    if let Some(url) = config.hopper.as_deref() {
         tracing::info!(
             hopper = url,
             "renewing results on hopper and deferring unknown lookups to it"
@@ -1089,187 +1092,6 @@ fn update_rules() -> ExitCode {
         }
     }
     code
-}
-
-/// `atomscan version`: this build, and the identity and size of every rule
-/// source it would scan with. A closed pipe is an error, not a panic.
-fn print_version(format: scan::OutputFormat) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let bloom = scan::bloom_repo::installed_manifest();
-    let nsrl = scan::nsrl_repo::installed_manifest();
-    if format == scan::OutputFormat::Json {
-        let version = version_json(bloom.as_ref(), nsrl.as_ref());
-        return writeln!(std::io::stdout(), "{version}");
-    }
-    // Counting traits/composites/YARA initialises the rule engines.
-    let info = cleave::version_info();
-    let bloom_count: u64 = bloom
-        .as_ref()
-        .map_or(0, |m| m.filter.values().map(|e| e.n).sum());
-    let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
-    scan::output::print_version(
-        env!("CARGO_PKG_VERSION"),
-        &info.traits_edition.styled(),
-        bloom_count,
-        rules,
-        &version_rows(&info, bloom.as_ref(), nsrl.as_ref()),
-    )
-}
-
-/// `atomscan -f json version`: the build and each rule source's identity.
-fn version_json(
-    bloom: Option<&burton::Manifest>,
-    nsrl: Option<&burton::Manifest>,
-) -> serde_json::Value {
-    let bloom_json = bloom.map(|m| {
-        let filters: serde_json::Map<String, serde_json::Value> = m
-            .filter
-            .iter()
-            .map(|(stem, e)| {
-                (
-                    stem.clone(),
-                    serde_json::json!({
-                        "n": e.n,
-                        // One format per bundle now; kept per filter so the
-                        // JSON keeps its shape.
-                        "format_version": burton::FORMAT_VERSION,
-                        "sha256": e.sha256,
-                    }),
-                )
-            })
-            .collect();
-        serde_json::json!({
-            "built": m.built,
-            "schema": m.schema,
-            "filters": filters,
-        })
-    });
-    // Dates beside the commits, so a benchmark comparing two rules channels
-    // can say how fresh each one was, not only which it was.
-    let traits_date =
-        cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.date);
-    let models_date = scan::models_repo::install_target()
-        .ok()
-        .and_then(|dir| scan::model_update::installed(&dir))
-        .map(|i| i.date);
-    serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "models": scan::models_repo::version(),
-        "models_date": models_date,
-        "traits": cleave::traits_repo::version(),
-        "traits_date": traits_date,
-        "traits_channel": cleave::traits_repo::Edition::current().as_str(),
-        "bloom": bloom_json,
-        "nsrl": nsrl,
-        "nsrl_release": scan::nsrl_repo::installed_release(),
-    })
-}
-
-/// The terminal `version` table: one row per rule source.
-fn version_rows(
-    info: &cleave::VersionInfo,
-    bloom: Option<&burton::Manifest>,
-    nsrl: Option<&burton::Manifest>,
-) -> Vec<scan::output::SourceRow> {
-    use scan::output::SourceRow;
-
-    // Atomics, composites, and third-party YARA all ship in the traits repo, so
-    // they share one identity and build date. Prefer the installed bundle's
-    // sidecar (commit + committer date); for a dev checkout with no sidecar,
-    // read git HEAD directly.
-    let traits_dir = cleave::cache::traits_path();
-    let traits_installed = cleave::rule_update::installed(&traits_dir);
-    let traits_git = traits_installed
-        .is_none()
-        .then(|| git_head(&traits_dir))
-        .flatten();
-    let traits_version = traits_installed
-        .as_ref()
-        .map(|i| i.commit.chars().take(9).collect::<String>())
-        .or_else(|| traits_git.as_ref().map(|(c, _)| c.clone()))
-        .unwrap_or_default();
-    let traits_epoch = traits_installed
-        .as_ref()
-        .and_then(|i| scan::output::parse_ymd(&i.date))
-        .or_else(|| traits_git.as_ref().map(|&(_, e)| e));
-
-    let mut rows = Vec::new();
-    if let Some(nsrl) = nsrl {
-        rows.push(SourceRow {
-            label: "nsrl",
-            count: nsrl.filter.values().map(|e| e.n).sum(),
-            metric: None,
-            version: scan::nsrl_repo::installed_release()
-                .unwrap_or_else(|| format!("v{}", burton::FORMAT_VERSION)),
-            epoch: scan::output::parse_ymd(&nsrl.built),
-        });
-    }
-    if let Some(bloom) = bloom {
-        rows.push(SourceRow {
-            label: "blooms",
-            count: bloom.filter.values().map(|e| e.n).sum(),
-            metric: None,
-            version: format!("v{}", burton::FORMAT_VERSION),
-            epoch: scan::output::parse_ymd(&bloom.built),
-        });
-    }
-    for (label, count) in [
-        ("atomics", info.trait_count),
-        ("composites", info.composite_count),
-        ("third-party YARA", info.yara_rules),
-    ] {
-        rows.push(SourceRow {
-            label,
-            count: count as u64,
-            metric: None,
-            version: traits_version.clone(),
-            epoch: traits_epoch,
-        });
-    }
-
-    // ML models: route-model count by feature dimensionality (e.g. `64 x 229`),
-    // plus the bundle's commit and build date.
-    if let Some(count) = scan::models_repo::model_count() {
-        let model_installed = scan::models_repo::install_target()
-            .ok()
-            .and_then(|dir| scan::model_update::installed(&dir));
-        let metric = scan::models_repo::feature_dimension().map(|dim| format!("{count} x {dim}"));
-        rows.push(SourceRow {
-            label: "ML models",
-            count: count as u64,
-            metric,
-            // Truncate to 9 chars to match the traits commit width.
-            version: scan::models_repo::version()
-                .map(|c| c.chars().take(9).collect())
-                .unwrap_or_default(),
-            epoch: model_installed
-                .as_ref()
-                .and_then(|i| scan::output::parse_ymd(&i.date)),
-        });
-    }
-    rows
-}
-
-/// The abbreviated commit hash and committer date (Unix seconds) of `HEAD` in
-/// `dir`, when `dir` is a git checkout. Returns `None` if git is unavailable or
-/// `dir` is not a repository, in which case `scan version` omits that source's
-/// identity. This recovers the authentic upstream identity and date for a traits
-/// checkout that has no install sidecar.
-fn git_head(dir: &Path) -> Option<(String, i64)> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["show", "-s", "--format=%H %ct", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(out.stdout).ok()?;
-    let mut fields = stdout.split_whitespace();
-    let commit: String = fields.next()?.chars().take(9).collect();
-    let epoch: i64 = fields.next()?.parse().ok()?;
-    Some((commit, epoch))
 }
 
 #[cfg(test)]

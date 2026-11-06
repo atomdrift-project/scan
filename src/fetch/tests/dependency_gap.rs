@@ -519,7 +519,7 @@ fn timeout_defers_unvisited_references() {
         },
     );
     pass.deadline.at = Some(Instant::now());
-    pass.run(&mut supplied, vec![("source".into(), vec![r.clone()])]);
+    pass.run(&mut supplied, vec![("source".into(), vec![r])]);
     assert!(
         pass.out.records[0].coverage.iter().any(
             |fact| matches!(fact, Coverage::Pending { reason, .. } if reason == "fetch timeout")
@@ -612,7 +612,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
             .workspace_coverage(&report, &app_sha, &different)
             .is_none()
     );
-    let mut incomplete_report = report.clone();
+    let mut incomplete_report = report;
     let target = incomplete_report
         .files
         .iter()
@@ -634,7 +634,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     );
     pass.run(
         &mut incomplete_report,
-        vec![(app_sha.clone(), vec![reference.clone()])],
+        vec![(app_sha, vec![reference.clone()])],
     );
     assert!(pass.out.records.iter().any(|record| {
         record
@@ -724,7 +724,7 @@ fn ambiguous_yarn_workspaces_stay_unresolved() {
             .workspace_coverage(&shadowed, &app_sha, reference)
             .is_none()
     );
-    let mut duplicate = report.clone();
+    let mut duplicate = report;
     duplicate.files.push(
         duplicate
             .files

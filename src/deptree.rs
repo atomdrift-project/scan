@@ -643,8 +643,8 @@ mod tests {
         );
         let body = strip_ansi(&compose(&s, false).join("\n"));
         assert!(body.contains("1/2"));
-        assert!(!body.contains("b"));
-        assert!(body.contains("a") && body.contains("c"));
+        assert!(!body.contains('b'));
+        assert!(body.contains('a') && body.contains('c'));
     }
 
     #[test]

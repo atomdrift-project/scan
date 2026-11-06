@@ -278,10 +278,7 @@ fn trim_registry_raw(sidecar: &mut serde_json::Value) {
         .is_some_and(|raw| raw.len() > MAX_RAW_BYTES);
     if over_cap {
         registry.remove("raw");
-        registry.insert(
-            "status".to_string(),
-            serde_json::Value::String("partial".to_string()),
-        );
+        registry.insert("status".into(), "partial".into());
     }
 }
 
@@ -491,11 +488,7 @@ impl RegistryProvenance {
                 return Vec::new();
             };
             let mut urls = Vec::new();
-            let (registry_url, raw) = if let Some(registry) = document.registry {
-                (registry.url, registry.raw.or(registry.sources))
-            } else {
-                (None, document.raw.or(document.sources))
-            };
+            let (registry_url, raw) = document.into_parts();
             if let Some(url) = registry_url {
                 urls.push(url);
             }
@@ -602,6 +595,18 @@ struct UrlDocument<'a> {
     sources: Option<&'a serde_json::value::RawValue>,
 }
 
+impl<'a> UrlDocument<'a> {
+    /// The registry's own URL, and the raw provider payload from whichever
+    /// shape carried it: a hopper sidecar nests both under `registry`, a bare
+    /// fletch envelope keeps the payload at the top level.
+    fn into_parts(self) -> (Option<String>, Option<&'a serde_json::value::RawValue>) {
+        match self.registry {
+            Some(registry) => (registry.url, registry.raw.or(registry.sources)),
+            None => (None, self.raw.or(self.sources)),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct UrlRegistry<'a> {
     #[serde(default)]
@@ -619,12 +624,10 @@ struct SourceUrl {
 }
 
 fn registry_raw_json(json: &[u8]) -> Option<&serde_json::value::RawValue> {
-    let document = serde_json::from_slice::<UrlDocument<'_>>(json).ok()?;
-    if let Some(registry) = document.registry {
-        registry.raw.or(registry.sources)
-    } else {
-        document.raw.or(document.sources)
-    }
+    serde_json::from_slice::<UrlDocument<'_>>(json)
+        .ok()?
+        .into_parts()
+        .1
 }
 
 /// Parse only the normalized record, letting serde skip the potentially huge

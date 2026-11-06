@@ -179,6 +179,8 @@ pub fn refresh(
     quiet: bool,
 ) -> Refreshed {
     let results = std::thread::scope(|s| {
+        // Collected so every update is spawned before the first join; a lazy
+        // chain would run them one after another.
         let running: Vec<_> = sources
             .iter()
             .map(|&source| {

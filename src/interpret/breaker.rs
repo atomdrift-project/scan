@@ -37,7 +37,7 @@ pub(super) struct Permit<'a>(&'a InFlight);
 /// most of the pool would add seconds to every foreground prompt. Nobody waits
 /// on background work, so it drains at whatever rate the endpoint leaves it.
 pub(super) fn background_cap(max: usize, over: Option<NonZeroUsize>) -> usize {
-    let cap = over.map_or((max / 4).max(1), NonZeroUsize::get);
+    let cap = over.map_or_else(|| (max / 4).max(1), NonZeroUsize::get);
     if max < 2 { max } else { cap.min(max - 1) }
 }
 
