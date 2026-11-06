@@ -1324,7 +1324,7 @@ impl Tally {
 /// *local file* was written, and is the guard against a bloom false-positive
 /// shielding something a live intrusion just planted. Shrinking it to match the
 /// dependency window would narrow that guard for no reason connected to it.
-const KNOWN_GOOD_RESCAN: Duration = Duration::from_secs(48 * 3_600);
+const KNOWN_GOOD_RESCAN: Duration = Duration::from_hours(48);
 
 /// Whether the file at `path` was created (btime), status-changed (ctime), or
 /// modified (mtime) within the last `window` (in whole seconds). A known-good file this

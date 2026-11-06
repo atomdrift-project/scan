@@ -479,7 +479,7 @@ fn format_eta(secs: f64) -> String {
     if secs < 1.0 {
         "<1s".to_string()
     } else if secs < 60.0 {
-        format!("~{:.0}s", secs)
+        format!("~{secs:.0}s")
     } else {
         format!("~{}m{:.0}s", (secs / 60.0) as u32, secs % 60.0)
     }

@@ -104,7 +104,7 @@ impl DisplayFilter {
     /// the cue to emit a complete archive manifest in JSON output — every member,
     /// including the ones cleave never analyzed because they carry no findings.
     #[must_use]
-    fn is_all(&self) -> bool {
+    const fn is_all(self) -> bool {
         self.hostile && self.suspicious && self.benign
     }
 }

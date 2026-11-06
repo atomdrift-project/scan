@@ -1,6 +1,7 @@
 //! The terminal result card, the `--format tiny` and `--extra` writers, and
 //! the human-facing account of fetched dependencies.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
@@ -606,12 +607,12 @@ fn render_archive_cards(
         let psize = file.map_or(0, |f| f.size);
         // Rank over every member in the package, then spend exactly three rows
         // on its strongest distinct traits. A large package reads like one
-        // artifact instead of a transcript of its member traversal.
-        let member_ids: HashSet<u32> = pkg.members.iter().copied().collect();
-        let package: Vec<&FileAnalysis> = files
+        // artifact instead of a transcript of its member traversal. `members`
+        // is in report order, so the package's root still leads.
+        let package: Vec<&FileAnalysis> = pkg
+            .members
             .iter()
-            .copied()
-            .filter(|f| member_ids.contains(&f.id))
+            .filter_map(|id| by_id.get(id).copied())
             .collect();
         let rows = output::terminal_trait_rows(
             &terminal_top_traits(&package),
@@ -754,16 +755,16 @@ fn archive_own_rows(files: &[&FileAnalysis], root: &FileAnalysis) -> Option<Stri
 /// delimiter — which renders as an alarming doubled path. When the segment
 /// before `##` is immediately preceded by an identical `!!MEMBER`, drop the
 /// duplicate so it reads as `MEMBER##encoding@off`. A no-op for any other path.
-fn collapse_decoded_dup(path: &str) -> String {
+fn collapse_decoded_dup(path: &str) -> Cow<'_, str> {
     let Some(enc) = path.rfind("##") else {
-        return path.to_string();
+        return Cow::Borrowed(path);
     };
     let (head, tail) = path.split_at(enc);
     // The last archive segment before the encoding marker, and everything before
     // it. If that preceding text ends with an identical `!!<segment>`, the member
     // is doubled — keep one copy.
     let Some((rest, seg)) = head.rsplit_once(ARCHIVE_DELIMITER) else {
-        return path.to_string();
+        return Cow::Borrowed(path);
     };
     if !seg.is_empty()
         && (rest == seg
@@ -771,9 +772,9 @@ fn collapse_decoded_dup(path: &str) -> String {
                 .strip_suffix(seg)
                 .is_some_and(|before| before.ends_with(ARCHIVE_DELIMITER)))
     {
-        return format!("{rest}{tail}");
+        return Cow::Owned(format!("{rest}{tail}"));
     }
-    path.to_string()
+    Cow::Borrowed(path)
 }
 
 /// Turn cleave's decoded-region suffix into a compact relationship label.

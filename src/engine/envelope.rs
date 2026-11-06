@@ -296,6 +296,10 @@ impl From<&CompactTrait> for TopFinding {
     }
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` passes the field by reference"
+)]
 fn serialize_rank<S: serde::Serializer>(
     crit: &cleave::Criticality,
     serializer: S,
@@ -640,7 +644,7 @@ impl ScanResult {
 
     /// The envelope's `raw`: the stored report, or an empty one.
     fn raw(&self) -> &Arc<RawValue> {
-        self.cleave.as_ref().map_or(empty_report(), |r| &r.json)
+        self.cleave.as_ref().map_or_else(empty_report, |r| &r.json)
     }
 }
 

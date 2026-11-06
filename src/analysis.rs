@@ -7,6 +7,7 @@
 //! [`RequestPhase`] the per-request stage tracker, and the whale lanes decide
 //! which rayon pool an analysis runs on.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -256,30 +257,32 @@ impl RequestPhase {
             .0
             .marks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let mut order: Vec<String> = Vec::new();
-        let mut spent: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
-        let mut account = |name: &str, dur: Duration| {
-            if !spent.contains_key(name) {
-                order.push(name.to_owned());
-            }
-            *spent.entry(name.to_owned()).or_insert(0) += dur.as_millis();
-        };
-        if let Some((_, first)) = marks.first()
-            && !first.is_zero()
-        {
-            account("pre", *first);
-        }
-        for (i, (name, at)) in marks.iter().enumerate() {
-            let end = marks.get(i + 1).map_or(now, |(_, next)| *next);
-            account(name, end.saturating_sub(*at));
-        }
-        order
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pre = marks
+            .first()
+            .map(|&(_, first)| ("pre", first))
+            .filter(|(_, first)| !first.is_zero());
+        let ends = marks.iter().skip(1).map(|&(_, at)| at).chain([now]);
+        let phases = marks
             .iter()
-            .map(|name| format!("{name}={}", spent.get(name).copied().unwrap_or(0)))
-            .collect::<Vec<_>>()
-            .join(" ")
+            .zip(ends)
+            .map(|((name, at), end)| (name.as_str(), end.saturating_sub(*at)));
+        // At most PHASE_MARKS_MAX + 1 names: a linear scan beats hashing.
+        let mut spent: Vec<(&str, u128)> = Vec::new();
+        for (name, dur) in pre.into_iter().chain(phases) {
+            match spent.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ms)) => *ms += dur.as_millis(),
+                None => spent.push((name, dur.as_millis())),
+            }
+        }
+        let mut line = String::new();
+        for (name, ms) in spent {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            let _ = write!(line, "{name}={ms}");
+        }
+        line
     }
 }
 
@@ -561,6 +564,26 @@ fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
             tracing::warn!(error = %e, bytes, "failed to build a private analysis pool; this payload shares the global pool");
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod request_phase_tests {
+    /// Each phase is listed once, in first-entered order, with re-entries
+    /// summed into it.
+    #[test]
+    fn timeline_lists_each_phase_once_in_entry_order() {
+        let phase = super::RequestPhase::with_label("t");
+        for name in ["fetch", "analyze", "fetch", "classify"] {
+            phase.set(name);
+        }
+        let timeline = phase.timeline();
+        let names: Vec<&str> = timeline
+            .split(' ')
+            .filter_map(|field| field.split_once('=').map(|(name, _)| name))
+            .filter(|&name| name != "pre")
+            .collect();
+        assert_eq!(names, ["fetch", "analyze", "classify"], "{timeline}");
     }
 }
 
