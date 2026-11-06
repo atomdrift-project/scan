@@ -348,7 +348,7 @@ fn interpret_render_budget_drops_weakest_members_first() {
     // finding) goes first, and its nested child goes with it even though
     // the child alone, with four findings, would have outranked m2 and m3.
     let over = full.len() - 1;
-    let (capped, dropped) = budget_primary_context(&mut report.clone(), over);
+    let (capped, dropped) = budget_primary_context(&mut report, over);
     assert!(capped.len() <= over, "{} > {over}", capped.len());
     assert!(
         !capped.contains("m4.py"),
@@ -1206,7 +1206,7 @@ fn notable_composite_with_registry_source_selects_dependency_provenance() {
     let mut report = empty_report();
     report.files = vec![artifact, registry];
     assert!(provenance_has_notable_match(
-        &report,
+        &ReportIndex::new(&report),
         &[4].into_iter().collect(),
         registry_id,
     ));

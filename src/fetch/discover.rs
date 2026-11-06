@@ -775,40 +775,34 @@ impl LocalNpmPackages {
         source_sha: &str,
         reference: &Reference,
     ) -> Option<WorkspaceCoverage> {
-        if reference.kind != RefKind::Dependency {
+        // Without a workspace nothing can match, and the scan for the source's
+        // files below is per reference: skip it for the common case.
+        if reference.kind != RefKind::Dependency || self.workspaces.is_empty() {
             return None;
         }
         let coordinate = Coordinate::of(locator(reference)).filter(|c| c.typ == "npm")?;
         let version = coordinate.version?;
         let package = npm_import_name(reference)?;
-        let sources: Vec<_> = report
+        let mut sources = report
             .files
             .iter()
             .filter(|f| f.sha256 == source_sha)
-            .collect();
-        if sources.is_empty() {
-            return None;
-        }
+            .peekable();
+        sources.peek()?;
+        let package_dir = format!("node_modules/{package}");
         let mut covered = Vec::new();
         let mut incomplete = false;
         for source in sources {
             let normalized = source.path.replace('\\', "/");
             let directory = virtual_parent(&normalized)?;
-            let mut ancestor = Some(directory.clone());
-            let mut shadowed = reference
+            let shadowed = reference
                 .context
                 .as_ref()
-                .and_then(|c| c.installed_path.as_ref())
-                .is_some();
-            while let Some(dir) = ancestor {
-                if safe_package_path(&dir, &format!("node_modules/{package}"))
-                    .is_some_and(|candidate| self.roots.contains(&candidate))
-                {
-                    shadowed = true;
-                    break;
-                }
-                ancestor = virtual_parent(&dir);
-            }
+                .is_some_and(|c| c.installed_path.is_some())
+                || ancestors(&normalized).any(|dir| {
+                    safe_package_path(&dir, &package_dir)
+                        .is_some_and(|candidate| self.roots.contains(&candidate))
+                });
             if shadowed {
                 return None;
             }
@@ -839,20 +833,20 @@ impl LocalNpmPackages {
         source_sha: &str,
         reference: &Reference,
     ) -> Option<String> {
-        if reference.kind != RefKind::Dependency {
+        // Every match ends in a `declarations` lookup; see `workspace_coverage`.
+        if reference.kind != RefKind::Dependency || self.declarations.is_empty() {
             return None;
         }
         let coordinate = Coordinate::of(locator(reference)).filter(|c| c.typ == "npm")?;
         let version = coordinate.version?;
         let package = npm_import_name(reference)?;
-        let sources: Vec<_> = report
+        let mut sources = report
             .files
             .iter()
             .filter(|f| f.sha256 == source_sha)
-            .collect();
-        if sources.is_empty() {
-            return None;
-        }
+            .peekable();
+        sources.peek()?;
+        let package_dir = format!("node_modules/{package}");
         let mut covered = Vec::new();
         for source in sources {
             let normalized = source.path.replace('\\', "/");
@@ -864,16 +858,11 @@ impl LocalNpmPackages {
             {
                 safe_package_path(&directory, installed)?
             } else {
-                let mut dir = directory;
-                loop {
-                    let candidate = safe_package_path(&dir, &format!("node_modules/{package}"))?;
-                    // A nearer installation shadows ancestors, even if it is
-                    // incomplete or has a different version.
-                    if self.roots.contains(&candidate) {
-                        break candidate;
-                    }
-                    dir = virtual_parent(&dir)?;
-                }
+                // A nearer installation shadows ancestors, even if it is
+                // incomplete or has a different version.
+                ancestors(&normalized)
+                    .filter_map(|dir| safe_package_path(&dir, &package_dir))
+                    .find(|candidate| self.roots.contains(candidate))?
             };
             let supplied = self.declarations.get(&root)?;
             if supplied.name != package || supplied.version != version {
@@ -1152,6 +1141,12 @@ pub(super) fn virtual_parent(path: &str) -> Option<String> {
         });
     }
     path.rsplit_once('/').map(|(parent, _)| parent.to_owned())
+}
+
+/// The directories enclosing `path`, nearest first, up to its archive's root
+/// (see [`virtual_parent`]).
+pub(super) fn ancestors(path: &str) -> impl Iterator<Item = String> {
+    std::iter::successors(virtual_parent(path), |dir| virtual_parent(dir))
 }
 
 fn safe_package_path(root: &str, target: &str) -> Option<String> {

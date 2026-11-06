@@ -100,7 +100,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 # repetitive JSON; zstd cuts them 3-5x on the wire. Already present transitively
 # in the lock graph, so this only promotes it to a direct dependency.
 zstd = "0.13"
-toml = "0.8"
+toml = "1"
 semver = "1"
 anyhow = "1"
 dirs = "6.0"

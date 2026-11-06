@@ -180,14 +180,6 @@ impl<'a> ReportIndex<'a> {
     pub(super) fn is_fetched(&self, id: u32) -> bool {
         self.fetched_root.contains_key(&id)
     }
-
-    /// Every file of the fetched payload rooted at `root`.
-    fn payload(&self, root: u32) -> HashSet<u32> {
-        self.fetched_root
-            .iter()
-            .filter_map(|(&file, &payload)| (payload == root).then_some(file))
-            .collect()
-    }
 }
 
 /// A fetched payload grafted into the report, with what scan knows about it.
@@ -231,17 +223,25 @@ pub(super) fn fetched_subjects<'a>(
             .entry(registry.locator.as_str())
             .or_insert(registry);
     }
-    let mut seen = HashSet::new();
+    // Grouped once: a scan can fetch hundreds of payloads into a report of
+    // tens of thousands of files, and a walk of every file per payload is
+    // their product.
+    let mut payloads: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for (&file, &root) in &index.fetched_root {
+        payloads.entry(root).or_default().insert(file);
+    }
+    // Removing a payload as its subject is built also keeps one subject per
+    // root when several edges landed the same bytes.
     fetched
         .edges
         .iter()
         .filter_map(|edge| {
             let content = edge.content_sha256.as_deref()?;
             let root = *index.fetched_by_sha.get(content)?;
-            seen.insert(root.id).then(|| FetchedSubject {
+            Some(FetchedSubject {
                 edge,
                 root,
-                files: index.payload(root.id),
+                files: payloads.remove(&root.id)?,
                 graded: graded.get(content).copied(),
                 registry: registries.get(edge.locator.as_str()).copied(),
             })
@@ -364,7 +364,7 @@ pub(super) fn render_interpret_context(
             .verdict()
             .is_some_and(|v| v.class >= Classification::Suspicious);
         let provenance_hit = subject.registry.is_some_and(|registry| {
-            provenance_has_notable_match(report, &subject.files, registry.file_id)
+            provenance_has_notable_match(index, &subject.files, registry.file_id)
         });
         if severe_finding || severe_verdict || provenance_hit {
             let risk = dep_subject_risk(subject.verdict(), severe_finding);
@@ -374,7 +374,7 @@ pub(super) fn render_interpret_context(
     // A removed or age-gated dependency may have no artifact subtree at all.
     // Its atomic provenance finding is still evidence and gets its own subject.
     for registry in registry_only {
-        if provenance_has_notable_match(report, &HashSet::new(), registry.file_id) {
+        if provenance_has_notable_match(index, &HashSet::new(), registry.file_id) {
             // No artifact was analyzed, so there is no verdict and no member trait.
             ranked.push((
                 dep_subject_risk(None, false),
@@ -651,10 +651,6 @@ fn trait_category(trait_id: &str) -> String {
     let Some(namespace) = parts.next() else {
         return "pattern".to_string();
     };
-    let rest: Vec<&str> = parts.collect();
-    if rest.is_empty() {
-        return namespace.to_string();
-    }
     // `well-known/` is the exception: its depth is not a taxonomy of technique,
     // it is an *identity* — `unwanted/newtab-wallpaper-adware/owhit` names the
     // family, and the family is the whole finding. Truncating it to two
@@ -662,12 +658,17 @@ fn trait_category(trait_id: &str) -> String {
     // a Chrome extension cleave had already recognized as newtab wallpaper adware
     // reached the grader as an unremarkable observation and was cleared.
     if namespace == "well-known" {
-        return rest.join("/");
+        let identity = parts.collect::<Vec<_>>().join("/");
+        return if identity.is_empty() {
+            namespace.to_string()
+        } else {
+            identity
+        };
     }
-    match rest.as_slice() {
-        [a, b, ..] => format!("{a}/{b}"),
-        [a] => (*a).to_string(),
-        [] => "pattern".to_string(),
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}/{b}"),
+        (Some(a), None) => a.to_string(),
+        (None, _) => namespace.to_string(),
     }
 }
 
@@ -687,23 +688,29 @@ fn fetched_root_id(file: &FileAnalysis, by_id: &HashMap<u32, &FileAnalysis>) -> 
 /// True for a notable+ atomic match on the registry node, or a notable+
 /// composite on the dependency artifact whose resolved sources include it.
 fn provenance_has_notable_match(
-    report: &AnalysisReport,
+    index: &ReportIndex<'_>,
     artifact_ids: &HashSet<u32>,
     registry_id: u32,
 ) -> bool {
-    report.files.iter().any(|file| {
-        if file.id == registry_id && file.findings.iter().any(|f| f.crit >= Criticality::Notable) {
-            return true;
-        }
-        artifact_ids.contains(&file.id)
-            && file.findings.iter().any(|finding| {
-                finding.crit >= Criticality::Notable
-                    && file
-                        .composite_sources
-                        .get(finding.id.as_str())
-                        .is_some_and(|sources| sources.iter().any(|s| s.file == registry_id))
+    let registry_hit = index.by_id.get(&registry_id).is_some_and(|registry| {
+        registry
+            .findings
+            .iter()
+            .any(|f| f.crit >= Criticality::Notable)
+    });
+    registry_hit
+        || artifact_ids
+            .iter()
+            .filter_map(|id| index.by_id.get(id))
+            .any(|file| {
+                file.findings.iter().any(|finding| {
+                    finding.crit >= Criticality::Notable
+                        && file
+                            .composite_sources
+                            .get(finding.id.as_str())
+                            .is_some_and(|sources| sources.iter().any(|s| s.file == registry_id))
+                })
             })
-    })
 }
 
 /// The name the grader is shown for a scanned file: its last path component.
@@ -1007,7 +1014,7 @@ pub(super) fn render_dependency_context(
         let _ = write!(
             out,
             "  referenced: {} in {}",
-            ref_kind_phrase(&rec.kind),
+            ref_kind_phrase(rec.kind),
             tty(source)
         );
         if let Some(off) = rec.source_offset {
@@ -1076,7 +1083,7 @@ pub(super) fn render_dependency_context(
 
 /// How a fetch edge's declaring reference binds the sample to the dependency,
 /// as prose for the LLM context.
-fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
+fn ref_kind_phrase(kind: fletch::RefKind) -> &'static str {
     match kind {
         fletch::RefKind::Dependency => "declared as a dependency",
         fletch::RefKind::Command => "named by an install command",
