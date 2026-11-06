@@ -251,13 +251,15 @@ impl Corpus {
                 // let the next configured address (normally the primary) try.
                 continue;
             }
-            if response
-                .content_length()
-                .is_some_and(|length| length > max_bytes as u64)
-            {
+            let declared = response.content_length();
+            if declared.is_some_and(|length| length > max_bytes as u64) {
                 return Err(SampleError::TooLarge(max_bytes));
             }
-            let mut body = bytes::BytesMut::new();
+            // Sized up front when declared — within `max_bytes`, just checked —
+            // so a large sample is not regrown and copied as it arrives.
+            let mut body = bytes::BytesMut::with_capacity(
+                declared.map_or(0, |length| usize::try_from(length).unwrap_or(max_bytes)),
+            );
             let mut digest = sha2::Sha256::new();
             let mut complete = false;
             loop {

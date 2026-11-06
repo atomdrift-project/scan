@@ -128,8 +128,7 @@ mod imp {
         pos
     }
 
-    /// Decimal-format a `u64` into a small inline buffer (max 20 digits).
-    /// Returns a `(buf, len)` pair as a tiny stack type so callers can slice it.
+    /// A `u64` in decimal, on the stack: the digits are `buf[start..]`.
     struct Itoa {
         buf: [u8; 20],
         start: usize,
@@ -139,6 +138,7 @@ mod imp {
             &self.buf[self.start..]
         }
     }
+    /// `v` in decimal, without allocating.
     fn itoa(mut v: u64) -> Itoa {
         let mut buf = [0u8; 20];
         let mut i = buf.len();
@@ -169,9 +169,9 @@ mod imp {
         let rc = unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_abort as *const () as usize;
-            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigemptyset(&raw mut sa.sa_mask);
             sa.sa_flags = libc::SA_ONSTACK | libc::SA_RESETHAND;
-            libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut())
+            libc::sigaction(libc::SIGABRT, &raw const sa, std::ptr::null_mut())
         };
         if rc != 0 {
             tracing::warn!(
@@ -184,7 +184,7 @@ mod imp {
     extern "C" fn on_abort(_sig: libc::c_int) {
         // Async-signal-safe only: atomic loads, a stack copy, and `write(2)`.
         write_all(b"\n--- scan aborting: in-flight analyses (one is the likely culprit) ---\n");
-        for slot in REGISTRY.iter() {
+        for slot in &REGISTRY {
             let id = slot.id.load(Ordering::Acquire);
             if id == 0 || id == CLAIMING {
                 continue;

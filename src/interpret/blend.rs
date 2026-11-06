@@ -22,12 +22,10 @@ pub enum LlmGrade {
 impl LlmGrade {
     /// Parse a model-emitted grade, case-insensitively. Unknown → `None`.
     pub(super) fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "benign" => Some(Self::Benign),
-            "suspicious" => Some(Self::Suspicious),
-            "hostile" => Some(Self::Hostile),
-            _ => None,
-        }
+        let s = s.trim();
+        [Self::Benign, Self::Suspicious, Self::Hostile]
+            .into_iter()
+            .find(|grade| s.eq_ignore_ascii_case(grade.as_str()))
     }
 
     /// Lowercase label.
@@ -159,6 +157,10 @@ fn label<S: serde::Serializer>(class: &Classification, serializer: S) -> Result<
     serializer.collect_str(class)
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` passes the field by reference"
+)]
 const fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -332,11 +334,11 @@ pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Cla
     match target.cmp(&ml) {
         Ordering::Greater => match ml {
             Classification::Benign => Classification::Suspicious,
-            _ => Classification::Hostile,
+            Classification::Suspicious | Classification::Hostile => Classification::Hostile,
         },
         Ordering::Less => match ml {
             Classification::Hostile => Classification::Suspicious,
-            _ => Classification::Benign,
+            Classification::Benign | Classification::Suspicious => Classification::Benign,
         },
         Ordering::Equal => ml,
     }

@@ -100,14 +100,14 @@ pub fn os_thread_id() -> u64 {
     {
         let mut tid: u64 = 0;
         // SAFETY: writes this thread's id into a local; handle 0 means self.
-        unsafe { libc::pthread_threadid_np(0, &mut tid) };
+        unsafe { libc::pthread_threadid_np(0, &raw mut tid) };
         tid
     }
     #[cfg(target_os = "freebsd")]
     {
         let mut tid: libc::c_long = 0;
         // SAFETY: `thr_self` writes the calling thread's id into the pointee.
-        unsafe { libc::thr_self(&mut tid) };
+        unsafe { libc::thr_self(&raw mut tid) };
         u64::try_from(tid).unwrap_or(0)
     }
     #[cfg(target_os = "openbsd")]
@@ -257,9 +257,13 @@ pub fn install() {
         let rc = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = capture::on_capture as *const () as usize;
-            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigemptyset(&raw mut action.sa_mask);
             action.sa_flags = libc::SA_RESTART;
-            libc::sigaction(capture::CAPTURE_SIGNAL, &action, std::ptr::null_mut())
+            libc::sigaction(
+                capture::CAPTURE_SIGNAL,
+                &raw const action,
+                std::ptr::null_mut(),
+            )
         };
         if rc == 0 {
             INSTALLED.store(true, Ordering::Release);

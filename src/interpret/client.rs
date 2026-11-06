@@ -833,5 +833,6 @@ pub(super) fn parse_grade_reason(content: &str) -> Option<(LlmGrade, String)> {
     if let Some((cut, _)) = reason.char_indices().nth(MAX_REASON_CHARS) {
         reason.truncate(cut);
     }
-    Some((grade, reason.trim_end().to_string()))
+    reason.truncate(reason.trim_end().len());
+    Some((grade, reason))
 }

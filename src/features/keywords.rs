@@ -58,7 +58,10 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
         return result;
     }
     // Match the f32 representation used by compact findings at the threshold.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the gate compares in the compact report's f32"
+    )]
     const COMPACT_MIN_CONFIDENCE: f32 = MIN_CONFIDENCE as f32;
     for finding in &file.findings {
         if finding.id.is_empty()

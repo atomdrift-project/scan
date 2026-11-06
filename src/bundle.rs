@@ -74,7 +74,8 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
         say(&why);
         return Ok(false);
     }
-    let http = client(quiet && B::installed(dir).is_some())?;
+    let installed = B::installed(dir);
+    let http = client(quiet && installed.is_some())?;
     let remote = B::fetch(&http)?;
     let current = |have: &Option<B::Installed>| {
         !force
@@ -88,7 +89,7 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
             say(&note);
         }
     };
-    if current(&B::installed(dir)) {
+    if current(&installed) {
         settled(
             &remote,
             format!("{} already up to date: {}", B::NAME, B::describe(&remote)),

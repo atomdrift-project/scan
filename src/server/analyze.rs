@@ -513,9 +513,6 @@ fn classify_purl(
         (registry, fetched)
     });
     let (registry, registry_sources) = registry_lookup;
-    let registry_provenance = registry.clone().map(|record| {
-        crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
-    });
 
     // A removed version, or a release that is gone while the registry still
     // has a record: analyze the registry's document instead. Any other
@@ -530,6 +527,9 @@ fn classify_purl(
         .as_ref()
         .filter(|reg| gone || reg.version_removed == Some(true))
         .and_then(crate::fetch::registry_document);
+    let registry_provenance = registry.map(|record| {
+        crate::provenance::RegistryProvenance::from_record_sources(record, &registry_sources)
+    });
     if let Some((name, bytes)) = fallback {
         if let Err(error) = &fetched {
             tracing::warn!(%purl, error = %format!("{error:#}"), "artifact gone; scanning registry metadata only");

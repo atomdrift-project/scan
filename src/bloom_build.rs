@@ -27,7 +27,20 @@ struct PoolRecord {
     purl: Option<String>,
     #[serde(default)]
     sha256: Option<String>,
-    label: String,
+    label: Label,
+}
+
+/// A record's `label`: the producer's contract, one per [`Tier`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Label {
+    Good,
+    Bad,
+    SightedHostile,
+    SightedSuspicious,
+    /// A label this build predates.
+    #[serde(other)]
+    Other,
 }
 
 /// Ingest diagnostics for a pool read; the keys themselves live in [`KeySets`].
@@ -62,13 +75,18 @@ pub struct PoolStats {
 ///
 /// # Errors
 /// Propagates only underlying read errors from `reader`.
-pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
+pub fn read_pool(mut reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
     let mut sets = KeySets::new();
     let mut stats = PoolStats::default();
 
-    for line in reader.lines() {
-        let line = line.context("reading pool line")?;
-        let line = line.trim();
+    // One buffer for every line: a pool runs to tens of millions of rows.
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        if reader.read_line(&mut buf).context("reading pool line")? == 0 {
+            break;
+        }
+        let line = buf.trim();
         if line.is_empty() {
             continue;
         }
@@ -103,12 +121,12 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
         // counted and dropped, which is silent data loss if a producer starts
         // emitting a tier this build predates — hence the count, and hence the
         // rule that the builder change lands first.
-        let tier = match rec.label.as_str() {
-            "good" => Tier::Good,
-            "bad" => Tier::Bad,
-            "sighted-hostile" => Tier::SightedHostile,
-            "sighted-suspicious" => Tier::SightedSuspicious,
-            _ => {
+        let tier = match rec.label {
+            Label::Good => Tier::Good,
+            Label::Bad => Tier::Bad,
+            Label::SightedHostile => Tier::SightedHostile,
+            Label::SightedSuspicious => Tier::SightedSuspicious,
+            Label::Other => {
                 stats.other_label += 1;
                 continue;
             }

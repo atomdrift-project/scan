@@ -296,16 +296,20 @@ impl FetchSession {
         // `require("x")` is diffed against the root manifest's declarations.
         // Debug, not warn: it means something only when a manifest is present
         // to diff against, and loose files flag every import as undeclared.
-        let all_refs: Vec<Reference> = worklist
-            .iter()
-            .flat_map(|(_, refs)| refs.iter().cloned())
-            .collect();
-        for u in find::undeclared_packages(&all_refs) {
-            tracing::debug!(
-                package = %locator(u),
-                source = %u.source,
-                "undeclared dependency: imperatively acquired but not declared in manifest"
-            );
+        // Gated because the diff needs a copy of every reference in the work
+        // list, which a large lockfile makes worth skipping when nobody reads it.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let all_refs: Vec<Reference> = worklist
+                .iter()
+                .flat_map(|(_, refs)| refs.iter().cloned())
+                .collect();
+            for u in find::undeclared_packages(&all_refs) {
+                tracing::debug!(
+                    package = %locator(u),
+                    source = %u.source,
+                    "undeclared dependency: imperatively acquired but not declared in manifest"
+                );
+            }
         }
         Self {
             policy,
@@ -439,9 +443,9 @@ impl FetchSession {
                     return true;
                 };
                 if !policy.deps {
-                    reference.locator = declaration.locator.clone();
-                    reference.pinned_hash = declaration.pinned_hash.clone();
-                    reference.context = declaration.context.clone();
+                    reference.locator.clone_from(&declaration.locator);
+                    reference.pinned_hash.clone_from(&declaration.pinned_hash);
+                    reference.context.clone_from(&declaration.context);
                     return true;
                 }
                 let coverage = if policy.wants_at(RefKind::Dependency, hop) {
@@ -798,7 +802,15 @@ impl FetchSession {
         let Some(precheck) = &self.precheck else {
             return HashMap::new();
         };
-        let candidates: Vec<String> = plans
+        // A coordinate whose bytes can change is asked about by the digest its
+        // registry lists today, never by name; see `precheck_resolved`. A
+        // release's age, where the age gate looked it up, can settle that.
+        let ages: HashMap<&str, u64> = plans
+            .iter()
+            .flat_map(|plan| &plan.registries)
+            .filter_map(|g| Some((locator(&g.reference), g.record.age_secs(self.now)?)))
+            .collect();
+        let (candidates, mutable): (Vec<String>, Vec<String>) = plans
             .iter()
             .flat_map(|plan| &plan.selected)
             .filter(|r| {
@@ -808,17 +820,6 @@ impl FetchSession {
                     && pins_exact_version(locator(r))
             })
             .map(|r| locator(r).to_owned())
-            .collect();
-        // A coordinate whose bytes can change is asked about by the digest its
-        // registry lists today, never by name; see `precheck_resolved`. A
-        // release's age, where the age gate looked it up, can settle that.
-        let ages: HashMap<&str, u64> = plans
-            .iter()
-            .flat_map(|plan| &plan.registries)
-            .filter_map(|g| Some((locator(&g.reference), g.record.age_secs(self.now)?)))
-            .collect();
-        let (candidates, mutable): (Vec<String>, Vec<String>) = candidates
-            .into_iter()
             .partition(|purl| immutable_coordinate(purl, ages.get(purl.as_str()).copied()));
         // Hopper is ours; Uplink is told only public-registry coordinates.
         // The rest are fetched and asked about by digest.
@@ -1054,7 +1055,7 @@ impl FetchSession {
         for record in &mut records {
             if matches!(record.outcome, Outcome::BudgetExceeded) {
                 record.coverage.push(Coverage::BudgetExceeded {
-                    notice: notice.to_string(),
+                    notice: notice.clone(),
                     fetches: u64::try_from(grant.fetches).unwrap_or(u64::MAX),
                     bytes: grant.bytes,
                 });

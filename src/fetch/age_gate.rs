@@ -337,17 +337,19 @@ pub(super) fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
         };
         num.then_with(|| rx.cmp(ry))
     }
-    let (ca, cb): (Vec<&str>, Vec<&str>) = (
-        a.split(['.', '-', '_', '+']).collect(),
-        b.split(['.', '-', '_', '+']).collect(),
-    );
-    for (x, y) in ca.iter().zip(cb.iter()) {
-        let ord = component_cmp(x, y);
-        if ord != Ordering::Equal {
-            return ord;
+    const SEPARATORS: [char; 4] = ['.', '-', '_', '+'];
+    let (mut ca, mut cb) = (a.split(SEPARATORS), b.split(SEPARATORS));
+    loop {
+        match (ca.next(), cb.next()) {
+            (Some(x), Some(y)) => match component_cmp(x, y) {
+                Ordering::Equal => {}
+                ord => return ord,
+            },
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
         }
     }
-    ca.len().cmp(&cb.len())
 }
 
 /// Look up each declared dependency's registry metadata, stamp its relative

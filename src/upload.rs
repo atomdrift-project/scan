@@ -327,16 +327,14 @@ fn prepare_result(
         duration_ms: 0,
         envelope: Some(envelope),
     };
-    match encode_result_body(payload, sha256) {
-        Some((bytes, encoding)) => Some(EncodedResult {
-            bytes,
-            zstd: encoding.is_some(),
-        }),
-        None => {
-            tally.failed.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
+    let Some((bytes, encoding)) = encode_result_body(payload, sha256) else {
+        tally.failed.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    Some(EncodedResult {
+        bytes,
+        zstd: encoding.is_some(),
+    })
 }
 
 /// Only upload inputs cross the queue, not the dependency's analysis graph.
@@ -833,7 +831,7 @@ impl Hopper {
                     cleanup_upload_dirs(cleanup_dirs);
                 }
                 Job::Dependencies { deps } => {
-                    self.sync_prepared_dependencies(cache.as_ref(), &mut seen, deps, publish)
+                    self.sync_prepared_dependencies(cache.as_ref(), &mut seen, deps, publish);
                 }
             }
         }

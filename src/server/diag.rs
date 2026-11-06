@@ -196,11 +196,8 @@ pub(super) async fn health(
         }
     }
 
-    let load = if max_tasks > 0 {
-        active_tasks as f64 / max_tasks as f64
-    } else {
-        0.0
-    };
+    // `workers` is validated to be at least one before the app is built.
+    let load = active_tasks as f64 / max_tasks as f64;
     // A fully-utilised worker pool is the *target* steady state, not a fault.
     // Report it as "saturated" with HTTP 200 so monitors can distinguish "all
     // slots busy" from real failures (memory pressure, stuck workers). The
@@ -653,7 +650,7 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<Request
                 name: e.name.clone(),
                 size_bytes: e.size_bytes,
                 elapsed_ms,
-                long_running: elapsed_ms >= 120_000,
+                long_running: elapsed_ms >= u128::from(super::LONG_RUNNING_SECS) * 1_000,
                 phase: e.phase.current(),
                 thread_id: (tid > 0).then_some(tid),
             }

@@ -2,6 +2,7 @@
 //! nothing declares is a phantom dependency, and one the package itself
 //! provides is not a dependency at all.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cleave::{AnalysisOptions, AnalysisReport};
@@ -9,7 +10,7 @@ use filefacts::FileType;
 use fletch::fetch::{CandidateSource, Coverage, FetchRecord};
 use fletch::{RefKind, RefLocator, Reference, find};
 
-use super::discover::{PYPROJECT_LOCKS, npm_import_name, virtual_parent};
+use super::discover::{PYPROJECT_LOCKS, ancestors, npm_import_name, virtual_parent};
 use super::render::delivered_bytes;
 use super::{Group, report_file_type};
 
@@ -251,20 +252,13 @@ pub(super) fn npm_import_is_package_or_framework_provided(
     package: &str,
     contexts: &HashMap<String, PackageContext>,
 ) -> bool {
-    let Some(mut dir) = virtual_parent(path) else {
-        return false;
-    };
-    loop {
-        if let Some(context) = contexts.get(&dir) {
-            return package == context.name
+    ancestors(path)
+        .find_map(|dir| contexts.get(&dir))
+        .is_some_and(|context| {
+            package == context.name
                 || (context.ember
-                    && (package.starts_with("@ember/") || package == "@glimmer/tracking"));
-        }
-        let Some(parent) = virtual_parent(&dir) else {
-            return false;
-        };
-        dir = parent;
-    }
+                    && (package.starts_with("@ember/") || package == "@glimmer/tracking"))
+        })
 }
 
 /// Match imports to the nearest manifest in this hop. Shared source hashes
@@ -305,26 +299,21 @@ pub(super) fn declared_npm_imports_in_hop(
         ) {
             continue;
         }
-        let mut dir = virtual_parent(&file.path);
-        let mut names = HashMap::new();
-        while let Some(current) = dir {
-            let separator = if current.ends_with("!!") { "" } else { "/" };
-            let path = format!("{current}{separator}package.json");
-            if let Some(manifest) = manifests.get(path.as_str()) {
-                names = declarations
-                    .get(manifest.sha256.as_str())
-                    .cloned()
-                    .unwrap_or_default();
-                break;
-            }
-            dir = virtual_parent(&current);
-        }
-        result
-            .entry(file.sha256.clone())
-            .and_modify(|existing| {
-                existing.retain(|name, reference| names.get(name) == Some(reference))
+        let names = ancestors(&file.path)
+            .find_map(|dir| {
+                let separator = if dir.ends_with("!!") { "" } else { "/" };
+                let manifest = manifests.get(format!("{dir}{separator}package.json").as_str())?;
+                Some(declarations.get(manifest.sha256.as_str()))
             })
-            .or_insert(names);
+            .flatten();
+        match result.entry(file.sha256.clone()) {
+            Entry::Occupied(mut existing) => existing.get_mut().retain(|name, reference| {
+                names.and_then(|names| names.get(name)) == Some(reference)
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(names.cloned().unwrap_or_default());
+            }
+        }
     }
     result
 }
@@ -418,9 +407,9 @@ pub(super) fn reconcile_python_imports(
             if !dependencies {
                 for declaration in declarations {
                     let mut bound = reference.clone();
-                    bound.locator = declaration.locator.clone();
-                    bound.pinned_hash = declaration.pinned_hash.clone();
-                    bound.context = declaration.context.clone();
+                    bound.locator.clone_from(&declaration.locator);
+                    bound.pinned_hash.clone_from(&declaration.pinned_hash);
+                    bound.context.clone_from(&declaration.context);
                     if !updated.contains(&bound) {
                         updated.push(bound);
                     }
@@ -501,21 +490,15 @@ fn python_contexts(
         {
             continue;
         }
-        let mut dir = Some(virtual_parent(&file.path).unwrap_or_else(|| ".".into()));
-        let mut names = HashMap::new();
-        while let Some(current) = dir {
-            if let Some(found) = owners.get(&current) {
-                names = found.clone();
-                break;
-            }
-            dir = virtual_parent(&current);
-        }
+        let start = virtual_parent(&file.path).unwrap_or_else(|| ".".into());
+        let names = std::iter::successors(Some(start), |dir| virtual_parent(dir))
+            .find_map(|dir| owners.get(&dir));
         let context = contexts.entry(file.sha256.clone()).or_default();
         context.occurrences += 1;
-        for (name, declarations) in names {
-            let named = context.names.entry(name).or_default();
+        for (name, declarations) in names.into_iter().flatten() {
+            let named = context.names.entry(name.clone()).or_default();
             named.occurrences += 1;
-            named.declarations.extend(declarations);
+            named.declarations.extend(declarations.iter().cloned());
         }
     }
     contexts

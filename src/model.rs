@@ -471,7 +471,9 @@ impl Model {
         let general = score_general();
         let group_score = score_specialist(group.as_ref());
         let filetype_score = score_specialist(filetype.as_ref());
-        let additional = self.routes.additional_policy_routes(file_type);
+        let additional = self
+            .routes
+            .additional_policy_routes(file_type, &type_key, group_key);
         let additional_scores = additional
             .iter()
             .map(|entry| score_specialist(Some(entry)))
@@ -671,7 +673,9 @@ impl Model {
             let (type_key, group_key) = self.routes.specialist_keys(file_type);
             let group = group_key.and_then(|name| self.routes.filegroups.get(name));
             let filetype = self.routes.filetypes.get(&type_key);
-            let additional = self.routes.additional_policy_routes(file_type);
+            let additional = self
+                .routes
+                .additional_policy_routes(file_type, &type_key, group_key);
             for (_, route) in group.iter().chain(filetype.iter()).chain(additional.iter()) {
                 needs = needs.union(route.ctx.raw_needs());
             }

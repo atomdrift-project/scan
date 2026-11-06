@@ -644,7 +644,10 @@ impl ScanResult {
 
     /// The envelope's `raw`: the stored report, or an empty one.
     fn raw(&self) -> &Arc<RawValue> {
-        self.cleave.as_ref().map_or_else(empty_report, |r| &r.json)
+        match &self.cleave {
+            Some(report) => &report.json,
+            None => empty_report(),
+        }
     }
 }
 

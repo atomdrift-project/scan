@@ -20,8 +20,12 @@ use crate::output::strip_ansi;
 pub fn sanitize_context(rendered: &str) -> String {
     let mut out = String::with_capacity(rendered.len());
     for raw in rendered.lines() {
-        out.push_str(&strip_ansi(raw).replace("!!", "/"));
+        out.push_str(&strip_ansi(raw));
         out.push('\n');
+    }
+    // Once over the whole text: no `!!` spans the newlines joining the lines.
+    if out.contains("!!") {
+        out = out.replace("!!", "/");
     }
     out
 }

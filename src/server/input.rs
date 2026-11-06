@@ -54,13 +54,14 @@ pub(super) fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
 
 /// Whether `raw` is an absolute http(s) URL. Callers keep and log `raw`
 /// itself, and `Url::parse` silently drops tab, CR and LF, so a raw control
-/// character (a forged log line, a terminal escape) is refused outright; a
-/// real URL percent-encodes them.
+/// character or bidi override (a forged log line, a terminal escape, text
+/// that renders reversed) is refused outright; a real URL percent-encodes
+/// them.
 ///
 /// A URL carrying credentials (`https://user:pass@host/`) is refused too: it
 /// would be logged, listed in `/_/requests` and stored in fetch provenance.
 pub(super) fn valid_http_url(raw: &str) -> bool {
-    !raw.chars().any(char::is_control)
+    !raw.chars().any(crate::output::tty_hostile)
         && reqwest::Url::parse(raw).is_ok_and(|url| {
             matches!(url.scheme(), "http" | "https")
                 && url.username().is_empty()
@@ -76,11 +77,14 @@ mod tests {
     #[test]
     fn submitted_urls_refuse_raw_control_characters() {
         assert!(valid_http_url("https://a.example/x?q=%0A"));
+        assert!(valid_http_url("https://例え.jp/パス"), "an IRI is a URL");
         for raw in [
             "https://a.example/x\nINFO forged",
             "https://a.example/x\r\n",
             "https://a.example/\tx",
             "https://a.example/\u{1b}[2J",
+            "https://a.example/\u{9b}2J",
+            "https://a.example/\u{202e}exe.txt",
             "file:///etc/passwd",
         ] {
             assert!(!valid_http_url(raw), "{raw:?}");

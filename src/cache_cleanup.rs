@@ -18,7 +18,7 @@ use crate::cache_sweep::{self, Budget, Root};
 
 /// Re-sweep interval for daemon modes. The daily marker makes most wakes a
 /// single `stat`, so this only bounds how soon a newly-oversized cache is seen.
-const DAEMON_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const DAEMON_SWEEP_INTERVAL: Duration = Duration::from_hours(6);
 
 /// Start cache reclamation for this process. `daemon` = a long-running mode that
 /// never exits (sweep must recur); otherwise a one-shot CLI that sweeps once at
@@ -57,7 +57,7 @@ fn budget() -> Budget {
     Budget {
         label: "scan",
         roots: scan_roots,
-        max_age: Duration::from_secs(30 * 24 * 60 * 60),
+        max_age: Duration::from_hours(30 * 24),
         max_bytes: 2 * 1024 * 1024 * 1024,
         max_entries: filefacts::cache::DEFAULT_MAX_ITEMS,
     }

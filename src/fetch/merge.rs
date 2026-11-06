@@ -543,7 +543,7 @@ fn graft_subtree(
         }
         if is_sub_root {
             file.rel = cleave::types::Rel::Fetched;
-            file.via = via.clone();
+            file.via.clone_from(&via);
         }
         graft.push(report, file);
     }

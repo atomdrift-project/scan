@@ -156,10 +156,9 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         Ok((bytes, name, rec)) => {
             // Display under the resolved URL when there is one (a PURL resolves to
             // its download URL); fall back to the locator itself.
-            let label = crate::fetch::fetch_target(&rec).to_owned();
             crate::engine::run_bytes(
                 Fetched {
-                    label: &label,
+                    label: crate::fetch::fetch_target(&rec),
                     name: &name,
                     bytes,
                     registry: registry_provenance.as_ref(),

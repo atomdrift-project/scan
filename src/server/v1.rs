@@ -468,6 +468,18 @@ async fn read_body(
     body: axum::body::Body,
     limit: usize,
 ) -> Result<(bytes::Bytes, String), ApiError> {
+    let too_large = || {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact_too_large",
+            format!("The artifact exceeds the {limit} byte limit."),
+        )
+    };
+    // A declared `Content-Length` past the limit is refused before a byte of
+    // it is read, rather than after the first `limit` bytes are.
+    if body.size_hint().lower() > limit as u64 {
+        return Err(too_large());
+    }
     let mut stream = body.into_data_stream();
     let mut digest = Sha256::new();
     let mut buf = bytes::BytesMut::new();
@@ -490,11 +502,7 @@ async fn read_body(
             ApiError::bad_request("unreadable_body", "The request body could not be read.")
         })?;
         if buf.len().saturating_add(chunk.len()) > limit {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "artifact_too_large",
-                format!("The artifact exceeds the {limit} byte limit."),
-            ));
+            return Err(too_large());
         }
         digest.update(&chunk);
         buf.extend_from_slice(&chunk);

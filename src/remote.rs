@@ -46,7 +46,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Whole-request ceiling for a lookup.
 pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Whole-request ceiling for a remote analysis, which streams progress.
-const ANALYZE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ANALYZE_TIMEOUT: Duration = Duration::from_mins(30);
 /// How long a remote analysis keeps retrying transient failures before the
 /// artifact is reported as failed. Under `remote` there is no local analysis
 /// to fall back to, so it is the longest any call waits.
@@ -181,14 +181,16 @@ pub(crate) fn public_purl(purl: &str) -> bool {
     let qualifiers = path.split_once('?').map_or("", |(_, q)| q);
     // Each names bytes other than the public registry's under this coordinate.
     if qualifiers.split('&').any(|q| {
-        let q = q.to_ascii_lowercase();
         ["repository_url=", "download_url=", "vcs_url="]
             .iter()
-            .any(|key| q.starts_with(key))
+            .any(|key| {
+                q.get(..key.len())
+                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
+            })
     }) {
         return false;
     }
-    MAINSTREAM.contains(&kind.to_ascii_lowercase().as_str())
+    MAINSTREAM.iter().any(|m| m.eq_ignore_ascii_case(kind))
 }
 
 /// How a remote level grades at this run's operating level — the same rule a
@@ -370,7 +372,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
         // Bounded and escaped: the body is the remote's, and this error is
         // printed to the operator's terminal.
         let mut body = String::new();
-        let _ = std::io::Read::read_to_string(&mut resp.take(4096), &mut body);
+        let _ = resp.take(4096).read_to_string(&mut body);
         anyhow::bail!("Uplink refused the analysis ({status}): {:?}", body.trim());
     }
     let answer = BufReader::new(resp)
@@ -390,7 +392,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     tracing::info!(
         event = "remote.analyze",
         status = status.as_u16(),
-        ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ms = crate::duration_ms(started.elapsed()),
         %sha,
     );
     Ok((sha, verdict))

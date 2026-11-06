@@ -108,9 +108,11 @@ pub(super) fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
         .filter_map(|(i, f)| Some((f.id?, i)))
         .collect();
     let mut depths = vec![None; files.len()];
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
     for start in 0..files.len() {
-        let mut chain = Vec::new();
-        let mut seen = HashSet::new();
+        chain.clear();
+        seen.clear();
         let mut i = start;
         while depths[i].is_none() {
             if !seen.insert(i) {
@@ -192,7 +194,7 @@ pub(super) fn write_structural_extensions(
 
         if let Some((_, ext)) = s.path.rsplit_once('.')
             && binary_like.contains(&s.file_type.as_str())
-            && text_exts.contains(&ext.to_ascii_lowercase().as_str())
+            && text_exts.iter().any(|t| ext.eq_ignore_ascii_case(t))
         {
             extension_mismatches += 1;
         }
@@ -582,8 +584,8 @@ fn normalize_vocab_token(value: &str, max_len: usize) -> String {
     while out.ends_with(' ') {
         out.pop();
     }
-    if out.chars().count() > max_len {
-        out = out.chars().take(max_len).collect();
+    if let Some((cut, _)) = out.char_indices().nth(max_len) {
+        out.truncate(cut);
     }
     out
 }
@@ -750,31 +752,25 @@ pub(super) fn write_symbol_features(
     for s in summaries {
         let sorted = s.symbols.as_slice();
         for sym in sorted {
-            key.clear();
-            let _ = write!(key, "symbol:{sym}");
-            w.set_token(&key, 1.0);
+            w.set_prefixed(&mut key, "symbol:", sym, 1.0);
         }
         if emit_bigrams {
-            let cap = sorted.len().min(SYMBOL_BIGRAM_CAP);
-            for i in 0..cap {
-                for j in (i + 1)..cap {
+            let capped = &sorted[..sorted.len().min(SYMBOL_BIGRAM_CAP)];
+            for (i, a) in capped.iter().enumerate() {
+                for b in &capped[i + 1..] {
                     key.clear();
-                    let _ = write!(key, "symbol_bi:{}||{}", sorted[i], sorted[j]);
+                    let _ = write!(key, "symbol_bi:{a}||{b}");
                     w.set_token(&key, 1.0);
                 }
             }
         }
         if emit_trigrams {
-            let cap = sorted.len().min(SYMBOL_TRIGRAM_CAP);
-            for i in 0..cap {
-                for j in (i + 1)..cap {
-                    for k in (j + 1)..cap {
+            let capped = &sorted[..sorted.len().min(SYMBOL_TRIGRAM_CAP)];
+            for (i, a) in capped.iter().enumerate() {
+                for (j, b) in capped.iter().enumerate().skip(i + 1) {
+                    for c in &capped[j + 1..] {
                         key.clear();
-                        let _ = write!(
-                            key,
-                            "symbol_tri:{}||{}||{}",
-                            sorted[i], sorted[j], sorted[k]
-                        );
+                        let _ = write!(key, "symbol_tri:{a}||{b}||{c}");
                         w.set_token(&key, 1.0);
                     }
                 }
@@ -937,7 +933,7 @@ pub(super) fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut F
     let n = combined
         .sample_paths
         .values()
-        .filter(|&&mo| mo >= 4)
+        .filter(|&&mo| mo >= CRIT_SUSPICIOUS)
         .count();
     let n_bi = n * n.saturating_sub(1) / 2;
     let n_tri = capped_triples(n, TRIPLE_SPAN);

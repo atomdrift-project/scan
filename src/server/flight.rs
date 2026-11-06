@@ -557,7 +557,6 @@ mod tests {
     /// flight, not by searching `/_/requests` for an entry named like the
     /// flight's subject: an upload's entry is named by its filename and its
     /// subject is the digest, so that search finds nothing for an upload.
-
     #[test]
     fn a_follower_reads_the_phase_of_the_run_it_rides() {
         let flights = Arc::new(Flights::default());

@@ -428,24 +428,23 @@ impl GlobalArgs {
         env: &LlmEnv,
     ) -> Result<Option<crate::interpret::InterpretConfig>> {
         use crate::interpret::{is_openrouter_endpoint, llm_models, llm_targets};
-        let flag_or = |flag: &Option<String>, env: &Option<String>| -> Option<String> {
-            flag.clone()
-                .or_else(|| env.clone())
-                .filter(|s| !s.is_empty())
-        };
+        // The flag wins over the environment, and an empty value means unset.
+        fn flag_or<'a>(flag: Option<&'a str>, env: Option<&'a str>) -> Option<&'a str> {
+            flag.or(env).filter(|s| !s.is_empty())
+        }
         // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
         // turns the pass on. `local` maps to the local endpoint, `openrouter`
         // to the public API, anything else is an OpenAI-compatible base URL;
         // a comma-separated target is a failover chain, tried in order.
-        let Some(target) = flag_or(&self.llm, &env.target) else {
+        let Some(target) = flag_or(self.llm.as_deref(), env.target.as_deref()) else {
             return Ok(None);
         };
-        let targets = llm_targets(&target);
+        let targets = llm_targets(target);
         if targets.is_empty() {
             anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
         }
         let pinned = llm_models(
-            flag_or(&self.llm_model, &env.model).as_deref(),
+            flag_or(self.llm_model.as_deref(), env.model.as_deref()),
             targets.len(),
         );
         // `SCAN_LLM_KEY` is the operator naming one credential, for the kind
