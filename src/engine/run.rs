@@ -114,7 +114,7 @@ pub fn run_paths_with(
         if path.is_file() {
             files.push(path.clone());
         } else if path.is_dir() {
-            dir_files.extend(discover_files(path));
+            dir_files.extend(discover_files(path, &session.tally.errors));
         } else {
             tracing::error!("path does not exist: {}", path.display());
             session.tally.errors.fetch_add(1, Ordering::Relaxed);
@@ -127,7 +127,7 @@ pub fn run_paths_with(
         crate::output::print_banner(detection_counts(config));
         session.progress = Some(Progress::new(u32::try_from(total).unwrap_or(u32::MAX)));
     }
-    // Each batch keeps its own policy, so each is offered to isotope13 alone.
+    // Each batch keeps its own policy, so each is offered to Uplink alone.
     let files = session.judge_remotely(files);
     let dir_files = session.judge_remotely(dir_files);
     scan_partitioned(&session, &files, dir_files, registry_map)?;
@@ -305,7 +305,7 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
     session.finish()
 }
 
-/// Report one artifact isotope13 judged with nothing fetched or analyzed here
+/// Report one artifact Uplink judged with nothing fetched or analyzed here
 /// — a `scan purl` answered by its coordinate — as a one-artifact scan.
 ///
 /// # Errors
@@ -578,7 +578,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Account for one artifact isotope13 judged, as [`Self::report`] does for
+    /// Account for one artifact Uplink judged, as [`Self::report`] does for
     /// one analyzed here: graded at this run's level, tallied, and shown under
     /// the same rules.
     fn record_remote(&self, label: &str, sha: &str, purl: Option<&str>, verdict: &Verdict) {
@@ -1144,23 +1144,38 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
     )))
 }
 
-/// Enumerate the regular files under `dir` for a directory scan, mirroring the
-/// structural filters cleave applies during its own walk: skip `.git*` trees,
-/// keep only regular files, never follow symlinks. This reads no file contents —
-/// it is a cheap `readdir` pass whose purpose is to learn the file count (and
-/// the list) upfront, so the progress bar has a denominator before analysis
-/// begins. The list is handed to [`cleave::scan_paths`], which still applies its
-/// program-type and size filters per file, so a few of these may be analyzed
-/// away without a verdict (the bar tops out just under 100%, then the summary
-/// reports the true total).
-fn discover_files(dir: &Path) -> Vec<PathBuf> {
+/// Enumerate the regular files under `dir` for a directory scan: skip `.git`
+/// object stores, keep only regular files, never follow symlinks. This reads no
+/// file contents — it is a cheap `readdir` pass whose purpose is to learn the
+/// file count (and the list) upfront, so the progress bar has a denominator
+/// before analysis begins. The list is handed to [`cleave::scan_paths`], which
+/// still applies its program-type and size filters per file, so a few of these
+/// may be analyzed away without a verdict (the bar tops out just under 100%,
+/// then the summary reports the true total).
+///
+/// Only a directory named exactly `.git` is skipped: `.github/workflows`,
+/// `.gitlab-ci.yml` and `.gitmodules` are where CI supply-chain changes land.
+/// Every entry the walk cannot read is logged and counted in `errors`, so an
+/// unreadable subtree fails the scan instead of passing as clean.
+fn discover_files(dir: &Path, errors: &AtomicU32) -> Vec<PathBuf> {
     walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !e.file_name().to_string_lossy().starts_with(".git"))
-        .filter_map(std::result::Result::ok)
+        .filter_entry(|e| !(e.file_type().is_dir() && e.file_name() == ".git"))
+        .filter_map(|entry| match entry {
+            Ok(e) => Some(e),
+            Err(err) => {
+                tracing::error!(
+                    path = %err.path().unwrap_or(dir).display(),
+                    error = %err,
+                    "cannot read directory entry; it was not scanned"
+                );
+                errors.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        })
         .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
+        .map(walkdir::DirEntry::into_path)
         .collect()
 }
 
@@ -1351,6 +1366,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovery_keeps_dot_git_lookalikes_and_skips_only_the_object_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            ".git/config",
+            ".github/workflows/ci.yml",
+            ".gitlab-ci.yml",
+            ".gitmodules",
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "x").expect("write");
+        }
+        let errors = AtomicU32::new(0);
+        let mut found: Vec<PathBuf> = discover_files(dir.path(), &errors)
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(dir.path())
+                    .expect("under root")
+                    .to_path_buf()
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [".github/workflows/ci.yml", ".gitlab-ci.yml", ".gitmodules"].map(PathBuf::from)
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+
+        // A scan rooted inside `.github` must still find its files.
+        let rooted = discover_files(&dir.path().join(".github"), &errors);
+        assert_eq!(rooted.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_counts_unreadable_directories_as_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::write(locked.join("payload.sh"), "x").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Root reads through any mode; there is nothing to prove there.
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let errors = AtomicU32::new(0);
+        let found = discover_files(dir.path(), &errors);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        if !readable {
+            assert!(found.is_empty());
+            assert_eq!(errors.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
     fn static_dependency_findings_survive_benign_verdict_display_filter() {
         let finding = super::super::TopFinding {
             id: "objectives/impact/test::issue".into(),
@@ -1474,7 +1543,7 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), body).expect("write");
         }
-        let mut found: Vec<String> = super::discover_files(dir.path())
+        let mut found: Vec<String> = super::discover_files(dir.path(), &AtomicU32::new(0))
             .iter()
             .filter_map(|p| p.file_name()?.to_str().map(String::from))
             .collect();

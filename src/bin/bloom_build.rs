@@ -31,8 +31,9 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     out: PathBuf,
 
-    /// Build date stamped into the manifest (`YYYY-MM-DD`).
-    #[arg(long, value_name = "YYYY-MM-DD")]
+    /// Build date stamped into the manifest (`YYYY-MM-DD`). Clients refuse a
+    /// bundle without one, since it orders their rollback check.
+    #[arg(long, value_name = "YYYY-MM-DD", value_parser = build_date)]
     date: String,
 
     /// Target false-positive rate. Sized for accidental collisions, not grind
@@ -67,6 +68,13 @@ struct Args {
     /// on in the timer.
     #[arg(long = "accept-unusual-growth")]
     accept_unusual_growth: bool,
+}
+
+/// `--date`, accepted only as a real `YYYY-MM-DD` date.
+fn build_date(value: &str) -> Result<String, String> {
+    scan::output::parse_ymd(value)
+        .map(|_| value.to_owned())
+        .ok_or_else(|| format!("{value:?} is not a YYYY-MM-DD date"))
 }
 
 /// `--fp` within (0, 1e-3]; see the flag's docs.

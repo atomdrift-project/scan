@@ -12,8 +12,8 @@ recategorized, so only arms that start from it apply: `described`,
 `pointer`, `elevated`, `raw`) need the severity letters, which no longer
 leave the scanner.
 
-    hacks/interpret-tune/tune.py --corpus /var/tmp/hopper-triage.last \
-                                 --labels hacks/interpret-tune/labels/hopper-triage.tsv
+    scripts/hacks/interpret-tune/tune.py --corpus /var/tmp/hopper-triage.last \
+                                         --labels /path/to/labels.tsv
 
 Shipped scan has exactly one live template — `described`: the render sent
 verbatim (annotations + prose kept), with a system prompt that frames each
@@ -27,6 +27,7 @@ Labels file: TSV `relpath <TAB> ideal <TAB> acceptable`, one row per sample.
   - ideal:      b | s | h   (benign / suspicious / hostile), or `?` to skip scoring
   - acceptable: comma-separated grades that count as non-errors (default: {ideal})
   - `#` comments and blank lines ignored. `--emit-labels` prints a fresh template.
+No labels ship with this repo: build your own for the corpus you score.
 """
 import argparse, concurrent.futures as cf, hashlib, json, os, re, subprocess, sys, urllib.request
 

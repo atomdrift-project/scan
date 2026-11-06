@@ -1,5 +1,5 @@
 //! The one retry policy for every blocking call this process makes to another
-//! service: hopper, isotope13, the update bucket.
+//! service: hopper, Uplink, the update bucket.
 //!
 //! A transient failure — the connection dropped or timed out, or the server
 //! answered 408, 429 or 5xx — is retried with exponential backoff and full

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::OutputFormat;
 use crate::engine::{Progress, ScanConfig, ScanResult, ScanSummary};
@@ -154,6 +154,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let dependency_gaps = AtomicU32::new(0);
     let static_flags = AtomicU32::new(0);
     let flagged_candidates = AtomicU32::new(0);
+    // Set when stdout closes under the scan (`atomscan ps | head`): nobody can
+    // be told the remaining verdicts, so the scan stops.
+    let broken_pipe = AtomicBool::new(false);
 
     // Map each scan path back to its process group for PID annotation.
     let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
@@ -233,8 +236,15 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                     OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
                 ) || config.filter().shows(result.classification)
                 {
-                    let print = || {
-                        emit_result(&result, config, progress.is_some());
+                    let print = || match emit_result(&result, config, progress.is_some()) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            broken_pipe.store(true, Ordering::Relaxed);
+                            cancellation.store(true, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!(path = %result.path, error = %e, "could not write a scan result")
+                        }
                     };
                     if let Some(p) = &progress {
                         p.around_result(print);
@@ -280,6 +290,17 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         static_flags: static_flags.load(Ordering::Relaxed),
         duration_ms: crate::duration_ms(scan_start.elapsed()),
     };
+
+    // As a path scan does: a verdict already reached still decides the exit
+    // status, so under `pipefail` a hostile process does not read as success
+    // because the reader stopped reading.
+    if broken_pipe.load(Ordering::Relaxed) {
+        if hostile > 0 || suspicious > 0 {
+            return Ok(summary);
+        }
+        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("writing scan results to stdout");
+    }
 
     if is_terminal {
         // Collapse the progress bar straight into the verdict: when a bar is
@@ -356,31 +377,27 @@ fn build_result(
 }
 
 /// Emit a single result with PID annotations.
-fn emit_result(r: &ScanResult, config: &ScanConfig, has_progress: bool) {
+///
+/// # Errors
+/// The write failed; `BrokenPipe` means nobody is reading any more.
+fn emit_result(r: &ScanResult, config: &ScanConfig, has_progress: bool) -> std::io::Result<()> {
     match config.format() {
         OutputFormat::Terminal => {
             output::print_ps_result(r, has_progress, config.extra());
+            Ok(())
         }
         // Serialized before stdout is locked, so a slow serialization never
         // holds up another thread's line.
-        OutputFormat::Json => match serde_json::to_vec(&r.envelope_ref()) {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                let _ = std::io::stdout().lock().write_all(&bytes);
-            }
-            Err(e) => tracing::error!(path = %r.path, "failed to serialize scan result: {e}"),
-        },
-        OutputFormat::Tiny => {
-            if let Err(e) = crate::engine::write_tiny(&mut std::io::stdout().lock(), r) {
-                tracing::error!(path = %r.path, "failed to write scan result: {e}");
-            }
+        OutputFormat::Json => {
+            let mut bytes = serde_json::to_vec(&r.envelope_ref())?;
+            bytes.push(b'\n');
+            std::io::stdout().lock().write_all(&bytes)
         }
+        OutputFormat::Tiny => crate::engine::write_tiny(&mut std::io::stdout().lock(), r),
         // The LLM payload verbatim — no verdict line, no PID annotations.
-        OutputFormat::Interpret => {
-            let _ = std::io::stdout()
-                .lock()
-                .write_all(r.rendered_context.as_bytes());
-        }
+        OutputFormat::Interpret => std::io::stdout()
+            .lock()
+            .write_all(r.rendered_context.as_bytes()),
     }
 }
 

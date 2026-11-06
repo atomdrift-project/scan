@@ -3,12 +3,31 @@ use super::{
     ExtractContext, FeatureWriter, HashSet, MIN_CONFIDENCE, ParsedReport, RawNeeds, Result,
 };
 
-fn words(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| word.len() >= 2 && word.bytes().any(|c| c.is_ascii_alphabetic()))
-        .map(str::to_owned)
-        .collect()
+/// Add the keywords of `text` to `into`: lowercased runs of ASCII letters and
+/// digits, at least two long and holding a letter.
+///
+/// Lowercasing comes first and is Unicode-aware, matching the Python reference
+/// (`str.lower()`): `K` (U+212A) becomes `k`, so it extends an ASCII word,
+/// and `İ` becomes `i` plus a combining dot, which ends one. ASCII text skips
+/// that copy, and a word already in the set costs no allocation.
+fn add_words(text: &str, into: &mut HashSet<String>) {
+    let lowered;
+    let text = if text.is_ascii() {
+        text
+    } else {
+        lowered = text.to_lowercase();
+        &lowered
+    };
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if word.len() < 2 || !word.bytes().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if word.bytes().any(|c| c.is_ascii_uppercase()) {
+            into.insert(word.to_ascii_lowercase());
+        } else if !into.contains(word) {
+            into.insert(word.to_owned());
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -25,9 +44,7 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
     if needs.context_keywords {
         // The typed reader has already decoded byte text and legacy Z85.
         for window in &file.context {
-            result
-                .context
-                .extend(words(&String::from_utf8_lossy(&window.data)));
+            add_words(&String::from_utf8_lossy(&window.data), &mut result.context);
         }
     }
     if !needs.rule_keywords && !needs.description_keywords && !needs.full_rule_keywords {
@@ -48,10 +65,10 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
                 || finding.id.rsplit('/').next().unwrap_or(""),
                 |(_, relative)| relative,
             );
-            result.ids.extend(words(relative));
+            add_words(relative, &mut result.ids);
         }
         if needs.full_rule_keywords {
-            result.full_ids.extend(words(&finding.id));
+            add_words(&finding.id, &mut result.full_ids);
         }
         if needs.description_keywords {
             if finding
@@ -63,7 +80,7 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
                     result.error = Some(finding.id.clone());
                 }
             } else {
-                result.descriptions.extend(words(&finding.description));
+                add_words(&finding.description, &mut result.descriptions);
             }
         }
     }
@@ -128,9 +145,21 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn words_lowercase_like_python_before_splitting() {
+        let mut got = HashSet::new();
+        add_words("Hello WORLD hello x1 42 a ab", &mut got);
+        // U+212A KELVIN SIGN lowercases to ASCII `k`; U+0130 lowercases to
+        // `i` plus a combining dot, which splits the word.
+        add_words("\u{212A}ey \u{130}stanbul", &mut got);
+        let mut got: Vec<_> = got.into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["ab", "hello", "key", "stanbul", "world", "x1"]);
+    }
+
+    #[test]
     fn keywords_match_python_fixture_and_preserve_base_abi() -> Result<()> {
         let cases: Vec<serde_json::Value> =
-            serde_json::from_str(include_str!("keyword_parity.json"))?;
+            serde_json::from_str(include_str!("../../testdata/features/keyword_parity.json"))?;
         for case in cases {
             let spec: FeatureSpec = serde_json::from_value(case["spec"].clone())?;
             spec.validate()?;
@@ -177,8 +206,9 @@ mod tests {
 
     #[test]
     fn every_keyword_source_combination_matches_python() -> Result<()> {
-        let cases: Vec<serde_json::Value> =
-            serde_json::from_str(include_str!("keyword_combinations_parity.json"))?;
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../testdata/features/keyword_combinations_parity.json"
+        ))?;
         assert_eq!(cases.len(), 31 * 9);
         for case in cases {
             let spec: FeatureSpec = serde_json::from_value(case["spec"].clone())?;
@@ -203,7 +233,7 @@ mod tests {
     #[test]
     fn shared_parse_validates_descriptions_only_for_models_that_use_them() -> Result<()> {
         let cases: Vec<serde_json::Value> =
-            serde_json::from_str(include_str!("keyword_parity.json"))?;
+            serde_json::from_str(include_str!("../../testdata/features/keyword_parity.json"))?;
         let case = cases
             .iter()
             .find(|case| case["name"] == "missing-description")
@@ -228,8 +258,9 @@ mod tests {
 
     #[test]
     fn extended_sources_match_python_with_both_context_encodings() -> Result<()> {
-        let cases: Vec<serde_json::Value> =
-            serde_json::from_str(include_str!("extended_keyword_parity.json"))?;
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../testdata/features/extended_keyword_parity.json"
+        ))?;
         for case in cases {
             let spec: FeatureSpec = serde_json::from_value(case["spec"].clone())?;
             spec.validate()?;

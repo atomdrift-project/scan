@@ -7,7 +7,7 @@ Atomdrift Scan is a modern ML-based malware scanner designed to detect 0-day att
 
 It's designed to be deterministic, fast, and flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. 
 
-As of October 2026, Atomdrift Scan has a [82%+ 0-day detection rate](https://atomdrift.org/compare/), +23% ahead of any other scanner: commercial or open.
+Rather than waiting for someone to report a sample and publish its signature or hash, Atomdrift Scan judges never-before-seen code by what it does. See [how it compares](https://atomdrift.org/compare/) with other scanners.
 
 <p align="center">
   <img src="media/screenshot.png" alt="Atomdrift Scan terminal output" width="760">
@@ -25,7 +25,7 @@ Most importantly, rules are constantly refreshed using reinforcement learning ag
 
 ## Install
 
-If you are an a UNIX-flavored host (macOS, Linux, BSD, Solaris, illumos, Android):
+If you are on a UNIX-flavored host (macOS, Linux, BSD, illumos, Android):
 
 ```bash
 curl -fsSL https://install.atomdrift.org/scan.sh | sh
@@ -171,7 +171,7 @@ The rule set includes platform-specific behaviors for Linux, macOS, Windows,
 Android, iOS, the BSDs, AIX, Solaris, QNX, z/OS, ESXi, OpenWrt, VxWorks,
 RouterOS, FortiOS, PAN-OS, IOS-XE, Junos, NetScaler, and Ivanti appliances.
 
-The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, illumos, Solaris, and Windows across several CPU architectures. Test depth
+The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, illumos, and Windows on 64-bit CPUs. Test depth
 varies by target; see the [build workflow](.github/workflows/build.yml) for the
 current matrix.
 
@@ -212,13 +212,19 @@ an interrupted training run never counts as a passing benchmark. Set
 
 Atomdrift Scan is available under the [Apache License 2.0](LICENSE).
 
+Release binaries also bundle third-party code under its own licenses, listed in
+the `THIRD_PARTY_LICENSES` file inside every release archive. That includes
+UnRAR (compiled in through the `unrar-ng-sys` crate), which is distributed
+under the UnRAR license: its source may be used to handle RAR archives, but
+not to develop a RAR-compatible archiver or to re-create the RAR compression
+algorithm.
+
 All contributions welcome!
 
 ## NSRL Modern allowlist
 
 NSRL's separate, independently versioned Bloom bundle installs with
-`atomscan update-rules` (`--check` checks availability without fetching the
-large filter). The initial download is approximately 512 MiB at the current
+`atomscan update-rules`. The initial download is approximately 512 MiB at the current
 corpus size. The daily rules check also installs and refreshes it, downloading
 filter bytes only when its own NSRL manifest changes.
 Pulsar publishes it under `litmus/nsrl/modern/v1/`, independently of the daily

@@ -194,12 +194,14 @@ mod capture {
         }
         SLOT_TID[idx].store(super::os_thread_id(), Ordering::Relaxed);
         let mut frames = 0usize;
-        // SAFETY: `trace_unsynchronized` requires that no other thread run
-        // `backtrace` concurrently with it in a way that races its caches;
-        // `DUMPING` admits one dump at a time and each target thread walks
-        // only its own stack. The closure only stores integers into
-        // preallocated atomics. The unwinder itself is not async-signal-safe,
-        // which the module docs accept for a process already being dumped.
+        // SAFETY: `trace_unsynchronized` must not run on two threads at once.
+        // `DUMPING` admits one dump at a time, and the dumper signals one
+        // thread, waits for its `DONE`, and only then signals the next; a
+        // thread that misses the deadline ends the signalling, so a late
+        // handler still runs alone. The closure only stores integers into
+        // preallocated atomics. A `backtrace` call elsewhere in the process
+        // could still overlap, and the unwinder is not async-signal-safe;
+        // the module docs accept both for a process already being dumped.
         unsafe {
             backtrace::trace_unsynchronized(|frame| {
                 if frames < MAX_FRAMES {
@@ -318,17 +320,24 @@ fn write_registered_backtraces(out: &mut impl Write) {
     capture::DONE.store(0, Ordering::Release);
     capture::CAPTURING.store(true, Ordering::Release);
 
-    let signalled = targets
-        .iter()
-        .filter(|&&tid| capture::signal_thread(tid))
-        .count();
-
-    // Wait for the signalled threads to record their slots, bounded so a thread
-    // that never returns from the kernel can't stall the dump. Polled: a signal
-    // handler can only report back through atomics.
+    // One capture at a time (see `on_capture`): signal a thread, wait for it
+    // to record its slot, then the next. Bounded overall, so a thread that
+    // never returns from the kernel can't stall the dump; once one misses the
+    // deadline, no other is signalled. Polled: a signal handler can only
+    // report back through atomics.
     let deadline = Instant::now() + Duration::from_secs(2);
-    while capture::DONE.load(Ordering::Acquire) < signalled && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
+    let mut signalled = 0;
+    for &tid in &targets {
+        if !capture::signal_thread(tid) {
+            continue;
+        }
+        signalled += 1;
+        while capture::DONE.load(Ordering::Acquire) < signalled && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if capture::DONE.load(Ordering::Acquire) < signalled {
+            break;
+        }
     }
     capture::CAPTURING.store(false, Ordering::Release);
 

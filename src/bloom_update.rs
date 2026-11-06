@@ -169,6 +169,14 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 /// manifest beside them as the sidecar.
 fn stage(staging: &Path, http: &bundle::Http, remote: &Published) -> Result<()> {
     let Published { manifest, prefix } = remote;
+    // The build date is what the rollback guard orders bundles by; a manifest
+    // without one could replace newer filters with older ones unnoticed.
+    if crate::output::parse_ymd(&manifest.built).is_none() {
+        bail!(
+            "bloom manifest has no valid build date ({:?}); refusing to install",
+            manifest.built
+        );
+    }
     for (stem, entry) in &manifest.filter {
         // A version this build cannot read is a real stop, not something to
         // work around: the layout would have to be guessed at. Fail closed and
@@ -229,9 +237,23 @@ mod tests {
         assert!(rolls_back(&installed, &built("2026-09-30")));
         assert!(!rolls_back(&installed, &built("2026-10-09")));
         assert!(!rolls_back(&installed, &built("2026-10-10")));
-        // Malformed dates never block an update: the guard only reads what it
-        // can order.
+        // The guard only orders well-formed dates; `stage` refuses a remote
+        // manifest without one, so only a damaged install reads as unknown.
         assert!(!rolls_back(&installed, &built("")));
         assert!(!rolls_back(&built("unknown"), &built("2020-01-01")));
+    }
+
+    #[test]
+    fn a_manifest_without_a_build_date_is_refused() {
+        let staging = tempfile::tempdir().expect("tempdir");
+        let http = bundle::Http::once(reqwest::blocking::Client::new());
+        for date in ["", "unknown", "2026-13-40"] {
+            let remote = Published {
+                manifest: built(date),
+                prefix: "v2".to_owned(),
+            };
+            let err = stage(staging.path(), &http, &remote).expect_err(date);
+            assert!(err.to_string().contains("no valid build date"), "{err}");
+        }
     }
 }

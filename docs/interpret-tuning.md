@@ -37,7 +37,7 @@ below) turned real droppers/stealers into benign false-negatives.
 There is deliberately **no template flag**: earlier tuning grew a
 `--interpret-template` with five render variants (`full`/`adaptive`/`pointer`/
 `elevated`/`raw`), but the variants were experiment arms, not product surface, and
-the offline harness (`hacks/interpret-tune/tune.py`) can sweep render/prompt
+the offline harness (`scripts/hacks/interpret-tune/tune.py`) can sweep render/prompt
 variants without any Rust-side switch. The verdict cache key includes the system
 prompt, so editing the prompt keys fresh verdicts rather than replaying old ones.
 
@@ -47,8 +47,8 @@ prompt; a downstream consumer should frame the descriptions with the same hedge.
 
 ## Historical measurements (two 30-sample batches, ground truth by manual RE incl. rizin/deobfuscation)
 
-Labels: `hacks/interpret-tune/labels/hopper-triage.tsv` (batch 1, source-heavy) and
-`…-batch2.tsv` (batch 2, packed-binary-heavy). These runs predate the hedged
+Batch 1 was source-heavy and batch 2 packed-binary-heavy; their hand-made
+label files are not part of this repository. These runs predate the hedged
 prompt and motivated it:
 
 | experiment arm | batch 1 (source) | batch 2 (binary) |
@@ -65,7 +65,7 @@ prompt and motivated it:
   escaped bytes, so `pointer` strips the only readable signal and turns real
   droppers/crypters/stealers into benign false-negatives.
 - The shipped `described` prompt aims to win both by keeping the prose and
-  hedging it; validate it against these baselines with the harness
+  hedging it; validate it against your own labelled batches with the harness
   (`tune.py --templates described,full,pointer`) when the labels or prompt change.
 - Residuals are borderline and in the safe direction: a crypto **donations** list
   reads as suspicious; dual-use hacktools (neutron, hcxdumptool) read as
@@ -413,7 +413,7 @@ sidecars — identity comes from `--registry-map`, built with
 
 ## Validating / tuning on a new batch
 
-The harness is `hacks/interpret-tune/tune.py`; the workflow is:
+The harness is `scripts/hacks/interpret-tune/tune.py`; the workflow is:
 
 1. Capture the LLM render per file with `atomscan -f interpret` (no
    `--llm` / LLM calls needed), or let `tune.py` do it for you.

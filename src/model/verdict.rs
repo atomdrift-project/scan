@@ -247,7 +247,7 @@ impl Thresholds {
 /// cutoff; `class = Suspicious` iff `probability >= threshold` for the
 /// Suspicious cutoff; `class = Benign` iff `probability < threshold`, where
 /// `threshold` is the Suspicious cutoff the score did not reach.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Decision {
     /// Classification outcome.
     pub class: Classification,

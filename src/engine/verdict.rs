@@ -215,16 +215,14 @@ pub(super) fn worst_member(evals: &MemberEvals) -> Option<Decision> {
 
 /// The worst verdict the *model alone* reached across an archive's members.
 ///
-/// Members the trait floor raised contribute nothing here, and correctly so:
-/// the floor fires only on a model-Benign decision, so on those members the
-/// model's own reading was benign. Everywhere else the stored verdict is the
-/// model's, untouched. `None` means no member was scored at all, which is not
-/// the same as every member being clean.
+/// A member the trait floor raised contributes the decision the model reached
+/// before the floor; every other member's stored verdict is the model's,
+/// untouched. `None` means no member was scored at all, which is not the same
+/// as every member being clean.
 pub(super) fn worst_member_model(evals: &MemberEvals) -> Option<Decision> {
     evals
         .values()
-        .filter(|member| member.floor.is_none())
-        .map(EmbeddedFile::decision)
+        .map(|member| member.floor.map_or_else(|| member.decision(), |f| f.model))
         .reduce(graver)
 }
 
@@ -439,6 +437,8 @@ pub struct FloorDecision {
     pub suspicious: u32,
     /// Trait families the firing arm measured its evidence across.
     pub families: usize,
+    /// The decision the model reached before the floor raised it.
+    pub model: Decision,
 }
 
 impl FloorDecision {
@@ -468,8 +468,8 @@ impl FloorDecision {
     }
 }
 
-/// Trait floor: override a model-**Benign** verdict when cleave surfaced
-/// high-criticality evidence the model did not act on:
+/// Trait floor: raise a model verdict when cleave surfaced high-criticality
+/// evidence the model did not act on:
 ///   - a hostile (crit-5) trait, corroborated by enough further severe findings
 ///     to reach `TRAIT_FLOOR_HOSTILE_SEVERE` across
 ///     `TRAIT_FLOOR_HOSTILE_FAMILIES` trait families → **Hostile**
@@ -480,25 +480,23 @@ impl FloorDecision {
 /// and both measure evidence by the families it comes from, so one behavior
 /// spelled several ways cannot corroborate itself.
 ///
-/// This is a backstop for model misses, not a second opinion: it fires only on
-/// a model-Benign verdict, and every threshold above is deliberately set where
-/// a lone mislabeled trait — or a cluster of near-duplicate ones — cannot reach
-/// it alone.
+/// This is a backstop for model misses, not a second opinion: every threshold
+/// above is deliberately set where a lone mislabeled trait — or a cluster of
+/// near-duplicate ones — cannot reach it alone.
 ///
-/// Never lowers a model verdict, and `None` here means "the floor had nothing
-/// to add", never "benign". Override levels are pinned to the same band
+/// Monotone: the floor fires whenever its class is graver than the model's, so
+/// evidence that makes a model-Benign file hostile makes a model-Suspicious one
+/// hostile too. It never lowers a model verdict, and `None` here means "the
+/// floor had nothing to add", never "benign". Override levels are pinned to the same band
 /// boundaries used by ordinary and interpreted verdicts, so a level-only
 /// downstream consumer cannot reinterpret the override as another class.
 #[must_use]
 fn trait_floor(
     findings: &[CompactTrait],
-    model_class: Classification,
+    model: Decision,
     active_level: Option<u16>,
     grid_max: u16,
 ) -> Option<FloorDecision> {
-    if model_class != Classification::Benign {
-        return None;
-    }
     let counts = trait_floor_counts(findings);
     // Whether cleave confidently recognized this sample as a named application,
     // library, tool or known dual-use utility. A sample cleave can name is one
@@ -525,11 +523,11 @@ fn trait_floor(
     } else {
         TRAIT_FLOOR_HOSTILE_CRIT5
     };
-    if counts.hostile >= required_crit5
+    let floor = if counts.hostile >= required_crit5
         && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
         && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
     {
-        return Some(FloorDecision {
+        FloorDecision {
             class: Classification::Hostile,
             confidence: counts.hostile_confidence,
             level: interpreted_level(active_level, grid_max, Classification::Hostile, true),
@@ -538,10 +536,10 @@ fn trait_floor(
             suspicious: counts.suspicious,
             // The hostile arm's diversity test spans both severe tiers.
             families: counts.severe_families.len(),
-        });
-    }
-    if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
-        return Some(FloorDecision {
+            model,
+        }
+    } else if counts.suspicious_families.len() >= TRAIT_FLOOR_SUSPICIOUS_FAMILIES {
+        FloorDecision {
             class: Classification::Suspicious,
             confidence: counts.suspicious_confidence,
             // The crit-4 arm by definition lacked the crit-5 anchor, but a lone
@@ -557,23 +555,25 @@ fn trait_floor(
             suspicious: counts.suspicious,
             // The suspicious arm measures diversity among the crit-4s alone.
             families: counts.suspicious_families.len(),
-        });
-    }
-    None
+            model,
+        }
+    } else {
+        return None;
+    };
+    (floor.class > model.class).then_some(floor)
 }
 
 /// Apply [`trait_floor`] to a decision in place, and say so in the log.
 ///
-/// The model graded these benign yet cleave is confident they carry severe
-/// traits — a model gap worth investigating. INFO keeps it visible in
+/// The model graded these below what cleave's confident severe traits support —
+/// a model gap worth investigating. INFO keeps it visible in
 /// serve mode (`scan=info`) without spamming default CLI runs
 /// (`scan=warn`).
 ///
 /// Returns what the floor did, so a caller reporting the model and the floor
-/// as separate opinions can tell which of them convicted a file. Callers that
-/// only want the verdict ignore it. Because the floor fires only on a
-/// model-Benign decision, "the floor fired here" is also the whole record of
-/// what the model said: benign.
+/// as separate opinions can tell which of them convicted a file; the returned
+/// [`FloorDecision::model`] is what the model said. Callers that only want the
+/// verdict ignore it.
 pub(super) fn apply_trait_floor(
     decision: &mut Decision,
     findings: &[CompactTrait],
@@ -581,7 +581,7 @@ pub(super) fn apply_trait_floor(
     grid_max: u16,
     label: &str,
 ) -> Option<FloorDecision> {
-    let floor = trait_floor(findings, decision.class, active_level, grid_max)?;
+    let floor = trait_floor(findings, *decision, active_level, grid_max)?;
     decision.class = floor.class;
     decision.probability = floor.confidence;
     decision.level = floor.level;
@@ -591,6 +591,7 @@ pub(super) fn apply_trait_floor(
     tracing::info!(
         path = %label,
         arm = floor.arm.as_str(),
+        model_class = %floor.model.class,
         escalated_to = %floor.class,
         confident_hostile = floor.hostile,
         confident_suspicious = floor.suspicious,
@@ -598,7 +599,7 @@ pub(super) fn apply_trait_floor(
         families = floor.families,
         trait_confidence = format!("{:.3}", floor.confidence),
         level = ?floor.level,
-        "TRAIT FLOOR: model said benign but cleave found corroborated severe traits",
+        "TRAIT FLOOR: cleave found corroborated severe traits the model graded lower",
     );
     Some(floor)
 }
@@ -983,7 +984,7 @@ mod tests {
         // Two anchors plus a further severe finding, across three families.
         let mut ts = spread(5, 0.98, 2);
         ts.extend([finding("execution", 4, 0.94)]);
-        let floor = trait_floor(&ts, Classification::Benign, Some(50), 100)
+        let floor = trait_floor(&ts, benign(), Some(50), 100)
             .expect("corroborated crit-5 evidence must reach the hostile arm");
 
         assert_eq!(floor.arm, FloorArm::Crit5);
@@ -999,7 +1000,7 @@ mod tests {
 
     #[test]
     fn the_reported_floor_counts_the_suspicious_arms_own_families() {
-        let floor = trait_floor(&spread(4, 0.9, 3), Classification::Benign, Some(50), 100)
+        let floor = trait_floor(&spread(4, 0.9, 3), benign(), Some(50), 100)
             .expect("three confident crit-4 families must reach the suspicious arm");
 
         assert_eq!(floor.arm, FloorArm::Crit4);
@@ -1014,17 +1015,47 @@ mod tests {
         // A caller reading the floor separately from the model must be able to
         // tell "the floor was silent" from "the floor said benign" — it never
         // says benign, and a silent floor must not be read as a clean bill.
-        assert!(trait_floor(&spread(4, 0.9, 2), Classification::Benign, Some(50), 100).is_none());
-        assert!(trait_floor(&[], Classification::Benign, Some(50), 100).is_none());
+        assert!(trait_floor(&spread(4, 0.9, 2), benign(), Some(50), 100).is_none());
+        assert!(trait_floor(&[], benign(), Some(50), 100).is_none());
+    }
+
+    fn model_says(class: Classification) -> Decision {
+        Decision { class, ..benign() }
     }
 
     #[test]
     fn the_floor_declines_a_verdict_the_model_already_reached() {
         for already in [Classification::Suspicious, Classification::Hostile] {
             assert!(
-                trait_floor(&spread(4, 0.9, 5), already, Some(50), 100).is_none(),
+                trait_floor(&spread(4, 0.9, 5), model_says(already), Some(50), 100).is_none(),
                 "the floor is a backstop for model misses, not a second opinion"
             );
+        }
+        let mut hostile_evidence = spread(5, 0.98, 2);
+        hostile_evidence.push(finding("execution", 4, 0.94));
+        assert!(
+            trait_floor(
+                &hostile_evidence,
+                model_says(Classification::Hostile),
+                Some(50),
+                100
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_floor_is_monotone_in_the_model_verdict() {
+        // Evidence that convicts a model-Benign file must convict a
+        // model-Suspicious one: a model that leans further toward hostile can
+        // never be the way past the hostile arm.
+        let mut hostile_evidence = spread(5, 0.98, 2);
+        hostile_evidence.push(finding("execution", 4, 0.94));
+        for model in [Classification::Benign, Classification::Suspicious] {
+            let floor = trait_floor(&hostile_evidence, model_says(model), Some(50), 100)
+                .expect("corroborated crit-5 evidence fires the hostile arm");
+            assert_eq!(floor.class, Classification::Hostile);
+            assert_eq!(floor.model.class, model, "the model's own reading is kept");
         }
     }
 
@@ -1052,7 +1083,7 @@ mod tests {
         for findings in shapes {
             let mut applied = benign();
             apply_trait_floor(&mut applied, &findings, Some(50), 100, "test");
-            let reported = trait_floor(&findings, Classification::Benign, Some(50), 100);
+            let reported = trait_floor(&findings, benign(), Some(50), 100);
 
             match reported {
                 Some(floor) => {
@@ -1212,6 +1243,7 @@ mod tests {
             hostile: 2,
             suspicious: 1,
             families: 3,
+            model: benign(),
         }
     }
 
@@ -1243,11 +1275,10 @@ mod tests {
     }
 
     #[test]
-    fn a_floored_member_contributes_nothing_to_the_models_own_reading() {
-        // The member's stored verdict is hostile, but the floor put it there —
-        // so the model's reading of that member was benign, and a caller
-        // reporting the model separately must not be handed the floor's work
-        // as if the model had done it.
+    fn a_floored_member_contributes_the_models_own_reading() {
+        // The member's stored verdict is hostile, but the floor put it there:
+        // a caller reporting the model separately gets the model's reading of
+        // that member, never the floor's work as if the model had done it.
         let table = evals(vec![member(
             1,
             Classification::Hostile,
@@ -1258,9 +1289,10 @@ mod tests {
             worst_member(&table).map(|d| d.class),
             Some(Classification::Hostile)
         );
-        assert!(
-            worst_member_model(&table).is_none(),
-            "every member was floored, so the model convicted nobody"
+        assert_eq!(
+            worst_member_model(&table).map(|d| d.class),
+            Some(Classification::Benign),
+            "the model graded the floored member benign"
         );
     }
 

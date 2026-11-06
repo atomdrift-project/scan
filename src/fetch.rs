@@ -209,7 +209,7 @@ pub(crate) fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
 /// deletion, though a young release can still gain *other* files.
 ///
 /// Only for a cache keyed by that exact file, such as a URL's alias. The
-/// corpus, the bloom filters and isotope13 key a PURL by its release and drop
+/// corpus, the bloom filters and Uplink key a PURL by its release and drop
 /// `file_name`, so there a young release must stay mutable: one file's verdict
 /// must not vouch for a different file added to it later.
 pub(crate) fn immutable_file(purl: &str) -> bool {

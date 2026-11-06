@@ -85,12 +85,6 @@ fn affirmative(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes")
 }
 
-fn matching_traits_version(stored: Option<&str>, local: Option<&str>) -> bool {
-    stored
-        .zip(local)
-        .is_some_and(|(stored, local)| stored == local)
-}
-
 impl V1Query {
     /// Fold the header alias into the parsed query. Either spelling opts in;
     /// neither can opt back out, so a proxy that adds the header cannot be
@@ -748,7 +742,7 @@ async fn refresh(state: &Arc<AppState>, req: &V1Analyze) -> Response {
             .await
             .ok()
             .flatten();
-        if matching_traits_version(record.traits_version.as_deref(), local) {
+        if crate::corpus_precheck::same_analyzer(&record, local) {
             let decided = V1Decision::corpus(&record, Some(&sha), None, req.budget);
             let mut resp = answered(decided, corpus_source(source), req.elapsed_ms());
             insert_follow(

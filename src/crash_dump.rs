@@ -62,6 +62,7 @@ mod imp {
     /// stack overflow `abort()`s without unwinding, so the entry is still live
     /// when the handler runs — which is exactly what we want to report.
     #[derive(Debug)]
+    #[must_use = "the analysis is unregistered as soon as the guard drops"]
     pub struct Guard {
         slot: Option<usize>,
     }
@@ -77,6 +78,7 @@ mod imp {
     /// Record an analysis as in flight. The line is formatted here, on the
     /// normal worker thread; the signal handler only ever copies bytes and
     /// calls `write(2)`, both async-signal-safe.
+    #[must_use = "the analysis is unregistered as soon as the guard drops"]
     pub fn register(analysis_id: u64, thread_id: u64, sha: &str, file: &str) -> Guard {
         let mut buf = [0u8; LINE];
         // The name is the caller's (an upload's filename, a member path), and

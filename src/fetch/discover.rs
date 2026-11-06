@@ -667,223 +667,21 @@ pub(super) struct LocalNpmPackages {
 
 impl LocalNpmPackages {
     pub(super) fn from_report(report: &AnalysisReport) -> Self {
-        let roots = report
-            .files
-            .iter()
-            .filter_map(|file| npm_package_root(&file.path))
-            .collect();
-        let mut declarations = HashMap::new();
-        let paths: HashSet<_> = report
+        // Every path whose analysis has gaps.
+        let incomplete: HashSet<String> = report
             .files
             .iter()
             .filter(|f| !f.analysis_gaps.is_empty())
             .map(|f| f.path.replace('\\', "/"))
             .collect();
-        let analyzed: HashSet<_> = report
-            .files
-            .iter()
-            .filter(|f| f.analysis_gaps.is_empty())
-            .map(|f| f.path.replace('\\', "/"))
-            .collect();
-        for file in &report.files {
-            let Some(root) = npm_package_root(&file.path) else {
-                continue;
-            };
-            let Some(view) = &file.filefacts else {
-                continue;
-            };
-            let Some(npm) = view.values.get("npm") else {
-                continue;
-            };
-            let Some(name) = npm.get("name").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Some(version) = npm.get("version").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let targets: Vec<_> = view
-                .references
-                .iter()
-                .filter_map(|r| match &r.locator {
-                    RefLocator::Path(path)
-                        if r.kind == RefKind::Local && r.source.starts_with("package.json:") =>
-                    {
-                        Some(path)
-                    }
-                    _ => None,
-                })
-                .collect();
-            // A manifest/README alone is not supplied executable code. Require
-            // a captured entry point and all declared entry points, with no
-            // incomplete member under this package. Wildcard-only exports and
-            // implicit index.js deliberately remain external until established.
-            if targets.is_empty()
-                || !file.analysis_gaps.is_empty()
-                || paths.iter().any(|path| {
-                    path.strip_prefix(root.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-                })
-            {
-                continue;
-            }
-            let complete = targets.iter().all(|target| {
-                let Some(path) = safe_package_path(&root, target) else {
-                    return false;
-                };
-                analyzed.contains(&path)
-                    || (std::path::Path::new(&path).extension().is_none()
-                        && [".js", ".json", "/index.js"]
-                            .iter()
-                            .any(|ext| analyzed.contains(&format!("{path}{ext}"))))
-            });
-            if complete {
-                declarations.insert(root, (name.to_owned(), version.to_owned()));
-            }
-        }
-        // An exact literal Yarn workspace declaration is stronger evidence of
-        // local resolution than a same-named registry record. Only use complete
-        // members with captured source; ambiguous/globbed workspaces remain
-        // unresolved rather than silently suppressing a registry investigation.
-        let mut workspaces = Vec::new();
-        let archive_incomplete = report
-            .files
-            .first()
-            .is_some_and(|f| !f.analysis_gaps.is_empty());
-        let by_path: HashMap<_, _> = report
-            .files
-            .iter()
-            .map(|f| (f.path.replace('\\', "/"), f))
-            .collect();
-        let mut seen = HashSet::new();
-        let duplicates: HashSet<_> = report
-            .files
-            .iter()
-            .filter_map(|f| {
-                let path = f.path.replace('\\', "/");
-                (!seen.insert(path.clone())).then_some(path)
-            })
-            .collect();
-        for file in &report.files {
-            let path = file.path.replace('\\', "/");
-            if !(path.ends_with("/package.json") || path.ends_with("!!package.json"))
-                || !file.analysis_gaps.is_empty()
-                || duplicates.contains(&path)
-            {
-                continue;
-            }
-            let Some(view) = &file.filefacts else {
-                continue;
-            };
-            if view
-                .values
-                .get("private")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-            {
-                continue;
-            }
-            if view
-                .values
-                .get("packageManager")
-                .is_some_and(|v| !v.as_str().is_some_and(|s| s.starts_with("yarn@")))
-            {
-                continue;
-            }
-            let Some(entries) = view
-                .values
-                .get("workspaces")
-                .and_then(serde_json::Value::as_array)
-            else {
-                continue;
-            };
-            // Do not ignore negative or wildcard patterns: an unsupported
-            // pattern could exclude a literal member or introduce ambiguity.
-            if entries.iter().any(|entry| {
-                entry
-                    .as_str()
-                    .is_none_or(|entry| entry.contains(['*', '?', '[', ']', '!', '{', '}']))
-            }) {
-                continue;
-            }
-            let Some(root) = virtual_parent(&path) else {
-                continue;
-            };
-            // Yarn config can disable workspaces or replace resolution. The
-            // compact report does not yet retain its settings, so do not infer
-            // local resolution when such a config is captured in any ancestor.
-            let mut scope = Some(root.clone());
-            let mut has_yarn_config = false;
-            while let Some(dir) = scope {
-                if [".yarnrc", ".yarnrc.yml"].iter().any(|name| {
-                    safe_package_path(&dir, name).is_some_and(|p| by_path.contains_key(&p))
-                }) {
-                    has_yarn_config = true;
-                    break;
-                }
-                scope = virtual_parent(&dir);
-            }
-            if has_yarn_config {
-                continue;
-            }
-            let Some(lock) = safe_package_path(&root, "yarn.lock") else {
-                continue;
-            };
-            if !by_path
-                .get(&lock)
-                .is_some_and(|f| f.analysis_gaps.is_empty())
-                || duplicates.contains(&lock)
-            {
-                continue;
-            }
-            let mut members = HashMap::new();
-            for entry in entries {
-                let Some(entry) = entry.as_str() else {
-                    continue;
-                };
-                let Some(member) = safe_package_path(&root, entry) else {
-                    continue;
-                };
-                if duplicates.contains(&format!("{member}/package.json")) {
-                    continue;
-                }
-                let Some(manifest) = by_path.get(&format!("{member}/package.json")) else {
-                    continue;
-                };
-                let Some(info) = manifest
-                    .filefacts
-                    .as_ref()
-                    .and_then(|v| v.values.get("npm"))
-                else {
-                    continue;
-                };
-                let Some(name) = info.get("name").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let Some(version) = info.get("version").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let prefix = format!("{member}/");
-                let present = by_path.iter().any(|(p, _)| {
-                    p.starts_with(&prefix)
-                        && !is_vendored_node_module(p.strip_prefix(&prefix).unwrap_or(p))
-                        && p != &format!("{member}/package.json")
-                        && [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
-                            .iter()
-                            .any(|ext| p.ends_with(ext))
-                });
-                let incomplete = archive_incomplete || paths.iter().any(|p| p.starts_with(&prefix));
-                if present && manifest.analysis_gaps.is_empty() {
-                    members.insert(member, (name.to_owned(), version.to_owned(), incomplete));
-                }
-            }
-            if !members.is_empty() {
-                workspaces.push(members);
-            }
-        }
         Self {
-            roots,
-            declarations,
-            workspaces,
+            roots: report
+                .files
+                .iter()
+                .filter_map(|file| npm_package_root(&file.path))
+                .collect(),
+            declarations: vendored_declarations(report, &incomplete),
+            workspaces: yarn_workspaces(report, &incomplete),
         }
     }
 
@@ -1018,6 +816,227 @@ impl LocalNpmPackages {
         }
         false
     }
+}
+
+/// Vendored packages under `node_modules` whose manifest and every declared
+/// entry point were analyzed without gaps, keyed by package root.
+fn vendored_declarations(
+    report: &AnalysisReport,
+    incomplete: &HashSet<String>,
+) -> HashMap<String, (String, String)> {
+    let mut declarations = HashMap::new();
+    let analyzed: HashSet<_> = report
+        .files
+        .iter()
+        .filter(|f| f.analysis_gaps.is_empty())
+        .map(|f| f.path.replace('\\', "/"))
+        .collect();
+    for file in &report.files {
+        let Some(root) = npm_package_root(&file.path) else {
+            continue;
+        };
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
+        let Some(npm) = view.values.get("npm") else {
+            continue;
+        };
+        let Some(name) = npm.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(version) = npm.get("version").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let targets: Vec<_> = view
+            .references
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Path(path)
+                    if r.kind == RefKind::Local && r.source.starts_with("package.json:") =>
+                {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .collect();
+        // A manifest/README alone is not supplied executable code. Require
+        // a captured entry point and all declared entry points, with no
+        // incomplete member under this package. Wildcard-only exports and
+        // implicit index.js deliberately remain external until established.
+        if targets.is_empty()
+            || !file.analysis_gaps.is_empty()
+            || incomplete.iter().any(|path| {
+                path.strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        {
+            continue;
+        }
+        let complete = targets.iter().all(|target| {
+            let Some(path) = safe_package_path(&root, target) else {
+                return false;
+            };
+            analyzed.contains(&path)
+                || (std::path::Path::new(&path).extension().is_none()
+                    && [".js", ".json", "/index.js"]
+                        .iter()
+                        .any(|ext| analyzed.contains(&format!("{path}{ext}"))))
+        });
+        if complete {
+            declarations.insert(root, (name.to_owned(), version.to_owned()));
+        }
+    }
+    declarations
+}
+
+/// Members of explicit, captured Yarn workspaces, one map per workspace root,
+/// keyed by member path: `(name, version, incomplete)`.
+fn yarn_workspaces(
+    report: &AnalysisReport,
+    incomplete: &HashSet<String>,
+) -> Vec<HashMap<String, (String, String, bool)>> {
+    // An exact literal Yarn workspace declaration is stronger evidence of
+    // local resolution than a same-named registry record. Only use complete
+    // members with captured source; ambiguous/globbed workspaces remain
+    // unresolved rather than silently suppressing a registry investigation.
+    let mut workspaces = Vec::new();
+    let archive_incomplete = report
+        .files
+        .first()
+        .is_some_and(|f| !f.analysis_gaps.is_empty());
+    let by_path: HashMap<_, _> = report
+        .files
+        .iter()
+        .map(|f| (f.path.replace('\\', "/"), f))
+        .collect();
+    let mut seen = HashSet::new();
+    let duplicates: HashSet<_> = report
+        .files
+        .iter()
+        .filter_map(|f| {
+            let path = f.path.replace('\\', "/");
+            (!seen.insert(path.clone())).then_some(path)
+        })
+        .collect();
+    for file in &report.files {
+        let path = file.path.replace('\\', "/");
+        if !(path.ends_with("/package.json") || path.ends_with("!!package.json"))
+            || !file.analysis_gaps.is_empty()
+            || duplicates.contains(&path)
+        {
+            continue;
+        }
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
+        if view
+            .values
+            .get("private")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            continue;
+        }
+        if view
+            .values
+            .get("packageManager")
+            .is_some_and(|v| !v.as_str().is_some_and(|s| s.starts_with("yarn@")))
+        {
+            continue;
+        }
+        let Some(entries) = view
+            .values
+            .get("workspaces")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        // Do not ignore negative or wildcard patterns: an unsupported
+        // pattern could exclude a literal member or introduce ambiguity.
+        if entries.iter().any(|entry| {
+            entry
+                .as_str()
+                .is_none_or(|entry| entry.contains(['*', '?', '[', ']', '!', '{', '}']))
+        }) {
+            continue;
+        }
+        let Some(root) = virtual_parent(&path) else {
+            continue;
+        };
+        // Yarn config can disable workspaces or replace resolution. The
+        // compact report does not yet retain its settings, so do not infer
+        // local resolution when such a config is captured in any ancestor.
+        let mut scope = Some(root.clone());
+        let mut has_yarn_config = false;
+        while let Some(dir) = scope {
+            if [".yarnrc", ".yarnrc.yml"]
+                .iter()
+                .any(|name| safe_package_path(&dir, name).is_some_and(|p| by_path.contains_key(&p)))
+            {
+                has_yarn_config = true;
+                break;
+            }
+            scope = virtual_parent(&dir);
+        }
+        if has_yarn_config {
+            continue;
+        }
+        let Some(lock) = safe_package_path(&root, "yarn.lock") else {
+            continue;
+        };
+        if !by_path
+            .get(&lock)
+            .is_some_and(|f| f.analysis_gaps.is_empty())
+            || duplicates.contains(&lock)
+        {
+            continue;
+        }
+        let mut members = HashMap::new();
+        for entry in entries {
+            let Some(entry) = entry.as_str() else {
+                continue;
+            };
+            let Some(member) = safe_package_path(&root, entry) else {
+                continue;
+            };
+            if duplicates.contains(&format!("{member}/package.json")) {
+                continue;
+            }
+            let Some(manifest) = by_path.get(&format!("{member}/package.json")) else {
+                continue;
+            };
+            let Some(info) = manifest
+                .filefacts
+                .as_ref()
+                .and_then(|v| v.values.get("npm"))
+            else {
+                continue;
+            };
+            let Some(name) = info.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(version) = info.get("version").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let prefix = format!("{member}/");
+            let present = by_path.iter().any(|(p, _)| {
+                p.starts_with(&prefix)
+                    && !is_vendored_node_module(p.strip_prefix(&prefix).unwrap_or(p))
+                    && p != &format!("{member}/package.json")
+                    && [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
+                        .iter()
+                        .any(|ext| p.ends_with(ext))
+            });
+            let gaps = archive_incomplete || incomplete.iter().any(|p| p.starts_with(&prefix));
+            if present && manifest.analysis_gaps.is_empty() {
+                members.insert(member, (name.to_owned(), version.to_owned(), gaps));
+            }
+        }
+        if !members.is_empty() {
+            workspaces.push(members);
+        }
+    }
+    workspaces
 }
 
 /// A virtual member's parent stops at its archive boundary.

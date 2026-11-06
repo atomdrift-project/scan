@@ -180,16 +180,22 @@ fn read_bytes(mut file: File) -> Vec<u8> {
 #[test]
 fn update_rules_installs_models_and_traits_from_r2() {
     let fixture = Fixture::new();
-    // The fixture pins `SCAN_MODELS_DIR` at a hand-written bundle the updater
-    // leaves alone; unpinned, the models install into the data directory,
-    // wherever this platform keeps it.
+    // `SCAN_MODELS_DIR` pins a bundle the updater never touches, so unpinned
+    // the models install into the platform data directory. Elsewhere that
+    // follows the fixture's `HOME`/`XDG_DATA_HOME`; Windows resolves it as a
+    // Known Folder that ignores both, so this process finds the same one.
     let mut cmd = fixture.command(&["update-rules"]);
     cmd.env_remove("SCAN_MODELS_DIR");
     fixture.run(&mut cmd, 0, Duration::from_secs(600));
+    let data = if cfg!(windows) {
+        scan::data_dir().expect("data directory")
+    } else {
+        fixture.root.path().to_path_buf()
+    };
 
     // Fresh destinations and sidecars prove this fetched/installed bundles,
     // rather than merely succeeding after skipping a pinned directory.
-    let model_meta = walkdir::WalkDir::new(fixture.root.path())
+    let model_meta = walkdir::WalkDir::new(&data)
         .into_iter()
         .filter_map(Result::ok)
         .map(walkdir::DirEntry::into_path)
@@ -198,7 +204,10 @@ fn update_rules_installs_models_and_traits_from_r2() {
                 .is_some_and(|name| name == ".litmus-models.toml")
         })
         .expect("R2 model installation sidecar");
-    let models = model_meta.parent().unwrap().to_path_buf();
+    let models = model_meta
+        .parent()
+        .expect("sidecar has a parent")
+        .to_path_buf();
     let trait_meta = fixture.traits.join(".cleave-rules.toml");
     let model_before = fs::read(&model_meta).expect("R2 model installation sidecar");
     let traits_before = fs::read(&trait_meta).expect("R2 traits installation sidecar");

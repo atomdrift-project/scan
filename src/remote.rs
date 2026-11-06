@@ -1,10 +1,10 @@
 //! Where an artifact is judged under `--uplink`: here, or via Atomdrift Uplink.
 //!
-//! `--analyze=auto` asks isotope13 for verdicts it already holds and analyzes
+//! `--analyze=auto` asks Uplink for verdicts it already holds and analyzes
 //! locally whatever it does not know. The asking goes through
 //! [`crate::corpus_precheck`] — the same batched `/v1/lookup` negotiation, the
 //! same circuit breaker, the same fail-open rule hopper's fleet lookups use —
-//! armed against isotope13 with the subscription token. `local` never asks,
+//! armed against Uplink with the subscription token. `local` never asks,
 //! and is the reproducible mode. `remote` sends every artifact to
 //! `/v1/analyze`, uploading local files' contents.
 //!
@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::corpus_precheck::{Standing, Verdict};
 use crate::model::{Classification, Level};
 
-/// isotope13's API. Fixed: an override would let any step of a CI job send the
+/// Uplink's API. Fixed: an override would let any step of a CI job send the
 /// subscription token, and every file it is shown, somewhere else.
 pub const API_URL: &str = "https://api.isotope13.ai";
 
@@ -71,7 +71,7 @@ static RESOLVED: OnceLock<(Analyze, Option<cleave::enriched::Token>)> = OnceLock
 /// token, or `--uplink`), once, before any scan starts.
 ///
 /// `auto` on an open-source run is `local`: no new traffic for anyone who did
-/// not ask for the service. On an Uplink run, `auto` arms the isotope13
+/// not ask for the service. On an Uplink run, `auto` arms the Uplink
 /// lookups and `remote` holds the token for uploads. A missing token is asked
 /// for here, on a terminal, and checked against the rules channel before it
 /// is used.
@@ -87,7 +87,7 @@ pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
         (mode, true) => {
             let token = token()?;
             if mode == Analyze::Auto {
-                crate::corpus_precheck::configure_isotope13(token.clone());
+                crate::corpus_precheck::configure_uplink(token.clone());
             }
             (mode, Some(token))
         }
@@ -113,10 +113,10 @@ fn token() -> Result<cleave::enriched::Token> {
     cleave::rule_update::enrich()?;
     cleave::enriched::token()?
         .map(|(token, _)| token)
-        .context("isotope13 token was accepted but could not be read back")
+        .context("Uplink token was accepted but could not be read back")
 }
 
-/// The process's client for isotope13: TLS only, and no redirects, so the
+/// The process's client for Uplink: TLS only, and no redirects, so the
 /// token can reach no host but [`API_URL`]'s.
 pub(crate) fn http() -> Option<&'static reqwest::blocking::Client> {
     static HTTP: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
@@ -127,7 +127,7 @@ pub(crate) fn http() -> Option<&'static reqwest::blocking::Client> {
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("atomdrift-scan/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|e| tracing::error!(error = %e, "cannot build the isotope13 HTTP client; remote analysis disabled"))
+            .map_err(|e| tracing::error!(error = %e, "cannot build the Uplink HTTP client; remote analysis disabled"))
             .ok()
     })
     .as_ref()
@@ -195,7 +195,7 @@ pub fn classification(fires_at: Level, level: Option<u16>) -> Option<Classificat
     }
 }
 
-/// The local files isotope13 already judges, by path, and the files left to
+/// The local files Uplink already judges, by path, and the files left to
 /// analyze here, in their original order.
 ///
 /// Only files of at least [`crate::analysis::SMALL_JOB_MAX_BYTES`] are asked
@@ -204,7 +204,7 @@ pub fn classification(fires_at: Level, level: Option<u16>) -> Option<Classificat
 /// comes back with a standing verdict is answered; everything else, including
 /// every file when lookups are off or the API is unreachable, is analyzed.
 pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdict)>, Vec<PathBuf>) {
-    let Some(precheck) = crate::corpus_precheck::armed().filter(|p| p.is_isotope13()) else {
+    let Some(precheck) = crate::corpus_precheck::armed().filter(|p| p.is_uplink()) else {
         return (Vec::new(), paths);
     };
     let floor = crate::analysis::SMALL_JOB_MAX_BYTES;
@@ -237,9 +237,9 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
     (answered, rest)
 }
 
-/// The verdict isotope13 holds for a fetched artifact's bytes, under `auto`.
+/// The verdict Uplink holds for a fetched artifact's bytes, under `auto`.
 pub(crate) fn known_bytes(bytes: &[u8]) -> Option<(String, Verdict)> {
-    let precheck = crate::corpus_precheck::armed().filter(|p| p.is_isotope13())?;
+    let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
     let sha = format!("{:x}", Sha256::digest(bytes));
     match precheck.standing(&sha) {
         Standing::Adopt(verdict) => Some((sha, verdict)),
@@ -247,10 +247,10 @@ pub(crate) fn known_bytes(bytes: &[u8]) -> Option<(String, Verdict)> {
     }
 }
 
-/// The verdict isotope13 holds for a package coordinate, under `auto`, without
+/// The verdict Uplink holds for a package coordinate, under `auto`, without
 /// fetching it.
 pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
-    let precheck = crate::corpus_precheck::armed().filter(|p| p.is_isotope13())?;
+    let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
     if !public_purl(purl) {
         tracing::debug!(
             event = "remote.withheld",
@@ -283,7 +283,7 @@ pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
 
 /// What to send `/v1/analyze` under `remote`.
 pub(crate) enum Upload<'a> {
-    /// A package isotope13 fetches itself.
+    /// A package Uplink fetches itself.
     Purl(&'a str),
     /// A file's contents.
     File(&'a Path),
@@ -291,11 +291,12 @@ pub(crate) enum Upload<'a> {
     Bytes(Vec<u8>),
 }
 
-/// Have isotope13 analyze one artifact, and return its verdict and digest.
+/// Have Uplink analyze one artifact, and return its verdict and digest.
 ///
 /// The answer streams: progress frames, then one line carrying `status`, which
 /// is the answer. Anything but an `analyzed` answer is an error for this
-/// artifact — under `remote` there is no local analysis to fall back to.
+/// artifact — under `remote` there is no local analysis to fall back to — and
+/// so is an answer about bytes other than the ones uploaded.
 ///
 /// # Errors
 /// No `remote` mode, a file over the upload cap, a transport failure, or an
@@ -304,7 +305,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     let Some((Analyze::Remote, Some(token))) = RESOLVED.get() else {
         anyhow::bail!("remote analysis was not enabled");
     };
-    let http = http().context("no isotope13 HTTP client")?;
+    let http = http().context("no Uplink HTTP client")?;
     let url = format!("{API_URL}/v1/analyze");
     // Held as `Bytes` so a retry resends the body without copying it.
     let (purl, body): (Option<&str>, Option<bytes::Bytes>) = match upload {
@@ -319,7 +320,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
                 .with_context(|| format!("reading {}", path.display()))?;
             if bytes.len() as u64 > MAX_UPLOAD_BYTES {
                 anyhow::bail!(
-                    "{} is over isotope13's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --analyze=auto or --analyze=local",
+                    "{} is over Uplink's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --analyze=auto or --analyze=local",
                     path.display()
                 );
             }
@@ -328,7 +329,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
         Upload::Bytes(bytes) => {
             if bytes.len() as u64 > MAX_UPLOAD_BYTES {
                 anyhow::bail!(
-                    "artifact is {} bytes, over isotope13's {MAX_UPLOAD_BYTES}-byte upload cap",
+                    "artifact is {} bytes, over Uplink's {MAX_UPLOAD_BYTES}-byte upload cap",
                     bytes.len()
                 );
             }
@@ -337,7 +338,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
     };
     let started = std::time::Instant::now();
     // A permanent 4xx, or an answer that has begun streaming, is final.
-    let resp = crate::retry::send("isotope13 analyze", ANALYZE_RETRY_BUDGET, |_| {
+    let resp = crate::retry::send("Uplink analyze", ANALYZE_RETRY_BUDGET, |_| {
         let mut request = http
             .post(&url)
             .timeout(ANALYZE_TIMEOUT)
@@ -359,10 +360,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
         // printed to the operator's terminal.
         let mut body = String::new();
         let _ = std::io::Read::read_to_string(&mut resp.take(4096), &mut body);
-        anyhow::bail!(
-            "isotope13 refused the analysis ({status}): {:?}",
-            body.trim()
-        );
+        anyhow::bail!("Uplink refused the analysis ({status}): {:?}", body.trim());
     }
     let answer = BufReader::new(resp)
         .lines()
@@ -370,9 +368,15 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
         .find(|line| {
             serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v.get("status").is_some())
         })
-        .context("isotope13's analysis stream ended without an answer")?;
+        .context("Uplink's analysis stream ended without an answer")?;
     let (sha, verdict) =
         crate::corpus_precheck::analyzed_verdict(&answer).map_err(anyhow::Error::msg)?;
+    if let Some(body) = &body {
+        let sent = format!("{:x}", Sha256::digest(body));
+        if sent != sha {
+            anyhow::bail!("Uplink answered for {sha}, but the upload was {sent}");
+        }
+    }
     tracing::info!(
         event = "remote.analyze",
         status = status.as_u16(),

@@ -283,7 +283,7 @@ pub fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
     None
 }
 
-/// One artifact as `/v1/lookup` reports it: hopper's corpus, and isotope13's
+/// One artifact as `/v1/lookup` reports it: hopper's corpus, and Uplink's
 /// API, which speaks the same wire.
 ///
 /// Every field is optional because the corpus spans several eras of stored

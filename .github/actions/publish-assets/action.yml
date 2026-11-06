@@ -46,17 +46,21 @@ runs:
           merge-multiple: true
           path: dist
 
+      # LICENSE and THIRD_PARTY_LICENSES from build.yml's `notices` job. Every
+      # archive must carry them, so a missing artifact fails the publish.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notices
+          path: notices
+
       # `freebsd` and `cross` are continue-on-error, so a run goes green while
       # quietly shipping fewer platforms than it should. Deliberately a warning
       # rather than a failure — a broken experimental target shouldn't block the
       # ones that built — but the gap gets named instead of being invisible.
       - name: Inventory targets
         env:
-          # Keep in sync with build.yml's matrices. Windows x86-64 became a
-          # required release target after its native build and smoke tests first
-          # passed in run 30966163861. Windows ARM64 is native-built and smoked on
-          # GitHub's Windows 11 ARM runner. Solaris is release-bound now that
-          # its native build can complete the fat-LTO link with ZFS-backed swap.
+          # Keep in sync with build.yml's matrices. Windows ARM64 is
+          # native-built and smoked on GitHub's Windows 11 ARM runner.
           EXPECTED: ${{ inputs.expected }}
           REQUESTED_TARGET: ${{ inputs.requested-target }}
         shell: bash
@@ -87,17 +91,28 @@ runs:
           fi
 
       # Artifacts are named by target; releases are named by version + target.
+      # Each archive gains the license notices beside the binary. Appending to
+      # the uncompressed tar keeps the binary's entry byte-for-byte as built
+      # (and, on macOS, as signed).
       - name: Assemble
         env:
           VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -eu
+          test -s notices/LICENSE
+          test -s notices/THIRD_PARTY_LICENSES
           cd dist
           for f in atomscan-*.tar.gz; do
             target="${f#atomscan-}"
             target="${target%.tar.gz}"
-            mv "$f" "atomscan-$VERSION-$target.tar.gz"
+            tarball="atomscan-$target.tar"
+            gzip -dc "$f" > "$tarball"
+            tar -rf "$tarball" --owner=0 --group=0 --numeric-owner \
+              -C ../notices LICENSE THIRD_PARTY_LICENSES
+            gzip -n -9 -c "$tarball" > "atomscan-$VERSION-$target.tar.gz"
+            rm -f "$f" "$tarball"
+            tar -tzf "atomscan-$VERSION-$target.tar.gz"
           done
           sha256sum ./*.tar.gz > SHA256SUMS
           cat SHA256SUMS

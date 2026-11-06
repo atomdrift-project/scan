@@ -29,6 +29,7 @@ fn fetch(url: &str) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(FETCH_TIMEOUT)
+        .https_only(true)
         .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update-check HTTP client")?;

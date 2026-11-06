@@ -872,9 +872,9 @@ impl FetchSession {
         let (candidates, mutable): (Vec<String>, Vec<String>) = candidates
             .into_iter()
             .partition(|purl| immutable_coordinate(purl, ages.get(purl.as_str()).copied()));
-        // Hopper is ours; isotope13 is told only public-registry coordinates.
+        // Hopper is ours; Uplink is told only public-registry coordinates.
         // The rest are fetched and asked about by digest.
-        let candidates = if precheck.is_isotope13() {
+        let candidates = if precheck.is_uplink() {
             let (public, withheld): (Vec<String>, Vec<String>) = candidates
                 .into_iter()
                 .partition(|purl| crate::remote::public_purl(purl));

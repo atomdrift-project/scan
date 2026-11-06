@@ -331,12 +331,19 @@ fn refresh_has_one_unambiguous_wire_spelling() {
 }
 
 #[test]
-fn refresh_reuses_only_an_explicit_matching_traits_version() {
-    assert!(matching_traits_version(Some("abc12"), Some("abc12")));
-    assert!(!matching_traits_version(Some("old00"), Some("abc12")));
-    assert!(!matching_traits_version(None, Some("abc12")));
-    assert!(!matching_traits_version(Some("abc12"), None));
-    assert!(!matching_traits_version(None, None));
+fn refresh_reuses_only_a_classified_verdict_at_the_local_traits_version() {
+    use crate::corpus_precheck::same_analyzer;
+    let record =
+        |json: &str| -> crate::hopper::Record { serde_json::from_str(json).expect("record") };
+    let judged = record(r#"{"fires_at":-1,"traits_version":"abc12"}"#);
+    assert!(same_analyzer(&judged, Some("abc12")));
+    assert!(!same_analyzer(&judged, Some("old00")));
+    assert!(!same_analyzer(&judged, None));
+    assert!(!same_analyzer(&judged, Some("")));
+    assert!(!same_analyzer(&record(r#"{"fires_at":-1}"#), Some("abc12")));
+    // Held at our version but never classified: nothing to reuse.
+    let unclassified = record(r#"{"fires_at":null,"traits_version":"abc12"}"#);
+    assert!(!same_analyzer(&unclassified, Some("abc12")));
 }
 
 #[test]

@@ -406,10 +406,18 @@ impl Installer {
             }
         };
         if let Err(e) = fs::rename(staging.path(), &self.target) {
-            if had_old {
-                let _ = fs::rename(&old, &self.target);
+            let installing = format!("installing {}", self.target.display());
+            if had_old && let Err(restore) = fs::rename(&old, &self.target) {
+                // Dropping `trash` would delete the only copy left, so keep it
+                // and say where it is.
+                let _kept = trash.keep();
+                return Err(e).context(format!(
+                    "{installing}; restoring the previous bundle also failed ({restore}), \
+                     so it was left at {}",
+                    old.display()
+                ));
             }
-            return Err(e).with_context(|| format!("installing {}", self.target.display()));
+            return Err(e).context(installing);
         }
         let _ = staging.keep(); // it is the target now
         fsync(parent).with_context(|| format!("flushing {}", parent.display()))

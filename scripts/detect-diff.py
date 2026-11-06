@@ -59,7 +59,7 @@ def diff_maps(name, a, b, limit=20):
 
 
 def is_fetch_derived(path):
-    """Nodes pulled over the network by --fetch, not shipped in the corpus.
+    """Nodes pulled over the network by --follow, not shipped in the corpus.
 
     Registry provenance sidecars and fetched package payloads. Their presence
     varies run to run (transient registry failures, rate limits — measured

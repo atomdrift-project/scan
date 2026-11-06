@@ -336,13 +336,15 @@ struct CompressedProvenance {
 }
 
 impl CompressedProvenance {
+    /// The document, decompressed. These bytes were encoded in this process,
+    /// so a failure is a bug; it is logged, and the document reads as empty —
+    /// unparseable, as in [`RegistryProvenance::from_record_sources`], so no
+    /// consumer mistakes a partial one for the evidence.
     fn decode(&self) -> Vec<u8> {
-        // These bytes were encoded here and never left this process; failure
-        // is an internal invariant violation. Do not replace capture-time
-        // evidence with an empty or partial document.
-        #[expect(clippy::expect_used, reason = "in-process encoder/decoder invariant")]
-        zstd::bulk::decompress(&self.encoded, self.decoded_len)
-            .expect("internally compressed registry provenance must decode")
+        zstd::bulk::decompress(&self.encoded, self.decoded_len).unwrap_or_else(|error| {
+            tracing::error!(%error, "registry provenance could not be decompressed; dropped");
+            Vec::new()
+        })
     }
 }
 
