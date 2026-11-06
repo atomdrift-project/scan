@@ -134,8 +134,9 @@
 //! writes (`config.json`, `evaluation.json`, `route_policies.json`). Scan
 //! derives it consumer-side as a **level-table lookup**: the suspicious
 //! threshold is the hostile threshold at level
-//! `min(max_grid_level, SUSPICIOUS_LEVEL_CEILING)` (the looser-budget row in
-//! the same `levels[]` table). A manual hostile threshold (no level)
+//! `suspicious_ceiling(level, max_grid_level)` — `min(max_grid_level,
+//! max(500, 100 × level))` — or the loosest row below it when that is not a
+//! row of its own (the looser-budget row in the same `levels[]` table). A manual hostile threshold (no level)
 //! skips the derivation: the `Thresholds` struct carries
 //! `suspicious == hostile`, so `classify` only ever returns Benign or Hostile.
 //!
@@ -207,7 +208,7 @@ pub struct Model {
     /// General route's hostile threshold per level (ascending), for the
     /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
     general_grid: Vec<(u16, f32)>,
-    /// Largest grid level; suspicious cap = `capped_suspicious_level(grid_max)`.
+    /// Largest grid level; caps `suspicious_ceiling(active, grid_max)`.
     grid_max: u16,
 }
 
@@ -744,7 +745,7 @@ impl Model {
     /// identical regardless of the deploy `-l`, keeping the result
     /// cache-shareable. The active deploy level only positions the cutoffs:
     /// hostile when the swept level is <= the deploy level, suspicious when it
-    /// is <= `capped_suspicious_level(grid_max)`, else benign. A file that
+    /// is <= `suspicious_ceiling(level, grid_max)`, else benign. A file that
     /// fires at no grid level is [`Level::Clean`].
     fn decide_swept(
         &self,
@@ -809,7 +810,7 @@ impl Model {
     }
 
     /// Largest calibrated grid level, which caps the suspicious ceiling (see
-    /// `capped_suspicious_level`).
+    /// `suspicious_ceiling`).
     #[must_use]
     pub(crate) const fn grid_max(&self) -> u16 {
         self.grid_max

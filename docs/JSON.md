@@ -34,6 +34,7 @@ obvious things. The tables below are the key.
 | `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
 | `lvl`         | `level`                   | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
 | `conf`        | `conf`                    | u8 percent or null     | Pessimistic display/export confidence derived from `lvl`; `null` when no level table applies. |
+| `cls`         | `class`                   | u8 (0/1/2), optional   | Class of record when `--llm` *placed* `lvl` rather than the sweep measuring it. Omitted otherwise. See **LLM-placed levels** below. |
 | `mods`        | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
 | `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
 | `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
@@ -45,7 +46,8 @@ obvious things. The tables below are the key.
 
 ## The verdict encoding
 
-The envelope carries no `class` or `threshold`. Instead it reports a
+The envelope carries no `threshold`, and no `class` except on an LLM-placed
+level (see **LLM-placed levels**). Instead it reports a
 single number — `lvl` — that is a **property of the file and the model,
 not of your deploy setting**:
 
@@ -126,17 +128,31 @@ bundle's own `default_severity_level` (`25` on current bundles; see
 `DEFAULT_SEVERITY_LEVEL`):
 
 - **hostile** when `lvl <= N` (default: `lvl <= 25`),
-- **suspicious** when `lvl <= min(grid_max, 3000)` (default: `lvl <= 3000`).
-  The suspicious ceiling is a **flat constant** (`SUSPICIOUS_LEVEL_CEILING`,
-  mirrored as `SUSPICIOUS_CEILING` in `server/decision.rs`), *not* a multiple of
-  `N` — it does not move when the operator changes `-l`. It is currently set
-  wide (an EXPERIMENTAL 2026-07 widening to surface the weak-signal tail), which
-  knowingly re-admits a low-precision band; see the note on the constant before
-  relying on it.
+- **suspicious** when `lvl <= min(grid_max, max(500, 100 × N))` (default:
+  `lvl <= 2500`). The suspicious ceiling is 100× the hostile budget with a
+  floor of L500 (`suspicious_ceiling`, `SUSPICIOUS_CEILING_MULTIPLE`,
+  `SUSPICIOUS_CEILING_FLOOR`): `-l 0` reviews through L500, `-l 25` through
+  L2500, and `-l 250` or looser through the whole grid.
 - **benign** otherwise. Note a file with, say, `lvl = 5000` is benign
-  under the default caps yet still reports `lvl = 5000`. Raising `-l` moves
-  the *hostile* line only: it can turn that same envelope hostile, but the
-  suspicious ceiling stays where it is.
+  under the default caps yet still reports `lvl = 5000`. Raising `-l` widens
+  both lines: at `-l 50` that same envelope is suspicious, and at `-l 5000`
+  hostile.
+
+### LLM-placed levels
+
+With `--llm`, the blend can move a verdict the model did not reach — lift a
+model-clean file into suspicious, clear a hostile one into suspicious — and the
+moved verdict still travels as `lvl`. Such a level is *placed*, not measured,
+and the envelope says so with `cls`: present exactly when the blend changed
+`lvl` from what the model measured (`llm.before.lvl`), holding the class graded
+at the level the scan ran at.
+
+Placed suspicious levels are anchored to the default band so they decode the
+same everywhere: geometrically across `26..=2500` (uncorroborated L255,
+cleave-corroborated L81), then clamped into the writing deploy's own band. A
+placed hostile level is the writing deploy's `-l`. Readers at another level
+should prefer `cls` when present; readers of `lvl` alone still get suspicious
+for any placed-suspicious verdict whose writer's band overlaps the default's.
 
 The Atomdrift Scan CLI/server applies these caps internally to pick exit codes
 and terminal output; downstream consumers reading stored envelopes

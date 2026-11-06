@@ -405,6 +405,7 @@ pub(crate) fn dep_envelope(
             probability: verdict.probability,
             level,
             conf: level_confidence(level),
+            class: None,
             model_scores: Vec::new(),
             skipped_models: Vec::new(),
             version: version.to_string(),
@@ -518,6 +519,17 @@ pub struct MlSection {
     /// Pessimistic integer confidence percent derived from `level`; `null` when no
     /// level table applies (manual-threshold mode).
     pub conf: Option<u8>,
+    /// The class of record when the LLM placed `level` rather than the sweep
+    /// measuring it; omitted otherwise.
+    ///
+    /// A placed level is deploy-relative (the hostile rung is the deploy's own
+    /// `-l`), so decoding it at another level can misread it. When this is
+    /// present it is the verdict, graded at the level the scan ran at, and
+    /// `llm.before.lvl` holds what the model measured. Absent on every
+    /// unsteered record, so the common envelope stays byte-identical across
+    /// deploy levels and pays nothing for it.
+    #[serde(rename = "cls", skip_serializing_if = "Option::is_none")]
+    pub class: Option<Classification>,
     /// Scores from models that ran.
     #[serde(rename = "mods", skip_serializing_if = "Vec::is_empty")]
     pub model_scores: Vec<RouteScore>,
@@ -557,6 +569,19 @@ impl ScanResult {
             })
     }
 
+    /// The class to record beside `level` when the LLM placed it: a graded
+    /// interpretation whose blend moved the level off what the model measured.
+    /// The blend is the last thing to touch `level`, so a difference from
+    /// `llm.before.lvl` is exactly a placed one.
+    fn llm_class(&self) -> Option<Classification> {
+        match &self.interpretation {
+            Some(Interpretation::Graded(graded)) if graded.before.lvl != self.level => {
+                Some(self.classification)
+            }
+            _ => None,
+        }
+    }
+
     /// The `ml` section. Clones only the small fields; `files` is built here.
     fn ml_section(&self) -> MlSection {
         MlSection {
@@ -564,6 +589,7 @@ impl ScanResult {
             probability: self.probability,
             level: self.level,
             conf: level_confidence(self.level),
+            class: self.llm_class(),
             model_scores: self.model_scores.clone(),
             skipped_models: self.skipped_models.clone(),
             version: self.version.clone(),
@@ -841,6 +867,47 @@ pub(super) mod tests {
             bloom_mark: None,
             hopper_route: HopperRoute::Normal,
         }
+    }
+
+    /// `ml.cls` appears exactly when the LLM placed `lvl`: the class of record
+    /// beside a deploy-relative number, and nothing on a measured one.
+    #[test]
+    fn ml_cls_marks_only_llm_placed_levels() {
+        use crate::interpret::{Graded, LlmGrade, MlVerdict};
+        let graded = |before: Level| {
+            Interpretation::Graded(Graded {
+                grade: LlmGrade::Suspicious,
+                outcome: Classification::Suspicious,
+                corroborated: false,
+                may_soften: false,
+                blended: 0.5,
+                interpretation: String::new(),
+                model: "m".to_string(),
+                analyzer_directed: false,
+                cached: false,
+                before: MlVerdict {
+                    class: Classification::Benign,
+                    prob: 0.1,
+                    lvl: before,
+                },
+            })
+        };
+        let ml = |r: &ScanResult| serde_json::to_value(r.ml_section()).unwrap();
+
+        // No interpretation: no cls.
+        let mut r = base_result();
+        assert!(ml(&r).get("cls").is_none());
+
+        // Graded, but the blend left the measured level alone: no cls.
+        r.interpretation = Some(graded(Level::Clean));
+        assert!(ml(&r).get("cls").is_none());
+
+        // The LLM lifted a model-clean file into suspicious at a placed level.
+        r.classification = Classification::Suspicious;
+        r.level = Level::At(255);
+        let v = ml(&r);
+        assert_eq!(v["cls"], 1, "suspicious is ordinal 1, as in mods[].cls");
+        assert_eq!(v["lvl"], 255);
     }
 
     #[test]

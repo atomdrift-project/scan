@@ -32,13 +32,13 @@ pub(crate) fn default_budget(server_level: Option<u16>) -> u16 {
     server_level.unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL)
 }
 
-/// Levels above this are never worse than suspicious, whatever the grid.
+/// The grid a stored verdict is read against.
 ///
-/// Mirrors `capped_suspicious_level(grid_max)`, which is
-/// `min(grid_max, SUSPICIOUS_LEVEL_CEILING)`. A stored verdict does not carry
-/// the grid it came from, and production grids run to 25000, so the ceiling is
-/// the constant. `agrees_with_the_model_grid` pins the two together.
-const SUSPICIOUS_CEILING: u16 = 3000;
+/// A stored verdict does not carry the grid it came from, and production grids
+/// run to 25000, so the suspicious ceiling is the model's own
+/// `suspicious_ceiling(budget, GRID_MAX)` — one rule, not a copy of it.
+/// `agrees_with_the_model_grid` pins the two together.
+const GRID_MAX: u16 = 25_000;
 
 /// What a caller should do about this package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -92,7 +92,9 @@ pub(crate) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
     match fires_at {
         Level::Manual => (Decision::Unanalyzed, Severity::Benign),
         Level::At(lvl) if lvl <= budget => (Decision::Block, Severity::Hostile),
-        Level::At(lvl) if lvl <= SUSPICIOUS_CEILING => (Decision::Allow, Severity::Suspicious),
+        Level::At(lvl) if lvl <= crate::model::suspicious_ceiling(budget, GRID_MAX) => {
+            (Decision::Allow, Severity::Suspicious)
+        }
         Level::Clean | Level::At(_) => (Decision::Allow, Severity::Benign),
     }
 }
@@ -155,12 +157,18 @@ mod tests {
             decide(Level::At(500), 1000),
             (Decision::Block, Severity::Hostile)
         );
+        // The suspicious ceiling is 100× the budget (floor L500), so the
+        // default reviews through L2500 and a looser caller reviews further.
         assert_eq!(
-            decide(Level::At(3001), 25),
+            decide(Level::At(2501), 25),
             (Decision::Allow, Severity::Benign)
         );
         assert_eq!(
-            decide(Level::At(3000), 25),
+            decide(Level::At(2500), 25),
+            (Decision::Allow, Severity::Suspicious)
+        );
+        assert_eq!(
+            decide(Level::At(2501), 100),
             (Decision::Allow, Severity::Suspicious)
         );
     }
@@ -197,9 +205,10 @@ mod tests {
     #[test]
     fn agrees_with_the_model_grid() {
         use crate::model::{Classification, verdict_for_level};
-        const GRID_MAX: u16 = 25_000;
-        for level in [0_u16, 1, 2, 25, 26, 500, 2999, 3000, 3001, 20_000, 25_000] {
-            for budget in [0_u16, 25, 500, 3000] {
+        for level in [
+            0_u16, 1, 2, 25, 26, 500, 501, 2500, 2501, 3000, 20_000, 25_000,
+        ] {
+            for budget in [0_u16, 5, 25, 70, 250, 500, 3000] {
                 let (decision, severity) = decide(Level::At(level), budget);
                 let expected = verdict_for_level(level, budget, GRID_MAX);
                 let blocked = decision == Decision::Block;

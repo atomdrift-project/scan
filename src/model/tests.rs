@@ -130,21 +130,27 @@ fn load_rejects_missing_feature_spec_with_update_guidance() -> Result<()> {
 }
 
 #[test]
-fn capped_suspicious_level_clamps_to_the_ceiling() {
-    // Below the ceiling passes through; at/above it clamps to the ceiling.
-    assert_eq!(
-        capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING - 1),
-        SUSPICIOUS_LEVEL_CEILING - 1
-    );
-    assert_eq!(
-        capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING),
-        SUSPICIOUS_LEVEL_CEILING
-    );
-    assert_eq!(
-        capped_suspicious_level(SUSPICIOUS_LEVEL_CEILING + 1),
-        SUSPICIOUS_LEVEL_CEILING
-    );
-    assert_eq!(capped_suspicious_level(25_000), SUSPICIOUS_LEVEL_CEILING);
+fn suspicious_ceiling_scales_with_the_hostile_level() {
+    // 100× the active level, never below the floor, never past the grid.
+    assert_eq!(SUSPICIOUS_CEILING_FLOOR, 500);
+    assert_eq!(SUSPICIOUS_CEILING_MULTIPLE, 100);
+    for (active, want) in [
+        (0, 500),
+        (1, 500),
+        (5, 500),
+        (10, 1_000),
+        (25, 2_500),
+        (70, 7_000),
+        (100, 10_000),
+        (250, 25_000),
+        (1_000, 25_000),
+        (u16::MAX, 25_000),
+    ] {
+        assert_eq!(suspicious_ceiling(active, 25_000), want, "-l {active}");
+    }
+    // A grid tighter than the scaled ceiling caps it.
+    assert_eq!(suspicious_ceiling(25, 2_000), 2_000);
+    assert_eq!(suspicious_ceiling(0, 100), 100);
 }
 
 #[test]
@@ -568,35 +574,50 @@ fn level_keeps_its_wire_encoding() {
 #[test]
 fn verdict_for_level_applies_caps() {
     // Rule: swept level <= active level is hostile; swept level above active
-    // but within the suspicious cap is suspicious; anything beyond the cap
-    // is benign.
+    // but within the suspicious ceiling is suspicious; anything beyond it is
+    // benign. The ceiling scales with the active level.
     let grid_max = 25_000;
     assert_eq!(verdict_for_level(20, 50, grid_max), Classification::Hostile);
     assert_eq!(verdict_for_level(50, 50, grid_max), Classification::Hostile);
-    // The suspicious band ends at the SUSPICIOUS_LEVEL_CEILING cap.
+    // -l 50: the suspicious band ends at 5000.
     assert_eq!(
-        verdict_for_level(SUSPICIOUS_LEVEL_CEILING, 50, grid_max),
+        verdict_for_level(5_000, 50, grid_max),
         Classification::Suspicious,
         "at the ceiling is still suspicious"
     );
     assert_eq!(
-        verdict_for_level(SUSPICIOUS_LEVEL_CEILING + 1, 50, grid_max),
+        verdict_for_level(5_001, 50, grid_max),
         Classification::Benign,
         "just past the suspicious ceiling is benign"
     );
+    // The shipped default reviews through 2500.
     assert_eq!(
-        verdict_for_level(25_000, 50, grid_max),
+        verdict_for_level(2_500, 25, grid_max),
+        Classification::Suspicious
+    );
+    assert_eq!(
+        verdict_for_level(3_000, 25, grid_max),
         Classification::Benign
     );
 
-    // Stricter deploy (-l 10): only levels <= 10 are hostile; the ceiling
-    // still bounds the top of the suspicious band.
+    // Stricter deploys keep the floor's band.
     assert_eq!(
         verdict_for_level(20, 10, grid_max),
         Classification::Suspicious
     );
     assert_eq!(
-        verdict_for_level(SUSPICIOUS_LEVEL_CEILING, 10, grid_max),
+        verdict_for_level(1_000, 10, grid_max),
+        Classification::Suspicious
+    );
+    assert_eq!(
+        verdict_for_level(500, 0, grid_max),
+        Classification::Suspicious
+    );
+    assert_eq!(verdict_for_level(750, 0, grid_max), Classification::Benign);
+
+    // A loose deploy reviews the whole grid.
+    assert_eq!(
+        verdict_for_level(25_000, 250, grid_max),
         Classification::Suspicious
     );
 }
