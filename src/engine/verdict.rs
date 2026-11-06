@@ -91,7 +91,7 @@ pub const fn level_confidence(level: Level) -> Option<u8> {
 /// strictest rung is moved barely past it.
 ///
 /// Geometric, for the same reason as [`interpreted_level`] — the axis is. At the
-/// shipped `-l 25` an ML `L1` lands at `L31`, an `L12` at `L248`.
+/// shipped `-l 25` an ML `L1` lands at `L31`, an `L12` at `L233`.
 ///
 /// `L0` never reaches here: `interpret::Evidence::may_cross` refuses the
 /// crossing outright.
@@ -109,20 +109,36 @@ pub(super) fn softened_level(ml_level: Level, active_level: Option<u16>, grid_ma
     suspicious_band_level(active, grid_max, fraction)
 }
 
-/// The rung `fraction` of the way, geometrically, from the strongest
-/// suspicious rung (just past `active`) to the band's ceiling.
+/// The rung `fraction` of the way, geometrically, across the *reference*
+/// suspicious band — the one the shipped default level defines — clamped into
+/// this deploy's own band.
+///
+/// A placed level is not measured, yet it travels as `ml.lvl`, and readers
+/// decode `lvl` at their own level, usually the default. Placing on this
+/// deploy's band made the number a function of `-l`: once the ceiling scales
+/// with the active level, an `-l 0` deploy put an uncorroborated suspicious at
+/// L22 (hostile to a default reader) and an `-l 250` deploy put it at L2505
+/// (benign to one). On the reference band the same verdict lands on the same
+/// number at every deploy level whose band contains it, so it decodes as
+/// suspicious under the default too. The clamp is what keeps it this deploy's
+/// suspicious all the same. Where the two bands do not overlap, the explicit
+/// `ml.cls` is the record (see `MlSection::class`).
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "a positive value clamped to `ceiling`, which is at most `grid_max`"
 )]
 fn suspicious_band_level(active: u16, grid_max: u16, fraction: f64) -> Level {
-    let ceiling = crate::model::capped_suspicious_level(grid_max);
+    use crate::model::{DEFAULT_SEVERITY_LEVEL, suspicious_ceiling};
+    let ceiling = suspicious_ceiling(active, grid_max);
     let floor = active.saturating_add(1);
     if floor >= ceiling {
         return Level::At(ceiling);
     }
-    let placed = f64::from(floor) * (f64::from(ceiling) / f64::from(floor)).powf(fraction);
+    let ref_floor = DEFAULT_SEVERITY_LEVEL + 1;
+    let ref_ceiling = suspicious_ceiling(DEFAULT_SEVERITY_LEVEL, grid_max).max(ref_floor);
+    let placed =
+        f64::from(ref_floor) * (f64::from(ref_ceiling) / f64::from(ref_floor)).powf(fraction);
     Level::At((placed.round() as u16).clamp(floor, ceiling))
 }
 
@@ -174,13 +190,13 @@ pub(super) fn interpreted_level(
             // Pinning every interpreted-suspicious verdict to the ceiling put all
             // of them on one number, which threw away the ordering the level axis
             // exists to carry: a sample cleave independently flagged and a sample
-            // resting on the LLM's word alone both read as 3000.
+            // resting on the LLM's word alone both read as the ceiling.
             //
             // Geometric, because the axis is: `level_confidence` compresses
             // 200→82, 1000→75, 2000→66, 5000→54, so a *linear* midpoint of
-            // 26..3000 sits at 1513 and reads as barely-suspicious. The geometric
-            // one lands near 279, which is where the middle of the band actually
-            // is in confidence terms.
+            // 26..2500 sits at 1263 and reads as barely-suspicious. The geometric
+            // one lands at 255 (corroborated: 81), which is where the middle of
+            // the band actually is in confidence terms.
             //
             // Corroboration moves it a quarter of the way in instead of half —
             // nearer the hostile boundary, because two detectors agreeing is a
@@ -1101,16 +1117,16 @@ mod tests {
 
     #[test]
     fn interpreted_level_places_a_verdict_inside_its_band() {
-        use crate::model::{capped_suspicious_level, verdict_for_level};
+        use crate::model::{DEFAULT_SEVERITY_LEVEL, suspicious_ceiling, verdict_for_level};
         use Classification::{Benign, Hostile, Suspicious};
 
         let grid_max = 30_000;
-        let ceiling = capped_suspicious_level(grid_max);
         let at = |level: Level| match level {
             Level::At(n) => n,
             other => panic!("expected a placed level, got {other:?}"),
         };
-        for deploy in [4_u16, 5, 25, 50] {
+        for deploy in [0_u16, 4, 5, 25, 50, 100, 250] {
+            let ceiling = suspicious_ceiling(deploy, grid_max);
             // Escalation to hostile lands on the active deploy level: the loosest
             // rung still inside the hostile budget.
             assert_eq!(
@@ -1144,14 +1160,37 @@ mod tests {
                 verdict_for_level(corroborated, deploy, grid_max),
                 Suspicious
             );
+            // Portability: a placed level is decoded by readers at their own
+            // level, usually the default. Whatever deploy wrote it, it must
+            // still read as suspicious there, not hostile and not benign.
+            for lvl in [alone, corroborated] {
+                assert_eq!(
+                    verdict_for_level(lvl, DEFAULT_SEVERITY_LEVEL, grid_max),
+                    Suspicious,
+                    "deploy {deploy}: level {lvl} misreads at the default level",
+                );
+            }
         }
+        // Placement does not move with the deploy level while the band holds it.
+        assert_eq!(
+            interpreted_level(Some(0), grid_max, Suspicious, false),
+            interpreted_level(Some(50), grid_max, Suspicious, false),
+        );
+        assert_eq!(
+            interpreted_level(Some(25), grid_max, Suspicious, false),
+            Level::At(255)
+        );
+        assert_eq!(
+            interpreted_level(Some(25), grid_max, Suspicious, true),
+            Level::At(81)
+        );
         // A grid tighter than the ceiling keeps the placement inside it.
         let tight = at(interpreted_level(Some(25), 2_000, Suspicious, false));
-        assert!(tight <= capped_suspicious_level(2_000) && tight > 25);
+        assert!(tight <= suspicious_ceiling(25, 2_000) && tight > 25);
         // A deploy level at or above the ceiling leaves no band to place within.
         assert_eq!(
-            interpreted_level(Some(3_000), grid_max, Suspicious, false),
-            Level::At(ceiling)
+            interpreted_level(Some(grid_max), grid_max, Suspicious, false),
+            Level::At(grid_max)
         );
         // Benign is the clean marker regardless of grid (even in manual mode).
         assert_eq!(

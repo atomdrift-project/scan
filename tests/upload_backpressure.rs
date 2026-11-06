@@ -22,6 +22,7 @@ fn envelope() -> ScanResultEnvelope {
             probability: 0.0,
             level: Level::Clean,
             conf: Some(100),
+            class: None,
             model_scores: Vec::new(),
             skipped_models: Vec::new(),
             version: "fixture".into(),

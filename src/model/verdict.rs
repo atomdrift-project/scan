@@ -7,28 +7,39 @@
 )]
 use super::*;
 
-/// Current suspicious ceiling (pool-adjusted FP scale) for level-sweep decisions.
+/// The suspicious ceiling never sits below this level, whatever the deploy.
 ///
-/// Set to L3000 — a deliberate EXPERIMENTAL widening (2026-07) to surface as much
-/// of the weak-signal tail as suspicious as the calibration curve supports. On
-/// the current calibrate run hostile recall climbs smoothly to a peak at L4000
-/// then COLLAPSES ~8pp at L5000 (the benign quantile runs out of resolution), so
-/// L3000 is the loosest robustly-stable point, one notch below that fragile peak.
-/// Trialed AGAINST prior precision evidence: a hopper fired-level analysis (model
-/// 2.2.0-rc.1) put the precision elbow far lower, at L100 — L0 (99.6%), L100
-/// (6168 bad vs 591 good — 91%), L250 (457 bad vs 1020 good — 31%), with L250+
-/// adding more false positives than true positives. So L3000 knowingly re-admits
-/// a low-precision tail. RE-MEASURE the elbow on the current model before making
-/// this permanent; tighten back toward L100/L250 if the suspicious bucket floods.
-pub(super) const SUSPICIOUS_LEVEL_CEILING: u16 = 3000;
+/// Without a floor the strictest deploys would have no suspicious band at all
+/// (`100 × 0 = 0`). L500 sits just above where interpreted and floor-placed
+/// suspicious verdicts land (see `engine::suspicious_band_level`), so even an
+/// `-l 0` deploy keeps a review band for them.
+pub(super) const SUSPICIOUS_CEILING_FLOOR: u16 = 500;
 
-/// The suspicious LEVEL for a grid: `min(max_grid_level, SUSPICIOUS_LEVEL_CEILING)`.
+/// The suspicious ceiling as a multiple of the active hostile level.
 ///
-/// Any file that fires at a level looser than the operator's selected hostile
-/// level — but not above the suspicious ceiling — is classified as suspicious.
+/// Suspicious means "up to 100× the false-positive budget you chose for
+/// blocking": the shipped `-l 25` reviews through L2500, and a deploy loose
+/// enough to block at L250 reviews the whole grid. Replaces the flat L3000 of
+/// the 2026-07 experiment, which a fired-level analysis (gauntlet, 2026-10-27..
+/// 11-06) showed bought nothing over L2500 at the default: model-only verdicts
+/// past L2500 were a handful, and interpreted ones are placed inside the band
+/// whatever its width.
+pub(super) const SUSPICIOUS_CEILING_MULTIPLE: u16 = 100;
+
+/// The suspicious ceiling for a deploy at `active`:
+/// `min(max_grid_level, max(SUSPICIOUS_CEILING_FLOOR, 100 × active))`.
+///
+/// Any file that fires at a level looser than `active` but not above this is
+/// classified as suspicious. Not necessarily a grid row (`-l 70` gives 7000):
+/// fired levels are grid rows, so comparing against it reads as "the loosest
+/// row at or below it", which is how the per-route lookup in `policy` resolves
+/// it too.
 #[must_use]
-pub(crate) fn capped_suspicious_level(max_grid_level: u16) -> u16 {
-    max_grid_level.min(SUSPICIOUS_LEVEL_CEILING)
+pub(crate) fn suspicious_ceiling(active: u16, max_grid_level: u16) -> u16 {
+    active
+        .saturating_mul(SUSPICIOUS_CEILING_MULTIPLE)
+        .max(SUSPICIOUS_CEILING_FLOOR)
+        .min(max_grid_level)
 }
 
 /// Classification outcome, ordered by severity (`Benign < Suspicious < Hostile`).

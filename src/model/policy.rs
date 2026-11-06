@@ -25,8 +25,8 @@ pub(super) struct EnsembleConfig {
     /// Drives the verdict sweep for filetypes with no route policy. Raw score
     /// space as written; `Model::load_ensemble` calibrates it.
     pub(super) general_grid: Vec<(u16, f32)>,
-    /// Largest level present in the `levels[]` grid. The suspicious cap is
-    /// `capped_suspicious_level(grid_max)`.
+    /// Largest level present in the `levels[]` grid. Caps
+    /// `suspicious_ceiling(level, grid_max)`.
     pub(super) grid_max: u16,
 }
 
@@ -534,9 +534,9 @@ pub(super) fn load_route_policies(
         // The default-level policy drives the diagnostic per-route
         // classification in the `models[]` array. Its suspicious band is
         // derived in level-space via the suspicious-ceiling lookup: the hostile
-        // policy at `capped_suspicious_level(max)`. An explicit `suspicious`
-        // block, when collimator emits one, wins; the level's own hostile is
-        // the final fallback.
+        // policy at the loosest row within `suspicious_ceiling(level, max)`.
+        // An explicit `suspicious` block, when collimator emits one, wins; the
+        // level's own hostile is the final fallback.
         let active = match route.levels.iter().find(|entry| entry.level == level) {
             Some(entry) => {
                 match policy_severity_from_json(&entry.hostile, names).with_context(context)? {
@@ -549,10 +549,11 @@ pub(super) fn load_route_policies(
                         };
                         let suspicious = explicit.unwrap_or_else(|| {
                             let max = route.levels.iter().map(|e| e.level).max().unwrap_or(level);
-                            let suspicious_level = capped_suspicious_level(max);
+                            let ceiling = suspicious_ceiling(level, max);
                             levels
                                 .iter()
-                                .find(|lp| lp.level == suspicious_level)
+                                .rev()
+                                .find(|lp| lp.level > level && lp.level <= ceiling)
                                 .map_or_else(|| hostile.clone(), |lp| lp.hostile.clone())
                         });
                         Some(RoutePolicy {
@@ -652,8 +653,8 @@ pub(super) fn blend_policy_from_json(
 /// Pull per-route thresholds from `levels[]` at the requested level. Pairs up
 /// hostile and suspicious thresholds for each route. When the JSON omits a
 /// `suspicious` block, suspicious is derived in level-space by reading the
-/// hostile threshold for the same route at level
-/// `capped_suspicious_level(max_grid_level)`.
+/// hostile threshold for the same route at the loosest row within
+/// `suspicious_ceiling(level, max_grid_level)`.
 pub(super) fn thresholds_at_level(
     levels: &[LevelEntryJson],
     level: u16,
@@ -670,10 +671,11 @@ pub(super) fn thresholds_at_level(
     };
 
     let max = levels.iter().map(|e| e.level).max().unwrap_or(level);
-    let suspicious_level = capped_suspicious_level(max);
-    let loose_hostile = (suspicious_level != level)
-        .then(|| levels.iter().find(|e| e.level == suspicious_level))
-        .flatten()
+    let ceiling = suspicious_ceiling(level, max);
+    let loose_hostile = levels
+        .iter()
+        .filter(|e| e.level > level && e.level <= ceiling)
+        .max_by_key(|e| e.level)
         .map(|e| &e.hostile.thresholds);
 
     let mut out: HashMap<String, Thresholds> = HashMap::new();
@@ -804,7 +806,7 @@ pub(super) fn sweep_policy_grid(
 pub(crate) fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> Classification {
     if fired_level <= level {
         Classification::Hostile
-    } else if fired_level <= capped_suspicious_level(grid_max) {
+    } else if fired_level <= suspicious_ceiling(level, grid_max) {
         Classification::Suspicious
     } else {
         Classification::Benign

@@ -149,8 +149,8 @@ right verdict:
    drift: `level_confidence` already reserves rungs for an L50000 grid, and a
    hardcoded `25000` stops meaning *the whole grid* the day the grid is re-cut.
 
-   Note the admission sits far past the suspicious ceiling (L3000, see
-   `SUSPICIOUS_LEVEL_CEILING`): a file admitted by ML alone out here is *not*
+   Note the admission sits far past the suspicious ceiling (L2500 at the
+   default, see `suspicious_ceiling`): a file admitted by ML alone out here is *not*
    suspicious under the deployed policy, just the weak tail. Measured ML
    false-negatives (a crypto clipper at 0.024, a git-push exfil at 0.039, an
    unverified download-exec at 0.012) sit under *every* calibrated cutoff — they
@@ -186,8 +186,9 @@ right verdict:
    malice up, a corroborated clean file *down* (the old code raised the malice
    probability of a file both graders called benign).
 3. **A *hostile* band crossing must be earned.** The verdict travels downstream as
-   `ml.lvl`, not as `ml.prob` — `MlSection` serializes no class field, so a
-   consumer reconstructs the class purely from the level via `verdict_for_level`.
+   `ml.lvl`, not as `ml.prob` — `MlSection` serializes a class (`cls`) only
+   beside a level the blend placed, so a consumer otherwise reconstructs the
+   class purely from the level via `verdict_for_level`.
    Bounding only the score would therefore leave the number that actually carries
    the verdict unguarded.
 
@@ -231,12 +232,13 @@ right verdict:
 
    > When the LLM's read is untrusted, the blend never lowers the class and never
    > lowers the score.
-5. **Synthetic level.** `engine::interpreted_level` pins an LLM-shifted verdict to
-   the loosest rung of the target band — the active deploy `-l` for hostile,
-   `capped_suspicious_level(grid_max)` for suspicious, `-1` for benign — so the
-   level tracks the model's real thresholds instead of a hardcoded rung. `ml.conf`
-   is `level_confidence()` of that level, so the displayed confidence follows
-   automatically; `ml.prob` carries the steered score.
+5. **Synthetic level.** `engine::interpreted_level` places an LLM-shifted verdict
+   in the target band — the active deploy `-l` for hostile, a fixed point of the
+   default suspicious band (L255, or L81 when cleave corroborates) clamped into
+   this deploy's band for suspicious, `-1` for benign — and `ml.cls` records the
+   class beside it. `ml.conf` is `level_confidence()` of that level, so the
+   displayed confidence follows automatically; `ml.prob` carries the steered
+   score.
 
 ### Trade-offs these rules accept
 
