@@ -50,23 +50,66 @@ pub struct Cidr {
     prefix_len: u8,
 }
 
+/// Why an `--allow-cidr` entry does not parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CidrError {
+    /// The entry has no `/prefix`.
+    MissingPrefix(String),
+    /// The part before the `/` is not an IP address.
+    Address(String, std::net::AddrParseError),
+    /// The part after the `/` is not a number.
+    Prefix(String, std::num::ParseIntError),
+    /// The prefix is longer than the address it applies to.
+    PrefixTooLong {
+        /// The address as written.
+        addr: String,
+        /// The prefix length given.
+        prefix_len: u8,
+        /// The longest prefix the address family allows.
+        max: u8,
+    },
+}
+
+impl fmt::Display for CidrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingPrefix(entry) => write!(f, "missing /prefix in {entry:?}"),
+            Self::Address(addr, e) => write!(f, "invalid address {addr:?}: {e}"),
+            Self::Prefix(prefix, e) => write!(f, "invalid prefix {prefix:?}: {e}"),
+            Self::PrefixTooLong {
+                addr,
+                prefix_len,
+                max,
+            } => write!(f, "prefix length {prefix_len} exceeds max {max} for {addr}"),
+        }
+    }
+}
+
+impl std::error::Error for CidrError {}
+
 impl Cidr {
     /// Parse `addr/prefix`. Both v4 and v6 are supported.
-    pub fn parse(s: &str) -> Result<Self, String> {
+    ///
+    /// # Errors
+    /// Returns an error when the entry is not `addr/prefix` with a prefix no
+    /// longer than the address.
+    pub fn parse(s: &str) -> Result<Self, CidrError> {
         let (addr, prefix) = s
             .split_once('/')
-            .ok_or_else(|| format!("missing /prefix in {s:?}"))?;
+            .ok_or_else(|| CidrError::MissingPrefix(s.to_owned()))?;
         let network: IpAddr = addr
             .parse()
-            .map_err(|e| format!("invalid address {addr:?}: {e}"))?;
+            .map_err(|e| CidrError::Address(addr.to_owned(), e))?;
         let prefix_len: u8 = prefix
             .parse()
-            .map_err(|e| format!("invalid prefix {prefix:?}: {e}"))?;
+            .map_err(|e| CidrError::Prefix(prefix.to_owned(), e))?;
         let max = if network.is_ipv4() { 32 } else { 128 };
         if prefix_len > max {
-            return Err(format!(
-                "prefix length {prefix_len} exceeds max {max} for {addr}"
-            ));
+            return Err(CidrError::PrefixTooLong {
+                addr: addr.to_owned(),
+                prefix_len,
+                max,
+            });
         }
         Ok(Self {
             network,
@@ -98,8 +141,11 @@ impl Cidr {
 }
 
 /// Parse a comma-separated list of CIDRs. Whitespace is trimmed; empty
-/// entries are skipped. Returns the first parse error encountered.
-pub fn parse_cidr_list(s: &str) -> Result<Vec<Cidr>, String> {
+/// entries are skipped.
+///
+/// # Errors
+/// Returns the first entry's parse error.
+pub(super) fn parse_cidr_list(s: &str) -> Result<Vec<Cidr>, CidrError> {
     s.split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
@@ -139,6 +185,43 @@ fn is_token68_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
 }
 
+/// Why a `--token-file` token cannot be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenError {
+    /// Shorter than `MIN_TOKEN_LEN` bytes.
+    TooShort(usize),
+    /// Nothing but base64 padding.
+    AllPadding,
+    /// A byte an `Authorization` header cannot carry.
+    Unsendable {
+        /// The offending byte.
+        byte: u8,
+        /// Its position in the token.
+        index: usize,
+    },
+}
+
+impl fmt::Display for TokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::TooShort(len) => {
+                write!(f, "token is {len} bytes; at least {MIN_TOKEN_LEN} required")
+            }
+            Self::AllPadding => f.write_str("token is entirely base64 padding"),
+            // Naming the offending character is what makes this actionable,
+            // and it is by definition not part of a usable token.
+            Self::Unsendable { byte, index } => write!(
+                f,
+                "token contains '{}' at position {index}: not sendable in an \
+                 Authorization header (allowed: A-Z a-z 0-9 - . _ ~ + / and trailing =)",
+                char::from(byte).escape_debug()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenError {}
+
 /// SHA-256 of the bearer token the server requires.
 ///
 /// The plaintext token is hashed at construction and never stored, so it
@@ -160,30 +243,21 @@ impl TokenDigest {
     /// Returns an error if the token is shorter than `MIN_TOKEN_LEN` bytes,
     /// or if it contains a character that cannot be sent in an `Authorization`
     /// header (see `is_token68_byte`).
-    pub fn new(token: &str) -> Result<Self, String> {
-        let len = token.len();
-        if len < MIN_TOKEN_LEN {
-            return Err(format!(
-                "token is {len} bytes; at least {MIN_TOKEN_LEN} required"
-            ));
+    pub fn new(token: &str) -> Result<Self, TokenError> {
+        if token.len() < MIN_TOKEN_LEN {
+            return Err(TokenError::TooShort(token.len()));
         }
         // Trailing `=` is base64 padding, valid only at the end of a token68.
         let body = token.trim_end_matches('=');
         if body.is_empty() {
-            return Err("token is entirely base64 padding".to_string());
+            return Err(TokenError::AllPadding);
         }
         if let Some((index, byte)) = body
             .bytes()
             .enumerate()
             .find(|&(_, byte)| !is_token68_byte(byte))
         {
-            // Naming the offending character is what makes this actionable,
-            // and it is by definition not part of a usable token.
-            let shown = char::from(byte).escape_debug();
-            return Err(format!(
-                "token contains '{shown}' at position {index}: not sendable in an \
-                 Authorization header (allowed: A-Z a-z 0-9 - . _ ~ + / and trailing =)"
-            ));
+            return Err(TokenError::Unsendable { byte, index });
         }
         Ok(Self(Sha256::digest(token.as_bytes()).into()))
     }

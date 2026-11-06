@@ -5,18 +5,17 @@
     reason = "feature values are narrowed to the model's f32 input dtype"
 )]
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
-/// The format group of a cleave-reported file type; `None` for one filefacts
-/// does not identify.
-pub(super) fn format_group_for_type(file_type: &str) -> Option<filefacts::Group> {
-    let group = filefacts::FileType::from_label(&file_type.trim().to_ascii_lowercase())?.group();
-    (group != filefacts::Group::Unknown).then_some(group)
-}
+use super::names::{
+    EXPECTED_GHOSTS, FORMAT_FEATURE_NAMES, FORMAT_GROUPS, GAP_FEATURE_NAMES,
+    INTENT_GAP_FEATURE_NAMES, MISSING_FEATURE_NAMES,
+};
+use super::report::{FileSummary, FindingSummary, metric_fields};
+use super::spec::{INTENT_GAP_CATEGORIES, KEY_METRICS, LOGIC_GAP_CATEGORIES};
+use super::write::{TRIPLE_SPAN, capped_triples};
+use super::{CRIT_NOTABLE, CRIT_SUSPICIOUS, FeatureWriter, trait_path};
 
 /// G6b: portable format-group hints derived only from cleave file types.
 pub(super) fn write_format_hint_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
@@ -25,9 +24,14 @@ pub(super) fn write_format_hint_features(summaries: &[FileSummary], w: &mut Feat
     let mut present_groups = HashSet::new();
 
     // Each file's format group, resolved once — the loop below is O(groups × files).
+    // `None` for a type filefacts does not identify.
     let file_groups: Vec<Option<filefacts::Group>> = summaries
         .iter()
-        .map(|s| format_group_for_type(&s.file_type))
+        .map(|s| {
+            let label = s.file_type.trim().to_ascii_lowercase();
+            let group = filefacts::FileType::from_label(&label)?.group();
+            (group != filefacts::Group::Unknown).then_some(group)
+        })
         .collect();
 
     for (&group, names) in FORMAT_GROUPS.iter().zip(FORMAT_FEATURE_NAMES.iter()) {
@@ -143,7 +147,8 @@ pub(super) fn relative_depths(files: &[FileSummary]) -> Vec<u32> {
         .collect()
 }
 
-/// G15: structure using absolute placement for legacy ABIs, relative for ABI 21.
+/// G15: archive structure, with depths relative to the sample from ABI 21
+/// and as the report placed them before.
 pub(super) fn write_structural_extensions(
     summaries: &[FileSummary],
     combined: &FindingSummary,
@@ -358,7 +363,7 @@ pub(super) fn write_intent_gap_features(summary: &FindingSummary, w: &mut Featur
         .contains_key("metadata/package/documentation");
     // `filesystem` is persistence alone: the deployed models were trained that
     // way. Widening it to `micro-behaviors/fs` changes the feature, so it waits
-    // for a retrain, in lockstep with collimator.
+    // for a retrain, made in lockstep with the training extractor.
     let risky: &[(&str, &[&str])] = &[
         ("network", &["micro-behaviors/network"]),
         ("filesystem", &["objectives/persistence"]),
@@ -473,7 +478,7 @@ pub(super) fn write_structural_features(
     }
 
     w.set("struct:tiny_executable", f32::from(any_tiny_binary));
-    // Collimator sets this when every file with an imports key imports
+    // Training sets this when every file with an imports key imports
     // nothing; the compact schema has no such key, so it is always 0.
     w.set("struct:no_imports", 0.0);
     w.set(
@@ -549,16 +554,13 @@ impl<'a> Iterator for FindingPaths<'a> {
     }
 }
 
-// ============================================================================
-// kv: / symbol: / textenc: / derived metric helpers — ported from
-// collimator/src/collimator/features.py. Each helper mirrors the Python
-// behavior exactly so the feature vectors stay bit-identical with the
-// training-time extraction.
-// ============================================================================
+// kv: / symbol: / textenc: / derived metric helpers. Each matches the
+// training extractor exactly, so the feature vectors are bit-identical with
+// the ones the model was trained on.
 
 /// Normalize a value to a bounded vocab token (collapse whitespace, truncate).
-/// Mirrors `_normalize_vocab_token` in collimator.
-pub(super) fn normalize_vocab_token(value: &str, max_len: usize) -> String {
+/// Matches training's vocab-token normalization.
+fn normalize_vocab_token(value: &str, max_len: usize) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -586,7 +588,7 @@ pub(super) fn normalize_vocab_token(value: &str, max_len: usize) -> String {
     out
 }
 
-pub(super) fn count_bucket(n: usize) -> &'static str {
+fn count_bucket(n: usize) -> &'static str {
     match n {
         0 => "0",
         1 => "1",
@@ -600,7 +602,7 @@ pub(super) fn count_bucket(n: usize) -> &'static str {
     }
 }
 
-pub(super) fn number_bucket(n: f64) -> String {
+fn number_bucket(n: f64) -> String {
     if !n.is_finite() {
         return "nonfinite".into();
     }
@@ -696,8 +698,8 @@ pub(super) fn kv_tokens(metrics: Option<&serde_json::Value>) -> Vec<String> {
     kv_tokens_with_options(metrics, false, false)
 }
 
-/// A file's normalized symbols, sorted and unique. Mirrors `_file_symbols`
-/// in collimator: an import contributes its bare name and its `lib!name`
+/// A file's normalized symbols, sorted and unique, as training builds them:
+/// an import contributes its bare name and its `lib!name`
 /// form (or whichever half it has); exports, function names, AST call
 /// targets and member chains contribute their name. Tokens shorter than two
 /// characters are dropped.
@@ -733,9 +735,9 @@ pub(super) fn file_symbols(facts: &cleave::types::CompactFacts) -> Vec<String> {
     symbols
 }
 
-/// Per-file caps from collimator (`_SYMBOL_BIGRAM_CAP`/`_SYMBOL_TRIGRAM_CAP`).
-pub(super) const SYMBOL_BIGRAM_CAP: usize = 64;
-pub(super) const SYMBOL_TRIGRAM_CAP: usize = 24;
+/// Per-file caps on symbol pairs and triples, as in training.
+const SYMBOL_BIGRAM_CAP: usize = 64;
+const SYMBOL_TRIGRAM_CAP: usize = 24;
 
 /// Emit symbol:*, symbol_bi:*, symbol_tri:* for a set of summaries.
 pub(super) fn write_symbol_features(
@@ -884,7 +886,7 @@ pub(super) fn derived_metric(
     }
 }
 
-/// Cross-metric derived ratios. Mirrors collimator `_BATCH1_RATIOS`.
+/// Cross-metric derived ratios.
 pub(super) fn write_derived_metric_features(merged_metrics: &MetricMap, w: &mut FeatureWriter<'_>) {
     let get = |group: &str, field: &str| -> f64 {
         merged_metrics
@@ -914,7 +916,7 @@ pub(super) fn write_derived_metric_features(merged_metrics: &MetricMap, w: &mut 
 }
 
 /// `struct:silent_packer_signal` — large file size / few findings → packer.
-/// Mirrors collimator's gated computation (Exp 43).
+/// Set only when the spec carries it, as in training.
 pub(super) fn write_silent_packer_signal(
     summaries: &[FileSummary],
     filtered_finding_count: u32,
@@ -929,24 +931,16 @@ pub(super) fn write_silent_packer_signal(
     );
 }
 
-/// Aggregate-level suspicious n-gram co-occurrence counts. Mirrors
-/// collimator's `include_suspicious_trigrams` branch.
+/// Aggregate-level co-occurrence counts among the suspicious-or-above sample
+/// paths: pairs, and triples capped as for the objective paths.
 pub(super) fn write_suspicious_ngram_counts(combined: &FindingSummary, w: &mut FeatureWriter<'_>) {
     let n = combined
         .sample_paths
         .values()
         .filter(|&&mo| mo >= 4)
         .count();
-    let mut n_bi: u64 = 0;
-    let mut n_tri: u64 = 0;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            n_bi += 1;
-            // Python caps the third-element span to 20 to bound O(n^3).
-            let k_end = n.min(j + 20);
-            n_tri += (k_end.saturating_sub(j + 1)) as u64;
-        }
-    }
+    let n_bi = n * n.saturating_sub(1) / 2;
+    let n_tri = capped_triples(n, TRIPLE_SPAN);
     w.set("agg:suspicious_bigram_count", (n_bi as f64).ln_1p() as f32);
     w.set(
         "agg:suspicious_trigram_count",

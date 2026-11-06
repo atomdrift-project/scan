@@ -1,18 +1,19 @@
 //! Bounding LLM calls: the in-flight cap, the foreground reserve, and the
-//! per-endpoint and whole-chain breakers that fail over quickly.
+//! per-endpoint breakers that fail over quickly.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
+
+use super::LlmCaller;
 
 /// LLM calls in flight. Each caller waits until the count is below its own
 /// limit, so the cap is the caller's `max_concurrency`, not whichever
 /// configuration happened to ask first.
 pub(super) struct InFlight {
     pub(super) count: Mutex<usize>,
-    pub(super) cv: Condvar,
+    cv: Condvar,
 }
 
 /// The process's one pool: every caller shares the endpoint's capacity.
@@ -25,25 +26,19 @@ pub(super) struct Permit<'a>(&'a InFlight);
 /// quarter of the pool (or `over`, `SCAN_LLM_BACKGROUND_CONCURRENCY`), at
 /// least one, never all of it.
 ///
-/// A process does not compete only with itself: the fleet's workers share one
-/// GPU with serve, and vLLM splits every prefill step's token budget across
-/// *running* requests whatever their priority; priority only orders the
-/// waiting queue. Background calls that hold most of the pool therefore add
-/// seconds to every foreground prompt, at any priority. Nobody waits on a
-/// queue job, so background work takes the small share and drains at whatever
-/// rate the GPU leaves it.
+/// Everything above the cap stays free for foreground callers, so a request
+/// with someone waiting on it queues only behind other such requests, never
+/// behind background work. A pool of one reserves nothing; there, background
+/// work simply takes turns.
+///
+/// The share is small because an endpoint serving several clients splits each
+/// prefill step's token budget across its *running* requests whatever their
+/// priority; priority only orders the waiting queue. Background calls holding
+/// most of the pool would add seconds to every foreground prompt. Nobody waits
+/// on background work, so it drains at whatever rate the endpoint leaves it.
 pub(super) fn background_cap(max: usize, over: Option<NonZeroUsize>) -> usize {
     let cap = over.map_or((max / 4).max(1), NonZeroUsize::get);
     if max < 2 { max } else { cap.min(max - 1) }
-}
-
-/// Permits background work may never take: everything above
-/// [`background_cap`] stays free for foreground callers, so a serve request
-/// queues only behind other requests, never behind background work. A pool of one
-/// reserves nothing; there, background work simply takes turns.
-#[cfg(test)]
-pub(super) fn foreground_reserve(max: usize) -> usize {
-    max - background_cap(max, None)
 }
 
 impl InFlight {
@@ -90,21 +85,19 @@ impl Drop for Permit<'_> {
 }
 
 // ── per-endpoint breaker ────────────────────────────────────────────────────
-// The health gate below is chain-wide: it asks whether *any* endpoint answers.
-// It cannot see the case this breaker exists for — a dead primary in front of
-// a live fallback — where the chain is healthy and every call still pays the
-// primary's timeout before the fallback grades. With the primary saturated,
-// every request spends the full timeout there before the fallback answers in
-// seconds, and the abandoned requests are still prefilled on the host after
-// the client is gone.
+// Without a breaker, a dead primary in front of a live fallback costs every
+// call the primary's timeout before the fallback grades it, and a saturated
+// primary keeps prefilling requests whose client has already given up.
 //
 // So each endpoint carries its own breaker. Consecutive transport failures
 // open it; while open the endpoint is skipped outright and the next one in
-// the chain is tried at once. After the cooldown exactly one call probes it,
-// and that call's outcome closes the breaker or re-arms the cooldown.
+// the chain is tried at once. When every endpoint is open, a call fails
+// immediately instead of waiting. After the cooldown exactly one call probes
+// an endpoint, and that call's outcome closes the breaker or re-arms the
+// cooldown.
 
 /// How long a tripped endpoint is skipped before one request probes it again.
-pub const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+pub(super) const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 /// Consecutive transport failures that trip an endpoint's breaker. One is a
 /// blip; three in a row against a chain that answers in seconds is an outage.
 pub(super) const BREAKER_TRIP_AFTER: u32 = 3;
@@ -114,11 +107,11 @@ pub(super) struct BreakerState {
     /// Transport failures since the endpoint last answered, probes included.
     pub(super) consecutive_failures: u32,
     /// `None` while closed.
-    pub(super) open: Option<Opened>,
+    open: Option<Opened>,
 }
 
 /// An open breaker.
-pub(super) struct Opened {
+struct Opened {
     /// When it opened, or when its last probe failed.
     since: Instant,
     /// A half-open probe is in flight: other callers keep skipping until it
@@ -148,7 +141,7 @@ pub(super) enum Admit {
 
 /// Per-endpoint breakers, keyed by base URL. Tests build their own so the
 /// process-wide instance never carries one test's failures into another.
-pub(crate) struct Breakers {
+pub(super) struct Breakers {
     pub(super) inner: Mutex<HashMap<String, BreakerState>>,
     pub(super) cooldown: Duration,
 }
@@ -165,11 +158,7 @@ impl Breakers {
 
     /// Run `f` on one endpoint's state, holding the registry lock only for
     /// the duration of the call.
-    pub(super) fn with_state<R>(
-        &self,
-        endpoint: &str,
-        f: impl FnOnce(&mut BreakerState) -> R,
-    ) -> R {
+    fn with_state<R>(&self, endpoint: &str, f: impl FnOnce(&mut BreakerState) -> R) -> R {
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let out = f(g.entry(endpoint.to_string()).or_default());
         drop(g);
@@ -216,109 +205,5 @@ impl Breakers {
                 None => false,
             }
         })
-    }
-}
-
-// ── endpoint health (circuit breaker) ───────────────────────────────────────
-// A process-wide breaker over the LLM endpoint. It starts *closed* (optimistic):
-// the first request goes straight through. A transport failure opens it; while
-// open, callers don't fire doomed requests — exactly one of them probes
-// `GET /models` every `HEALTH_RETRY_INTERVAL` and the rest wait, until the
-// endpoint recovers or each caller's budget (the request timeout) elapses.
-
-pub(super) struct Health {
-    pub(super) inner: Mutex<HealthState>,
-    pub(super) cv: Condvar,
-}
-
-pub(super) struct HealthState {
-    /// Breaker closed (`true`) vs open (`false`). Starts closed.
-    pub(super) healthy: bool,
-    /// Whether a caller currently owns the probe loop (so only one probes).
-    pub(super) probing: bool,
-}
-
-pub(super) static HEALTH: Health = Health {
-    inner: Mutex::new(HealthState {
-        healthy: true,
-        probing: false,
-    }),
-    cv: Condvar::new(),
-};
-
-impl Health {
-    /// Record the outcome of a real request: a success closes the breaker, a
-    /// transport failure opens it. Wakes any waiters.
-    pub(super) fn set(&self, healthy: bool) {
-        {
-            let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            g.healthy = healthy;
-        } // release the lock before waking waiters
-        self.cv.notify_all();
-    }
-
-    /// Block until the endpoint is healthy or `budget` elapses; returns whether
-    /// it ended up healthy. When closed, returns immediately. When open, the
-    /// first caller becomes the sole prober (re-probing every `retry`); others
-    /// wait for its result. `probe` is injected so the state machine is testable
-    /// without a network.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the guard is held across the condvar loop on purpose"
-    )]
-    pub(super) fn wait_until_healthy(
-        &self,
-        budget: Duration,
-        retry: Duration,
-        probe: &dyn Fn() -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + budget;
-        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if g.healthy {
-                return true;
-            }
-            if g.probing {
-                // Someone else is probing — wait for their result (or the budget).
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return g.healthy;
-                }
-                g = self
-                    .cv
-                    .wait_timeout(g, remaining)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-                continue;
-            }
-            // Become the sole prober for the whole recovery loop.
-            g.probing = true;
-            let healthy = loop {
-                drop(g);
-                let ok = probe();
-                g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-                g.healthy = ok;
-                if ok {
-                    break true;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break false;
-                }
-                // Nap before the next probe, releasing the lock so a concurrent
-                // request's `set(true)` can wake us early.
-                g = self
-                    .cv
-                    .wait_timeout(g, retry.min(remaining))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
-                if g.healthy {
-                    break true;
-                }
-            };
-            g.probing = false;
-            self.cv.notify_all();
-            return healthy;
-        }
     }
 }

@@ -45,6 +45,15 @@ struct StoreRef<'a> {
     next: &'a [(String, Vec<Reference>)],
 }
 
+/// Prefix of every namespace directory, ahead of [`ruleset_version`]. Bumped
+/// when reference discovery changes what a cached next-hop list means, which
+/// the trait set alone does not capture: v4 requires Python import candidates
+/// to pass namespace verification.
+const NAMESPACE_PREFIX: &str = "dependency-v4-";
+
+/// zstd level for cached entries: the default, cheap next to the analysis.
+const ZSTD_LEVEL: i32 = 3;
+
 /// Handle to the cache directory for the current ruleset version.
 pub(crate) struct AnalysisCache {
     dir: PathBuf,
@@ -68,14 +77,13 @@ impl AnalysisCache {
             return None;
         }
         let base = cache_base()?;
-        // Reference discovery/context changed independently of the trait set.
-        // Historical next-hop lists can contain prose-derived package names.
-        // v4: Python import candidates require namespace verification. Old
-        // next-hop lists used unqualified ast-call edges for dynamic imports.
-        let version = format!("dependency-v4-{}", ruleset_version());
+        let version = format!("{NAMESPACE_PREFIX}{}", ruleset_version());
         prune_stale_versions(&base, &version);
         let dir = base.join(version);
-        std::fs::create_dir_all(&dir).ok()?;
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::debug!(dir = %dir.display(), %error, "analysis cache: cannot create namespace; caching disabled");
+            return None;
+        }
         Some(Self { dir })
     }
 
@@ -83,16 +91,31 @@ impl AnalysisCache {
     /// entry, or an unreadable/garbled one — treated as a miss so a corrupt file
     /// self-heals on the next write).
     pub(crate) fn get(&self, key: &str) -> Option<Cached> {
-        let bytes = std::fs::read(self.path(key)).ok()?;
-        let json = zstd::decode_all(&bytes[..]).ok()?;
-        let cached: Cached = serde_json::from_slice(&json).ok()?;
+        let bytes = match std::fs::read(self.path(key)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::debug!(key, %error, "analysis cache: unreadable entry; analyzing");
+                return None;
+            }
+        };
+        let cached: Cached = match zstd::decode_all(&bytes[..])
+            .map_err(|e| e.to_string())
+            .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string()))
+        {
+            Ok(cached) => cached,
+            Err(error) => {
+                tracing::debug!(key, %error, "analysis cache: garbled entry; analyzing");
+                return None;
+            }
+        };
         (!cached.sub.as_ref().is_some_and(incomplete)).then_some(cached)
     }
 
     /// Store an analysis under `key` (see [`entry_key`]). Best-effort: any failure
-    /// (serialize, compress, write) leaves the cache untouched and is silent —
-    /// the result is already in hand, the cache is only an optimization. An
-    /// [`incomplete`] analysis is not stored.
+    /// (serialize, compress, write) leaves the cache untouched and is logged at
+    /// debug — the result is already in hand, the cache is only an
+    /// optimization. An [`incomplete`] analysis is not stored.
     pub(crate) fn put(
         &self,
         key: &str,
@@ -102,24 +125,28 @@ impl AnalysisCache {
         if sub.is_some_and(incomplete) {
             return;
         }
-        let Ok(json) = serde_json::to_vec(&StoreRef { sub, next }) else {
-            return;
-        };
-        let Ok(compressed) = zstd::encode_all(&json[..], 3) else {
-            return;
+        let compressed = match serde_json::to_vec(&StoreRef { sub, next }) {
+            Ok(json) => zstd::encode_all(&json[..], ZSTD_LEVEL),
+            Err(error) => {
+                tracing::debug!(key, %error, "analysis cache: cannot serialize entry; not stored");
+                return;
+            }
         };
         // Write to a unique temp file, then rename into place — a reader never
         // sees a half-written entry, and concurrent writers (in any process)
         // don't collide. Another process may have pruned this namespace as
         // idle (`prune_stale_versions`); recreate it rather than stop caching.
-        let tmp = tempfile::NamedTempFile::new_in(&self.dir).or_else(|_| {
-            std::fs::create_dir_all(&self.dir)?;
-            tempfile::NamedTempFile::new_in(&self.dir)
+        let stored = compressed.and_then(|compressed| {
+            let mut tmp = tempfile::NamedTempFile::new_in(&self.dir).or_else(|_| {
+                std::fs::create_dir_all(&self.dir)?;
+                tempfile::NamedTempFile::new_in(&self.dir)
+            })?;
+            tmp.write_all(&compressed)?;
+            tmp.persist(self.path(key)).map_err(|e| e.error)?;
+            Ok(())
         });
-        if let Ok(mut tmp) = tmp
-            && tmp.write_all(&compressed).is_ok()
-        {
-            let _ = tmp.persist(self.path(key));
+        if let Err(error) = stored {
+            tracing::debug!(key, %error, "analysis cache: cannot write entry; not stored");
         }
     }
 
@@ -180,18 +207,31 @@ fn incomplete(report: &AnalysisReport) -> bool {
 /// already-seen file would keep the verdict that bundle gave it, so a defect
 /// in one bundle would outlive the corrected bundle that fixes it.
 pub(crate) fn ruleset_version() -> String {
-    let traits = cleave::cache::traits_revision_fingerprint();
     let bloom = crate::bloom_repo::installed_manifest()
         .map_or_else(|| "nobloom".to_string(), |m| bloom_token(&m));
     let nsrl = crate::nsrl_repo::installed_manifest().map_or_else(
         || "nonsrl".to_string(),
         |m| format!("nsrl-{}", bloom_token(&m)),
     );
+    let model = model_token(
+        crate::models_repo::version().as_deref(),
+        crate::models_repo::install_target().ok().as_deref(),
+    );
+    ruleset_token(
+        cleave::cache::traits_revision_fingerprint(),
+        &bloom,
+        &nsrl,
+        &model,
+    )
+}
+
+/// [`ruleset_version`] from its inputs: every one of them, so none can be
+/// dropped from the key without a compile error.
+fn ruleset_token(traits: i64, bloom: &str, nsrl: &str, model: &str) -> String {
     format!(
-        "{}-c{}-r{traits:016x}-{bloom}-{nsrl}-m{}",
+        "{}-c{}-r{traits:016x}-{bloom}-{nsrl}-m{model}",
         env!("CARGO_PKG_VERSION"),
         cleave::types::CompactReport::default().version,
-        model_version(),
     )
 }
 
@@ -213,19 +253,17 @@ fn bloom_token(manifest: &burton::Manifest) -> String {
 
 /// Identity of the installed model bundle, for [`ruleset_version`].
 ///
-/// Prefers the updater's sidecar commit. A dev tree — the `~/azoth` symlink a
-/// local `make azoth-deploy` writes — has no sidecar, and that is exactly the
-/// setup where bundles change most often, so fall back to a stamp of
+/// Prefers the updater's sidecar commit. A bundle installed by hand — a
+/// development build symlinked into place — has no sidecar, and that is
+/// exactly the setup where bundles change most often, so fall back to a stamp of
 /// `config.json`'s size and mtime. Either way a redeployed bundle moves the
 /// token. `nomodel` when nothing is installed.
-fn model_version() -> String {
-    if let Some(commit) = crate::models_repo::version() {
-        return sanitize(&commit);
+fn model_token(commit: Option<&str>, install_dir: Option<&Path>) -> String {
+    if let Some(commit) = commit {
+        return sanitize(commit);
     }
-    let Ok(dir) = crate::models_repo::install_target() else {
-        return "nomodel".to_string();
-    };
-    let Ok(meta) = std::fs::metadata(dir.join("config.json")) else {
+    let Some(meta) = install_dir.and_then(|dir| std::fs::metadata(dir.join("config.json")).ok())
+    else {
         return "nomodel".to_string();
     };
     let stamp = meta
@@ -239,14 +277,15 @@ fn model_version() -> String {
 /// How long a namespace must go unwritten before another version prunes it.
 /// The cache sweep ([`crate::cache_cleanup`]) already drops entries this old
 /// by default, so an idle namespace holds nothing it would keep.
-const IDLE_NAMESPACE_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const IDLE_NAMESPACE_AGE: Duration =
+    Duration::from_secs(30 * crate::civil::SECS_PER_DAY.unsigned_abs());
 
 /// Delete namespace directories under `base`, other than `current`, that no
 /// process has written to in [`IDLE_NAMESPACE_AGE`]. Every rules, engine, or
 /// bloom update starts a fresh namespace, and the superseded ones would
 /// otherwise pile up. Not "everything but mine": a long-running server on the
-/// previous ruleset still writes to its own namespace. Best-effort and silent,
-/// like the cache itself.
+/// previous ruleset still writes to its own namespace. Best-effort, like the
+/// cache itself.
 pub(crate) fn prune_stale_versions(base: &Path, current: &str) {
     prune_idle(base, current, SystemTime::now());
 }
@@ -261,8 +300,11 @@ fn prune_idle(base: &Path, current: &str, now: SystemTime) {
                 && m.modified()
                     .is_ok_and(|t| now.duration_since(t).unwrap_or_default() > IDLE_NAMESPACE_AGE)
         });
-        if idle && entry.file_name().to_str() != Some(current) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if idle
+            && entry.file_name().to_str() != Some(current)
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            tracing::debug!(dir = %entry.path().display(), %error, "analysis cache: cannot prune idle namespace");
         }
     }
 }
@@ -329,7 +371,7 @@ mod tests {
             ruleset_version()
         };
         let cache = |version: &str| {
-            let dir = root.path().join(format!("dependency-v3-{version}"));
+            let dir = root.path().join(format!("{NAMESPACE_PREFIX}{version}"));
             std::fs::create_dir_all(&dir).unwrap();
             AnalysisCache { dir }
         };
@@ -394,7 +436,9 @@ mod tests {
 
         // A month and a day later, nobody has written to either; only the
         // current version's namespace survives.
-        let later = SystemTime::now() + IDLE_NAMESPACE_AGE + Duration::from_secs(86_400);
+        let later = SystemTime::now()
+            + IDLE_NAMESPACE_AGE
+            + Duration::from_secs(crate::civil::SECS_PER_DAY.unsigned_abs());
         prune_idle(base.path(), "mine", later);
         assert!(base.path().join("mine").is_dir());
         assert!(!base.path().join("theirs").exists());
@@ -404,7 +448,7 @@ mod tests {
     fn a_same_day_bloom_rebuild_moves_the_token() {
         let manifest = |sha: &str| -> burton::Manifest {
             toml::from_str(&format!(
-                "schema = 1\nbuilt = \"2026-10-01\"\n[filter.purl-good]\nfile = \"purl-good.adbl\"\nsha256 = \"{sha}\"\nformat_version = 1\nn = 1\n"
+                "schema = 2\nbuilt = \"2026-10-01\"\nkey_scheme = \"test/v1\"\n[filter.purl-good]\nfile = \"purl-good.adbl\"\nsha256 = \"{sha}\"\nn = 1\n"
             ))
             .unwrap()
         };
@@ -475,30 +519,43 @@ mod tests {
     /// model token being dropped from the key again.
     #[test]
     fn ruleset_version_carries_the_model_token() {
-        let version = ruleset_version();
-        let token = model_version();
+        let token = model_token(Some("abc123"), None);
+        let version = ruleset_token(7, "nobloom", "nonsrl", &token);
         assert!(
             version.ends_with(&format!("-m{token}")),
             "ruleset_version {version} must carry model token {token}",
+        );
+        assert_ne!(
+            version,
+            ruleset_token(7, "nobloom", "nonsrl", &model_token(Some("def456"), None)),
+            "a model swap must move the namespace"
         );
     }
 
     #[test]
     fn model_version_is_stable_and_path_safe() {
-        assert_eq!(model_version(), model_version());
-        assert!(
-            model_version()
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let path_safe = |token: &str| {
+            token
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
-            "model token must be a safe path segment: {}",
-            model_version(),
-        );
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        };
+        for (commit, install) in [
+            (Some("v1/../ab c"), None),
+            (None, Some(dir.path())),
+            (None, None),
+        ] {
+            let token = model_token(commit, install);
+            assert_eq!(token, model_token(commit, install));
+            assert!(
+                path_safe(&token),
+                "model token must be a safe path segment: {token}"
+            );
+        }
+        assert_eq!(model_token(None, None), "nomodel");
     }
-}
 
-#[cfg(test)]
-mod historical_gap_tests {
-    use super::*;
     #[test]
     fn historical_partial_cache_entry_is_rejected_on_read() {
         let dir = tempfile::tempdir().unwrap();

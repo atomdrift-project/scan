@@ -1,8 +1,8 @@
 //! Integration test for the model-backend dispatch in `scan::model::Model`.
 //!
 //! Scan loads ONNX models only; a native LightGBM (`.txt`) or XGBoost (`.json`)
-//! bundle is refused. These tests verify that:
-//!   * a directory containing `model.onnx` loads via the ONNX backend.
+//! route is refused. These tests verify that:
+//!   * a route containing `model.onnx` loads via the ONNX backend.
 //!   * multi-seed `models/seed_*.onnx` load and average correctly.
 //!   * a directory with both `model.onnx` and `models/` is ambiguous.
 //!   * a native `.txt`/`.json` (or empty) bundle is rejected.
@@ -16,10 +16,21 @@ use scan::model::Model;
 
 mod bundle;
 
-/// A loadable single-model bundle to copy routes and seeds from.
+/// A loadable bundle to copy routes and seeds from.
 fn onnx_bundle() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     bundle::write(dir.path()).expect("write bundle");
+    dir
+}
+
+/// A bundle with `src`'s spec and config but no model in its `general/`
+/// route, for a test to add one.
+fn staged(src: &std::path::Path) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("general")).unwrap();
+    for file in ["general/feature_spec.json", "config.json"] {
+        std::fs::copy(src.join(file), dir.path().join(file)).unwrap();
+    }
     dir
 }
 
@@ -49,16 +60,13 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     // predict paths are wired correctly without needing two distinct models.
     let src = onnx_bundle();
     let src = src.path();
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::copy(
-        src.join("feature_spec.json"),
-        dir.path().join("feature_spec.json"),
-    )
-    .unwrap();
-    let models_dir = dir.path().join("models");
+    let dir = staged(src);
+    let general = dir.path().join("general");
+    let models_dir = general.join("models");
     std::fs::create_dir(&models_dir).unwrap();
-    std::fs::copy(src.join("model.onnx"), models_dir.join("seed_42.onnx")).unwrap();
-    std::fs::copy(src.join("model.onnx"), models_dir.join("seed_43.onnx")).unwrap();
+    let model = src.join("general/model.onnx");
+    std::fs::copy(&model, models_dir.join("seed_42.onnx")).unwrap();
+    std::fs::copy(&model, models_dir.join("seed_43.onnx")).unwrap();
     // Bystander file — must be ignored, not loaded.
     std::fs::write(models_dir.join("README.md"), b"hi").unwrap();
 
@@ -66,7 +74,7 @@ fn multi_seed_onnx_bundle_loads_and_predicts() {
     let prob = predict(&model);
     assert!(prob.is_finite() && (0.0..=1.0).contains(&prob));
 
-    let single_model = Model::load(src, None, None).expect("load single bundle");
+    let single_model = Model::load(src, None, None).expect("load single-model bundle");
     let single_prob = predict(&single_model);
     assert!(
         (prob - single_prob).abs() < 1e-6,
@@ -80,16 +88,16 @@ fn ambiguous_onnx_legacy_plus_multi_seed_layout_is_rejected() {
     // ambiguous — the deploy should choose one layout. We refuse to guess.
     let src = onnx_bundle();
     let src = src.path();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = staged(src);
+    let general = dir.path().join("general");
+    std::fs::copy(src.join("general/model.onnx"), general.join("model.onnx")).unwrap();
+    let models_dir = general.join("models");
+    std::fs::create_dir(&models_dir).unwrap();
     std::fs::copy(
-        src.join("feature_spec.json"),
-        dir.path().join("feature_spec.json"),
+        src.join("general/model.onnx"),
+        models_dir.join("seed_42.onnx"),
     )
     .unwrap();
-    std::fs::copy(src.join("model.onnx"), dir.path().join("model.onnx")).unwrap();
-    let models_dir = dir.path().join("models");
-    std::fs::create_dir(&models_dir).unwrap();
-    std::fs::copy(src.join("model.onnx"), models_dir.join("seed_42.onnx")).unwrap();
 
     let err = Model::load(dir.path(), None, None).expect_err("ambiguous layout must error");
     let msg = format!("{err:#}");
@@ -106,8 +114,10 @@ fn native_txt_model_is_rejected() {
     // contents are fine.)
     for native in ["model.txt", "model.json"] {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join(native), b"stub").unwrap();
+        let general = dir.path().join("general");
+        std::fs::create_dir(&general).unwrap();
+        std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
+        std::fs::write(general.join(native), b"stub").unwrap();
         let err = Model::load(dir.path(), None, None).expect_err("native model must be rejected");
         let msg = format!("{err:#}");
         assert!(
@@ -131,7 +141,8 @@ fn empty_bundle_is_rejected() {
 #[test]
 fn bundle_with_spec_but_no_model_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
+    std::fs::create_dir(dir.path().join("general")).unwrap();
+    std::fs::write(dir.path().join("general/feature_spec.json"), b"{}").unwrap();
     let err = Model::load(dir.path(), None, None).expect_err("spec-only must error");
     let msg = format!("{err:#}");
     assert!(
@@ -146,9 +157,11 @@ fn empty_models_dir_falls_through_to_incomplete_error() {
     // model.onnx either) must error out with the same "incomplete" path so the
     // operator gets a clear signal.
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("feature_spec.json"), b"{}").unwrap();
-    std::fs::create_dir(dir.path().join("models")).unwrap();
-    std::fs::write(dir.path().join("models").join("README.md"), b"hi").unwrap();
+    let general = dir.path().join("general");
+    std::fs::create_dir(&general).unwrap();
+    std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
+    std::fs::create_dir(general.join("models")).unwrap();
+    std::fs::write(general.join("models").join("README.md"), b"hi").unwrap();
 
     let err = Model::load(dir.path(), None, None).expect_err("empty models dir must error");
     let msg = format!("{err:#}");

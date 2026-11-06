@@ -122,6 +122,11 @@ const THIRD_PARTY: &[&str] = &[
 /// service endpoints rather than user-hosted artifacts. These are discovery
 /// exceptions only; they do not change [`publisher_controlled`] or explicit
 /// `scan url` behavior.
+///
+/// Each entry covers its subdomains too, deliberately: these services spread
+/// the same documentation and endpoints over regional and per-project hosts,
+/// and an exception only stops automatic discovery — a subdomain someone else
+/// controls can still be analyzed by name with `scan url`.
 const DISCOVERY_DOMAINS: &[&str] = &[
     "ajax.googleapis.com",
     "bibnum.bnf.fr",

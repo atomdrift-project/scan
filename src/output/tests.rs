@@ -135,7 +135,7 @@ fn terminal_trait_grid_is_three_rows_and_keeps_location_tail() {
     // sets it these rows arrive wrapped in escapes and every prefix and
     // suffix assertion below reads a different string than the one under
     // test.
-    colored::control::set_override(false);
+    let _plain = PlainOutput::new();
     let rendered = terminal_trait_rows(&traits, 72);
     assert_eq!(rendered.lines().count(), 3);
     assert!(rendered.lines().next().unwrap().contains("…"));
@@ -146,7 +146,7 @@ fn terminal_trait_grid_is_three_rows_and_keeps_location_tail() {
 #[test]
 fn embedded_branch_uses_two_lines_without_a_closing_rule() {
     // See `terminal_trait_grid_is_three_rows_and_keeps_location_tail`.
-    colored::control::set_override(false);
+    let _plain = PlainOutput::new();
     let body = " \u{25cf}\u{25cf}\u{25cf} Payload behavior";
     let rendered = terminal_embedded_branch(
         Classification::Hostile,
@@ -167,7 +167,7 @@ fn embedded_branch_uses_two_lines_without_a_closing_rule() {
 #[test]
 fn plain_renderers_emit_grep_able_text() {
     // See `terminal_trait_grid_is_three_rows_and_keeps_location_tail`.
-    colored::control::set_override(false);
+    let _plain = PlainOutput::new();
     let lines = [
         terminal_artifact_line("pkg.tgz", "npm", 2048, true),
         terminal_identity_line("lodash 4.17.21").unwrap(),
@@ -349,4 +349,72 @@ fn age_formats_by_unit() {
     assert_eq!(fmt_age(90), "1m ago");
     assert_eq!(fmt_age(3 * 3600), "3h ago");
     assert_eq!(fmt_age(2 * 86_400 + 5 * 3600), "2d ago");
+}
+
+#[test]
+fn strip_ansi_removes_color_codes() {
+    assert_eq!(strip_ansi("\x1b[38;2;1;2;3mhi\x1b[0m"), "hi");
+}
+
+#[test]
+fn elide_keeps_both_ends() {
+    // Fits within the width: returned untouched.
+    assert_eq!(elide("short", 10, Keep::Ends), "short");
+    // A long URL keeps its host prefix and its filename tail around the
+    // ellipsis, so the version and extension survive the cut.
+    let url =
+        "github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-IosevkaCurlySlab-34.7.0.zip";
+    let out = elide(url, 34, Keep::Ends);
+    assert_eq!(
+        out.chars().count(),
+        34,
+        "elided name must fill exactly the column"
+    );
+    assert!(out.starts_with("github.com/"), "host prefix lost: {out}");
+    assert!(out.ends_with(".zip"), "filename tail lost: {out}");
+    assert!(
+        out.contains('\u{2026}'),
+        "no ellipsis marking the cut: {out}"
+    );
+    // Wide characters count double.
+    assert!(elide("ああああああああああ", 9, Keep::Ends).width() <= 9);
+}
+
+#[test]
+fn elide_tail_keeps_the_filename_end() {
+    assert_eq!(elide("short.py", 48, Keep::Tail), "short.py");
+    let long = "animica/stratum_pool/_data/aicf_rag/chunks/deeply/nested/file.json";
+    let tail = elide(long, 20, Keep::Tail);
+    assert!(tail.starts_with('\u{2026}'));
+    assert!(tail.ends_with("file.json"));
+    assert_eq!(tail.chars().count(), 20);
+}
+
+#[test]
+fn elide_head_fits_display_columns() {
+    assert_eq!(elide("abcdef", 4, Keep::Head), "abc\u{2026}");
+    assert_eq!(elide("abcdef", 1, Keep::Head), "\u{2026}");
+    assert_eq!(elide("abcdef", 0, Keep::Head), "");
+    assert!(elide("日本語のパッケージ", 7, Keep::Head).width() <= 7);
+}
+
+#[test]
+fn only_the_terminal_filters_results() {
+    assert!(!OutputFormat::Terminal.emits_every_result());
+    for format in [
+        OutputFormat::Json,
+        OutputFormat::Tiny,
+        OutputFormat::Interpret,
+    ] {
+        assert!(format.emits_every_result(), "{format:?}");
+    }
+}
+
+#[test]
+fn pids_line_lists_a_few_and_counts_the_rest() {
+    let _plain = PlainOutput::new();
+    assert!(terminal_pids_line(&[1, 2, 3], false).ends_with("pids: 1, 2, 3"));
+    let many = terminal_pids_line(&[1, 2, 3, 4, 5, 6, 7], true);
+    assert!(many.contains("pids: 1, 2, 3, 4 +3 more"), "{many}");
+    assert!(many.ends_with("(deleted)"), "{many}");
 }

@@ -59,9 +59,9 @@ fn load_fixture() -> ExtractionFixture {
     })
 }
 
-/// The feature spec the fixture was generated against.
+/// The feature spec the fixture was generated against: the general route's.
 fn load_spec() -> FeatureSpec {
-    let path = model_dir().join("feature_spec.json");
+    let path = model_dir().join("general").join("feature_spec.json");
     FeatureSpec::load(&path)
         .unwrap_or_else(|e| panic!("{} is missing or unusable: {e:#}", path.display()))
 }

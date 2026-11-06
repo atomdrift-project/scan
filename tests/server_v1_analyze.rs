@@ -191,61 +191,13 @@ async fn something_is_said_almost_immediately() -> Result<()> {
     Ok(())
 }
 
-/// The stream's contract, stated as the rule a client implements: read lines
-/// until one carries `decision`, and that is the answer. Progress frames say
-/// what the run is doing and are safe to ignore; nothing before the decision
-/// line is an answer, and there is exactly one decision line.
-#[tokio::test]
-async fn a_client_reads_lines_until_one_carries_a_decision() -> Result<()> {
-    let streamed = concat!(
-        r#"{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":1002,"phase":"unpack"}"#,
-        "\n",
-        r#"{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":6004,"phase":"features+model"}"#,
-        "\n",
-        r#"{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}"#,
-        "\n",
-    );
-
-    let mut answer = None;
-    let mut progress = 0;
-    for line in streamed.lines().filter(|l| !l.trim().is_empty()) {
-        let frame: serde_json::Value = serde_json::from_str(line).context("every line is JSON")?;
-        if frame.get("decision").is_some() {
-            answer = Some(frame);
-        } else {
-            assert_eq!(
-                frame["state"], "analyzing",
-                "a frame that is neither progress nor a decision"
-            );
-            progress += 1;
-        }
-    }
-    assert_eq!(progress, 2, "progress frames were not readable as progress");
-    let answer = answer.context("the stream carried no decision")?;
-    assert_eq!(answer["decision"], "block");
-    assert_eq!(answer["fires_at"], 3);
-    Ok(())
-}
-
-/// An analysis that finishes before the first progress frame is due emits
-/// nothing but the decision — so the fast path still looks like a single JSON
-/// object, and a caller that never expected a stream still parses it.
-#[tokio::test]
-async fn a_fast_analysis_is_still_one_json_object() -> Result<()> {
-    let streamed = "{\"decision\":\"allow\",\"fires_at\":-1}\n";
-    let parsed: serde_json::Value =
-        serde_json::from_str(streamed.trim()).context("a lone decision must parse as JSON")?;
-    assert_eq!(parsed["decision"], "allow");
-    Ok(())
-}
-
 /// The applied policy is reported back, because the caller has to file the
 /// answer under the question it actually answers.
 ///
 /// Scan applies the requested selection on top of its own configuration, so
 /// what ran is knowable only here. A caller left guessing files under what it
 /// asked for, and the two disagree the moment either default moves — which is
-/// exactly how a fleet ends up analysing correctly and recording nothing.
+/// exactly how a caller ends up analysing correctly and recording nothing.
 ///
 /// `follow=none` is asserted rather than the default because its name does not
 /// depend on how this server was started. Force requests a new analysis so an

@@ -109,9 +109,9 @@ async fn accepts_a_valid_token() -> Result<()> {
             .oneshot(loopback(get("/_/info", Some(&header))?))
             .await
             .context("request failed")?;
-        assert_ne!(
+        assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::OK,
             "valid token rejected for {header:?}",
         );
     }
@@ -132,9 +132,11 @@ async fn health_never_requires_a_token() -> Result<()> {
             .oneshot(loopback(get("/_/health", header)?))
             .await
             .context("request failed")?;
-        assert_ne!(
+        // The server never becomes ready (see `config`), so a probe the ACL
+        // lets through is answered 503 by the handler — never 401 by the ACL.
+        assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
             "health rejected for {header:?}",
         );
     }
@@ -192,7 +194,7 @@ async fn unauthenticated_server_is_unchanged() -> Result<()> {
         .await
         .context("request failed")?;
 
-    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 

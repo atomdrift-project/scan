@@ -13,7 +13,7 @@ check, an ingestion pipeline.
 # install (Linux/macOS via Homebrew)
 brew install atomdrift-project/tap/scan
 
-# or build from source — needs Rust 1.96+
+# or build from source — needs Rust 1.97+
 git clone https://github.com/atomdrift-project/scan.git && cd scan && make install
 
 # scan a file, a directory, or an archive (archives unpack automatically)
@@ -38,7 +38,7 @@ Start with the CLI; move to the server when volume demands it.
 | ------------ | -------------------------------------------------------- | ----------------------------------------------- | ---------------------------------- |
 | **CLI**      | One-shot or batch, up to ~5 scans/min.                   | Reloads the model on every run.                 | `atomscan --help`                 |
 | **HTTP server** | Sustained traffic past ~5 scans/min.                 | You run a long-lived process.                   | [SERVER_API.md](SERVER_API.md)     |
-| **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | source — `classify_file`, `classify_bytes` |
+| **Rust library** | You are already in Rust and want in-process calls. | More setup, weaker API stability. See [Library](#library). | `cargo doc` — `scan::Analyzer` |
 
 A registry gating uploads on ingest should start with the **CLI** and grow
 into the **HTTP server**.
@@ -79,9 +79,16 @@ review a scan that did not fully happen.
 
 ## Set the false-positive level
 
-For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation.
+A level is a false-positive allowance, measured on the benign files the
+model was calibrated against:
 
-These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk. See the [shared level definition](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
+- **L0** flags only what fired on none of them.
+- **L*n*** (n ≥ 1) allows one false positive plus an estimated *n* − 1 more
+  per 100 million benign files. L25 is one plus 24 per 100 million.
+
+Higher levels are more sensitive: they catch more and cry wolf more. The
+levels are calibration targets, not guarantees: L0 means no false positive
+was observed, not that none can happen.
 
 ```bash
 atomscan -l 0 ./pkg/       # zero observed calibration FPs; strictest
@@ -137,11 +144,10 @@ uses `https://openrouter.ai/api/v1`; the key is `SCAN_LLM_KEY` or
 `~/.tok/openrouter`, and `--llm-model` defaults to `openrouter/auto`, OpenRouter's
 own router — nothing else from its billed catalog is ever guessed.
 
-An endpoint that requires a bearer token — ours does — is authenticated without
-any flag: put the token in `~/.tok/llm` (mode 0600, first non-empty line) and
-atomscan sends it on every request. `SCAN_LLM_KEY` overrides the
-file. `~/.tok/llm` is *our* endpoint's credential and is never sent to
-OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
+An endpoint that requires a bearer token is authenticated without any flag:
+put the token in `~/.tok/llm` (mode 0600, first non-empty line) and atomscan
+sends it on every request. `SCAN_LLM_KEY` overrides the file. `~/.tok/llm` is
+never sent to OpenRouter, which takes `~/.tok/openrouter` or nothing. Without a token the
 endpoint answers 401, which costs the second opinion but not the scan: the
 verdict falls back to ML alone and the reason appears in the `llm` section.
 A server running under a service account reads `~/.tok/llm` from that
@@ -149,24 +155,24 @@ account's home.
 
 ### Failing over between endpoints
 
-Comma-separate `--llm` to name a chain, tried in order — the shape the deploy
-scripts install by default:
+Comma-separate `--llm` to name a chain, tried in order. For example, the
+Atomdrift Uplink hosted endpoint with OpenRouter behind it:
 
 ```bash
 atomscan --llm 'https://llm.isotope13.ai/v1,openrouter' ./project
 ```
 
-The first endpoint that answers wins, so an outage on our own box costs a retry
+The first endpoint that answers wins, so an outage on the first costs a retry
 rather than the second opinion, and the billed public API is only reached when
 the free one cannot answer — put the endpoint you would rather not pay for
 last. Any refusal moves to the next: unreachable, timeout, 5xx, or a 4xx such
-as the 401 from a host we hold no token for. The `llm` section names the model
+as the 401 from a host you hold no token for. The `llm` section names the model
 that actually graded, not the one configured first.
 
 Each link resolves independently. `--llm-model` pairs with `--llm`
 positionally — a blank slot asks that endpoint what it serves, and a single
 name (no comma) applies to the whole chain — and each takes its own key, so the
-example above discovers `Qwen/Qwen3.8-27B` on our vLLM with `~/.tok/llm` and
+example above asks the Uplink endpoint what it serves, authenticating with `~/.tok/llm`, and
 sends `openrouter/auto` to OpenRouter with `~/.tok/openrouter`; adding
 `--llm-model ',qwen/qwen3.8-27b'` would pin that second slot instead. A link
 that cannot be used (no key) is dropped with a warning while the rest carry on; only
@@ -202,5 +208,8 @@ deployment with `SCAN_FOLLOW` instead of the flag if that suits you better.
 
 The in-process Rust API is the most direct path and the least stable. Until
 1.0, minor releases may break it, so **pin a commit** of
-`github.com/atomdrift-project/scan`. Give `main` an 8 MB rayon stack. It returns
-the same JSON envelope as every other path.
+`github.com/atomdrift-project/scan`. Start with `scan::Analyzer`: load it once
+from a model bundle, then call `scan_bytes` or `scan_file`. Call
+`scan::runtime::install_rayon_pool()` at startup, so analysis runs on a pool
+with the deep stacks nested archives need. Results serialize to the same JSON
+envelope as every other path.

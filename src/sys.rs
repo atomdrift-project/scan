@@ -28,14 +28,15 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
 
     if is_terminal {
-        eprintln!("\n\x1b[1m\u{2592} processes\x1b[0m");
+        eprintln!("\n{}", heading("\u{2592} processes"));
     }
     let ps_summary = crate::ps::run(config)?;
 
     let targets = curated_targets();
     if is_terminal {
         eprintln!(
-            "\n\x1b[1m\u{2592} persistence & temp locations\x1b[0m  ({} paths)",
+            "\n{}  ({} paths)",
+            heading("\u{2592} persistence & temp locations"),
             targets.len(),
         );
     }
@@ -46,6 +47,11 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     };
 
     Ok(merge(&ps_summary, &fs_summary, start))
+}
+
+/// A phase heading, bold on a colour terminal.
+fn heading(text: &str) -> String {
+    crate::output::Ink::stderr().fg_bold(crate::output::palette().path_name, text)
 }
 
 /// Curated, OS-aware set of locations where malware commonly stages or persists.

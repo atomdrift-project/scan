@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 /// The public update bucket (`<base>/versions.toml`, `<base>/models/...`,
 /// `<base>/bloom/v<N>/...`, `<base>/nsrl/...`).
-const BASE_URL: &str = "https://updates.atomdrift.org/litmus";
+const BASE_URL: &str = "https://updates.atomdrift.org/scan";
 
 /// One kind of installable bundle.
 pub(crate) trait Bundle {
@@ -49,8 +49,6 @@ pub(crate) trait Bundle {
     fn stage(staging: &Path, http: &Http, remote: &Self::Remote) -> Result<()>;
     /// `remote` as a line names it.
     fn describe(remote: &Self::Remote) -> String;
-    /// `have` as a line names it.
-    fn describe_installed(have: &Self::Installed) -> String;
     /// Anything else worth saying once a run settles.
     fn note(_remote: &Self::Remote) -> Option<String> {
         None
@@ -128,34 +126,6 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
         ),
     );
     Ok(true)
-}
-
-/// Report what [`update`] would install into `dir`, changing nothing.
-///
-/// # Errors
-/// When the manifest cannot be fetched or validated.
-pub(crate) fn check<B: Bundle>(dir: &Path) -> Result<()> {
-    if let Some(why) = hands_off(B::NAME, dir) {
-        eprintln!("{why}");
-        return Ok(());
-    }
-    let remote = B::fetch(&client(false)?)?;
-    let available = B::describe(&remote);
-    match B::installed(dir) {
-        Some(have) if B::is_current(dir, &have, &remote) => {
-            eprintln!("{} up to date: {available}", B::NAME);
-        }
-        Some(have) => eprintln!(
-            "{} update available: {available} (installed: {})",
-            B::NAME,
-            B::describe_installed(&have)
-        ),
-        None => eprintln!("{} not installed; available: {available}", B::NAME),
-    }
-    if let Some(note) = B::note(&remote) {
-        eprintln!("{note}");
-    }
-    Ok(())
 }
 
 /// Stall budget: how long a connect, the request, or any one read of a body
@@ -249,6 +219,47 @@ pub(crate) fn download_to(http: &Http, url: &str, sha256: &str, path: &Path) -> 
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Download each filter `manifest` lists from `<base>/<file>` into `staging`,
+/// and refuse the set unless every one is what the manifest says: a bare
+/// file name, the manifest's sha256, a filter that loads (which refuses any
+/// format but the one this build reads), and a header whose stem and element
+/// count match the manifest's entry. The bloom and NSRL bundles both stage
+/// through here; each writes its own sidecar afterwards.
+pub(crate) fn stage_filters(
+    staging: &Path,
+    http: &Http,
+    base: &str,
+    manifest: &burton::Manifest,
+) -> Result<()> {
+    for (stem, entry) in &manifest.filter {
+        // The name must stay inside `staging`.
+        if Path::new(&entry.file).file_name() != Some(std::ffi::OsStr::new(&entry.file)) {
+            bail!("filter {stem} has an unsafe file name {:?}", entry.file);
+        }
+        let path = staging.join(&entry.file);
+        download_to(
+            http,
+            &format!("{base}/{}", entry.file),
+            &entry.sha256,
+            &path,
+        )?;
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", entry.file))?;
+        let filter =
+            burton::Filter::load(bytes).with_context(|| format!("validating {}", entry.file))?;
+        if filter.stem() != stem || filter.len() != entry.n {
+            bail!(
+                "filter {} header (stem {}, {} elements) disagrees with the manifest \
+                 (stem {stem}, {} elements); refusing to install",
+                entry.file,
+                filter.stem(),
+                filter.len(),
+                entry.n
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Stream `url` into `out`, refusing more than `max` bytes.
 ///
 /// A transient failure before the body starts — a dropped connection, 408,
@@ -256,7 +267,7 @@ pub(crate) fn download_to(http: &Http, url: &str, sha256: &str, path: &Path) -> 
 /// Retry-After, within `http`'s retry budget. Nothing has been written to
 /// `out` by then, so a retry cannot corrupt it; a failure mid-body is final.
 fn copy_capped(http: &Http, url: &str, max: u64, out: &mut impl Write) -> Result<()> {
-    tracing::debug!("fetching {url}");
+    tracing::debug!(url, "fetching");
     let _span = tracing::info_span!("bundle_fetch", url).entered();
     let resp = crate::retry::send("bundle fetch", http.retry, |_| http.client.get(url))
         .and_then(reqwest::blocking::Response::error_for_status)
@@ -327,7 +338,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// The right to replace one install directory, held across processes.
 ///
 /// Several updaters can target one directory at once (a scan's auto-update,
-/// `update-rules`, a server's `/_/update`, postdoc's worker). The lock, a
+/// `update-rules`, a server's `/_/update`, an embedding daemon). The lock, a
 /// `.<name>.lock` file beside the target, serializes their staging and swap.
 /// Readers don't take it; see [`settle`].
 #[derive(Debug)]
@@ -612,9 +623,6 @@ mod tests {
         }
         fn describe(remote: &u32) -> String {
             remote.to_string()
-        }
-        fn describe_installed(have: &u32) -> String {
-            have.to_string()
         }
     }
 

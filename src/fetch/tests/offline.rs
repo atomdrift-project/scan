@@ -1,4 +1,4 @@
-use super::{BlobCache, Fetch, FetchError, Fetched, Request};
+use fletch::fetch::{BlobCache, Fetch, FetchError, Fetched, Request};
 
 /// Refuses every request, so a test that would fetch says so instead of
 /// depending on what the internet answers today.

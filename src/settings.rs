@@ -6,20 +6,16 @@
 //! parts of one process can disagree about them.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// The process's settings.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// What the fetch client and blob cache are built with.
-    pub fetch: crate::fetch::Settings,
     /// A ceiling on everything one execution fetches; `None` is unlimited, as
     /// a server's is: each of its jobs is bounded on its own.
     pub fetch_total: Option<FetchTotal>,
-    /// A file that keeps unfinished fetch work for a later run.
-    pub fetch_backlog: Option<PathBuf>,
     /// Where scan's caches live instead of the platform cache directory.
     pub cache_dir: Option<PathBuf>,
     /// The terminal theme; `None` is dark.
@@ -35,30 +31,17 @@ pub struct FetchTotal {
     pub bytes: u64,
 }
 
-/// The settings, with what [`configure`] built from them.
-struct Settled {
-    settings: Settings,
-    backlog: Option<Arc<crate::fetch::Backlog>>,
-}
-
-static SETTLED: OnceLock<Settled> = OnceLock::new();
+static SETTLED: OnceLock<Settings> = OnceLock::new();
 
 /// Settle the process's settings. Call it before anything reads them: the
 /// first read settles the defaults.
 ///
 /// # Errors
-/// When the fetch backlog cannot be read, or the settings are already settled.
+/// When the settings are already settled.
 pub fn configure(settings: Settings) -> Result<()> {
-    let backlog = match &settings.fetch_backlog {
-        Some(path) => Some(Arc::new(
-            crate::fetch::Backlog::open(path)
-                .with_context(|| format!("opening fetch backlog {}", path.display()))?,
-        )),
-        None => None,
-    };
     let total = settings.fetch_total;
     SETTLED
-        .set(Settled { settings, backlog })
+        .set(settings)
         .map_err(|_rejected| anyhow::anyhow!("process settings are already settled"))?;
     if let Some(total) = total {
         crate::fetch::set_total_budget(total.fetches, total.bytes);
@@ -66,19 +49,7 @@ pub fn configure(settings: Settings) -> Result<()> {
     Ok(())
 }
 
-fn settled() -> &'static Settled {
-    SETTLED.get_or_init(|| Settled {
-        settings: Settings::default(),
-        backlog: None,
-    })
-}
-
 /// The process's settings.
 pub(crate) fn get() -> &'static Settings {
-    &settled().settings
-}
-
-/// The fetch backlog [`configure`] opened, if one was named.
-pub(crate) fn fetch_backlog() -> Option<&'static Arc<crate::fetch::Backlog>> {
-    settled().backlog.as_ref()
+    SETTLED.get_or_init(Settings::default)
 }

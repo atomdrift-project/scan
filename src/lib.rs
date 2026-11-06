@@ -6,14 +6,16 @@
 //! - [`engine::run`] scans files and directories under a [`ScanConfig`].
 //! - [`Classification`] and [`Thresholds`] interpret the model's output.
 //!
-//! The other public modules exist for the `atomscan` binary and the
-//! integration tests, and change with them.
+//! Every other public item exists for the `atomscan` binary, the integration
+//! tests and the daemons built on this crate, is hidden from these docs, and
+//! changes with them.
 //!
 //! # Example
 //! ```no_run
 //! use scan::{DisplayFilter, OutputFormat, ScanConfig, Thresholds};
 //!
-//! let config = ScanConfig::new("/path/to/models", OutputFormat::Json, Some(Thresholds::default()))?
+//! let thresholds = Thresholds { suspicious: 0.9, hostile: 0.99 };
+//! let config = ScanConfig::new("/path/to/models", OutputFormat::Json, Some(thresholds))?
 //!     .with_filter(DisplayFilter::all());
 //!
 //! let summary = scan::engine::run(std::path::Path::new("/tmp/sample.exe"), &config)?;
@@ -21,67 +23,99 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+// The supported API: what the crate docs above describe.
+pub mod engine;
+pub mod model;
+
 pub(crate) mod analysis_cache;
 pub(crate) mod analyzer;
-pub mod auto_update;
-pub mod bloom_build;
-pub mod bloom_repo;
-pub mod bloom_update;
 pub(crate) mod bundle;
-pub mod cache_cleanup;
 mod cache_sweep;
 mod civil;
-pub mod cli;
 pub(crate) mod deptree;
 mod digest;
-pub mod engine;
-pub mod env;
-pub mod features;
-pub mod fetch;
-pub mod heap_profile;
-pub mod hopper;
 pub(crate) mod hosts;
-pub mod interpret;
 mod interrupt;
-pub mod memory;
-pub mod model;
-pub mod model_update;
-pub mod models_repo;
-pub mod nsrl_repo;
-pub mod output;
-pub mod pkg;
-pub mod provenance;
-pub mod ps;
-pub mod remote;
 mod retry;
-pub mod rules;
-pub mod runtime;
-pub mod server;
-pub mod settings;
-pub mod sys;
-pub mod tools;
-pub mod traits_repo;
-pub mod update_check;
-pub(crate) mod update_manifest;
-pub mod upload;
-pub mod validate;
+pub(crate) mod thread_priority;
 
-// Plumbing for the fleet daemon built on this crate. Public so it can link
-// against it, hidden because it is not a supported API and changes with it.
+// Everything below is public only because the `atomscan` binary, the
+// integration tests and the Atomdrift daemons built on this crate link it.
+// None of it is a supported API: it changes with them, without notice.
 #[doc(hidden)]
 pub mod analysis;
+#[doc(hidden)]
+pub mod auto_update;
+#[doc(hidden)]
+pub mod bloom_build;
+#[doc(hidden)]
+pub mod bloom_repo;
+#[doc(hidden)]
+pub mod bloom_update;
+#[doc(hidden)]
+pub mod cache_cleanup;
+#[doc(hidden)]
+pub mod cli;
 #[doc(hidden)]
 pub mod corpus_precheck;
 #[doc(hidden)]
 pub mod crash_dump;
 #[doc(hidden)]
+pub mod env;
+#[doc(hidden)]
 pub mod explain;
+#[doc(hidden)]
+pub mod features;
+#[doc(hidden)]
+pub mod fetch;
+#[doc(hidden)]
+pub mod freebsd_malloc;
+#[doc(hidden)]
+pub mod hopper;
+#[doc(hidden)]
+pub mod interpret;
 #[doc(hidden)]
 pub mod lookup;
 #[doc(hidden)]
+pub mod memory;
+#[doc(hidden)]
+pub mod model_update;
+#[doc(hidden)]
+pub mod models_repo;
+#[doc(hidden)]
+pub mod nsrl_repo;
+#[doc(hidden)]
+pub mod output;
+#[doc(hidden)]
+pub mod pkg;
+#[doc(hidden)]
+pub mod provenance;
+#[doc(hidden)]
+pub mod ps;
+#[doc(hidden)]
+pub mod remote;
+#[doc(hidden)]
+pub mod rules;
+#[doc(hidden)]
+pub mod runtime;
+#[doc(hidden)]
+pub mod server;
+#[doc(hidden)]
+pub mod settings;
+#[doc(hidden)]
+pub mod sys;
+#[doc(hidden)]
 pub mod thread_dump;
 #[doc(hidden)]
-pub mod thread_priority;
+pub mod tools;
+#[doc(hidden)]
+pub mod traits_repo;
+#[doc(hidden)]
+pub mod update_check;
+#[doc(hidden)]
+pub mod upload;
+#[doc(hidden)]
+pub mod validate;
 
 pub use analyzer::Analyzer;
 pub use engine::{DisplayFilter, ScanConfig, ScanResult, ScanSummary};

@@ -1,10 +1,24 @@
 //! Analyzing what was fetched and grafting it into the root's report.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+
+use cleave::{AnalysisOptions, AnalysisReport, Finding};
+use fletch::fetch::{BlobCache, FetchRecord, Outcome, Served};
+use fletch::{Reference, find};
+
+use crate::analysis_cache::AnalysisCache;
+use crate::corpus_precheck::{Precheck, Standing, Verdict};
+
+use super::budget::PAYLOADS_ANALYZED_TOTAL;
+use super::discover::{
+    LocalModules, is_ci_context, is_vendored_node_module, mark_scope, npm_import_name,
+};
+use super::imports::{is_python_import_candidate, static_es_module_refs};
+use super::render::{delivered_bytes, fetch_target};
+use super::session::Landed;
+use super::urls::mark_redirect_destinations;
+use super::{FetchedDependency, Group, found, locator, report_file_type};
 
 /// Every finding a finalized sub-report carries, flattened across its file
 /// nodes — the seed half the package pass contributes from one side (artifact
@@ -128,11 +142,11 @@ impl Payloads<'_> {
             });
         }
 
-        // Fleet-shared skip: the corpus already holds a verdict for these exact
-        // bytes that spares the analysis. The local cache above is better when
-        // it hits (it returns the full sub-report to graft); this covers the
-        // fleet-wide case it cannot — another host analyzed the same
-        // dependency, or a release just invalidated every local cache at once.
+        // Corpus skip: the corpus already holds a verdict for these exact bytes
+        // that spares the analysis. The local cache above is better when it
+        // hits (it returns the full sub-report to graft); this covers the
+        // shared case it cannot — another host analyzed the same dependency,
+        // or a release just invalidated every local cache at once.
         match self.precheck.map_or(Standing::Analyze, |precheck| {
             precheck.standing(&content_sha)
         }) {
@@ -183,7 +197,7 @@ impl Payloads<'_> {
                 Some(sub)
             }
             Err(e) => {
-                tracing::warn!("analysis of fetched {} failed: {e:#}", rec.locator);
+                tracing::warn!(locator = %rec.locator, error = format!("{e:#}"), "analysis of fetched payload failed");
                 None
             }
         };
@@ -280,7 +294,7 @@ impl Graft {
         graft
     }
 
-    pub(super) fn note(&mut self, file: &cleave::types::FileAnalysis) {
+    fn note(&mut self, file: &cleave::types::FileAnalysis) {
         self.next_id = self.next_id.max(file.id.saturating_add(1));
         self.first
             .entry(file.sha256.clone())
@@ -337,7 +351,7 @@ pub(super) fn merge_registry(
 /// and carrying the URL it came from. It has no members and no traits of its
 /// own — nothing was analyzed here — so it is the identity a verdict hangs on,
 /// not an analysis result.
-pub(super) fn append_adopted_node(
+fn append_adopted_node(
     report: &mut AnalysisReport,
     graft: &mut Graft,
     rec: &FetchRecord,
@@ -400,16 +414,91 @@ pub(super) fn merge_payload(
         // verdict. Give it the node a grafted payload would have had, so the
         // adopted result has somewhere to live: the tree shows the dependency,
         // `ml.files` can carry its grade, and the backref pass can find it by
-        // content sha. Without a node an adopted verdict would be invisible —
-        // the hole this whole path exists to close.
+        // content sha. Without a node an adopted verdict would be invisible.
         if analyzed.corpus.is_some() {
             append_adopted_node(report, graft, rec, &analyzed.content_sha);
         }
         return next;
     };
+    // Imports are read against the payload's own paths, before the graft
+    // renames them, so local package resolution sees the layout it shipped.
+    next.extend(payload_imports(&sub));
+    let first_new = report.files.len();
+    graft_subtree(report, graft, rec, sub);
+    // If the payload was an archive, its members' facts (declared deps, npm
+    // hooks) are the next hop too — the bytes hunt only saw the container.
+    // The payload's own node is skipped; the bytes hunt already covered it.
+    for file in &report.files[first_new..] {
+        if file.sha256 == analyzed.content_sha {
+            continue;
+        }
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
+        let values = filefacts::Values::from(view.values.clone());
+        let mut refs = found(
+            find::references_from_facts(
+                report_file_type(&file.file_type),
+                &values,
+                &view.symbols,
+                &view.references,
+            ),
+            &file.path,
+        );
+        mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
+        if is_ci_context(file) {
+            mark_scope(&mut refs, filefacts::DependencyScope::Ci);
+        }
+        if !refs.is_empty() {
+            next.push((file.sha256.clone(), refs));
+        }
+    }
+    next
+}
 
-    // Attach under the file that declared the reference (its sha256 is the
-    // edge's source endpoint); fall back to the root file.
+/// Each payload file's module imports the payload does not itself provide,
+/// grouped by file sha. Files under a vendored `node_modules` are skipped:
+/// their imports resolve inside the dependency graph that shipped them.
+fn payload_imports(sub: &AnalysisReport) -> Vec<Group> {
+    let local = LocalModules::of(sub);
+    let mut groups = Vec::new();
+    for file in &sub.files {
+        if is_vendored_node_module(&file.path) {
+            continue;
+        }
+        let Some(view) = &file.filefacts else {
+            continue;
+        };
+        let file_type = report_file_type(&file.file_type);
+        let refs: Vec<_> = static_es_module_refs(&file.path, file_type, &view.values)
+            .into_iter()
+            .chain(find::python_imports(file_type, &view.symbols))
+            .chain(
+                find::import_calls(file_type, &view.symbols)
+                    .into_iter()
+                    .filter(is_python_import_candidate),
+            )
+            .filter(|r| {
+                !local.provides_python(file, r)
+                    && npm_import_name(r).is_none_or(|name| !local.provides_npm(&file.path, &name))
+            })
+            .collect();
+        if !refs.is_empty() {
+            groups.push((file.sha256.clone(), refs));
+        }
+    }
+    groups
+}
+
+/// Append `sub`'s files to the report as a subtree under the file that
+/// declared the reference (its sha256 is the edge's source endpoint), falling
+/// back to the root.
+fn graft_subtree(
+    report: &mut AnalysisReport,
+    graft: &mut Graft,
+    rec: &FetchRecord,
+    sub: AnalysisReport,
+) {
     let (parent_id, parent_depth) = graft.parent(rec.source_sha256.as_deref());
     let id_base = graft.next_id;
     // The resolved download URL (falling back to the bare locator/PURL) this
@@ -419,10 +508,10 @@ pub(super) fn merge_payload(
         .map(str::to_owned);
     // Name the subtree for what it is. cleave named these from payload_name — the
     // URL's basename, which it needs for extension type detection but which says
-    // nothing about origin. In the merged report that left a fetched dependency
-    // indistinguishable from an archive member, and put two dependencies whose
+    // nothing about origin. In the merged report that leaves a fetched dependency
+    // indistinguishable from an archive member, and puts two dependencies whose
     // URLs end in the same basename (index.js, package.tgz, download) under one
-    // path, so anything keyed on path merged them.
+    // path, so anything keyed on path would merge them.
     //
     // The locator is unique per dependency and is what a reader recognizes.
     // Rewritten across the whole subtree, not just its root, so members stay
@@ -437,33 +526,7 @@ pub(super) fn merge_payload(
     let rename = old_root
         .filter(|old| !old.is_empty() && !rec.locator.is_empty())
         .map(|old| (format!("{old}!!"), old, rec.locator.clone()));
-
-    let local = LocalModules::of(&sub);
-    let first_new = report.files.len();
     for mut file in sub.files {
-        // Preserve the payload's original paths for local package resolution.
-        if !is_vendored_node_module(&file.path)
-            && let Some(view) = &file.filefacts
-        {
-            let file_type = report_file_type(&file.file_type);
-            let refs: Vec<_> = static_es_module_refs(&file.path, file_type, &view.values)
-                .into_iter()
-                .chain(find::python_imports(file_type, &view.symbols))
-                .chain(
-                    find::import_calls(file_type, &view.symbols)
-                        .into_iter()
-                        .filter(is_python_import_candidate),
-                )
-                .filter(|r| {
-                    !local.provides_python(&file, r)
-                        && npm_import_name(r)
-                            .is_none_or(|name| !local.provides_npm(&file.path, &name))
-                })
-                .collect();
-            if !refs.is_empty() {
-                next.push((file.sha256.clone(), refs));
-            }
-        }
         // The payload's own top node (the sub-report's root) is a fetched edge:
         // pulled from `via`, not contained in its parent. Its exploded members
         // stay ordinary members.
@@ -484,35 +547,6 @@ pub(super) fn merge_payload(
         }
         graft.push(report, file);
     }
-
-    // If the payload was an archive, its members' facts (declared deps, npm
-    // hooks) are the next hop too — the bytes hunt above only saw the container.
-    // The payload's own node is skipped; the bytes hunt already covered it.
-    for file in &report.files[first_new..] {
-        if file.sha256 == analyzed.content_sha {
-            continue;
-        }
-        if let Some(view) = &file.filefacts {
-            let values = filefacts::Values::from(view.values.clone());
-            let mut refs = found(
-                find::references_from_facts(
-                    report_file_type(&file.file_type),
-                    &values,
-                    &view.symbols,
-                    &view.references,
-                ),
-                &file.path,
-            );
-            mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
-            if is_ci_context(file) {
-                mark_scope(&mut refs, filefacts::DependencyScope::Ci);
-            }
-            if !refs.is_empty() {
-                next.push((file.sha256.clone(), refs));
-            }
-        }
-    }
-    next
 }
 
 /// Run the package-scoped composite pass for one fetched artifact, grafting any
@@ -545,7 +579,7 @@ pub(super) fn apply_package_composites(
             grafted = n,
             "package-scoped composites fired across artifact and registry metadata"
         ),
-        Err(e) => tracing::warn!("package composite pass failed: {e:#}"),
+        Err(e) => tracing::warn!(error = format!("{e:#}"), "package composite pass failed"),
     }
 }
 

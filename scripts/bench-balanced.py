@@ -6,78 +6,11 @@ import json
 import os
 from pathlib import Path
 import resource
-import shutil
 import signal
 import statistics
 import sys
 import subprocess
 import time
-
-
-def cpu_list(value):
-    cpus = set()
-    for part in value.split(","):
-        bounds = part.split("-")
-        start = int(bounds[0])
-        end = int(bounds[-1])
-        if start < 0 or end < start or len(bounds) > 2:
-            raise ValueError(f"Invalid CPU list: {value}")
-        cpus.update(range(start, end + 1))
-    return cpus
-
-
-def configure_rizin(args, env):
-    """Bake helper settings into a wrapper: filefacts clears helper env vars."""
-    if not args.rizin:
-        if args.native_cpus:
-            raise ValueError("--native-cpus requires --rizin")
-        return
-    actual = args.rizin.resolve(strict=True)
-    if not os.access(actual, os.X_OK):
-        raise ValueError(f"Rizin is not executable: {actual}")
-    cores = sorted(cpu_list(args.native_cpus)) if args.native_cpus else []
-    if cores:
-        available = os.sched_getaffinity(0)
-        if not set(cores) <= available:
-            raise ValueError("Native CPUs must be within the caller's CPU affinity")
-        reserved = set(cores)
-        for core in cores:
-            topology = Path(f"/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list")
-            reserved.update(cpu_list(topology.read_text().strip()))
-        scanner_cpus = available - reserved
-        if not scanner_cpus:
-            raise ValueError("Native CPU reservation leaves no CPUs for the scanner")
-        os.sched_setaffinity(0, scanner_cpus)
-    wrapper = Path(f"{args.output}.rizin").resolve()
-    (wrapper / "bin").mkdir(parents=True, exist_ok=True)
-    (wrapper / "counter").write_text("0")
-    (wrapper / "starts.jsonl").unlink(missing_ok=True)
-    code = f"#!{sys.executable}\n" + "import fcntl,json,os,sys,time\n"
-    code += f"cores={cores!r}\nactual={str(actual)!r}\nroot={str(wrapper)!r}\n"
-    code += '''
-try:
-    size = os.stat(sys.argv[-1]).st_size
-except OSError:
-    size = 0
-if cores and size >= 16 * 1024 * 1024:
-    with open(root + '/counter', 'a+') as counter:
-        fcntl.flock(counter, fcntl.LOCK_EX)
-        counter.seek(0)
-        position = int(counter.read() or '0')
-        core = cores[position % len(cores)]
-        counter.seek(0)
-        counter.truncate()
-        counter.write(str(position + 1))
-        counter.flush()
-    os.sched_setaffinity(0, {core})
-    with open(root + '/starts.jsonl', 'a') as log:
-        log.write(json.dumps(dict(pid=os.getpid(), start=time.monotonic(), size=size, core=core)) + '\\n')
-os.execv(actual, [actual, *sys.argv[1:]])
-'''
-    executable = wrapper / "bin/rizin"
-    executable.write_text(code)
-    executable.chmod(0o755)
-    env["PATH"] = str(wrapper / "bin") + os.pathsep + env.get("PATH", os.defpath)
 
 
 def available_memory_bytes():
@@ -110,8 +43,6 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("out/balanced-benchmark"))
     parser.add_argument("--limit", type=float)
     parser.add_argument("--runs", type=int, default=1, help="Require every run to pass the limit and completeness checks")
-    parser.add_argument("--rizin", type=Path, help="Use this Rizin executable or scanner-facing wrapper")
-    parser.add_argument("--native-cpus", help="Linux CPUs for large native helpers; exclude their SMT siblings from scanner affinity")
     parser.add_argument("--interrupt-after", type=float, help="Interrupt profiling training after this many seconds; interrupted runs always fail the benchmark")
     args = parser.parse_args()
     if not args.path.exists():
@@ -130,10 +61,6 @@ def main():
                        "--output", str(prefix)]
             if args.limit is not None:
                 command.extend(["--limit", str(args.limit)])
-            if args.rizin:
-                command.extend(["--rizin", str(args.rizin)])
-            if args.native_cpus:
-                command.extend(["--native-cpus", args.native_cpus])
             if args.interrupt_after is not None:
                 command.extend(["--interrupt-after", str(args.interrupt_after)])
             measurement_path = Path(f"{prefix}.time.json")
@@ -168,10 +95,6 @@ def main():
         SCAN_FOLLOW="none",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        configure_rizin(args, env)
-    except (OSError, ValueError, AttributeError) as error:
-        parser.error(str(error))
     command = [str(args.binary.resolve()), "--mode", "balanced", "-f", "json", str(args.path)]
     interrupted = False
     with Path(f"{args.output}.jsonl").open("w") as out, Path(f"{args.output}.log").open("w") as err:
@@ -250,9 +173,6 @@ def main():
         member_pressure_floor_mb=env.get("CLEAVE_MEMBER_PRESSURE_FLOOR_MB", "default"),
         memgate_expansion=env.get("CLEAVE_MEMGATE_EXPANSION", "default"),
         raw_gate_source_max_kb=env.get("CLEAVE_RAW_GATE_SOURCE_MAX_KB", "default"),
-        rizin_cores=args.native_cpus,
-        rizin_executable=str(args.rizin.resolve()) if args.rizin else None,
-        rizin=shutil.which("rizin", path=env.get("PATH")),
         available_memory_start_bytes=memory_start,
         available_memory_end_bytes=available_memory_bytes(),
         zfs_arc_start=arc_start,

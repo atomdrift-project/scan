@@ -2,8 +2,8 @@ use super::*;
 
 fn memoized(error: FetchError, purl: &str) -> Option<Option<Registry>> {
     let res = Resources {
-        net: Box::new(super::tests_offline::Failing(error)),
-        cache: super::tests_offline::cache(),
+        net: Box::new(super::offline::Failing(error)),
+        cache: super::offline::cache(),
     };
     let reference = Reference::new(
         RefLocator::Purl(purl.into()),
@@ -45,8 +45,8 @@ fn only_a_final_answer_is_memoized() {
 fn a_memo_entry_expires() {
     let purl = "pkg:npm/memo-test-expiry@1.0.0";
     let res = Resources {
-        net: Box::new(super::tests_offline::Failing(FetchError::Status(404))),
-        cache: super::tests_offline::cache(),
+        net: Box::new(super::offline::Failing(FetchError::Status(404))),
+        cache: super::offline::cache(),
     };
     let reference = Reference::new(
         RefLocator::Purl(purl.into()),

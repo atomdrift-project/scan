@@ -13,10 +13,6 @@ mod bundle;
 fn bundle() -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     bundle::write(dir.path())?;
-    std::fs::write(
-        dir.path().join("config.json"),
-        br#"{"suspicious":0.9,"hostile":0.99}"#,
-    )?;
     Ok(dir)
 }
 

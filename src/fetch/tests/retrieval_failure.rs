@@ -42,11 +42,7 @@ fn metadata_outages_survive_resolution_as_infrastructure_failures() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let cache = BlobCache::with_dir(dir.path());
-        let record = fetch_one_record(
-            &reference,
-            &super::tests_offline::Failing(error.clone()),
-            &cache,
-        );
+        let record = fetch_one_record(&reference, &super::offline::Failing(error.clone()), &cache);
         assert_eq!(record.outcome, Outcome::Failed(error));
     }
 }
@@ -62,7 +58,7 @@ fn a_metadata_404_remains_a_missing_release() {
     );
     let record = fetch_one_record(
         &reference,
-        &super::tests_offline::Failing(FetchError::Status(404)),
+        &super::offline::Failing(FetchError::Status(404)),
         &BlobCache::with_dir(dir.path()),
     );
     assert!(matches!(record.outcome, Outcome::Unresolved(_)));

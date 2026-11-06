@@ -164,8 +164,9 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
-    /// Full jitter: the draw scales the ceiling, so a fleet retrying against one
-    /// saturated hopper spreads out instead of re-saturating it in lockstep.
+    /// Full jitter: the draw scales the ceiling, so many clients retrying
+    /// against one saturated hopper spread out instead of re-saturating it in
+    /// lockstep.
     #[test]
     fn backoff_applies_full_jitter() {
         let low = backoff(10, None, 0.0);
@@ -185,6 +186,40 @@ mod tests {
         assert!(at(1) < at(3), "not growing: {:?} then {:?}", at(1), at(3));
         assert!(at(3) < at(6), "not growing: {:?} then {:?}", at(3), at(6));
         assert_eq!(at(20), RETRY_MAX_BACKOFF, "ceiling not enforced");
+    }
+
+    /// A long budget still ends: the delay exists while time is left and not
+    /// once it is spent.
+    #[test]
+    fn delay_within_respects_the_budget() {
+        let budget = Duration::from_secs(60);
+        assert!(delay_within(budget, 1, None, Duration::ZERO, 0.5).is_some());
+        assert!(delay_within(budget, 9, None, budget - Duration::from_secs(1), 0.5).is_some());
+        assert!(delay_within(budget, 9, None, budget, 0.5).is_none());
+        assert!(delay_within(budget, 9, None, budget + Duration::from_secs(1), 0.5).is_none());
+    }
+
+    /// A sleep must never outlive the budget, or the give-up log arrives late
+    /// and the ceiling stops meaning anything.
+    #[test]
+    fn delay_within_never_sleeps_past_the_budget() {
+        let budget = Duration::from_secs(60);
+        let elapsed = budget - Duration::from_millis(400);
+        let d = delay_within(budget, 12, Some(Duration::from_secs(60)), elapsed, 1.0).unwrap();
+        assert!(
+            d <= Duration::from_millis(400),
+            "slept past the budget: {d:?}"
+        );
+    }
+
+    /// The server knows when its slots free; a shorter sleep just burns a
+    /// slot-acquire on a pool that has already said it is full.
+    #[test]
+    fn backoff_honours_retry_after_as_a_floor() {
+        let hint = Duration::from_secs(30);
+        assert!(backoff(1, Some(hint), 0.0) >= hint);
+        let budget = Duration::from_secs(60);
+        assert!(delay_within(budget, 1, Some(hint), Duration::ZERO, 0.0).unwrap() >= hint);
     }
 
     #[test]

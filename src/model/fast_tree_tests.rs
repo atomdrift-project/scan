@@ -1,4 +1,5 @@
-use super::{FastTreeBackend, TractOnnxBackend};
+use super::backend::TractOnnxBackend;
+use super::fast_tree::FastTreeBackend;
 use tract_onnx::pb::{AttributeProto, GraphProto, NodeProto};
 use tract_onnx::prelude::Framework as _;
 

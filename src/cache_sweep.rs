@@ -109,7 +109,8 @@ pub(crate) fn spawn(mut budgets: Vec<Budget>) {
             let _guard = RunningGuard;
             run_all(&budgets);
         });
-    if started.is_err() {
+    if let Err(error) = started {
+        tracing::warn!(%error, "cache sweep thread did not start; caches are not reclaimed this run");
         RUNNING.store(false, Ordering::Release);
     }
 }
@@ -123,7 +124,7 @@ pub(crate) fn spawn_periodic(mut budgets: Vec<Budget>, interval: Duration) {
     if budgets.is_empty() {
         return;
     }
-    let _ = std::thread::Builder::new()
+    let started = std::thread::Builder::new()
         .name("cache-sweep".into())
         .spawn(move || {
             loop {
@@ -131,6 +132,9 @@ pub(crate) fn spawn_periodic(mut budgets: Vec<Budget>, interval: Duration) {
                 std::thread::sleep(interval);
             }
         });
+    if let Err(error) = started {
+        tracing::warn!(%error, "cache sweep thread did not start; caches are not reclaimed");
+    }
 }
 
 fn run_all(budgets: &[Budget]) {
@@ -222,11 +226,6 @@ fn run(b: &Budget) {
     }
 }
 
-/// Whether `path` is a directory itself, not a symlink to one.
-fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-}
-
 /// Symlinks followed resolving a root before it is refused, as the kernel's
 /// own `ELOOP` limit does.
 #[cfg(unix)]
@@ -241,14 +240,15 @@ const MAX_LINKS: u32 = 40;
 /// budget does not own; and on unix, a path through a directory or link that
 /// another user can change — a cache under a shared directory (`HOME=/tmp`,
 /// or `XDG_CACHE_HOME` pointed there) whose `.cache` someone else created.
-pub(crate) fn trusted_dir(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_absolute() || !is_real_dir(dir) {
+fn trusted_dir(dir: &Path) -> Option<PathBuf> {
+    // A directory itself, not a symlink to one.
+    let real_dir = fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+    if !dir.is_absolute() || !real_dir {
         return None;
     }
     #[cfg(unix)]
     let dir = {
         // SAFETY: neither call has preconditions; each only returns an id.
-        #[allow(unsafe_code)]
         let ids = unsafe { (libc::geteuid(), libc::getegid()) };
         let mut resolved = PathBuf::new();
         resolve_trusted(dir, ids, &mut resolved, &mut 0)?;
@@ -392,8 +392,7 @@ fn stat_entry(path: PathBuf, is_dir: bool) -> Option<Entry> {
     })
 }
 
-/// Recursive byte size of a directory entry. Only ever called on the small
-/// per-item cache directories (a handful of files each).
+/// Recursive byte size of a directory entry.
 ///
 /// Recursion is gated on `file_type()`, which does NOT follow symlinks: a
 /// symlink is neither descended nor counted. That keeps a stray symlink loop

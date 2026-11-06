@@ -25,7 +25,7 @@
 //! mean other bytes — `crate::fetch::immutable_coordinate` — and a URL is
 //! judged by the PURL it parses into, when it parses into one. Every other
 //! name (a gem, a young PyPI release, a git tag, any other URL) answers from
-//! here for [`MUTABLE_ALIAS_TTL`] after it was last resolved, and is resolved
+//! here for `MUTABLE_ALIAS_TTL` after it was last resolved, and is resolved
 //! again after that.
 
 use std::num::NonZeroUsize;
@@ -39,16 +39,16 @@ use crate::model::Level;
 
 /// Findings kept per verdict. The wire view serves the worst few; the rest are
 /// headroom so the projection can widen without re-analyzing everything.
-pub const MAX_STORED_HITS: usize = 10;
+const MAX_STORED_HITS: usize = 10;
 
 /// How long a mutable name — one whose bytes can change under it — answers
 /// from the index after the analysis that last resolved it. Immutable names
 /// keep their alias for the life of the ruleset namespace.
-pub const MUTABLE_ALIAS_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const MUTABLE_ALIAS_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Criticality floor for a stored finding: 3 notable, 4 suspicious, 5 hostile.
 /// Anything below is baseline noise that no consumer gates on.
-pub const MIN_HIT_CRIT: u8 = 3;
+const MIN_HIT_CRIT: u8 = 3;
 
 /// Verdicts memoized in process, ahead of the on-disk read.
 const MEMO_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
@@ -102,7 +102,7 @@ pub struct Verdict {
     /// One-sentence rationale from the interpreter, when `--llm` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
-    /// Worst findings, most critical first, at most [`MAX_STORED_HITS`].
+    /// Worst findings, most critical first, at most `MAX_STORED_HITS`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hits: Vec<Hit>,
 }
@@ -177,33 +177,11 @@ pub(crate) fn collect_hits(report: &cleave::types::CompactReport) -> Vec<Hit> {
             });
         }
     }
-    // Worst first, then by id — the same order beamline ranks its own hits in,
-    // so one artifact reads the same whichever layer answered.
+    // Worst first, then by id — the order every layer ranks hits in, so one
+    // artifact reads the same whichever layer answered.
     hits.sort_by(|a, b| b.crit.cmp(&a.crit).then_with(|| a.id.cmp(&b.id)));
     hits.truncate(MAX_STORED_HITS);
     hits
-}
-
-/// Findings served on a lookup. The store keeps more (see
-/// [`MAX_STORED_HITS`]); a consumer acts on the worst few.
-pub const SERVED_HITS: usize = 3;
-
-/// The wire form of a lookup answer: the verdict plus the filter's opinion of
-/// the same key. `bloom` is present whether or not we hold a verdict — it is a
-/// separate, cheaper kind of knowledge, and collapsing the two would let a
-/// probabilistic filter hit read as an analysis we never ran.
-#[derive(Debug, Serialize)]
-pub struct View<'a> {
-    pub sha: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purl: Option<&'a str>,
-    pub lvl: Level,
-    pub eng: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub why: Option<&'a str>,
-    #[serde(skip_serializing_if = "<[Hit]>::is_empty")]
-    pub hits: &'a [Hit],
-    pub bloom: &'a str,
 }
 
 /// The finding id on a bloom-derived answer, mirroring hopper's `feedTraitID`.
@@ -212,12 +190,12 @@ pub struct View<'a> {
 /// for the reason hopper gives: those ids say what an artifact DOES, and this
 /// one says where a claim about it CAME FROM. A consumer resolving trait ids to
 /// documentation would otherwise look this up and find nothing.
-pub const FEED_TRAIT_ID: &str = "intel/feed/malicious";
+const FEED_TRAIT_ID: &str = "intel/feed/malicious";
 
 /// The finding id when our own catalogue is the source rather than an outside
 /// feed. Same namespace, different claim: the corpus convicted this artifact at
 /// some earlier point, and the filter remembers only that it did.
-pub const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
+const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 
 /// Synthesize the answer a bloom match justifies on its own, for an artifact no
 /// stored verdict covers.
@@ -247,9 +225,9 @@ pub const CORPUS_TRAIT_ID: &str = "intel/corpus/known-bad";
 /// # The empty engine
 ///
 /// `eng` is deliberately empty. Downstream branches on it to tell a measured
-/// verdict from a citation — beamline's `customerView` omits an empty `eng`
-/// entirely, and its cache treats an engine-less body as short-lived and refuses
-/// to let it stand in for an analysis. Stamping a build here would make a filter
+/// verdict from a citation: a caller's view may omit an empty `eng` entirely,
+/// and a cache treats an engine-less body as short-lived and refuses to let it
+/// stand in for an analysis. Stamping a build here would make a filter
 /// hit read as a scan we never ran, which is the one thing this must not do.
 #[derive(Debug)]
 pub struct BloomClaim {
@@ -319,61 +297,10 @@ pub fn bloom_claim(decision: crate::bloom_repo::Decision) -> Option<BloomClaim> 
     })
 }
 
-/// The native-route projection of [`bloom_claim`]. `hits` is scratch the caller
-/// owns so the view can borrow from it.
-pub fn bloom_derived_view<'a>(
-    decision: crate::bloom_repo::Decision,
-    bloom: &'a str,
-    sha256: &'a str,
-    purl: Option<&'a str>,
-    hits: &'a mut Vec<Hit>,
-) -> Option<View<'a>> {
-    let claim = bloom_claim(decision)?;
-    let lvl = claim.lvl;
-    if let Some(c) = claim.finding {
-        hits.push(Hit {
-            id: c.id.to_owned(),
-            crit: c.crit,
-            desc: c.desc.to_owned(),
-            file: String::new(),
-            pkg: purl.unwrap_or_default().to_owned(),
-            off: None,
-            line: None,
-        });
-    }
-    Some(View {
-        sha: sha256,
-        purl,
-        lvl,
-        eng: "",
-        why: None,
-        hits: &hits[..],
-        bloom,
-    })
-}
-
 /// The level a lone, unadjudicated outside citation justifies — hopper's
 /// `Floor(Weak)`. Above the default budget deliberately, so it does not convict
 /// by itself. Mirrors hopper's corroboration.go; keep the pair in sync.
 const SIGHTED_SUSPICIOUS_LEVEL: u16 = 100;
-
-impl Verdict {
-    /// Project the stored verdict onto the wire, worst findings first.
-    /// `requested_purl` is what the caller asked by, which names the artifact
-    /// more precisely than a locator recorded on some earlier analysis.
-    #[must_use]
-    pub fn view<'a>(&'a self, bloom: &'a str, requested_purl: Option<&'a str>) -> View<'a> {
-        View {
-            sha: &self.sha256,
-            purl: requested_purl.or(self.purl.as_deref()),
-            lvl: self.lvl,
-            eng: &self.eng,
-            why: self.why.as_deref(),
-            hits: &self.hits[..self.hits.len().min(SERVED_HITS)],
-            bloom,
-        }
-    }
-}
 
 /// Where a finding fired: `(byte offset, 1-based line)`.
 ///
@@ -406,14 +333,14 @@ pub struct Index {
     dir: PathBuf,
     /// Recently served verdicts, keyed by content sha. A PURL hit resolves to a
     /// sha first, so both key kinds share one memo.
-    memo: Mutex<lru::LruCache<String, Option<Verdict>>>,
+    memo: Mutex<lru::LruCache<String, Verdict>>,
 }
 
 /// Root of the verdict index (`…/atomdrift/scan/lookup`), above the
 /// per-ruleset-version subdirectory. Entries live at `lookup/<version>/…`, two
 /// levels below this root — the shape [`crate::cache_cleanup`] reclaims.
 #[must_use]
-pub fn index_base() -> Option<PathBuf> {
+pub(crate) fn index_base() -> Option<PathBuf> {
     Some(crate::cache_dir()?.join("lookup"))
 }
 
@@ -451,15 +378,15 @@ impl Index {
     /// The memo, even after a panicking holder: an LRU of finished answers has
     /// no invariant a panic can break, and giving up on it would disable the
     /// memo for the life of the process.
-    fn memo(&self) -> MutexGuard<'_, lru::LruCache<String, Option<Verdict>>> {
+    fn memo(&self) -> MutexGuard<'_, lru::LruCache<String, Verdict>> {
         self.memo.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The verdict for a content digest, or `None` when we hold none.
-    pub fn get_sha(&self, sha256: &str) -> Option<Verdict> {
+    pub fn sha(&self, sha256: &str) -> Option<Verdict> {
         let sha = normalize_sha(sha256)?;
         if let Some(hit) = self.memo().get(&sha) {
-            return hit.clone();
+            return Some(hit.clone());
         }
         // A missing entry is the ordinary miss; an unreadable one is a miss
         // too, but worth a line.
@@ -468,18 +395,22 @@ impl Index {
                 .map_err(|e| tracing::debug!(sha256 = %sha, error = %e, "unreadable verdict index entry"))
                 .ok()
         });
-        self.memo().put(sha, found.clone());
+        // Only hits are memoized: a miss must see a verdict another process
+        // writes to the shared index later.
+        if let Some(verdict) = &found {
+            self.memo().put(sha, verdict.clone());
+        }
         found
     }
 
     /// The verdict for a PURL, resolved through the alias index. `None` when
     /// the PURL is unparseable, unseen, mutable and last resolved more than
     /// [`MUTABLE_ALIAS_TTL`] ago, or its artifact has since been pruned.
-    pub fn get_purl(&self, purl: &str) -> Option<Verdict> {
-        self.get_purl_at(purl, crate::civil::now_secs())
+    pub fn purl(&self, purl: &str) -> Option<Verdict> {
+        self.purl_at(purl, crate::civil::now_secs())
     }
 
-    fn get_purl_at(&self, purl: &str, now: u64) -> Option<Verdict> {
+    fn purl_at(&self, purl: &str, now: u64) -> Option<Verdict> {
         let key = purl_key(purl)?;
         let immutable = crate::fetch::immutable_coordinate(purl, None);
         self.resolve_alias(&self.alias_path(&key), immutable, now)
@@ -488,12 +419,20 @@ impl Index {
     /// The verdict for the bytes last analyzed from `url`. A URL that parses
     /// into an immutable PURL (a registry tarball) keeps its alias; any other
     /// answers for [`MUTABLE_ALIAS_TTL`] after it was last fetched.
-    pub fn get_url(&self, url: &str) -> Option<Verdict> {
-        self.get_url_at(url, crate::civil::now_secs())
+    pub fn url(&self, url: &str) -> Option<Verdict> {
+        self.url_at(url, crate::civil::now_secs())
     }
 
-    fn get_url_at(&self, url: &str, now: u64) -> Option<Verdict> {
-        self.resolve_alias(&self.url_alias_path(url), url_is_immutable(url), now)
+    fn url_at(&self, url: &str, now: u64) -> Option<Verdict> {
+        // A URL's bytes can never change only when it parses into a PURL
+        // naming an immutable file, such as a registry's tarball for a
+        // published version or a PyPI file. The alias is keyed by the URL, so
+        // it is that exact file, which is what lets a PyPI file count where its
+        // release would not. `url_to_purl` recognizes registry hosts only, so a
+        // look-alike path elsewhere stays an ordinary, mutable URL.
+        let immutable = fletch::purl::url_to_purl(url.trim())
+            .is_some_and(|purl| crate::fetch::immutable_file(&purl));
+        self.resolve_alias(&self.url_alias_path(url), immutable, now)
     }
 
     /// Record that `url` served the bytes `sha256` names, now.
@@ -515,8 +454,8 @@ impl Index {
         let mut fields = alias.split_whitespace();
         let sha = fields.next()?;
         let resolved_at = fields.next().and_then(|at| at.parse::<u64>().ok());
-        let fresh =
-            resolved_at.is_some_and(|at| now.saturating_sub(at) <= MUTABLE_ALIAS_TTL.as_secs());
+        let fresh = resolved_at
+            .is_some_and(|at| crate::civil::fresh_at(at, MUTABLE_ALIAS_TTL.as_secs(), now));
         if !immutable && !fresh {
             tracing::debug!(
                 alias = %path.display(),
@@ -528,7 +467,7 @@ impl Index {
         }
         // An alias outliving its verdict (evicted by the cache sweeper) reads
         // as a miss, which is the honest answer.
-        self.get_sha(sha)
+        self.sha(sha)
     }
 
     /// Store a verdict, plus a PURL alias when the artifact was fetched as one.
@@ -551,7 +490,7 @@ impl Index {
         let Some(sha) = normalize_sha(&verdict.sha256) else {
             return;
         };
-        if overwrite || self.get_sha(&sha).is_none() {
+        if overwrite || self.sha(&sha).is_none() {
             let Ok(json) = serde_json::to_vec(verdict) else {
                 return;
             };
@@ -559,7 +498,7 @@ impl Index {
                 tracing::debug!(sha256 = %sha, error = %e, "verdict index write failed");
                 return;
             }
-            self.memo().put(sha.clone(), Some(verdict.clone()));
+            self.memo().put(sha.clone(), verdict.clone());
         }
         // The alias is rewritten even when the verdict stood: this analysis
         // resolved the name again, which restarts a mutable name's
@@ -621,16 +560,6 @@ fn alias_line(sha: &str, now: u64) -> String {
     format!("{sha} {now}")
 }
 
-/// Whether a URL's bytes can never change: only when it parses into a PURL
-/// naming an immutable file, such as a registry's tarball for a published
-/// version or a PyPI file. The alias is keyed by the URL, so it is that exact
-/// file, which is what lets a PyPI file count where its release would not.
-/// `fletch::purl::url_to_purl` recognizes registry hosts only, so a look-alike
-/// path elsewhere stays an ordinary, mutable URL.
-fn url_is_immutable(url: &str) -> bool {
-    fletch::purl::url_to_purl(url.trim()).is_some_and(|purl| crate::fetch::immutable_file(&purl))
-}
-
 /// Lowercased digest, or `None` when the input is not 64 hex characters.
 fn normalize_sha(raw: &str) -> Option<String> {
     let sha = raw.trim().to_ascii_lowercase();
@@ -669,45 +598,20 @@ mod tests {
     use super::*;
     use crate::bloom_repo::Decision;
 
-    /// The invariant everything downstream depends on: a derived answer carries
-    /// no engine. beamline omits an empty `eng` entirely, and branches on its
-    /// absence to keep a citation from standing in for an analysis — so if this
-    /// ever stamps a build, a filter hit starts reading as a scan we never ran
-    /// and `/v1/analyze` stops running.
-    #[test]
-    fn a_derived_view_never_claims_an_engine() {
-        for d in [
-            Decision::KnownBad,
-            Decision::Conflicted,
-            Decision::SightedHostile,
-            Decision::SightedSuspicious,
-        ] {
-            let mut hits = Vec::new();
-            let view = bloom_derived_view(d, d.as_str(), "abc", None, &mut hits)
-                .expect("an adverse decision is answerable");
-            assert_eq!(view.eng, "", "{d:?} must not claim an engine");
-            assert_eq!(view.hits.len(), 1, "{d:?}");
-        }
-    }
-
     /// No filter had an opinion, so there is nothing to say — this must stay a
     /// miss rather than becoming a fabricated `allow`.
     #[test]
     fn an_unknown_decision_synthesizes_nothing() {
-        let mut hits = Vec::new();
-        assert!(bloom_derived_view(Decision::Unknown, "unknown", "abc", None, &mut hits).is_none());
+        assert!(bloom_claim(Decision::Unknown).is_none());
     }
 
     /// A bless answers benign and names no evidence: the filters say we looked
     /// and found nothing, which is an answer, but not a finding.
     #[test]
     fn a_bless_answers_benign_with_no_findings() {
-        let mut hits = Vec::new();
-        let view = bloom_derived_view(Decision::Skip, "skip", "abc", None, &mut hits)
-            .expect("a bless is answerable");
-        assert_eq!(view.lvl, Level::Clean);
-        assert!(view.hits.is_empty(), "a bless names no evidence");
-        assert_eq!(view.eng, "", "still not a measurement of ours");
+        let claim = bloom_claim(Decision::Skip).expect("a bless is answerable");
+        assert_eq!(claim.lvl, Level::Clean);
+        assert!(claim.finding.is_none(), "a bless names no evidence");
     }
 
     /// Levels follow hopper's floors: the loosest its band can justify, never
@@ -715,12 +619,9 @@ mod tests {
     #[test]
     fn derived_levels_are_the_loosest_of_their_band() {
         let default_level = crate::model::DEFAULT_SEVERITY_LEVEL;
-        let level = |d: Decision| {
-            let mut hits = Vec::new();
-            match bloom_derived_view(d, d.as_str(), "abc", None, &mut hits).map(|v| v.lvl) {
-                Some(Level::At(n)) => n,
-                other => panic!("{d:?}: expected a level, got {other:?}"),
-            }
+        let level = |d: Decision| match bloom_claim(d).map(|c| c.lvl) {
+            Some(Level::At(n)) => n,
+            other => panic!("{d:?}: expected a level, got {other:?}"),
         };
         assert_eq!(level(Decision::SightedHostile), default_level);
         assert_eq!(level(Decision::KnownBad), default_level);
@@ -740,13 +641,15 @@ mod tests {
     #[test]
     fn derived_findings_name_their_source() {
         let id = |d: Decision| {
-            let mut hits = Vec::new();
-            let v = bloom_derived_view(d, d.as_str(), "abc", None, &mut hits).expect("a view");
-            v.hits[0].id.clone()
+            bloom_claim(d)
+                .and_then(|c| c.finding)
+                .expect("a finding")
+                .id
         };
         assert_eq!(id(Decision::SightedHostile), FEED_TRAIT_ID);
         assert_eq!(id(Decision::SightedSuspicious), FEED_TRAIT_ID);
         assert_eq!(id(Decision::KnownBad), CORPUS_TRAIT_ID);
+        assert_eq!(id(Decision::Conflicted), CORPUS_TRAIT_ID);
     }
 
     fn verdict(sha: &str) -> Verdict {
@@ -796,11 +699,11 @@ mod tests {
     fn round_trips_by_sha() {
         let (_dir, idx) = temp_index();
         let sha = "a".repeat(64);
-        assert!(idx.get_sha(&sha).is_none(), "empty index is a miss");
+        assert!(idx.sha(&sha).is_none(), "empty index is a miss");
         idx.put(&verdict(&sha));
-        assert_eq!(idx.get_sha(&sha).expect("stored").lvl, Level::Clean);
+        assert_eq!(idx.sha(&sha).expect("stored").lvl, Level::Clean);
         // Uppercase and surrounding whitespace name the same artifact.
-        assert!(idx.get_sha(&format!(" {} ", sha.to_uppercase())).is_some());
+        assert!(idx.sha(&format!(" {} ", sha.to_uppercase())).is_some());
     }
 
     #[test]
@@ -810,12 +713,12 @@ mod tests {
         let mut v = verdict(&sha);
         v.purl = Some("pkg:npm/left-pad@1.3.0".to_string());
         idx.put(&v);
-        let hit = idx.get_purl("pkg:npm/left-pad@1.3.0").expect("purl hit");
+        let hit = idx.purl("pkg:npm/left-pad@1.3.0").expect("purl hit");
         assert_eq!(hit.sha256, sha);
         // Identity folding is the bloom filters' own, so the `pkg:` scheme and
         // case variations resolve to the same artifact.
-        assert!(idx.get_purl("PKG:NPM/left-pad@1.3.0").is_some());
-        assert!(idx.get_purl("pkg:npm/right-pad@1.3.0").is_none());
+        assert!(idx.purl("PKG:NPM/left-pad@1.3.0").is_some());
+        assert!(idx.purl("pkg:npm/right-pad@1.3.0").is_none());
     }
 
     /// When a mutable name has expired: one second past the TTL from now.
@@ -837,7 +740,7 @@ mod tests {
         let (_dir, idx) = temp_index();
         let sha = "1".repeat(64);
         put_as(&idx, &sha, "pkg:npm/left-pad@1.3.0");
-        let hit = idx.get_purl_at("pkg:npm/left-pad@1.3.0", past_ttl());
+        let hit = idx.purl_at("pkg:npm/left-pad@1.3.0", past_ttl());
         assert_eq!(hit.map(|v| v.sha256), Some(sha));
     }
 
@@ -850,21 +753,39 @@ mod tests {
         let sha = "2".repeat(64);
         let purl = "pkg:gem/rails@7.1.0";
         put_as(&idx, &sha, purl);
-        assert!(idx.get_purl(purl).is_some(), "fresh: answered");
+        assert!(idx.purl(purl).is_some(), "fresh: answered");
         let edge = crate::civil::now_secs() + MUTABLE_ALIAS_TTL.as_secs() - 5;
         assert!(
-            idx.get_purl_at(purl, edge).is_some(),
+            idx.purl_at(purl, edge).is_some(),
             "inside the TTL: answered"
         );
         assert!(
-            idx.get_purl_at(purl, past_ttl()).is_none(),
+            idx.purl_at(purl, past_ttl()).is_none(),
             "past the TTL: resolved again"
         );
         // A young PyPI release can still gain files, and an index has no age
         // for it, so it is mutable too.
         let pypi = "pkg:pypi/requests@2.32.3";
         put_as(&idx, &"3".repeat(64), pypi);
-        assert!(idx.get_purl_at(pypi, past_ttl()).is_none());
+        assert!(idx.purl_at(pypi, past_ttl()).is_none());
+        // Written by a clock an hour ahead: not a time, so not fresh either.
+        let behind = crate::civil::now_secs() - 3600;
+        assert!(
+            idx.purl_at(purl, behind).is_none(),
+            "a future alias expired"
+        );
+    }
+
+    /// A miss is not remembered: a verdict another process files later is
+    /// served on the next ask.
+    #[test]
+    fn a_miss_sees_a_verdict_written_later() {
+        let (dir, idx) = temp_index();
+        let sha = "4".repeat(64);
+        assert!(idx.sha(&sha).is_none());
+        let other = Index::open(dir.path().join("v")).expect("open index");
+        other.put(&verdict(&sha));
+        assert!(idx.sha(&sha).is_some(), "the miss was not memoized");
     }
 
     /// Analyzing a mutable name again re-resolves it, restarting its TTL, even
@@ -877,11 +798,11 @@ mod tests {
         // An alias from before aliases carried a time: mutable, so expired.
         std::fs::write(idx.alias_path(&purl_key(purl).expect("key")), &sha).expect("write");
         assert!(
-            idx.get_purl(purl).is_none(),
+            idx.purl(purl).is_none(),
             "an untimed mutable alias has expired"
         );
         put_as(&idx, &sha, purl);
-        assert!(idx.get_purl(purl).is_some(), "re-resolved: answered again");
+        assert!(idx.purl(purl).is_some(), "re-resolved: answered again");
     }
 
     /// An untimed alias for an immutable name still answers: nothing it could
@@ -893,7 +814,7 @@ mod tests {
         idx.put(&verdict(&sha));
         let purl = "pkg:cargo/serde@1.0.200";
         std::fs::write(idx.alias_path(&purl_key(purl).expect("key")), &sha).expect("write");
-        assert!(idx.get_purl_at(purl, past_ttl()).is_some());
+        assert!(idx.purl_at(purl, past_ttl()).is_some());
     }
 
     /// A URL that parses into an immutable PURL is judged as that PURL: a
@@ -943,14 +864,14 @@ mod tests {
             ("https://example.com/app.tgz", false),
         ] {
             idx.alias_url(url, &sha);
-            assert!(idx.get_url(url).is_some(), "{url}: fresh, answered");
+            assert!(idx.url(url).is_some(), "{url}: fresh, answered");
             assert_eq!(
-                idx.get_url_at(url, past_ttl()).is_some(),
+                idx.url_at(url, past_ttl()).is_some(),
                 immutable,
                 "{url}: past the TTL"
             );
         }
-        assert!(idx.get_url("https://example.com/never-seen.tgz").is_none());
+        assert!(idx.url("https://example.com/never-seen.tgz").is_none());
     }
 
     /// A URL alias names its file by digest: no caller text becomes a path.
@@ -961,7 +882,7 @@ mod tests {
         idx.put(&verdict(&sha));
         let url = "https://example.com/../../../../etc/passwd";
         idx.alias_url(url, &sha);
-        assert!(idx.get_url(url).is_some());
+        assert!(idx.url(url).is_some());
         let alias = idx.url_alias_path(url);
         assert_eq!(alias.parent(), Some(dir.path().join("v").as_path()));
     }
@@ -988,7 +909,7 @@ mod tests {
         // findings — a later write never displaces the stored answer.
         idx.put(&verdict(&sha));
 
-        let kept = idx.get_sha(&sha).expect("stored");
+        let kept = idx.sha(&sha).expect("stored");
         assert_eq!(kept.hits.len(), 1, "findings are not overwritten");
         assert!(kept.why.is_some(), "interpretation is not overwritten");
         assert_eq!(kept.purl.as_deref(), Some("pkg:npm/evil@1.0.0"));
@@ -1003,7 +924,7 @@ mod tests {
         refreshed.why = Some("updated".to_string());
         idx.replace(&refreshed);
         assert_eq!(
-            idx.get_sha(&sha).and_then(|v| v.why),
+            idx.sha(&sha).and_then(|v| v.why),
             Some("updated".to_string())
         );
     }
@@ -1072,7 +993,7 @@ mod tests {
         }));
         assert!(poisoned.is_err() && idx.memo.is_poisoned());
         std::fs::remove_file(idx.verdict_path(&sha)).expect("remove the stored copy");
-        assert!(idx.get_sha(&sha).is_some(), "served from the memo");
+        assert!(idx.sha(&sha).is_some(), "served from the memo");
     }
 
     /// Writes land whole and leave nothing behind: no temp file outlives the
@@ -1100,8 +1021,8 @@ mod tests {
     #[test]
     fn rejects_keys_that_are_not_digests() {
         let (_dir, idx) = temp_index();
-        assert!(idx.get_sha("not-a-sha").is_none());
-        assert!(idx.get_sha(&"g".repeat(64)).is_none(), "not hex");
+        assert!(idx.sha("not-a-sha").is_none());
+        assert!(idx.sha(&"g".repeat(64)).is_none(), "not hex");
         // A verdict with a malformed digest is dropped rather than written to
         // an attacker-chosen path.
         idx.put(&verdict("../../etc/passwd"));

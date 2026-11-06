@@ -1,5 +1,6 @@
 //! One analysis of a file or byte buffer against a loaded model bundle: the
-//! pipeline `atomscan serve` and postdoc's worker share.
+//! pipeline every long-running analysis daemon shares, `atomscan serve`
+//! included.
 //!
 //! [`classify_file`] and [`classify_bytes`] run cleave and then the model, and
 //! return the wire [`ScanResult`]. [`ModelResources`] is the loaded bundle,
@@ -236,7 +237,7 @@ impl RequestPhase {
 
     /// The current phase name, as the tracker reports it.
     #[must_use]
-    pub fn get(&self) -> String {
+    pub fn current(&self) -> String {
         self.0.tracker.get()
     }
 
@@ -286,8 +287,7 @@ impl RequestPhase {
 /// The loaded model bundle an analysis runs against: thresholds, the ML
 /// ensemble, and the optional LLM and fetch policies attached to it.
 ///
-/// Shared by the server and postdoc's worker, each of which holds one behind an
-/// `Arc` and swaps it on reload.
+/// A daemon holds one behind an `Arc` and swaps it on reload.
 pub struct ModelResources {
     pub model: Model,
     pub shap: Option<ShapImportance>,
@@ -300,7 +300,7 @@ pub struct ModelResources {
 }
 
 /// Payloads at or below this many bytes count as small, for
-/// [`whale_lane_for`] and for the daemons' admission lanes alike.
+/// `whale_lane_for` and for the daemons' admission lanes alike.
 pub const SMALL_JOB_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Threads for one whale's private pool on a host with this many physical
@@ -309,7 +309,7 @@ pub const SMALL_JOB_MAX_BYTES: u64 = 1024 * 1024;
 /// 4 cores → 2, 64 → 16, 128 → 16. Several whales in flight each get their
 /// own; the global pool keeps every core for everything else.
 #[must_use]
-pub fn whale_pool_threads(physical_cores: usize) -> usize {
+fn whale_pool_threads(physical_cores: usize) -> usize {
     (physical_cores / 4).clamp(2, 16)
 }
 
@@ -318,7 +318,7 @@ pub fn whale_pool_threads(physical_cores: usize) -> usize {
 /// package under the small cap has few members, so a wider pool mostly idles,
 /// and eight threads give a lower p50 than sixteen.
 #[must_use]
-pub fn small_pool_threads(physical_cores: usize) -> usize {
+fn small_pool_threads(physical_cores: usize) -> usize {
     (physical_cores / 8).clamp(2, 8)
 }
 
@@ -329,7 +329,7 @@ pub fn small_pool_threads(physical_cores: usize) -> usize {
 /// while a whale is in a serial phase, not so much that the global pool's
 /// small work loses its cores.
 #[must_use]
-pub fn whale_slots(physical_cores: usize) -> usize {
+fn whale_slots(physical_cores: usize) -> usize {
     (physical_cores / 8).clamp(1, 8)
 }
 
@@ -341,8 +341,30 @@ pub fn whale_slots(physical_cores: usize) -> usize {
 const BIG_JOB_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Analyses admitted and not yet finished, process-wide — what a new lane
-/// shares the cores with. The server counts each request in and out.
-pub static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+/// shares the cores with. Counted only through [`ActiveRequest`], so a count
+/// cannot leak past the analysis it stands for.
+static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// One admitted analysis, counted in the share of cores `whale_lane_for`
+/// hands each lane for as long as it is held. A daemon takes one per request
+/// it admits; a one-shot scan takes none and always gets the global pool.
+#[derive(Debug)]
+#[must_use = "the analysis is counted only while this is held"]
+pub struct ActiveRequest(());
+
+impl ActiveRequest {
+    /// Count an analysis in until the returned value is dropped.
+    pub fn begin() -> Self {
+        ACTIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Threads a private lane of tier minimum `floor` gets when `active`
 /// requests (this one included) are in flight on a host with `physical`
@@ -356,7 +378,7 @@ pub static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 /// covers both ends: 64 physical cores / 8 in flight = 8 (the small floor),
 /// / 4 = 16, / 2 = 32, alone = everything.
 #[must_use]
-pub fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
+fn lane_threads(floor: usize, physical: usize, active: usize) -> Option<usize> {
     if active <= 1 {
         return None;
     }
@@ -473,12 +495,11 @@ impl Drop for WhaleSlot {
 /// its own pool ([`whale_pool_threads`] wide, dropped when the analysis
 /// returns); nothing shares an injector with a whale. Big ones
 /// (over `BIG_JOB_MIN_BYTES`) also take one of [`whale_slots`]; a burst of them is
-/// refused past that count ([`WhaleSlotBusy`]) so the router spreads it over
-/// the fleet instead of oversubscribing this host; the threads are cheap, the
+/// refused past that count ([`WhaleSlotBusy`]) so a router spreads it over
+/// other hosts instead of oversubscribing this one; the threads are cheap, the
 /// cores are the budget.
-///
 #[derive(Debug)]
-pub struct WhaleLane {
+struct WhaleLane {
     pool: rayon::ThreadPool,
     /// Held for the pool's life when the payload is a big whale.
     _slot: Option<WhaleSlot>,
@@ -512,7 +533,7 @@ pub fn whale_slot_usage() -> (usize, usize) {
 ///
 /// A big whale with every slot taken is refused ([`WhaleSlotBusy`]) rather
 /// than queued; the handler turns that into a retry-later response.
-pub fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
+fn whale_lane_for(bytes: u64) -> Result<Option<WhaleLane>, WhaleSlotBusy> {
     let cfg = whale_config();
     let floor = if bytes <= SMALL_JOB_MAX_BYTES {
         cfg.small_threads

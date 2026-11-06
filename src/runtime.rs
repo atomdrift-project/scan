@@ -4,12 +4,14 @@
 //! are blocked, how wide the Rayon pool is, which environment variables the
 //! downstream crates will read. A second binary that runs the same workload
 //! without them does not merely lose a convenience — it loses the behaviour the
-//! fleet was tuned around, quietly, and only under load.
+//! stack was tuned around, quietly, and only under load.
 //!
 //! The one thing that cannot live here is the global allocator. A
 //! `#[global_allocator]` static has to be declared in the binary crate, so each
 //! binary declares its own against [`cleave::JEMALLOC_CONF`], the shared tuning
 //! string. Everything else is here so it is written once.
+
+use std::num::NonZeroUsize;
 
 /// `SCAN_NO_ANALYSIS_CACHE=1` — one switch that disables every cache of our
 /// own analysis across the stack: filefacts file metadata, stng extracted
@@ -154,7 +156,7 @@ pub unsafe fn install() {
 pub fn install_diagnostics() {
     crate::crash_dump::install();
     crate::thread_dump::install();
-    crate::heap_profile::install();
+    crate::freebsd_malloc::install();
     #[cfg(unix)]
     spawn_sigusr1_thread();
 }
@@ -209,10 +211,9 @@ pub fn install_rayon_pool() {
         detected_cores.unwrap_or_else(|| {
             tracing::warn!(
                 fallback = RAYON_FALLBACK_THREADS,
-                "CPU count detection failed; rayon pool DOWNGRADED to \
-                 {RAYON_FALLBACK_THREADS} threads. On a many-core host this throttles \
-                 throughput and oversubscribes workers — set CLEAVE_RAYON_THREADS to the \
-                 core count.",
+                "CPU count detection failed; rayon pool downgraded to the fallback width. \
+                 On a many-core host this throttles throughput and oversubscribes workers — \
+                 set CLEAVE_RAYON_THREADS to the core count.",
             );
             RAYON_FALLBACK_THREADS
         })
@@ -221,8 +222,8 @@ pub fn install_rayon_pool() {
     // worker blocked in an inner join steals other pending tasks — including
     // other in-flight analyses' tasks on this shared pool — and runs them on
     // top of its current stack. Frames from independent deep analyses stack
-    // up, so the headroom must cover several, not one (64 MB overflowed in
-    // production with 4 large archives in flight). Stacks are virtual memory;
+    // up, so the headroom must cover several, not one (64 MB has overflowed
+    // with four large archives in flight). Stacks are virtual memory;
     // only pages actually touched are committed, so the cost of the extra
     // headroom is address space, not RSS.
     if let Err(e) = rayon::ThreadPoolBuilder::new()
@@ -230,7 +231,7 @@ pub fn install_rayon_pool() {
         .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
         .thread_name(|i| format!("rayon-{i}"))
         // Each worker registers for the SIGUSR1 in-process thread dump (no
-        // debugger can attach in the production jails) and steps one
+        // debugger can attach inside a jail) and steps one
         // scheduling notch below normal (see `demote_current_thread`).
         .start_handler(|_| {
             crate::thread_dump::register_self();
@@ -261,6 +262,43 @@ pub fn install_rayon_pool() {
     );
 }
 
+/// Default request slots: three per physical core.
+///
+/// A slot spends much of its life on the network — dependency fetches and the
+/// LLM second opinion — so one per core leaves the CPU idle. Memory is bounded
+/// by the RSS ceiling, not by the slot count.
+#[must_use]
+pub fn default_workers() -> NonZeroUsize {
+    if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
+        return NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3)))
+            .unwrap_or(NonZeroUsize::MIN);
+    }
+    let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
+        tracing::warn!(
+            fallback = 4,
+            "CPU count detection failed; defaulting slot basis to 4 cores",
+        );
+        4
+    });
+    // A logical count is about twice the physical one.
+    NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3) / 2)).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// How many top-level analyses may execute at once: the rayon pool (at least
+/// 2), never more than `slots`.
+///
+/// Slots bound the requests in flight; this tighter gate bounds the
+/// memory-bandwidth-heavy cleave executions among them, held only around the
+/// blocking classify.
+pub(crate) fn cleave_concurrency(slots: usize) -> usize {
+    cleave_concurrency_from(slots, rayon::current_num_threads())
+}
+
+fn cleave_concurrency_from(slots: usize, pool: usize) -> usize {
+    let slots = slots.max(1);
+    pool.max(1).clamp(2.min(slots), slots)
+}
+
 /// Pool width when CPU detection fails entirely.
 const RAYON_FALLBACK_THREADS: usize = 4;
 
@@ -270,21 +308,17 @@ const SMALL_HOST_CORES: usize = 8;
 /// The pool width for this host's shape, before any override.
 ///
 /// On a wide SMT host the pool takes the physical cores plus half again
-/// (24 on a 16c/32t host). Every logical sibling (32) oversubscribes
-/// archive-member analysis and runs it slower than that, while one thread
-/// per core leaves the siblings idle during the serial phases of the files
-/// in flight. Measured 2026-11-01 on a 16c/32t 9950X3D over a 672-file
-/// benign corpus (wall, cold cache, identical output): 16 threads 150-164 s,
-/// 20 threads 137 s, 24 threads 130-136 s, 28 threads 145 s, 32 threads
-/// 143 s; over a 2,454-file hostile corpus 16 threads 167-169 s, 24 threads
-/// 159 s. Peak RSS rose from 8.3 GB to 9.1 GB at 24.
+/// (24 on a 16c/32t host). Every logical sibling oversubscribes
+/// archive-member analysis and runs it slower than that, while one thread per
+/// core leaves the siblings idle during the serial phases of the files in
+/// flight; the midpoint was fastest on the 16c/32t host it was measured on,
+/// at a modest cost in peak RSS.
 ///
 /// On a small SMT host the pool is the only parallelism there is, and it
 /// idles whenever the one admitted archive is in a serial phase (tar/gzip
-/// read), so taking every logical CPU on a 4c/8t host finishes a batch about
-/// a fifth sooner at flat peak RSS with identical output. Either wider pool
-/// is taken only where that class of sibling exists (see
-/// [`smt_pool_vendor`]).
+/// read), so it takes every logical CPU. Either wider pool is taken only
+/// where that class of sibling exists (see [`smt_pool_vendor`]);
+/// `CLEAVE_RAYON_THREADS` overrides both.
 fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool) -> Option<usize> {
     match (physical, logical) {
         (Some(p), Some(l)) if l > p && smt_vendor => Some(if p < SMALL_HOST_CORES {
@@ -320,10 +354,19 @@ fn smt_pool_vendor() -> bool {
 
 #[cfg(test)]
 mod pool_tests {
-    use super::pool_cores;
+    use super::{cleave_concurrency_from, pool_cores};
 
     #[test]
-    fn small_smt_hosts_take_their_siblings_and_wide_hosts_do_not() {
+    fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
+        assert_eq!(cleave_concurrency_from(16, 32), 16);
+        assert_eq!(cleave_concurrency_from(16, 16), 16);
+        assert_eq!(cleave_concurrency_from(16, 8), 8);
+        assert_eq!(cleave_concurrency_from(2, 64), 2);
+        assert_eq!(cleave_concurrency_from(0, 32), 1);
+    }
+
+    #[test]
+    fn small_smt_hosts_take_every_sibling_and_wide_hosts_half_of_them() {
         assert_eq!(pool_cores(Some(4), Some(8), true), Some(8));
         assert_eq!(pool_cores(Some(4), Some(8), false), Some(4));
         assert_eq!(pool_cores(Some(16), Some(32), true), Some(24));

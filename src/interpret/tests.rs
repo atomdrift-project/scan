@@ -1,5 +1,13 @@
 use super::*;
-use std::sync::atomic::Ordering;
+
+use super::breaker::{Admit, BREAKER_TRIP_AFTER, Breakers, InFlight, background_cap};
+use super::client::{
+    MAX_REASON_CHARS, attempt_timeout, chat_raw_with, param_billions, parse_grade_reason,
+    prompt_hash, status_hint,
+};
+use super::gate::{LLM_GATE_PREFIXES, LLM_GATE_STRONG_PREFIXES, leaf_matches, prefix_admits};
+use super::prompt::ANALYZER_DIRECTED;
+use crate::model::Level;
 
 mod blend;
 
@@ -143,64 +151,36 @@ fn size_veto_withholds_big_benign_samples_unless_something_strong_says_otherwise
     );
 }
 
+/// The prefix matcher, on synthetic ids. Which ids the shipped lists name is
+/// taxonomy, and `validate_gate_prefixes` checks that against installed traits.
 #[test]
-fn strong_prefixes_match_current_trait_ids() {
-    assert!(id_strong(
-        "micro-behaviors/fs/path/agent-instructions::claude-global-instructions-path"
-    ));
-    assert!(id_strong(
-        "micro-behaviors/fs/path/config/app::vscode-project-tasks-path"
-    ));
-    assert!(!id_strong(
-        "micro-behaviors/fs/path/config/app::claude-config-directory"
-    ));
-    assert!(id_strong(
-        "micro-behaviors/os/env/provider::anthropic-base-url-off-vendor"
-    ));
-    assert!(id_strong(
-        "micro-behaviors/os/env/provider::openai-base-url-off-vendor"
-    ));
-    assert!(id_strong(
-        "micro-behaviors/os/env/provider::deepseek-base-url-off-vendor"
-    ));
-    assert!(!id_strong(
-        "micro-behaviors/os/env/provider::anthropic-base-url-setdefault-call"
-    ));
-    assert!(id_strong("metadata/file/archive::archive-encrypted-member"));
-    assert!(!id_strong("metadata/file/archive::archive-sole-member"));
-    assert!(id_strong(
-        "micro-behaviors/data/decode/command::base64-decode-to-file"
-    ));
-    assert!(!id_strong("micro-behaviors/data/decode/command::tr-delete"));
-}
-
-#[test]
-fn gate_prefixes_match_ids_at_or_below_a_family() {
-    // A family prefix admits itself and anything under it.
-    assert!(id_admits(
-        "micro-behaviors/fs/path/config/app::claude-skills-directory"
-    ));
+fn prefixes_admit_a_family_an_exact_leaf_or_a_glob() {
+    let admits = |prefixes: &[&str], id: &str| prefix_admits(prefixes.iter().copied(), id);
+    // A family admits itself and every id at or below it, on a path boundary.
+    let family = ["fam/sub"];
+    assert!(admits(&family, "fam/sub::leaf"));
+    assert!(admits(&family, "fam/sub/deeper::leaf"));
+    assert!(!admits(&family, "fam/subway::leaf"));
+    assert!(!admits(&family, "fam::sub"));
     // A synthesized id has no `::` at all and is matched as its own head.
-    assert!(id_admits("metadata/encoded-payload/url"));
-    // An exact `family::leaf` prefix admits only that leaf, never a sibling
-    // in the same directory.
-    assert!(id_admits(
-        "micro-behaviors/communications/http/url/scheme::cleartext-http-url"
-    ));
-    assert!(!id_admits(
-        "micro-behaviors/communications/http/url/scheme::https-url"
-    ));
-    assert!(id_admits("metadata/file/archive::archive-encrypted-member"));
-    assert!(!id_admits("metadata/file/archive::archive-sole-member"));
-    // A family prefix must match on a path boundary.
-    assert!(!id_admits(
-        "micro-behaviors/fs/path/config/application::whatever"
-    ));
-    // Neighbouring families that are deliberately excluded.
-    assert!(!id_admits("metadata/encoded-payload/base64"));
-    assert!(!id_admits(
-        "micro-behaviors/communications/ip/direct::literal"
-    ));
+    assert!(admits(&family, "fam/sub"));
+    assert!(!admits(&family, "fam/other"));
+    // An exact leaf admits only itself: never a sibling in the same family,
+    // nor the same leaf in a deeper one.
+    let exact = ["fam/sub::chosen"];
+    assert!(admits(&exact, "fam/sub::chosen"));
+    assert!(!admits(&exact, "fam/sub::chosen-too"));
+    assert!(!admits(&exact, "fam/sub::other"));
+    assert!(!admits(&exact, "fam/sub/deeper::chosen"));
+    // A glob leaf admits through the family it is written under, and never
+    // through a sibling family that declares a matching leaf.
+    let glob = ["fam/upload::*curl*"];
+    assert!(admits(&glob, "fam/upload::shell-curl-form"));
+    assert!(!admits(&glob, "fam/upload::wget-form"));
+    assert!(!admits(&glob, "fam/download::shell-curl-form"));
+    // Any one entry suffices; no entries admit nothing.
+    assert!(admits(&["x/y", "fam/sub::chosen"], "fam/sub::chosen"));
+    assert!(!admits(&[], "fam/sub::chosen"));
 }
 
 /// The skeleton the whole gate exists to separate: one ordinary package
@@ -209,7 +189,7 @@ fn gate_prefixes_match_ids_at_or_below_a_family() {
 fn gate_admits_intended_shapes() {
     // An ordinary package. Notable findings on families nobody gated, and a
     // raw score in the benign mass. This is the sample we are trying not to
-    // send, and it is ~78% of the benign corpus.
+    // send, and it is most of what a scanner sees.
     let ordinary = [
         finding(
             "micro-behaviors/communications/http/request/client::fetch-call",
@@ -239,7 +219,7 @@ fn gate_admits_intended_shapes() {
 
     // The case criticality misses: a password-protected payload dropper.
     // Nothing above notable anywhere, raw score at zero, and it must still
-    // be sent — this prefix alone carries 154 of the malicious corpus.
+    // be sent.
     let encrypted = [finding(
         "metadata/file/archive::archive-encrypted-member",
         cleave::Criticality::Notable,
@@ -278,14 +258,22 @@ fn finding_severity_reports_every_axis_independently() {
         ),
     ];
     let sev = FindingSeverity::from_findings(&both);
-    assert!(sev.hostile && sev.elevated && sev.gate_trait);
+    assert!(sev.hostile && sev.gate_trait);
 
     let gated_only = [finding(
         "micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate",
         cleave::Criticality::Notable,
     )];
     let sev = FindingSeverity::from_findings(&gated_only);
-    assert!(sev.gate_trait && !sev.elevated && !sev.hostile);
+    assert!(sev.gate_trait && !sev.hostile);
+
+    // A suspicious finding is not hostile, and it is not an admission.
+    let suspicious = [finding(
+        "objectives/evasion/masquerade::config-insert",
+        cleave::Criticality::Suspicious,
+    )];
+    let sev = FindingSeverity::from_findings(&suspicious);
+    assert!(!sev.hostile && !sev.gate_trait && !sev.strong_trait);
 }
 
 #[test]
@@ -448,8 +436,8 @@ fn openrouter_token_path_is_under_dot_tok() {
 fn llm_targets_splits_and_resolves_each_alias() {
     assert_eq!(llm_targets("local"), vec![DEFAULT_BASE_URL]);
     assert_eq!(
-        llm_targets("https://llm.isotope13.ai/v1,openrouter"),
-        vec!["https://llm.isotope13.ai/v1", OPENROUTER_BASE_URL]
+        llm_targets("https://llm.example.com/v1,openrouter"),
+        vec!["https://llm.example.com/v1", OPENROUTER_BASE_URL]
     );
     // Whitespace and stray separators are the operator's, not the config's.
     assert_eq!(
@@ -473,8 +461,8 @@ fn llm_models_aligns_with_the_target_list() {
             Some("Qwen/Qwen3.8-27B".to_string())
         ]
     );
-    // Positional, and a blank slot still means "discover" — the shape the
-    // default deploy uses: discover on our vLLM, pin OpenRouter's spelling.
+    // Positional, and a blank slot still means "discover": discover on the
+    // self-hosted server, pin OpenRouter's spelling.
     assert_eq!(
         llm_models(Some(",qwen/qwen3.8-27b"), 2),
         vec![None, Some("qwen/qwen3.8-27b".to_string())]
@@ -512,8 +500,12 @@ fn fake_llm(
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len(),
             );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(body.as_bytes());
+            if let Err(e) = stream
+                .write_all(head.as_bytes())
+                .and_then(|()| stream.write_all(body.as_bytes()))
+            {
+                eprintln!("fake llm: writing the reply failed: {e}");
+            }
         }
         seen
     });
@@ -523,8 +515,8 @@ fn fake_llm(
 const GRADE_BODY: &str =
     r#"{"choices":[{"message":{"content":"{\"grade\":\"hostile\",\"reason\":\"test\"}"}}]}"#;
 
-/// Background work is tagged priority 1 for our own vLLM; foreground work
-/// and OpenRouter get no field at all. A vLLM without the priority policy
+/// Background work is tagged with a queue priority for a self-hosted server;
+/// small foreground work and OpenRouter get no field at all. A vLLM without the priority policy
 /// refuses the tag with a 400, which costs one resend — never the sample,
 /// and never a fall-over to the next endpoint.
 #[test]
@@ -711,22 +703,6 @@ fn leaf_globs_match_a_run_of_characters() {
     assert!(!leaf_matches("url-*-curl", "curl-command-remote-url"));
     // A bare `*` admits anything in the family.
     assert!(leaf_matches("*", "anything"));
-}
-
-/// A glob leaf admits through the family it is written under, and never
-/// through a sibling family that happens to declare the same leaf name.
-#[test]
-fn a_glob_gate_entry_admits_only_within_its_own_family() {
-    const FAMILY: &str = "micro-behaviors/communications/http/upload";
-    assert!(leaf_matches("curl-*", "curl-upload-file"));
-    // What `id_admits` composes: family head must match exactly, then the
-    // leaf pattern. Spelled out here because the two halves are easy to
-    // conflate and only their conjunction is the gate.
-    let id = format!("{FAMILY}::curl-upload-file");
-    let head = id.split("::").next().unwrap();
-    assert_eq!(head, FAMILY);
-    let sibling = "micro-behaviors/communications/http/download::curl-upload-file";
-    assert_ne!(sibling.split("::").next().unwrap(), FAMILY);
 }
 
 /// The origin gets the configured budget; a hosted route gets at least the
@@ -932,7 +908,17 @@ fn admit_returns_the_tier_and_the_admitted_verdict() {
         base_url: "http://127.0.0.1:1/v1".to_string(),
         ..Default::default()
     };
-    assert!(interpret_admitted(&cfg, &admitted, "  \n", LlmCaller::Foreground).is_none());
+    assert!(
+        interpret_admitted(
+            &cfg,
+            &admitted,
+            "  \n",
+            LlmCaller::Foreground,
+            "test-sample",
+            "0".repeat(64).as_str()
+        )
+        .is_none()
+    );
     assert!(
         admits(&[], 0.1).is_none(),
         "nothing fires, nothing admitted"
@@ -970,23 +956,48 @@ fn each_caller_is_capped_by_its_own_concurrency() {
 /// Background work holds at most a quarter of the permits (at least one),
 /// and a pool too small to split reserves nothing rather than starving.
 #[test]
-fn foreground_reserve_is_a_quarter_at_least_one_and_never_the_whole_pool() {
+fn background_cap_is_a_quarter_at_least_one_and_never_the_whole_pool() {
     assert_eq!(background_cap(1, None), 1);
     assert_eq!(background_cap(2, None), 1);
     assert_eq!(background_cap(4, None), 1);
     assert_eq!(background_cap(16, None), 4);
     assert_eq!(background_cap(64, None), 16);
-    assert_eq!(foreground_reserve(1), 0);
-    assert_eq!(foreground_reserve(2), 1);
-    assert_eq!(foreground_reserve(4), 3);
-    assert_eq!(foreground_reserve(16), 12);
-    assert_eq!(foreground_reserve(64), 48);
     for max in 2..=64 {
         assert!(
-            foreground_reserve(max) < max,
-            "background can still run at {max}"
+            background_cap(max, None) < max,
+            "foreground keeps a slot at {max}"
         );
     }
+    // An explicit share is honoured, but never the whole pool.
+    let eight = NonZeroUsize::new(8);
+    assert_eq!(background_cap(16, eight), 8);
+    assert_eq!(background_cap(4, eight), 3);
+}
+
+/// The reserve, through the pool itself: background work stops at its cap
+/// while a foreground caller still gets a slot.
+#[test]
+fn background_work_never_takes_the_foreground_reserve() {
+    let pool = InFlight::new();
+    let four = NonZeroUsize::new(4).unwrap();
+    let bg = pool.acquire(four, None, LlmCaller::Background);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| drop(pool.acquire(four, None, LlmCaller::Background)));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "a second background call is over a cap of one"
+        );
+        // Foreground callers fill the rest without waiting.
+        let fg: Vec<_> = (0..3)
+            .map(|_| pool.acquire(four, None, LlmCaller::Foreground))
+            .collect();
+        assert_eq!(*pool.count.lock().unwrap(), 4);
+        drop(fg);
+        drop(bg);
+        waiter.join().expect("waiter");
+    });
+    assert_eq!(*pool.count.lock().unwrap(), 0);
 }
 
 /// The cache key must not change for a plain single-endpoint config, or
@@ -1315,58 +1326,6 @@ fn prompt_hash_is_deterministic_and_input_sensitive() {
         a,
         prompt_hash("SYS2", "modelA", "analysis X"),
         "system prompt changes key"
-    );
-}
-
-fn breaker(healthy: bool) -> Health {
-    Health {
-        inner: Mutex::new(HealthState {
-            healthy,
-            probing: false,
-        }),
-        cv: Condvar::new(),
-    }
-}
-
-#[test]
-fn health_closed_passes_through_without_probing() {
-    let h = breaker(true);
-    let probed = std::sync::atomic::AtomicBool::new(false);
-    let ok = h.wait_until_healthy(Duration::from_secs(1), Duration::from_millis(1), &|| {
-        probed.store(true, Ordering::SeqCst);
-        true
-    });
-    assert!(ok, "a closed breaker passes through");
-    assert!(
-        !probed.load(Ordering::SeqCst),
-        "no probe when already healthy"
-    );
-}
-
-#[test]
-fn health_open_recovers_when_probe_succeeds() {
-    let h = breaker(false);
-    let ok = h.wait_until_healthy(Duration::from_secs(1), Duration::from_millis(1), &|| true);
-    assert!(ok, "an open breaker recovers when the probe succeeds");
-}
-
-#[test]
-fn health_open_gives_up_after_budget_when_probe_keeps_failing() {
-    use std::sync::atomic::AtomicUsize;
-    let h = breaker(false);
-    let probes = AtomicUsize::new(0);
-    let ok = h.wait_until_healthy(
-        Duration::from_millis(60),
-        Duration::from_millis(10),
-        &|| {
-            probes.fetch_add(1, Ordering::SeqCst);
-            false
-        },
-    );
-    assert!(!ok, "stays open and gives up once the budget elapses");
-    assert!(
-        probes.load(Ordering::SeqCst) >= 1,
-        "probed at least once before giving up",
     );
 }
 

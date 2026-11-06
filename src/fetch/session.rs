@@ -1,23 +1,72 @@
 //! One fetch session: the hop-by-hop loop that selects references, fetches
 //! them, analyzes what lands, and grafts it into the root's report.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-fn is_registry_security_hold_finding(id: &str) -> bool {
+use cleave::{AnalysisOptions, AnalysisReport, Finding};
+use filefacts::FileType;
+use fletch::fetch::{
+    Coverage, FetchBudget, FetchError, FetchRecord, Outcome, UrlFetches, fetch_references,
+};
+use fletch::{RefKind, RefLocator, Reference, find};
+use reqwest::Url;
+
+use crate::analysis_cache::AnalysisCache;
+use crate::corpus_precheck::{Precheck, Standing};
+use crate::hosts;
+use crate::provenance::RegistryProvenance;
+
+use super::age_gate::{
+    Gated, Priority, SkipReason, age_gate, dep_skip_predicate, dependency_execution_priority,
+    keep_registry_provenance, lenient_version_cmp, superseded_by_pin, versioned_purl,
+};
+use super::budget::{
+    Deadline, FetchClass, RootBudget, TOTAL_BUDGET, fetch_count_budget_notice, live_fetch_usage,
+};
+use super::discover::{
+    CiRefs, LocalNpmPackages, TRAIT_SECURITY_HOLD_RECORD, collect_references_from_input,
+    image_carrier_urls, inherit_dependency_context, is_ci_context, npm_import_name, skipped_record,
+};
+use super::imports::{
+    annotate_python_import_candidate, attribute_undeclared_npm_imports, candidate_static_issues,
+    declared_npm_imports_in_hop, is_python_import_candidate, python_candidate_provides_namespace,
+    reconcile_python_imports,
+};
+use super::merge::{
+    Analyzed, Graft, Payloads, apply_package_composites, capture_dependency, corpus_hit_record,
+    merge_payload, merge_registry, prepare_dependency_report_with, registry_findings_for_reference,
+    sub_findings,
+};
+use super::policy::{FetchPolicy, Platform, host_platform, off_host_platform};
+use super::registry::{mark_peer_candidate, registry_node};
+use super::render::{
+    Reporter, artifact_absent, delivered_bytes, dep_display_name, gone_status, landed_state,
+    manifest_relpath,
+};
+use super::urls::{
+    AsClient, MAX_REDIRECT_HOPS, client_user_agent, has_unexpanded_url_placeholder,
+    is_download_to_file_url, is_eval_pipeline_url, is_redirect_destination,
+    looks_like_dropper_download_url, valid_discovered_url_host,
+};
+use super::{
+    BATCH_PAYLOAD_TARGET, Coordinate, DependencyRegistry, FetchOutcome, Follow, Group, Resources,
+    fetch_work_key, immutable_coordinate, locator, pin_verified, pins_exact_version,
+    registry_digest, report_file_type,
+};
+
+pub(super) fn is_registry_security_hold_finding(id: &str) -> bool {
     id.strip_prefix("metadata/registry::")
         .is_some_and(|name| name == TRAIT_SECURITY_HOLD_RECORD || name == "registry-security-hold")
 }
 
 /// One group's references after selection and the age gate: the ones to
 /// fetch, and the registry records materialized for its dependencies.
-pub(super) struct GroupPlan {
-    pub(super) source_sha: String,
-    pub(super) selected: Vec<Reference>,
-    pub(super) registries: Vec<Gated>,
+struct GroupPlan {
+    source_sha: String,
+    selected: Vec<Reference>,
+    registries: Vec<Gated>,
 }
 
 /// One group after the network phase.
@@ -131,6 +180,14 @@ pub(super) fn unresolved_maven_records(
     records
 }
 
+/// How many registry records were materialized for one declaring file, and
+/// how many of those carry a registry security hold.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RegistryTally {
+    materialized: u64,
+    security_held: u64,
+}
+
 /// One fetch phase: everything `orchestrate` carries from hop to hop.
 pub(super) struct FetchSession {
     pub(super) policy: FetchPolicy,
@@ -142,12 +199,11 @@ pub(super) struct FetchSession {
     /// isn't needlessly re-disassembled.
     pub(super) opts: AnalysisOptions,
     /// A registry record is canonical JSON we serialized ourselves; its signal
-    /// is entirely `registry.*` value facts and no YARA rule targets it.
-    /// Disabling YARA here removed ~1400s of system time per scan — the
-    /// engine's per-analysis setup, paid hundreds of times. Built once:
-    /// cloning `AnalysisOptions` per record cost more user time than the YARA
-    /// saving returned.
-    pub(super) registry_opts: AnalysisOptions,
+    /// is entirely `registry.*` value facts and no YARA rule targets it, so
+    /// YARA's per-analysis setup — paid once per record, hundreds of times a
+    /// scan — buys nothing. Built once, because cloning `AnalysisOptions` per
+    /// record costs more than the setup it saves.
+    registry_opts: AnalysisOptions,
     /// Opened on the first payload actually analyzed, so a scan that analyzes
     /// nothing (every reference age-gated or none present, the common `pkg:`
     /// case) never creates or prunes the cache directory.
@@ -156,28 +212,27 @@ pub(super) struct FetchSession {
     /// on an interactive single-artifact scan, the streamed log above any active
     /// scan bar otherwise, or nothing for machine output. Shared across every
     /// hop, so transitive dependencies join the same view.
-    pub(super) reporter: Reporter,
+    reporter: Reporter,
     pub(super) capture_deps: bool,
     /// One wall-clock reading for the whole run, so every dependency's age is
     /// judged against the same instant.
     pub(super) now: u64,
     /// The host platform, for filtering off-host native-binary dependencies.
-    pub(super) host: (&'static str, &'static str),
+    pub(super) host: Platform,
     pub(super) deadline: Deadline,
     pub(super) budget: RootBudget,
     /// Loop guard: a locator is fetched at most once per run, so a chain that
     /// points back at an earlier stage can't cycle.
     pub(super) seen: HashSet<String>,
     /// Newest-version gate: only the most recent version of a package in the
-    /// dependency tree is fetched and analyzed. Deep ungated trees pin dozens
-    /// of releases of the same packages (syn ×27, libc ×21 on the mx crate
-    /// benchmark — 48% of its tree was older duplicates); analyzing every
-    /// pinned release repeats near-identical work without detection value the
-    /// newest release doesn't provide. Versionless references are exempt (they
-    /// already resolve to the latest release), and the kept version is monotone
-    /// across hops: once a release is scanned, an older sibling discovered in a
-    /// later hop never resurrects the package.
-    pub(super) newest: HashMap<String, String>,
+    /// dependency tree is fetched and analyzed. A deep lockfile pins many
+    /// releases of the same packages, and analyzing every one repeats
+    /// near-identical work without detection value the newest release doesn't
+    /// provide. Versionless references are exempt (they already resolve to the
+    /// latest release), and the kept version is monotone across hops: once a
+    /// release is scanned, an older sibling discovered in a later hop never
+    /// resurrects the package.
+    newest: HashMap<String, String>,
     /// Coordinates (`pkg:eco/name`) for which a version-pinned reference exists
     /// anywhere in the tree. A manifest range (`"puppeteer": "^10.4.0"`) reaches
     /// us version-stripped as a bare `pkg:npm/puppeteer` and would resolve to
@@ -191,7 +246,7 @@ pub(super) struct FetchSession {
     /// so a payload reached through one credits its group a hop and the chain
     /// behind the redirect keeps its full `policy.depth`. Keyed by the payload
     /// content sha that `merge_payload` groups next-hop references under.
-    pub(super) redirect_credit: HashMap<String, u8>,
+    redirect_credit: HashMap<String, u8>,
     /// Image URLs whose declaring file shows a stego loader: exempt from the
     /// page-asset extension filter. Hop 0 only — later hops hunt payload bytes
     /// before any analysis, so there are no findings to vouch for one.
@@ -203,23 +258,24 @@ pub(super) struct FetchSession {
     pub(super) manifests: HashMap<String, String>,
     pub(super) graft: Graft,
     pub(super) out: FetchOutcome,
-    /// (declaring file sha) -> (registry records materialized, of which security-held)
-    pub(super) registry_outcomes: BTreeMap<String, (u64, u64)>,
-    pub(super) root_sha: String,
-    pub(super) current_hop: u8,
-    pub(super) pending_error: Option<String>,
-    pub(super) pending: Option<Arc<pending::Store>>,
+    /// Registry records materialized per declaring file sha.
+    registry_outcomes: BTreeMap<String, RegistryTally>,
     /// Locally supplied copies: source sha → locator → path.
-    pub(super) local_coverage: HashMap<String, HashMap<String, String>>,
-    pub(super) unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
+    local_coverage: HashMap<String, HashMap<String, String>>,
+    /// Unresolved downloader calls and Maven gaps already recorded, by
+    /// declaring sha, offset and locator, so a file seen twice records once.
+    unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
 }
 
 impl FetchSession {
+    /// A session for `report`, whose hop-0 work is `worklist`. `precheck` is
+    /// hopper's corpus when this process has one to ask.
     pub(super) fn new(
         report: &AnalysisReport,
         worklist: &[Group],
         res: &'static Resources,
         follow: Follow<'_>,
+        precheck: Option<Arc<Precheck>>,
     ) -> Self {
         let Follow {
             policy,
@@ -238,10 +294,8 @@ impl FetchSession {
         // deps — a covertly-installed companion or a dependency-confusion
         // target. Computed across the whole work-list so a member's
         // `require("x")` is diffed against the root manifest's declarations.
-        // Surfaced at debug, not warn: this is only meaningful when a manifest
-        // is present to diff against. Scanning loose files (no manifest) flags
-        // every imperative import as "undeclared", so emitting it by default is
-        // noise. `--verbose` (scan=debug) still exposes it for investigation.
+        // Debug, not warn: it means something only when a manifest is present
+        // to diff against, and loose files flag every import as undeclared.
         let all_refs: Vec<Reference> = worklist
             .iter()
             .flat_map(|(_, refs)| refs.iter().cloned())
@@ -256,7 +310,7 @@ impl FetchSession {
         Self {
             policy,
             res,
-            precheck: crate::corpus_precheck::armed(),
+            precheck,
             registry_opts: AnalysisOptions {
                 yara: false,
                 ..opts.clone()
@@ -282,14 +336,6 @@ impl FetchSession {
             graft: Graft::new(report),
             out: FetchOutcome::default(),
             registry_outcomes: BTreeMap::new(),
-            root_sha: report
-                .files
-                .first()
-                .map(|f| f.sha256.clone())
-                .unwrap_or_default(),
-            current_hop: 0,
-            pending_error: None,
-            pending: crate::settings::fetch_backlog().cloned(),
             local_coverage: HashMap::new(),
             unresolved_fetch_calls: HashSet::new(),
         }
@@ -321,146 +367,18 @@ impl FetchSession {
     /// Walk the hops: each works from the references found inside the
     /// previous hop's payloads.
     pub(super) fn run(&mut self, report: &mut AnalysisReport, mut worklist: Vec<Group>) {
-        let mut resumed: BTreeMap<u8, Vec<Group>> = BTreeMap::new();
-        if let Some(store) = self.pending.as_ref() {
-            match store.entries(&self.root_sha) {
-                Ok(entries) => {
-                    for entry in entries {
-                        self.redirect_credit
-                            .entry(entry.source_sha.clone())
-                            .and_modify(|credit| *credit = (*credit).max(entry.redirect_credit))
-                            .or_insert(entry.redirect_credit);
-                        resumed
-                            .entry(entry.hop)
-                            .or_default()
-                            .push((entry.source_sha, vec![entry.reference]));
-                    }
-                }
-                Err(error) => self.pending_error = Some(error.to_string()),
-            }
-        }
         let end = self.policy.depth.saturating_add(MAX_REDIRECT_HOPS);
         for hop in 0..end {
-            self.current_hop = hop;
-            worklist.extend(resumed.remove(&hop).unwrap_or_default());
-            let mut allowed = Vec::new();
-            for group in worklist {
-                if hop
-                    < self
-                        .policy
-                        .depth
-                        .saturating_add(self.redirect_credit.get(&group.0).copied().unwrap_or(0))
-                {
-                    allowed.push(group);
-                } else {
-                    self.defer_groups(&[group], hop, "depth limit");
-                }
-            }
-            worklist = allowed;
+            worklist = self.within_depth(worklist, hop);
             if self.deadline.passed() {
                 self.defer_groups(&worklist, hop, "fetch timeout");
-                worklist.clear();
-                break;
+                return;
             }
             if worklist.is_empty() {
-                continue;
+                return;
             }
-            // Reconcile imports before policy selection. Declared imports
-            // must not evade a transitive-dependency limit by resolving latest
-            // as a command. References-only scans retain the declaration's
-            // constraint while following the observed import.
-            let declared_imports = declared_npm_imports_in_hop(report, &worklist);
-            let mut covered = Vec::new();
-            for (source, reference) in
-                reconcile_python_imports(report, &mut worklist, self.policy.deps)
-            {
-                self.out.records.push(skipped_record(
-                    &source,
-                    &reference,
-                    Coverage::CoveredByDeclaration,
-                ));
-                covered.push(self.pending_entry(
-                    &source,
-                    &reference,
-                    hop,
-                    "declared Python requirement",
-                ));
-            }
-            for (source, refs) in &mut worklist {
-                refs.retain_mut(|reference| {
-                    if !self.policy.wants_at(RefKind::Command, hop)
-                        || reference.kind != RefKind::Command
-                        || !matches!(reference.source.as_str(), "ast-call" | "ast-import")
-                    {
-                        return true;
-                    }
-                    let Some(name) = npm_import_name(reference) else {
-                        return true;
-                    };
-                    let Some(declaration) = declared_imports
-                        .get(source)
-                        .and_then(|names| names.get(&name))
-                    else {
-                        return true;
-                    };
-                    if !self.policy.deps {
-                        reference.locator = declaration.locator.clone();
-                        reference.pinned_hash = declaration.pinned_hash.clone();
-                        reference.context = declaration.context.clone();
-                        return true;
-                    }
-                    let coverage = if self.policy.wants_at(RefKind::Dependency, hop) {
-                        Coverage::CoveredByDeclaration
-                    } else {
-                        Coverage::TransitiveNotFollowed
-                    };
-                    self.out
-                        .records
-                        .push(skipped_record(source, reference, coverage));
-                    covered.push(self.pending_entry(source, reference, hop, "manifest dependency"));
-                    false
-                });
-            }
-            let local = LocalNpmPackages::from_report(report);
-            for (source, refs) in &mut worklist {
-                refs.retain(|reference| {
-                    if !self.policy.wants_at(reference.kind, hop) {
-                        return true;
-                    }
-                    let workspace = local.workspace_coverage(report, source, reference);
-                    let incomplete = workspace
-                        .as_ref()
-                        .is_some_and(|(_, incomplete)| *incomplete);
-                    let Some(path) = workspace
-                        .map(|(path, _)| path)
-                        .or_else(|| local.declared_coverage(report, source, reference))
-                    else {
-                        return true;
-                    };
-                    if reference.pinned_hash.is_some() {
-                        self.local_coverage
-                            .entry(source.clone())
-                            .or_default()
-                            .insert(locator(reference).to_owned(), path);
-                        return true;
-                    }
-                    let mut record = skipped_record(
-                        source,
-                        reference,
-                        Coverage::Supplied {
-                            path,
-                            pin_verified: None,
-                        },
-                    );
-                    if incomplete {
-                        record.coverage.push(Coverage::Incomplete);
-                    }
-                    self.out.records.push(record);
-                    covered.push(self.pending_entry(source, reference, hop, "supplied code"));
-                    false
-                });
-            }
-            self.checkpoint(&[], &covered);
+            self.settle_declared_imports(report, &mut worklist, hop);
+            self.settle_local_packages(report, &mut worklist, hop);
             for (_, refs) in &mut worklist {
                 refs.sort_by_key(dependency_execution_priority);
             }
@@ -468,79 +386,140 @@ impl FetchSession {
                 refs.iter()
                     .map(dependency_execution_priority)
                     .min()
-                    .unwrap_or(3)
+                    .unwrap_or(Priority::Development)
             });
             self.bid_versions(&worklist, hop);
             worklist = self.hop(report, worklist, hop);
         }
         self.defer_groups(&worklist, end, "depth limit");
-        for (hop, groups) in resumed {
-            self.defer_groups(&groups, hop, "depth limit or fetch timeout");
+    }
+
+    /// The groups hop `hop` may still follow: within `policy.depth`, plus any
+    /// redirect credit their declaring payload earned. The rest are deferred.
+    fn within_depth(&mut self, worklist: Vec<Group>, hop: u8) -> Vec<Group> {
+        let (allowed, deferred): (Vec<Group>, Vec<Group>) =
+            worklist.into_iter().partition(|(sha, _)| {
+                let credit = self.redirect_credit.get(sha).copied().unwrap_or(0);
+                hop < self.policy.depth.saturating_add(credit)
+            });
+        self.defer_groups(&deferred, hop, "depth limit");
+        allowed
+    }
+
+    /// Reconcile imports with declarations before policy selection, so a
+    /// declared import cannot evade a transitive-dependency limit by resolving
+    /// `latest` as a command. A references-only scan keeps the declaration's
+    /// constraint while following the observed import.
+    fn settle_declared_imports(
+        &mut self,
+        report: &AnalysisReport,
+        worklist: &mut [Group],
+        hop: u8,
+    ) {
+        let declared_imports = declared_npm_imports_in_hop(report, worklist);
+        for (source, reference) in reconcile_python_imports(report, worklist, self.policy.deps) {
+            self.out.records.push(skipped_record(
+                &source,
+                &reference,
+                Coverage::CoveredByDeclaration,
+            ));
+        }
+        let policy = self.policy;
+        for (source, refs) in worklist {
+            refs.retain_mut(|reference| {
+                if !policy.wants_at(RefKind::Command, hop)
+                    || reference.kind != RefKind::Command
+                    || !matches!(reference.source.as_str(), "ast-call" | "ast-import")
+                {
+                    return true;
+                }
+                let Some(declaration) = npm_import_name(reference)
+                    .and_then(|name| declared_imports.get(source.as_str())?.get(&name))
+                else {
+                    return true;
+                };
+                if !policy.deps {
+                    reference.locator = declaration.locator.clone();
+                    reference.pinned_hash = declaration.pinned_hash.clone();
+                    reference.context = declaration.context.clone();
+                    return true;
+                }
+                let coverage = if policy.wants_at(RefKind::Dependency, hop) {
+                    Coverage::CoveredByDeclaration
+                } else {
+                    Coverage::TransitiveNotFollowed
+                };
+                self.out
+                    .records
+                    .push(skipped_record(source, reference, coverage));
+                false
+            });
         }
     }
 
-    pub(super) fn pending_entry(
-        &self,
-        source: &str,
-        reference: &Reference,
-        hop: u8,
-        reason: &str,
-    ) -> pending::Entry {
-        pending::Entry {
-            root_sha: self.root_sha.clone(),
-            source_sha: source.to_owned(),
-            hop,
-            reference: reference.clone(),
-            reason: reason.to_owned(),
-            redirect_credit: self.redirect_credit.get(source).copied().unwrap_or(0),
+    /// Drop the references a package inside the artifact already supplies —
+    /// a captured workspace member or a vendored `node_modules` copy — and
+    /// record where. A pinned one is still fetched, so its pin can be checked
+    /// against the bytes; its record notes the local copy.
+    fn settle_local_packages(&mut self, report: &AnalysisReport, worklist: &mut [Group], hop: u8) {
+        let local = LocalNpmPackages::from_report(report);
+        for (source, refs) in worklist {
+            refs.retain(|reference| {
+                if !self.policy.wants_at(reference.kind, hop) {
+                    return true;
+                }
+                let workspace = local.workspace_coverage(report, source, reference);
+                let incomplete = workspace.as_ref().is_some_and(|w| w.incomplete);
+                let Some(path) = workspace
+                    .map(|w| w.paths)
+                    .or_else(|| local.declared_coverage(report, source, reference))
+                else {
+                    return true;
+                };
+                if reference.pinned_hash.is_some() {
+                    self.local_coverage
+                        .entry(source.clone())
+                        .or_default()
+                        .insert(locator(reference).to_owned(), path);
+                    return true;
+                }
+                let mut record = skipped_record(
+                    source,
+                    reference,
+                    Coverage::Supplied {
+                        path,
+                        pin_verified: None,
+                    },
+                );
+                if incomplete {
+                    record.coverage.push(Coverage::Incomplete);
+                }
+                self.out.records.push(record);
+                false
+            });
         }
     }
-    pub(super) fn checkpoint(
-        &mut self,
-        additions: &[pending::Entry],
-        completed: &[pending::Entry],
-    ) {
-        if let Some(store) = self.pending.as_ref()
-            && let Err(error) = store.update(additions, completed)
-        {
-            tracing::error!(%error, "fetch backlog checkpoint failed");
-            self.pending_error = Some(error.to_string());
-        }
-    }
-    pub(super) fn defer_groups(&mut self, groups: &[Group], hop: u8, reason: &str) {
-        let entries: Vec<_> = groups
-            .iter()
-            .flat_map(|(sha, refs)| {
-                refs.iter()
-                    .filter(|r| self.policy.wants(r.kind))
-                    .map(|r| self.pending_entry(sha, r, hop, reason))
-            })
-            .collect();
-        // Every skip is reported, but only what `select` would take at `hop`
-        // is checkpointed: anything else is never fetched, so it would never
-        // be completed and would sit in the backlog forever.
-        let resumable: Vec<_> = entries
-            .iter()
-            .filter(|e| self.wanted(&e.reference, hop) && !self.dev_excluded(&e.reference))
-            .cloned()
-            .collect();
-        self.checkpoint(&resumable, &[]);
-        for entry in entries {
-            self.out.records.push(skipped_record(
-                &entry.source_sha,
-                &entry.reference,
-                Coverage::Pending {
-                    reason: reason.to_owned(),
-                    hop,
-                },
-            ));
+
+    /// Record every followable reference in `groups` as deferred at `hop`.
+    fn defer_groups(&mut self, groups: &[Group], hop: u8, reason: &str) {
+        for (sha, refs) in groups {
+            for r in refs.iter().filter(|r| self.policy.wants(r.kind)) {
+                self.out.records.push(skipped_record(
+                    sha,
+                    r,
+                    Coverage::Pending {
+                        reason: reason.to_owned(),
+                        hop,
+                    },
+                ));
+            }
         }
     }
 
     /// Pre-scan a whole hop so the newest version is hop-wide, not
     /// first-group-wins: every fetchable versioned reference bids, and the
     /// running cross-hop maximum only rises.
-    pub(super) fn bid_versions(&mut self, worklist: &[Group], hop: u8) {
+    fn bid_versions(&mut self, worklist: &[Group], hop: u8) {
         for r in worklist.iter().flat_map(|(_, refs)| refs) {
             if !self.policy.wants_at(r.kind, hop) {
                 continue;
@@ -627,7 +606,7 @@ impl FetchSession {
     /// seen. Selection is by [`RefKind`], so a command-mentioned package
     /// (`packages`) is distinct from a declared dependency (`deps`) even though
     /// both are PURLs.
-    pub(super) fn select(
+    fn select(
         &mut self,
         source_sha: &str,
         refs: Vec<Reference>,
@@ -644,15 +623,12 @@ impl FetchSession {
                 ));
                 continue;
             }
-            if self.dev_excluded(&r) {
-                self.out.records.push(skipped_record(
-                    source_sha,
-                    &r,
-                    Coverage::DevelopmentExcluded,
-                ));
-                continue;
-            }
-            if !self.wanted(&r, hop) {
+            // CI references only under `--follow=ci-actions`.
+            let ci = r
+                .context
+                .as_ref()
+                .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci);
+            if (ci && !self.policy.ci) || !self.policy.wants_at(r.kind, hop) {
                 continue;
             }
             if let Some(reason) = self.fetch_skip_reason(&r) {
@@ -667,7 +643,7 @@ impl FetchSession {
                         },
                     ));
                 } else {
-                    tracing::debug!(locator = %locator(&r), source = %r.source, "{reason}; fetch skipped");
+                    tracing::debug!(locator = %locator(&r), source = %r.source, reason, "fetch skipped");
                 }
                 continue;
             }
@@ -682,42 +658,15 @@ impl FetchSession {
         selected
     }
 
-    /// Whether `r` is a development dependency this policy leaves out.
-    fn dev_excluded(&self, r: &Reference) -> bool {
-        !self.policy.include_dev_dependencies
-            && r.context
-                .as_ref()
-                .is_some_and(|c| c.scope == filefacts::DependencyScope::Development)
-    }
-
-    /// Whether this hop follows `r`, CI references only under `--ci`. Called
-    /// from [`Self::select`] after it has recorded and dropped transitive and
-    /// development references.
-    fn wanted(&self, r: &Reference, hop: u8) -> bool {
-        (self.policy.ci
-            || !r
-                .context
-                .as_ref()
-                .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci))
-            && self.policy.wants_at(r.kind, hop)
-    }
-
-    /// Whether a reference can be fetched at all, and — for a discovered URL —
-    /// whether it is worth a round trip. Publisher-controlled URLs, obvious
-    /// site/API endpoints, and the exact documentation/update URLs observed in
-    /// stock /bin binaries cost a round trip each and are unlikely to yield a
-    /// dropper payload. Applied per hop so a payload's own boilerplate is
-    /// filtered too, and only to *discovered* references: `scan url <url>`
-    /// fetches whatever the operator names (see `crate::hosts`).
-    pub(super) fn fetchable(&self, r: &Reference) -> bool {
-        if let Some(reason) = self.fetch_skip_reason(r) {
-            tracing::debug!(locator = %locator(r), source = %r.source, "{reason}; fetch skipped");
-            return false;
-        }
-        true
-    }
-
-    pub(super) fn fetch_skip_reason(&self, r: &Reference) -> Option<&'static str> {
+    /// Why a reference cannot be fetched at all or — for a discovered URL —
+    /// is not worth a round trip; `None` to fetch it. Publisher-controlled
+    /// URLs, obvious site/API endpoints, and the exact documentation/update
+    /// URLs observed in stock /bin binaries cost a round trip each and are
+    /// unlikely to yield a dropper payload. Applied per hop so a payload's own
+    /// boilerplate is filtered too, and only to *discovered* references:
+    /// `scan url <url>` fetches whatever the operator names (see
+    /// `crate::hosts`).
+    fn fetch_skip_reason(&self, r: &Reference) -> Option<&'static str> {
         let raw = match &r.locator {
             RefLocator::Purl(_) => return None,
             // Resolved against the artifact's own files, never fetched.
@@ -757,13 +706,13 @@ impl FetchSession {
     /// they're ever fetched — the host variant is scanned, its linux/windows
     /// siblings never run here. Off unless the policy asks for it
     /// (`serve` audits every platform).
-    pub(super) fn off_host(&self, r: &Reference) -> bool {
+    fn off_host(&self, r: &Reference) -> bool {
         let off_host = self.policy.host_platform_only && off_host_platform(r, self.host);
         if off_host {
             tracing::debug!(
                 package = %locator(r),
-                host_os = self.host.0,
-                host_arch = self.host.1,
+                host_os = self.host.os,
+                host_arch = self.host.arch,
                 "dependency pinned to another platform; skipped"
             );
         }
@@ -773,10 +722,7 @@ impl FetchSession {
     /// Older-version duplicates are skipped entirely — no registry-record
     /// materialization, no fetch (operator policy). Never silent:
     /// each skip logs at debug, the hop logs one count at info.
-    pub(super) fn newest_version(&self, r: &Reference, dropped_old: &mut usize) -> bool {
-        if self.policy.all_versions {
-            return true;
-        }
+    fn newest_version(&self, r: &Reference, dropped_old: &mut usize) -> bool {
         let Some((key, version)) = versioned_purl(locator(r)) else {
             return true;
         };
@@ -798,7 +744,7 @@ impl FetchSession {
     /// `pkg:eco/name` is dropped when the same coordinate is pinned elsewhere
     /// in the tree, so the exact installed version is scanned instead of
     /// `dist-tags/latest`.
-    pub(super) fn superseded(&self, r: &Reference) -> bool {
+    fn superseded(&self, r: &Reference) -> bool {
         // Python imports use their own nearest declaration, not a pin in an
         // unrelated package that merely shares the distribution spelling.
         if is_python_import_candidate(r) {
@@ -819,17 +765,19 @@ impl FetchSession {
     /// are trait-matched, and releases older than the age ceiling are dropped
     /// before the expensive fetch+scan of their bytes. Skips are reported, never
     /// silent.
-    pub(super) fn plan(&self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
+    fn plan(&self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
         let (selected, registries) = age_gate(selected, &self.policy, self.res, self.now);
         // Reveal the kept (to-fetch) set as pending, so the tree shows the
         // dependencies it will actually scan up front. Aged-out deps are
         // deliberately never announced — for a large npm graph they are the
         // overwhelming majority and only a registry-metadata lookup runs on
         // them, so listing them would bury the handful of live scans.
-        self.reporter.announce(
-            &selected,
-            self.manifests.get(&source_sha).map_or("", String::as_str),
-        );
+        if let Reporter::Tree { tree, .. } = &self.reporter {
+            let source = self.manifests.get(&source_sha).map_or("", String::as_str);
+            for r in &selected {
+                tree.add(locator(r), &dep_display_name(r), source);
+            }
+        }
         GroupPlan {
             source_sha,
             selected,
@@ -843,7 +791,7 @@ impl FetchSession {
     /// downloading it. One batched lookup up front skips the download, the
     /// analysis, and the re-upload for every such PURL; the answer's sha still
     /// records the fetch edge. Anything unanswered fetches exactly as before.
-    pub(super) fn precheck_purls(
+    fn precheck_purls(
         &self,
         plans: &[GroupPlan],
     ) -> HashMap<String, crate::corpus_precheck::PurlHit> {
@@ -955,7 +903,7 @@ impl FetchSession {
     /// Fetch one group's selected references: dependencies and
     /// command-mentioned packages under one cap, opportunistic URLs under their
     /// own smaller one, and none at all for a dependency the corpus answered.
-    pub(super) fn fetch_group(
+    fn fetch_group(
         &mut self,
         plan: GroupPlan,
         corpus: &HashMap<String, crate::corpus_precheck::PurlHit>,
@@ -973,11 +921,6 @@ impl FetchSession {
                 landed: Vec::new(),
             };
         }
-        let entries: Vec<_> = selected
-            .iter()
-            .map(|r| self.pending_entry(&source_sha, r, self.current_hop, "in progress"))
-            .collect();
-        self.checkpoint(&entries, &[]);
         let mut slots: Vec<Option<(FetchRecord, Standing)>> = vec![None; selected.len()];
         let mut deps = Vec::new();
         let mut urls = Vec::new();
@@ -1048,7 +991,7 @@ impl FetchSession {
     /// Fetch one class's references under this root's budget and the
     /// process-wide one: reserve from the total first, refund what went
     /// unspent. Returns the records and the notice a budget-clipped edge shows.
-    pub(super) fn fetch_class(
+    fn fetch_class(
         &mut self,
         class: FetchClass,
         refs: &[Reference],
@@ -1132,7 +1075,7 @@ impl FetchSession {
     /// where the throttle expects. Each `registry_node` is an independent cleave
     /// analysis of one small JSON document, far cheaper than a payload's full
     /// cleave pass. Results align with `batch`.
-    pub(super) fn analyze_batch(&self, batch: &mut [GroupFetch]) -> Vec<GroupAnalysis> {
+    fn analyze_batch(&self, batch: &mut [GroupFetch]) -> Vec<GroupAnalysis> {
         let analyzes_bytes = batch
             .iter()
             .flat_map(|g| &g.landed)
@@ -1220,23 +1163,8 @@ impl FetchSession {
         // so the package pass below can pair an artifact with its own registry
         // metadata (see `apply_package_composites`).
         let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
-        let mut unverified_registry_issues: HashMap<String, std::collections::BTreeSet<String>> =
-            HashMap::new();
-        let verified_python: HashSet<&str> = landed
-            .iter()
-            .zip(&payloads)
-            .filter(|(landed, payload)| {
-                is_python_import_candidate(&landed.reference)
-                    && delivered_bytes(&landed.record)
-                    && payload
-                        .as_ref()
-                        .and_then(|payload| payload.sub.as_ref())
-                        .is_some_and(|sub| {
-                            python_candidate_provides_namespace(&landed.reference, sub)
-                        })
-            })
-            .map(|(landed, _)| landed.reference.evidence.as_str())
-            .collect();
+        let mut unverified_registry_issues: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let verified_python = verified_python_candidates(&landed, &payloads);
         for (gated, sub) in registries.into_iter().zip(subs) {
             // Registry claims against an unverified name must not convict a
             // Python importer whose distribution identity is still unknown.
@@ -1253,87 +1181,63 @@ impl FetchSession {
             }
             self.merge_registry_record(report, &source_sha, gated, sub, &mut registry_findings);
         }
-        // `next` spans the whole hop; only what this group adds is new here.
-        let discovered_from = next.len();
-        for (l, mut payload) in landed.iter_mut().zip(payloads) {
-            if payload.is_none()
-                && delivered_bytes(&l.record)
-                && matches!(l.standing, Standing::Analyze)
-            {
-                l.record
-                    .coverage
-                    .push(Coverage::Unavailable { reason: None });
-            }
-            if payload
-                .as_ref()
-                .and_then(|p| p.sub.as_ref())
-                .is_some_and(|sub| {
-                    !sub.analysis_gaps.is_empty()
-                        || sub.files.iter().any(|f| !f.analysis_gaps.is_empty())
-                })
-            {
-                l.record.coverage.push(Coverage::Incomplete);
-            }
-            mark_peer_candidate(&mut l.record, &l.reference.source);
-            if is_python_import_candidate(&l.reference) {
-                if !annotate_python_import_candidate(
-                    &mut l.record,
-                    &l.reference,
-                    payload.as_ref().and_then(|p| p.sub.as_ref()),
-                    unverified_registry_issues.get(&l.reference.evidence),
-                ) {
-                    payload = None;
-                }
-                self.reporter.analyzed(&l.reference, &l.record);
-                self.reporter.report(&l.record, "");
-            }
-            if let Some(payload) = payload {
+        for (l, payload) in landed.iter_mut().zip(payloads) {
+            let issues = unverified_registry_issues.get(&l.reference.evidence);
+            if let Some(payload) = self.settle_payload(l, payload, issues) {
                 self.merge_landed(report, &source_sha, l, payload, &registry_findings, next);
             }
         }
-        let mut pending = Vec::new();
-        let mut completed = Vec::new();
-        for l in &landed {
-            let entry = self.pending_entry(
-                &source_sha,
-                &l.reference,
-                self.current_hop,
-                "fetch failed or budget exceeded",
-            );
-            if matches!(l.record.outcome, Outcome::BudgetExceeded)
-                || matches!(&l.record.outcome, Outcome::Failed(error) if error.is_retryable())
-                || l.record.coverage.iter().any(is_analysis_gap)
-            {
-                pending.push(entry);
-            } else {
-                completed.push(entry);
-            }
-        }
-        self.checkpoint(&pending, &completed);
-        // Only what `select` would admit on the next hop: a reference it drops
-        // is never fetched, so it would never be completed and would sit in
-        // the backlog forever.
-        let next_hop = self.current_hop.saturating_add(1);
-        let discovered: Vec<_> = next[discovered_from..]
-            .iter()
-            .flat_map(|(sha, refs)| {
-                refs.iter()
-                    .filter(|r| {
-                        self.wanted(r, next_hop) && !self.dev_excluded(r) && self.fetchable(r)
-                    })
-                    .map(|r| self.pending_entry(sha, r, next_hop, "discovered"))
-            })
-            .collect();
-        self.checkpoint(&discovered, &[]);
         self.out
             .records
             .extend(landed.into_iter().map(|l| l.record));
     }
 
+    /// Record on `l`'s edge what became of its analysis, and return the payload
+    /// to graft: `None` when there is nothing to graft, or when a Python import
+    /// candidate's bytes do not provide the imported namespace.
+    fn settle_payload(
+        &self,
+        l: &mut Landed,
+        payload: Option<Analyzed>,
+        registry_issues: Option<&BTreeSet<String>>,
+    ) -> Option<Analyzed> {
+        if payload.is_none()
+            && delivered_bytes(&l.record)
+            && matches!(l.standing, Standing::Analyze)
+        {
+            l.record
+                .coverage
+                .push(Coverage::Unavailable { reason: None });
+        }
+        if payload
+            .as_ref()
+            .and_then(|p| p.sub.as_ref())
+            .is_some_and(|sub| {
+                !sub.analysis_gaps.is_empty()
+                    || sub.files.iter().any(|f| !f.analysis_gaps.is_empty())
+            })
+        {
+            l.record.coverage.push(Coverage::Incomplete);
+        }
+        mark_peer_candidate(&mut l.record, &l.reference.source);
+        if !is_python_import_candidate(&l.reference) {
+            return payload;
+        }
+        let verified = annotate_python_import_candidate(
+            &mut l.record,
+            &l.reference,
+            payload.as_ref().and_then(|p| p.sub.as_ref()),
+            registry_issues,
+        );
+        self.reporter.analyzed(&l.reference, &l.record);
+        self.reporter.report(&l.record, "");
+        payload.filter(|_| verified)
+    }
+
     /// Graft one materialized registry record under its declaring file, keep
     /// its provenance when anything downstream will read it, and report its
     /// skip.
-    pub(super) fn merge_registry_record(
+    fn merge_registry_record(
         &mut self,
         report: &mut AnalysisReport,
         source_sha: &str,
@@ -1359,13 +1263,13 @@ impl FetchSession {
             let tally = self
                 .registry_outcomes
                 .entry(source_sha.to_owned())
-                .or_insert((0, 0));
-            tally.0 += 1;
+                .or_default();
+            tally.materialized += 1;
             if findings
                 .iter()
                 .any(|f| is_registry_security_hold_finding(&f.id))
             {
-                tally.1 += 1;
+                tally.security_held += 1;
             }
             // A skipped dependency has no artifact upload and only appears in
             // provenance output when its registry node is notable. Drop its raw
@@ -1396,7 +1300,12 @@ impl FetchSession {
                     locator: locator(&reference).to_owned(),
                     provenance,
                     file_id,
-                    artifact_skip: skip.map(SkipReason::artifact_note),
+                    // Why the artifact is absent, as provenance output states it.
+                    artifact_skip: skip.map(|reason| match reason {
+                        SkipReason::Removed => "version removed",
+                        SkipReason::AgedOut => "older than fetch age limit",
+                        SkipReason::KnownGood => "known-good coordinate",
+                    }),
                 });
             }
         }
@@ -1440,7 +1349,7 @@ impl FetchSession {
 
     /// Fold one analyzed payload into the run: its redirect credit, its
     /// standalone capture, an adopted verdict, and its subtree in the report.
-    pub(super) fn merge_landed(
+    fn merge_landed(
         &mut self,
         report: &mut AnalysisReport,
         source_sha: &str,
@@ -1481,7 +1390,7 @@ impl FetchSession {
             && let Some(root_path) = sub
                 .files
                 .first()
-                .filter(|f| f.file_type == "npm")
+                .filter(|f| report_file_type(&f.file_type) == FileType::Npm)
                 .map(|f| f.path.clone())
             && let Some(bytes) = self.res.cache.load(&l.record.locator)
         {
@@ -1516,19 +1425,32 @@ impl FetchSession {
 
     /// Close out the phase: settle the progress view and record, on each file
     /// that declared references, what became of them.
-    pub(super) fn finish(mut self, report: &mut AnalysisReport) -> FetchOutcome {
-        if let Some(error) = self.pending_error {
-            let mut record = FetchRecord::terminal(
-                "fetch backlog".into(),
-                Outcome::Failed(FetchError::Internal(error)),
-            );
-            record.coverage.push(Coverage::BacklogUnsaved);
-            self.out.records.push(record);
-        }
+    pub(super) fn finish(self, report: &mut AnalysisReport) -> FetchOutcome {
         self.reporter.finish(&self.out.records);
         attribute_reference_outcomes(report, &self.out.records, &self.registry_outcomes);
         self.out
     }
+}
+
+/// The import evidence of every Python import candidate whose fetched bytes
+/// provide the namespace it was imported as.
+fn verified_python_candidates<'a>(
+    landed: &'a [Landed],
+    payloads: &[Option<Analyzed>],
+) -> HashSet<&'a str> {
+    landed
+        .iter()
+        .zip(payloads)
+        .filter(|(landed, payload)| {
+            is_python_import_candidate(&landed.reference)
+                && delivered_bytes(&landed.record)
+                && payload
+                    .as_ref()
+                    .and_then(|payload| payload.sub.as_ref())
+                    .is_some_and(|sub| python_candidate_provides_namespace(&landed.reference, sub))
+        })
+        .map(|(landed, _)| landed.reference.evidence.as_str())
+        .collect()
 }
 
 /// A copy of `r` whose offset is `index`. fletch drops references it will not
@@ -1586,89 +1508,23 @@ pub(super) fn pair_records(
 pub(super) fn attribute_reference_outcomes(
     report: &mut AnalysisReport,
     records: &[FetchRecord],
-    registry_outcomes: &BTreeMap<String, (u64, u64)>,
+    registry_outcomes: &BTreeMap<String, RegistryTally>,
 ) {
-    #[derive(Default)]
-    struct Tally<'a> {
-        declared: u64,
-        unresolved: Vec<&'a str>,
-        unavailable_commands: u64,
-        unavailable_command_spans: Vec<filefacts::Span>,
-    }
-
+    let by_source = tally_by_source(records);
     let mut touched: Vec<String> = Vec::new();
-    let mut by_source: BTreeMap<&str, Tally<'_>> = BTreeMap::new();
-    for rec in records {
-        let Some(source) = rec.source_sha256.as_deref() else {
-            continue;
-        };
-        let tally = by_source.entry(source).or_default();
-        tally.declared += 1;
-        // Only an actual command edge with an explicit absent-artifact HTTP
-        // response counts. Unknown resolution, 403, timeouts and docs do not.
-        if rec.kind == RefKind::Command
-            && matches!(rec.outcome, Outcome::Failed(FetchError::Status(404 | 410)))
-            && artifact_absent(rec)
-        {
-            tally.unavailable_commands += 1;
-            if let Some(offset) = rec.source_offset {
-                tally
-                    .unavailable_command_spans
-                    .push(filefacts::Span::new(offset, 1));
-            }
-        }
-        if matches!(rec.outcome, Outcome::Unresolved(_)) {
-            tally.unresolved.push(rec.locator.as_str());
-        }
-    }
-
     // One pass, two sources. A reference can leave a fetch record, a registry
-    // document, or both, and the declarer should carry its outcome either way --
-    // reading only the fetch records meant a dependency resolved without a live
-    // download was attributed nothing at all.
+    // document, or both, and the declarer should carry its outcome either way:
+    // reading only the fetch records would attribute nothing to a dependency
+    // resolved without a live download.
     for file in &mut report.files {
         let fetched = by_source.get(file.sha256.as_str());
         let registry = registry_outcomes.get(file.sha256.as_str());
         if fetched.is_none() && registry.is_none() {
             continue;
         }
-        let declared = fetched
-            .map_or(0, |t| t.declared)
-            .max(registry.map_or(0, |r| r.0));
-        let unresolved = fetched.map_or(0, |t| t.unresolved.len() as u64);
-        let held = registry.map_or(0, |r| r.1);
+        let registry = registry.copied().unwrap_or_default();
         let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
-        metrics.insert("references.declared_count".to_string(), declared as f64);
-        metrics.insert("references.unresolved_count".to_string(), unresolved as f64);
-        metrics.insert(
-            "references.unavailable_command_count".to_string(),
-            fetched.map_or(0, |t| t.unavailable_commands) as f64,
-        );
-        metrics.insert("references.security_hold_count".to_string(), held as f64);
-        // Editor-marketplace removals get their own count, because they do not
-        // mean what a registry 404 means. npm serves a 404 for a private name,
-        // a typo, or a package that moved; the VS Code and Open VSX galleries
-        // *remove* extensions, and removal is what they do to malware. A rule
-        // convicting on the first would be noise and on the second is not.
-        //
-        // Two fixed keys rather than one per ecosystem: the metric catalog
-        // checks exact names, so a key built from whatever PURL type happened
-        // to appear could never be declared, and an undeclared key validates
-        // against nothing. An archive member also carries no values tree for a
-        // `type: value` list to read, so a metric is the only surface that
-        // survives member retention.
-        let extension_unresolved = fetched.map_or(0, |t| {
-            t.unresolved
-                .iter()
-                .filter(|l| {
-                    Coordinate::of(l).is_some_and(|c| matches!(c.typ, "vscode" | "openvsx"))
-                })
-                .count()
-        });
-        metrics.insert(
-            "references.unresolved_extension_count".to_string(),
-            extension_unresolved as f64,
-        );
+        write_reference_metrics(metrics, fetched, registry);
         // The pass below covers every file with this sha at once.
         if !touched.contains(&file.sha256) {
             touched.push(file.sha256.clone());
@@ -1699,7 +1555,10 @@ pub(super) fn attribute_reference_outcomes(
         .collect();
     match cleave::graft_reference_outcomes_batch(report, &sources, &AnalysisOptions::default()) {
         Ok(0) => {}
-        Err(e) => tracing::warn!("reference-outcome pass failed: {e:#}"),
+        Err(error) => tracing::warn!(
+            error = format!("{error:#}"),
+            "reference-outcome pass failed"
+        ),
         Ok(n) => tracing::debug!(
             grafted = n,
             sources = sources.len(),
@@ -1708,26 +1567,82 @@ pub(super) fn attribute_reference_outcomes(
     }
 }
 
-#[cfg(test)]
-mod security_hold_finding_tests {
-    use super::is_registry_security_hold_finding;
+/// What became of the references one file declared, as its fetch records say.
+#[derive(Default)]
+struct SourceTally<'a> {
+    declared: u64,
+    unresolved: Vec<&'a str>,
+    unavailable_commands: u64,
+    unavailable_command_spans: Vec<filefacts::Span>,
+}
 
-    #[test]
-    fn recognizes_only_registry_hold_evidence() {
-        assert!(is_registry_security_hold_finding(
-            "metadata/registry::registry-security-hold"
-        ));
-        assert!(is_registry_security_hold_finding(
-            "metadata/registry::registry-security-hold-record"
-        ));
-        assert!(!is_registry_security_hold_finding(
-            "metadata/registry::registry-security-hold-record-impostor"
-        ));
-        assert!(!is_registry_security_hold_finding(
-            "other/registry::registry-security-hold-record"
-        ));
-        assert!(!is_registry_security_hold_finding(
-            "metadata/registry::deprecated"
-        ));
+/// [`SourceTally`] per declaring sha.
+fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceTally<'_>> {
+    let mut by_source: BTreeMap<&str, SourceTally<'_>> = BTreeMap::new();
+    for rec in records {
+        let Some(source) = rec.source_sha256.as_deref() else {
+            continue;
+        };
+        let tally = by_source.entry(source).or_default();
+        tally.declared += 1;
+        // Only an actual command edge with an explicit absent-artifact HTTP
+        // response counts. Unknown resolution, 403, timeouts and docs do not.
+        if rec.kind == RefKind::Command
+            && matches!(rec.outcome, Outcome::Failed(FetchError::Status(status)) if gone_status(status))
+            && artifact_absent(rec)
+        {
+            tally.unavailable_commands += 1;
+            if let Some(offset) = rec.source_offset {
+                tally
+                    .unavailable_command_spans
+                    .push(filefacts::Span::new(offset, 1));
+            }
+        }
+        if matches!(rec.outcome, Outcome::Unresolved(_)) {
+            tally.unresolved.push(rec.locator.as_str());
+        }
     }
+    by_source
+}
+
+/// Write one declaring file's `references.*` metrics.
+fn write_reference_metrics(
+    metrics: &mut BTreeMap<String, f64>,
+    fetched: Option<&SourceTally<'_>>,
+    registry: RegistryTally,
+) {
+    let declared = fetched.map_or(0, |t| t.declared).max(registry.materialized);
+    let unresolved = fetched.map_or(0, |t| t.unresolved.len() as u64);
+    metrics.insert("references.declared_count".to_string(), declared as f64);
+    metrics.insert("references.unresolved_count".to_string(), unresolved as f64);
+    metrics.insert(
+        "references.unavailable_command_count".to_string(),
+        fetched.map_or(0, |t| t.unavailable_commands) as f64,
+    );
+    metrics.insert(
+        "references.security_hold_count".to_string(),
+        registry.security_held as f64,
+    );
+    // Editor-marketplace removals get their own count, because they do not
+    // mean what a registry 404 means. npm serves a 404 for a private name,
+    // a typo, or a package that moved; the VS Code and Open VSX galleries
+    // *remove* extensions, and removal is what they do to malware. A rule
+    // convicting on the first would be noise and on the second is not.
+    //
+    // Two fixed keys rather than one per ecosystem: the metric catalog
+    // checks exact names, so a key built from whatever PURL type happened
+    // to appear could never be declared, and an undeclared key validates
+    // against nothing. An archive member also carries no values tree for a
+    // `type: value` list to read, so a metric is the only surface that
+    // survives member retention.
+    let extension_unresolved = fetched.map_or(0, |t| {
+        t.unresolved
+            .iter()
+            .filter(|l| Coordinate::of(l).is_some_and(|c| matches!(c.typ, "vscode" | "openvsx")))
+            .count()
+    });
+    metrics.insert(
+        "references.unresolved_extension_count".to_string(),
+        extension_unresolved as f64,
+    );
 }

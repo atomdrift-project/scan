@@ -22,7 +22,7 @@ fn go_pseudo_versions_date_themselves_without_a_lookup() {
         );
     }
 
-    // Real coordinates from the benchmark corpus, in both spellings the Go
+    // Real Go module coordinates, in both spellings the Go
     // proxy mints: the bare `v0.0.0-` form and the `vX.Y.Z-0.` form that
     // follows a release tag.
     assert_eq!(
@@ -80,19 +80,19 @@ fn go_pseudo_version_age_decides_the_gate_the_same_way_a_registry_would() {
         "pkg:golang/github.com/deckhouse/deckhouse@v0.0.0-20260528132821-f66b8cdce5b3",
     )
     .expect("datable");
-    let week = 7 * 86_400;
+    let week = 7 * SECS_PER_DAY;
 
     // A month later: comfortably past a 7-day ceiling.
-    let now = published + 30 * 86_400;
+    let now = published + 30 * SECS_PER_DAY;
     assert!(now.saturating_sub(published) >= week);
     // A day later: inside the window, so it must still be fetched.
-    let now = published + 86_400;
+    let now = published + SECS_PER_DAY;
     assert!(now.saturating_sub(published) < week);
     // Exactly at the boundary counts as aged out, matching `age_secs >= max`.
     let now = published + week;
     assert!(now.saturating_sub(published) >= week);
     // A clock behind the stamp must not underflow into "ancient".
-    let now = published - 86_400;
+    let now = published - SECS_PER_DAY;
     assert_eq!(now.saturating_sub(published), 0);
 }
 
@@ -186,7 +186,10 @@ fn freshly_published_and_must_rescan_track_publish_age() {
 
 #[test]
 fn off_host_platform_matches_native_binary_naming() {
-    let host = ("darwin", "arm64");
+    let host = Platform {
+        os: "darwin",
+        arch: "arm64",
+    };
     // The host variant is kept; other-platform siblings are skipped.
     assert!(!off_host_platform(
         &purl_ref("pkg:npm/%40biomejs/cli-darwin-arm64@2.5.0"),
@@ -224,7 +227,7 @@ fn off_host_platform_matches_native_binary_naming() {
     // Fail open when the host platform can't be named.
     assert!(!off_host_platform(
         &purl_ref("pkg:npm/%40biomejs/cli-linux-x64@2.5.0"),
-        ("", "")
+        Platform { os: "", arch: "" }
     ));
 }
 
@@ -234,7 +237,10 @@ fn off_host_platform_matches_cargo_target_naming() {
     // windows-rs platform crates ship multi-megabyte import libraries that
     // no Linux host will ever link; they are the cargo analogue of npm's
     // `cli-win32-x64`.
-    let host = ("linux", "x64");
+    let host = Platform {
+        os: "linux",
+        arch: "x64",
+    };
     assert!(off_host_platform(
         &purl_ref("pkg:cargo/windows_i686_gnu@0.52.0"),
         host
@@ -286,7 +292,10 @@ fn off_host_platform_matches_cargo_target_naming() {
         host
     ));
     // A musl host keeps its own variants and skips the glibc one.
-    let musl_host = ("linuxmusl", "x64");
+    let musl_host = Platform {
+        os: "linuxmusl",
+        arch: "x64",
+    };
     assert!(!off_host_platform(
         &purl_ref("pkg:npm/@img/sharp-linuxmusl-x64@0.35.3"),
         musl_host

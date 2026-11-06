@@ -1,3 +1,4 @@
+use super::lookup::{decide_many, held};
 use super::*;
 use crate::model::Level;
 use crate::server::decision::V1Finding;
@@ -689,9 +690,9 @@ fn an_unavailable_decision_carries_nothing_about_the_package() {
 
 /// The line this draws is the one [`ApiError::from_analysis`] already
 /// draws for unstreamed callers: an artifact nobody can download is the
-/// package's failure, and everything else is ours. Poppy only ever reads
-/// the stream, so without it a dead package — a deleted Go repo, say —
-/// would reach it as an outage and count against the fleet error rate.
+/// package's failure, and everything else is ours. A streaming caller only
+/// ever reads the stream, so without it a dead package — a deleted Go repo,
+/// say — would reach it as an outage and count against our error rate.
 #[test]
 fn only_the_artifacts_own_failures_are_named() {
     assert_eq!(
@@ -759,7 +760,7 @@ fn a_streamed_uploads_progress_carries_its_phase() {
     assert_eq!(frame["sha256"], sha, "an upload is named by its digest");
 }
 
-/// A batch bills as its most expensive row, on beamline's scale. A row that
+/// A batch reports its most expensive row. A row that
 /// reached nothing must not mask one that was answered, and work is never
 /// claimed by rows that only read a layer.
 #[test]

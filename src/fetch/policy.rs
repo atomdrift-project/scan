@@ -2,11 +2,11 @@
 //! per-file and per-run defaults, and the host platform a native dependency
 //! must match.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::time::Duration;
+
+use fletch::{RefKind, RefLocator, Reference};
+
+use super::Coordinate;
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -22,8 +22,8 @@ pub const DEFAULT_FETCH_DEPTH: u8 = 2;
 /// yanked, and the byte scan's cost isn't worth it. `0` disables the gate.
 pub const DEFAULT_MAX_DEP_AGE_DAYS: u32 = 7;
 
-/// Dependency age ceiling for a cache-population role such as postdoc's
-/// worker: `0` — no gate, fetch every resolvable dependency.
+/// Dependency age ceiling for a cache-population worker: `0` — no gate, fetch
+/// every resolvable dependency.
 ///
 /// An interactive scan gates at [`DEFAULT_MAX_DEP_AGE_DAYS`] because
 /// a fresh release is where a supply-chain compromise shows up and the operator is
@@ -40,13 +40,13 @@ pub const WORKER_MAX_DEP_AGE_DAYS: u32 = 0;
 /// This is a cache-population role. It scans on behalf of everybody, and the
 /// corpus it fills is asked about artifacts nobody has looked at yet — so a
 /// category left unfollowed is one the corpus never learns about, for every
-/// consumer, until somebody notices and restarts the fleet with a wider flag.
+/// consumer, until somebody notices and restarts the servers with a wider flag.
 /// The narrower interactive default exists to keep one person's scan fast,
 /// which is not what a service is for.
 ///
 /// Widest-by-default also settles which verdict wins. Hopper holds one verdict
-/// per artifact and the last writer takes the row, so a fleet whose members
-/// follow different amounts lets a narrow answer overwrite a wide one. When
+/// per artifact and the last writer takes the row, so servers that follow
+/// different amounts let a narrow answer overwrite a wide one. When
 /// every server follows everything, there is no narrower answer to lose to.
 #[must_use]
 pub fn default_service_follow_policy() -> FetchPolicy {
@@ -59,14 +59,8 @@ pub fn default_service_follow_policy() -> FetchPolicy {
     }
 }
 
-/// 1024-based size units, the basis for every byte ceiling.
-pub(super) const MIB: u64 = 1024 * 1024;
-pub(super) const GIB: u64 = 1024 * MIB;
-
-/// Default size ceiling for a single fetched artifact —
-/// mirrors fletch's [`fletch::fetch::DEFAULT_MAX_FETCH_BYTES`] (256 MiB). A
-/// response larger than this is abandoned, so one artifact can't dominate a run.
-pub const DEFAULT_MAX_FETCH_SIZE: u64 = 256 * MIB;
+/// A 1024-based gigabyte, the unit of every byte ceiling here.
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Default ceiling on *live* non-URL fetches triggered by a single scanned
 /// file. Cache hits don't count, so a warm re-run is
@@ -79,7 +73,7 @@ pub const DEFAULT_MAX_FILE_FETCHES: usize = 100;
 pub const DEFAULT_MAX_URL_FETCHES: usize = 4;
 
 /// Default ceiling on total bytes fetched on behalf of a single scanned file.
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
+pub(super) const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
 
 /// Default wall-clock ceiling on one artifact's whole fetch phase. The count
 /// and byte budgets bound how *much* a scan
@@ -87,7 +81,7 @@ pub const DEFAULT_MAX_FILE_SIZE: u64 = 2 * GIB;
 /// hold a scan open for as long as it likes while every count budget still has
 /// room. Five minutes is well past what a healthy tree needs and short enough
 /// that a wedged one still returns a verdict. `0` disables the cap.
-pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default ceiling on *live* fetches across one whole execution. Lifted in
 /// long-lived server modes, where each job is bounded by the per-file caps
@@ -103,20 +97,21 @@ pub const DEFAULT_MAX_TOTAL_SIZE: u64 = 10 * GIB;
 /// The public vocabulary groups implementation-level reference kinds by what a
 /// caller means: `dependencies` are manifest/lockfile declarations,
 /// `references` are packages or URLs named by executable commands, and
-/// `ci-actions` are third-party CI actions. The older `deps`, `packages`,
-/// `urls`, and `ci` spellings remain CLI aliases.
+/// `ci-actions` are third-party CI actions.
 ///
-/// The three kinds map onto [`fletch`]'s [`RefKind`] taxonomy, so the selection
+/// The fields map onto [`fletch`]'s [`RefKind`] taxonomy, so the selection
 /// distinguishes how strongly a reference is bound to the artifact:
 ///
-/// - `deps`     → [`RefKind::Dependency`]: a **strict dependency** declared in a
-///   manifest or lockfile (`package.json`, `Cargo.lock`, `.SRCINFO depends`).
-/// - `packages` → [`RefKind::Command`]: a **package merely mentioned** by an
-///   install-command invocation (`npm install foo`, `pip install bar`,
+/// - [`Self::deps`] → [`RefKind::Dependency`]: a **strict dependency** declared
+///   in a manifest or lockfile (`package.json`, `Cargo.lock`, `.SRCINFO
+///   depends`).
+/// - [`Self::packages`] → [`RefKind::Command`]: a **package merely mentioned**
+///   by an install-command invocation (`npm install foo`, `pip install bar`,
 ///   `cargo install baz`) — typically injected by a build/lifecycle script
 ///   rather than pinned in a manifest.
-/// - `urls`     → [`RefKind::UrlFetch`]: a **raw URL** with no package identity
-///   (a `curl`/`wget` target, a staged download) — the largest exposure.
+/// - [`Self::urls`] → [`RefKind::UrlFetch`]: a **raw URL** with no package
+///   identity (a `curl`/`wget` target, a staged download) — the largest
+///   exposure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FetchPolicy {
     /// Fetch raw `http(s)` URLs ([`RefKind::UrlFetch`]).
@@ -167,9 +162,8 @@ pub struct FetchPolicy {
     /// chain, which is the thing being judged; hop 2+ is a transitive closure
     /// that multiplies per hop and is dominated by the long tail of ordinary,
     /// old releases. Each of those costs a registry round trip *before* the age
-    /// gate can rule it out, because the publish date is what the lookup is for:
-    /// one 2.2 KB manifest sidecar pointing at a Go module drew 398 lookups at
-    /// hop 2, of which 398 aged out and none was fetched.
+    /// gate can rule it out, because the publish date is what the lookup is
+    /// for, so nearly all of that work ends in an age-out rather than a fetch.
     ///
     /// The dropper chain `--follow-depth 2` exists for runs through URLs and
     /// install-command packages, and those are followed at every hop regardless.
@@ -185,10 +179,6 @@ pub struct FetchPolicy {
     /// Applies to fetched dependencies only; a directly-scanned artifact is
     /// always analyzed.
     pub host_platform_only: bool,
-    /// Audit development-only locked dependencies; true preserves full coverage.
-    pub include_dev_dependencies: bool,
-    /// Analyze every pinned release, preserving separate version constraints.
-    pub all_versions: bool,
 }
 
 impl Default for FetchPolicy {
@@ -206,8 +196,6 @@ impl Default for FetchPolicy {
             max_duration: DEFAULT_FETCH_TIMEOUT,
             transitive_deps: false,
             host_platform_only: true,
-            include_dev_dependencies: true,
-            all_versions: false,
         }
     }
 }
@@ -225,7 +213,11 @@ impl FetchPolicy {
     /// widen it. Depth, age, byte, platform and fan-out ceilings stay.
     #[must_use]
     pub const fn restricted_to(self, selected: Self) -> Option<Self> {
-        if selected.selection_bits() & !self.selection_bits() != 0 {
+        let widens = (selected.urls && !self.urls)
+            || (selected.packages && !self.packages)
+            || (selected.deps && !self.deps)
+            || (selected.ci && !self.ci);
+        if widens {
             return None;
         }
         Some(Self {
@@ -378,7 +370,7 @@ impl std::str::FromStr for FetchPolicy {
 /// cargo platform crates (`windows_x86_64_gnu`) and Go module paths, so a
 /// match keys on a genuine `<os>-<arch>` native-binary name rather than an
 /// incidental word. `None` for anything that names no OS.
-pub(super) fn canonical_os(seg: &str) -> Option<&'static str> {
+fn canonical_os(seg: &str) -> Option<&'static str> {
     Some(match seg {
         "darwin" | "macos" => "darwin",
         "win32" | "windows" => "win32",
@@ -400,7 +392,7 @@ pub(super) fn canonical_os(seg: &str) -> Option<&'static str> {
 
 /// Canonicalize a CPU-architecture segment to its npm token (`process.arch`).
 /// Same vocabulary rule as [`canonical_os`].
-pub(super) fn canonical_arch(seg: &str) -> Option<&'static str> {
+fn canonical_arch(seg: &str) -> Option<&'static str> {
     Some(match seg {
         "x64" | "x8664" | "amd64" => "x64",
         "arm64" | "aarch64" => "arm64",
@@ -418,11 +410,18 @@ pub(super) fn canonical_arch(seg: &str) -> Option<&'static str> {
     })
 }
 
-/// The host's npm-style `(os, arch)` tokens, mapped from Rust's target
-/// constants. An unmapped target yields an empty token, which disables that
-/// half of the platform match — fail open, so a dependency is never skipped on a
-/// host we can't confidently name.
-pub(super) fn host_platform() -> (&'static str, &'static str) {
+/// A platform as npm names it: `process.platform` and `process.arch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Platform {
+    pub(super) os: &'static str,
+    pub(super) arch: &'static str,
+}
+
+/// The host's npm-style platform tokens, mapped from Rust's target constants.
+/// An unmapped target yields an empty token, which disables that half of the
+/// platform match — fail open, so a dependency is never skipped on a host we
+/// can't confidently name.
+pub(super) fn host_platform() -> Platform {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",
@@ -441,7 +440,7 @@ pub(super) fn host_platform() -> (&'static str, &'static str) {
         arch @ ("arm" | "ppc64" | "s390x" | "riscv64") => arch,
         _ => "",
     };
-    (os, arch)
+    Platform { os, arch }
 }
 
 /// Whether a dependency reference is a native-binary package pinned to a
@@ -451,9 +450,8 @@ pub(super) fn host_platform() -> (&'static str, &'static str) {
 /// package that names no such pair is treated as portable and kept. Returns
 /// `false` when the host platform can't be named (fail open) or for non-PURL
 /// locators (a raw URL carries no package identity to place).
-pub(super) fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
-    let (host_os, host_arch) = host;
-    if host_os.is_empty() || host_arch.is_empty() {
+pub(super) fn off_host_platform(r: &Reference, host: Platform) -> bool {
+    if host.os.is_empty() || host.arch.is_empty() {
         return false;
     }
     let RefLocator::Purl(purl) = &r.locator else {
@@ -490,7 +488,7 @@ pub(super) fn off_host_platform(r: &Reference, host: (&str, &str)) -> bool {
                 _ => continue,
             },
         };
-        return os != host_os || arch != host_arch;
+        return os != host.os || arch != host.arch;
     }
     false
 }

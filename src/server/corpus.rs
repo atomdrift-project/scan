@@ -16,7 +16,6 @@
 //! cost of an unreachable address is a timeout, and paying that in front of
 //! every lookup would be worse than the outage it is reacting to.
 
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,7 +35,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// gives the next address a chance. This catches a restarted backend without
 /// turning a lookup into an unbounded wait.
 const READ_RETRIES: usize = 2;
-const READ_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The longest one read retry sleeps, whatever the backoff or the server's
+/// `Retry-After` asks for: a caller is waiting on the far end of two hops.
+const READ_RETRY_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long a sample download may take: the bytes can run to the upload limit.
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How stale the preferred address may be before its silence stops counting as
 /// an answer.
@@ -68,7 +73,7 @@ const REST: Duration = Duration::from_secs(10);
 
 /// What hopper said about an artifact.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Reached {
+pub(super) enum Reached {
     /// The corpus holds a record for it.
     Record(Box<Record>),
     /// The corpus answered and holds nothing, or holds bytes nobody has
@@ -84,22 +89,43 @@ pub(crate) enum Reached {
 /// a replica relay can distinguish its local database from the primary it
 /// contacted for a `fresh=1` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CorpusSource {
+pub(super) enum CorpusSource {
     Replica,
     Primary,
 }
 
+/// Why hopper could not serve a sample. The messages name internal
+/// addresses: log them, do not serve them.
+#[derive(Debug)]
+pub(super) enum SampleError {
+    /// No address answered with the bytes; the last failure seen.
+    Unavailable(String),
+    /// The sample is larger than the caller's limit.
+    TooLarge(usize),
+}
+
+impl std::fmt::Display for SampleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(last) => f.write_str(last),
+            Self::TooLarge(limit) => write!(f, "Hopper sample exceeds the {limit} byte limit"),
+        }
+    }
+}
+
+impl std::error::Error for SampleError {}
+
 /// Sample bytes hopper served, and their digest.
 #[derive(Debug)]
-pub(crate) struct Sample {
-    pub(crate) bytes: bytes::Bytes,
+pub(super) struct Sample {
+    pub(super) bytes: bytes::Bytes,
     /// Lowercase hex SHA-256 of `bytes`, computed as they arrived.
-    pub(crate) sha256: String,
+    pub(super) sha256: String,
 }
 
 /// Where corpus lookups went, for `/_/stats`.
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct CorpusStats {
+pub(super) struct CorpusStats {
     /// Every deferral, and what came back. `unreachable` is the one that
     /// reaches a caller as a decision about us rather than the artifact.
     found: u64,
@@ -121,13 +147,13 @@ struct AddressStats {
 
 /// The corpus behind this server's index.
 #[derive(Debug)]
-pub(crate) struct Corpus {
+pub(super) struct Corpus {
     /// Every address the corpus can be reached at, in preference order.
     bases: Vec<String>,
     /// Per-address traffic, parallel to `bases`.
     ///
-    /// Failover is otherwise invisible: a fleet quietly reading from the
-    /// primary because the replica stopped answering looks exactly like one
+    /// Failover is otherwise invisible: servers quietly reading from the
+    /// primary because the replica stopped answering look exactly like ones
     /// reading from the replica, and the first sign is the primary's load. This
     /// is what turns that into a number an operator can see before it becomes a
     /// page.
@@ -155,7 +181,7 @@ struct Address {
 impl Corpus {
     /// A corpus reader, or `None` when `--hopper` named nothing and there is
     /// nothing behind this server to defer to.
-    pub(crate) fn new(hopper: Option<&str>) -> Option<Arc<Self>> {
+    pub(super) fn new(hopper: Option<&str>) -> Option<Arc<Self>> {
         let bases = crate::hopper::endpoints(hopper.unwrap_or(""));
         if bases.is_empty() {
             return None;
@@ -183,7 +209,7 @@ impl Corpus {
     }
 
     /// The addresses this corpus can be reached at, for a startup log line.
-    pub(crate) fn addresses(&self) -> String {
+    pub(super) fn addresses(&self) -> String {
         self.bases.join(", ")
     }
 
@@ -195,7 +221,7 @@ impl Corpus {
     /// direct `/v1/analyze` upload. Sample bytes are immutable, so a replica
     /// miss can simply fall through to the next configured address. The error
     /// names internal addresses: log it, do not serve it.
-    pub(crate) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<Sample, String> {
+    pub(super) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<Sample, SampleError> {
         use sha2::Digest as _;
         let path = format!("/api/file/{sha}");
         let mut last = "Hopper did not serve the sample".to_string();
@@ -203,7 +229,7 @@ impl Corpus {
             let mut request = self
                 .client
                 .get(format!("{base}{path}"))
-                .timeout(Duration::from_secs(5 * 60));
+                .timeout(SAMPLE_TIMEOUT);
             if let Some(token) = crate::hopper::token() {
                 request = request.bearer_auth(token);
             }
@@ -229,7 +255,7 @@ impl Corpus {
                 .content_length()
                 .is_some_and(|length| length > max_bytes as u64)
             {
-                return Err(format!("Hopper sample exceeds the {max_bytes} byte limit"));
+                return Err(SampleError::TooLarge(max_bytes));
             }
             let mut body = bytes::BytesMut::new();
             let mut digest = sha2::Sha256::new();
@@ -238,9 +264,7 @@ impl Corpus {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
                         if body.len().saturating_add(chunk.len()) > max_bytes {
-                            return Err(format!(
-                                "Hopper sample exceeds the {max_bytes} byte limit"
-                            ));
+                            return Err(SampleError::TooLarge(max_bytes));
                         }
                         digest.update(&chunk);
                         body.extend_from_slice(&chunk);
@@ -263,7 +287,7 @@ impl Corpus {
                 });
             }
         }
-        Err(last)
+        Err(SampleError::Unavailable(last))
     }
 
     /// The addresses to try, in order.
@@ -295,23 +319,16 @@ impl Corpus {
     /// `fresh` asks Hopper's authoritative side even when the preferred
     /// endpoint is a replica: an explicit refresh is a read-after-write
     /// request, which accepting replication lag would defeat.
-    pub(crate) async fn known_with_source(
+    pub(super) async fn known_with_source(
         &self,
         sha: Option<&str>,
         purl: Option<&str>,
         fresh: bool,
     ) -> (Reached, Option<CorpusSource>) {
-        let mut query = Vec::with_capacity(2);
-        if let Some(sha) = sha {
-            query.push(format!("sha256={sha}"));
-        }
-        if let Some(purl) = purl {
-            query.push(format!("purl={}", percent_encode(purl)));
-        }
-        if query.is_empty() {
+        let Some(query) = lookup_query(sha, purl) else {
             return (Reached::Nothing, None);
-        }
-        let mut path = format!("/v1/lookup?{}", query.join("&"));
+        };
+        let mut path = format!("/v1/lookup?{query}");
         // A replica too far behind cannot be believed about an absence, so its
         // reads are relayed to the primary until it catches up. `fresh=1` is
         // hopper's own read-after-write hatch and a no-op on the primary, which
@@ -452,7 +469,7 @@ impl Corpus {
     }
 
     /// A snapshot for `/_/stats`.
-    pub(crate) fn stats(&self) -> CorpusStats {
+    pub(super) fn stats(&self) -> CorpusStats {
         CorpusStats {
             found: self.found.load(Ordering::Relaxed),
             nothing: self.nothing.load(Ordering::Relaxed),
@@ -491,7 +508,7 @@ impl Corpus {
                         %error,
                         "retrying transient corpus read",
                     );
-                    tokio::time::sleep(read_backoff(attempt)).await;
+                    tokio::time::sleep(read_backoff(attempt, None)).await;
                     continue;
                 }
                 Err(error) => {
@@ -501,7 +518,7 @@ impl Corpus {
             };
             let status = response.status().as_u16();
             let source = hopper_source(&response);
-            if (status == 408 || status == 429 || status >= 500) && attempt < READ_RETRIES {
+            if crate::retry::is_transient(response.status()) && attempt < READ_RETRIES {
                 tracing::warn!(
                     endpoint = %base,
                     path = %path,
@@ -510,7 +527,8 @@ impl Corpus {
                     max_attempts = READ_RETRIES + 1,
                     "retrying transient corpus response",
                 );
-                tokio::time::sleep(read_backoff(attempt)).await;
+                let retry_after = crate::retry::parse_retry_after(response.headers());
+                tokio::time::sleep(read_backoff(attempt, retry_after)).await;
                 continue;
             }
             return match status {
@@ -575,30 +593,29 @@ fn hopper_source(response: &reqwest::Response) -> Option<CorpusSource> {
     }
 }
 
-/// Exponential, with jitter in `[0.5, 1.5)` of the step so a fleet of scan
-/// servers does not retry a restarted hopper in lockstep.
-fn read_backoff(attempt: usize) -> Duration {
-    READ_BACKOFF
-        .saturating_mul(1u32 << attempt.min(4))
-        .mul_f64(0.5 + crate::retry::fuzz())
+/// The sleep before retry `attempt + 1` of a read: the process's one backoff
+/// policy, cut to fit [`READ_RETRY_BUDGET`] so a caller waiting on a lookup
+/// pays a restart's worth of patience, not a renewal's.
+fn read_backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    crate::retry::backoff(attempt + 1, retry_after, crate::retry::fuzz()).min(READ_RETRY_BUDGET)
 }
 
-/// Percent-encode a PURL for a query string. A PURL's own grammar carries `?`,
-/// `#` and `&`, every one of which would otherwise end the value early and ask
-/// about a different artifact than the caller named.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(byte));
-            }
-            _ => {
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
+/// The query string for `/v1/lookup`, or `None` when nothing is named. Every
+/// value is form-encoded: a PURL's own grammar carries `?`, `#` and `&`, each
+/// of which would otherwise end the value early and ask about a different
+/// artifact than the caller named.
+fn lookup_query(sha: Option<&str>, purl: Option<&str>) -> Option<String> {
+    if sha.is_none() && purl.is_none() {
+        return None;
     }
-    out
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    if let Some(sha) = sha {
+        query.append_pair("sha256", sha);
+    }
+    if let Some(purl) = purl {
+        query.append_pair("purl", purl);
+    }
+    Some(query.finish())
 }
 
 #[cfg(test)]
@@ -880,6 +897,7 @@ mod tests {
             )
             .await
             .expect_err("over-limit response")
+            .to_string()
             .contains("byte limit")
         );
     }
@@ -1021,8 +1039,9 @@ mod tests {
     #[test]
     fn a_purl_survives_the_query_string() {
         assert_eq!(
-            percent_encode("pkg:npm/@scope/name@1.0.0?arch=x64#sub"),
-            "pkg%3Anpm%2F%40scope%2Fname%401.0.0%3Farch%3Dx64%23sub",
+            lookup_query(None, Some("pkg:npm/@scope/name@1.0.0?arch=x64#sub")).as_deref(),
+            Some("purl=pkg%3Anpm%2F%40scope%2Fname%401.0.0%3Farch%3Dx64%23sub"),
         );
+        assert_eq!(lookup_query(None, None), None);
     }
 }

@@ -1,4 +1,11 @@
+use super::policy::{
+    BlendPolicy, LevelPolicy, PolicySeverity, RouteKind, container_filetype,
+    normalize_archive_filetype, thresholds_at_level,
+};
+use super::verdict::{SUSPICIOUS_CEILING_FLOOR, SUSPICIOUS_CEILING_MULTIPLE};
 use super::*;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 #[test]
 fn normalize_archive_filetype_strips_pure_compression() {
@@ -52,9 +59,9 @@ fn container_filetype_maps_packages_to_their_archive() {
 
 #[test]
 fn specialist_keys_routes_compressed_archives_to_their_container() {
-    // collimator emits the filetype→filegroup map (and trains/calibrates
-    // every specialist) under the normalized container label, so the map
-    // carries `tar`/`javascript`, never `tar.gz`.
+    // Training emits the filetype→filegroup map (and trains every
+    // specialist) under the normalized container label, so the map carries
+    // `tar`/`javascript`, never `tar.gz`.
     let routes = RouteSet {
         filetype_to_filegroup: HashMap::from([
             ("tar".to_string(), "archive".to_string()),
@@ -68,10 +75,8 @@ fn specialist_keys_routes_compressed_archives_to_their_container() {
     };
 
     // A compressed tarball must resolve to the `tar` container specialist
-    // and its filegroup. This is the `.tgz` routing gap: selecting by the
-    // raw `tar.gz` label found no specialist, surfaced `filetypes/tar` as an
-    // `unavailable` skip, and let an obfuscated npm dropper score benign on
-    // the general route alone.
+    // and its filegroup: selecting by the raw `tar.gz` label finds no
+    // specialist and scores the file on the general route alone.
     let tar = ("tar".to_string(), Some("archive".to_string()));
     assert_eq!(keys("tar.gz"), tar);
     // Stacked compression suffixes collapse all the way to the container.
@@ -173,163 +178,11 @@ fn bundle_config_is_absent_when_missing_and_fatal_when_malformed() -> Result<()>
 }
 
 #[test]
-fn single_bundle_thresholds_must_be_valid() -> Result<()> {
-    let cfg: BundleConfig = serde_json::from_str(r#"{"hostile": 0.9}"#)?;
-    let t = cfg.thresholds()?.context("hostile present")?;
-    assert_eq!((t.suspicious, t.hostile), (0.9, 0.9), "hostile-only");
-
-    let cfg: BundleConfig = serde_json::from_str(r#"{"suspicious": 0.95, "hostile": 0.9}"#)?;
-    assert!(cfg.thresholds().is_err(), "inverted thresholds are fatal");
-
+fn bundle_config_reads_the_default_severity_level() -> Result<()> {
     let cfg: BundleConfig = serde_json::from_str(r#"{"default_severity_level": 50}"#)?;
-    assert!(cfg.thresholds()?.is_none());
     assert_eq!(cfg.default_severity_level, Some(50));
-    Ok(())
-}
-
-#[test]
-fn isotonic_calibrator_load_apply_and_endpoints() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1",
-                 "x":[0.0,0.25,0.5,0.75,1.0],
-                 "y":[0.0,0.10,0.40,0.85,1.0]}"#,
-    )?;
-    let cal = IsotonicCalibrator::load_optional(dir.path())?.context("calibrator should load")?;
-
-    // Endpoint clipping.
-    assert!((cal.apply(-1.0) - 0.0).abs() < 1e-6);
-    assert!((cal.apply(2.0) - 1.0).abs() < 1e-6);
-    // Exact breakpoints pass through.
-    assert!((cal.apply(0.5) - 0.40).abs() < 1e-6);
-    // Linear interpolation between breakpoints.
-    // At raw=0.625 we sit halfway between (0.5,0.40) and (0.75,0.85) → 0.625.
-    assert!((cal.apply(0.625) - 0.625).abs() < 1e-6);
-    Ok(())
-}
-
-#[test]
-fn isotonic_preserves_threshold_decisions() -> Result<()> {
-    // Decision-equivalence property: for any monotone calibrator,
-    // cal(p) >= cal(τ) iff p >= τ. This is the invariant that lets us
-    // calibrate thresholds at load time without changing decisions.
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1",
-                 "x":[0.0,0.1,0.3,0.6,0.9,1.0],
-                 "y":[0.0,0.02,0.15,0.55,0.92,1.0]}"#,
-    )?;
-    let cal = IsotonicCalibrator::load_optional(dir.path())?.context("calibrator should load")?;
-
-    for &raw_t in &[0.05_f32, 0.2, 0.5, 0.7, 0.95] {
-        let cal_t = cal.apply(raw_t);
-        for &raw_p in &[0.0_f32, 0.05, 0.2, 0.5, 0.7, 0.95, 1.0] {
-            let cal_p = cal.apply(raw_p);
-            assert_eq!(
-                raw_p >= raw_t,
-                cal_p >= cal_t,
-                "decision flipped for raw_p={raw_p} raw_t={raw_t}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn isotonic_rejects_unknown_schema() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.spline.v2","x":[0.0,1.0],"y":[0.0,1.0]}"#,
-    )?;
-    let err = IsotonicCalibrator::load_optional(dir.path())
-        .expect_err("future schema should be rejected");
-    assert!(err.to_string().contains("unsupported schema"));
-    Ok(())
-}
-
-#[test]
-fn isotonic_load_optional_returns_none_when_absent() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let cal = IsotonicCalibrator::load_optional(dir.path())?;
-    assert!(
-        cal.is_none(),
-        "missing calibrator must be a None, not an error"
-    );
-    Ok(())
-}
-
-#[test]
-fn isotonic_rejects_duplicate_x_breakpoints() -> Result<()> {
-    // Equal adjacent breakpoints make linear interpolation divide by zero
-    // and produce NaN in apply() — silently turning every prediction into
-    // NaN and every classification into Benign. Reject at load time.
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,0.5,1.0],"y":[0.0,0.4,0.6,1.0]}"#,
-    )?;
-    let err = IsotonicCalibrator::load_optional(dir.path())
-        .expect_err("duplicate breakpoints must be rejected");
-    assert!(
-        err.to_string().contains("strictly ascending"),
-        "error should mention strict ascending: {err}"
-    );
-    Ok(())
-}
-
-#[test]
-fn isotonic_rejects_non_finite_values() -> Result<()> {
-    // NaN or Inf in x or y would propagate through every apply() call.
-    for body in [
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,1.0],"y":[0.0,"NaN",1.0]}"#
-            as &[u8],
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,"Infinity",1.0],"y":[0.0,0.5,1.0]}"#,
-    ] {
-        let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("calibrator.json"), body)?;
-        let result = IsotonicCalibrator::load_optional(dir.path());
-        // serde may reject NaN/Inf at parse time (depending on parser
-        // strict-mode); either parse-rejection or our own check is fine
-        // — both prevent the bad calibrator from being installed.
-        assert!(
-            result.is_err(),
-            "non-finite calibrator must be rejected (got {result:?})"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn isotonic_rejects_y_out_of_unit_interval() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.5,1.0],"y":[0.0,0.5,1.5]}"#,
-    )?;
-    let err = IsotonicCalibrator::load_optional(dir.path()).expect_err("y > 1 must be rejected");
-    assert!(
-        err.to_string().contains("outside [0, 1]"),
-        "error should explain the bound: {err}"
-    );
-    Ok(())
-}
-
-#[test]
-fn isotonic_rejects_non_monotone_y() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    std::fs::write(
-        dir.path().join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,0.4,0.8,1.0],"y":[0.0,0.6,0.3,1.0]}"#,
-    )?;
-    let err =
-        IsotonicCalibrator::load_optional(dir.path()).expect_err("non-monotone y must be rejected");
-    assert!(
-        err.to_string().contains("monotone"),
-        "error should mention monotone: {err}"
-    );
+    let cfg: BundleConfig = serde_json::from_str("{}")?;
+    assert_eq!(cfg.default_severity_level, None);
     Ok(())
 }
 
@@ -350,55 +203,6 @@ fn score(names: &mut RouteNames, route: &str, probability: f32) -> RouteProbabil
         route: names.intern(route),
         probability,
     }
-}
-
-#[test]
-fn calibrate_policy_thresholds_pushes_each_route_through_its_calibrator() {
-    // Build two distinct calibrators so we can verify per-route routing.
-    let cal_general = IsotonicCalibrator {
-        x: vec![0.0, 0.5, 1.0],
-        y: vec![0.0, 0.10, 1.0],
-    };
-    let cal_elf = IsotonicCalibrator {
-        x: vec![0.0, 0.5, 1.0],
-        y: vec![0.0, 0.90, 1.0],
-    };
-    // RoutePolicy with thresholds for general, filetypes/elf (calibrated)
-    // and filegroups/missing (no calibrator — must remain untouched).
-    let mut names = RouteNames::default();
-    let policy = RoutePolicy {
-        hostile: or_rule(
-            &mut names,
-            &[
-                ("general", 0.5),
-                ("filetypes/elf", 0.5),
-                ("filegroups/missing", 0.5),
-            ],
-        ),
-        suspicious: or_rule(&mut names, &[("general", 0.5)]),
-    };
-    let mut policies = RoutePolicies {
-        by_filetype: HashMap::from([("elf".to_string(), policy)]),
-        ..Default::default()
-    };
-
-    let elf = names.id("filetypes/elf").unwrap();
-    let missing = names.id("filegroups/missing").unwrap();
-    calibrate_policy_thresholds(&mut policies, |route| match route {
-        RouteId::GENERAL => Some(&cal_general),
-        r if r == elf => Some(&cal_elf),
-        _ => None,
-    });
-
-    let policy = policies.by_filetype.get("elf").expect("policy retained");
-    // general at raw=0.5 → 0.10
-    assert!((policy.hostile.threshold(RouteId::GENERAL).unwrap() - 0.10).abs() < 1e-6);
-    // filetypes/elf at raw=0.5 → 0.90
-    assert!((policy.hostile.threshold(elf).unwrap() - 0.90).abs() < 1e-6);
-    // No calibrator for filegroups/missing — left at raw 0.5.
-    assert!((policy.hostile.threshold(missing).unwrap() - 0.5).abs() < 1e-6);
-    // Suspicious side also calibrated.
-    assert!((policy.suspicious.threshold(RouteId::GENERAL).unwrap() - 0.10).abs() < 1e-6);
 }
 
 #[test]
@@ -455,6 +259,11 @@ fn thresholds_at_level_extracts_per_route_pairs() {
     );
 }
 
+/// The class a policy decides for `scores`, benign when nothing fires.
+fn decided(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classification {
+    policy_decide(policy, scores).map_or(Classification::Benign, |d| d.class)
+}
+
 #[test]
 fn route_policy_classification_keeps_general_escape() {
     let mut names = RouteNames::default();
@@ -467,25 +276,19 @@ fn route_policy_classification_keeps_general_escape() {
         score(&mut names, "general", 0.96),
         score(&mut names, "filetypes/elf", 0.10),
     ];
-    assert_eq!(
-        policy_classify(&policy, &general_escape),
-        Classification::Hostile
-    );
+    assert_eq!(decided(&policy, &general_escape), Classification::Hostile);
 
     let specialist_suspicious = [
         score(&mut names, "general", 0.10),
         score(&mut names, "filetypes/elf", 0.91),
     ];
     assert_eq!(
-        policy_classify(&policy, &specialist_suspicious),
+        decided(&policy, &specialist_suspicious),
         Classification::Suspicious
     );
 
     let inactive_route = [score(&mut names, "filegroups/native", 1.0)];
-    assert_eq!(
-        policy_classify(&policy, &inactive_route),
-        Classification::Benign
-    );
+    assert_eq!(decided(&policy, &inactive_route), Classification::Benign);
 }
 
 fn general_only(prob: f32) -> Vec<RouteProbability> {
@@ -666,11 +469,11 @@ fn blend_policy_fires_on_hand_built_inputs() {
         ]
     };
     // general=0.6 → fires
-    assert!(blend.fires(&scores(0.6, 0.0)));
+    assert!(blend.fire(&scores(0.6, 0.0)).is_some());
     // general=0.5 → doesn't fire (logit(0.5)=0, intercept negative)
-    assert!(!blend.fires(&scores(0.5, 0.99)));
+    assert!(blend.fire(&scores(0.5, 0.99)).is_none());
     // Missing route → can't blend, doesn't fire.
-    assert!(!blend.fires(&general_only(1.0)));
+    assert!(blend.fire(&general_only(1.0)).is_none());
 }
 
 /// Compare frozen Python decisions with the actual serving implementation.
@@ -717,7 +520,7 @@ fn collimator_frozen_blend_decisions_match() -> Result<()> {
             .collect();
         blend.threshold = case.threshold;
         assert_eq!(
-            blend.fires(&scores),
+            blend.fire(&scores).is_some(),
             case.fires,
             "blend parity case {index}"
         );
@@ -803,6 +606,14 @@ fn a_malformed_blend_stops_the_load() -> Result<()> {
             r#"{"routes": ["general"], "weights": [1.0], "intercept": 0.0, "threshold": 0.5, "transform": "gam"}"#,
             "unknown transform",
         ),
+        (
+            r#"{"routes": ["general"], "weights": [1e39], "intercept": 0.0, "threshold": 0.5}"#,
+            "infinite weight",
+        ),
+        (
+            r#"{"routes": ["general"], "weights": [1.0], "intercept": -1e39, "threshold": 0.5}"#,
+            "infinite intercept",
+        ),
     ] {
         let dir = tempfile::tempdir()?;
         write_policies(dir.path(), blend)?;
@@ -821,47 +632,6 @@ fn route_policies_are_optional_but_must_parse() -> Result<()> {
     std::fs::write(dir.path().join("route_policies.json"), b"{\"routes\": 7}")?;
     assert!(load_route_policies(dir.path(), 5, &mut RouteNames::default()).is_err());
     Ok(())
-}
-
-#[test]
-fn blend_policy_severity_isnt_isotonic_calibrated() {
-    // calibrate_policy_thresholds must leave blend severities alone —
-    // the blend's threshold is already in calibrated-prob space (its fit
-    // ran on isotonic-calibrated route probs at policy-search time).
-    // If we double-applied isotonic here it would shift the threshold off
-    // the calibrated distribution and deploy verdicts would silently drift.
-    let blend = BlendPolicy {
-        routes: vec![RouteId::GENERAL],
-        weights: vec![1.0],
-        intercept: 0.0,
-        threshold: 0.42,
-    };
-    let policy = RoutePolicy {
-        hostile: PolicySeverity {
-            thresholds: Vec::new(),
-            blend: Some(blend),
-        },
-        suspicious: PolicySeverity {
-            thresholds: vec![(RouteId::GENERAL, 0.5)],
-            blend: None,
-        },
-    };
-    let mut policies = RoutePolicies {
-        by_filetype: HashMap::from([("elf".to_string(), policy)]),
-        ..Default::default()
-    };
-    // A calibrator that shifts every input by +0.1 (clamped to [0, 1]).
-    let cal = IsotonicCalibrator {
-        x: vec![0.0, 1.0],
-        y: vec![0.1, 1.0],
-    };
-    calibrate_policy_thresholds(&mut policies, |_route| Some(&cal));
-    let pol = policies.by_filetype.get("elf").unwrap();
-    // Hostile (blend) threshold stays at its original calibrated value.
-    let blend = pol.hostile.blend.as_ref().unwrap();
-    assert!((blend.threshold - 0.42).abs() < 1e-6);
-    // Suspicious (OR-rule) threshold did get mapped.
-    assert!((pol.suspicious.threshold(RouteId::GENERAL).unwrap() - cal.apply(0.5)).abs() < 1e-6);
 }
 
 #[test]
@@ -918,7 +688,7 @@ fn load_route_policies_reads_level_and_route_membership() -> Result<()> {
 
 #[test]
 fn policy_routes_never_firing_sentinel_is_dropped() -> Result<()> {
-    // Collimator writes one ulp above 1.0 for a route that must never fire
+    // The policy search writes one ulp above 1.0 for a route that must never fire
     // at a level; the real bundle carries it, so it must still load.
     let dir = tempfile::tempdir()?;
     std::fs::write(
@@ -984,6 +754,7 @@ fn raw_needs_cover_the_specialists_a_file_type_selects() -> Result<()> {
             "version": crate::features::EXPECTED_SPEC_VERSION,
             "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
             "base_feature_abi": 21,
+            "trait_path_depth": 3,
             "presence_vocab": ["metadata"],
             "kv_vocab": kv_vocab,
             "feature_names": [feature],
@@ -1032,6 +803,7 @@ fn additional_policy_routes_are_scored_at_every_level() -> Result<()> {
             "version": crate::features::EXPECTED_SPEC_VERSION,
             "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
             "base_feature_abi": 21,
+            "trait_path_depth": 3,
             "presence_vocab": ["metadata"], "kv_vocab": kv,
             "feature_names": [feature], "total_features": 1,
             "standardized": false, "metric_transforms": {}
@@ -1084,11 +856,10 @@ fn additional_policy_routes_are_scored_at_every_level() -> Result<()> {
     Ok(())
 }
 
-/// A file type with no route policy is swept against the general grid, and
-/// the probabilities it is compared with are calibrated, so the grid must be
-/// too. Here the raw cutoff 0.0 calibrates to 0.2.
+/// The per-route thresholds are resolved at the bundle's own default level,
+/// not the build's.
 #[test]
-fn the_general_grid_is_swept_in_calibrated_space() -> Result<()> {
+fn diagnostic_thresholds_follow_the_bundles_default_level() -> Result<()> {
     let root = tempfile::tempdir()?;
     let general = root.path().join("general");
     std::fs::create_dir_all(&general)?;
@@ -1099,45 +870,28 @@ fn the_general_grid_is_swept_in_calibrated_space() -> Result<()> {
     let spec = serde_json::json!({
         "version": crate::features::EXPECTED_SPEC_VERSION,
         "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
-            "base_feature_abi": 21,
-        "presence_vocab": ["metadata"],
-        "kv_vocab": [],
-        "feature_names": ["present:metadata"],
-        "total_features": 1,
-        "standardized": false,
-        "metric_transforms": {}
+        "base_feature_abi": 21, "trait_path_depth": 3,
+        "presence_vocab": ["metadata"], "feature_names": ["present:metadata"],
+        "total_features": 1, "standardized": false, "metric_transforms": {}
     });
     std::fs::write(
         general.join("feature_spec.json"),
         serde_json::to_vec(&spec)?,
     )?;
     std::fs::write(
-        general.join("calibrator.json"),
-        br#"{"schema":"azoth.calibrator.isotonic.v1","x":[0.0,1.0],"y":[0.2,0.9]}"#,
-    )?;
-    std::fs::write(
         root.path().join("config.json"),
-        r#"{"levels": [{"level": 25, "hostile": {"thresholds": {"general": 0.0}}}]}"#,
+        r#"{"default_severity_level": 50, "levels": [
+            {"level": 25, "hostile": {"thresholds": {"general": 0.99}}},
+            {"level": 50, "hostile": {"thresholds": {"general": 0.95}}}
+        ]}"#,
     )?;
     let model = Model::load(root.path(), None, Some(25))?;
-
-    let mut report = cleave::types::CompactReport::default();
-    report.files.push(cleave::types::CompactFile {
-        file_type: "python".into(),
-        ..Default::default()
-    });
-    let (decision, _, _) = model.predict_report(&report)?;
-    assert_eq!(decision.level, Level::At(25));
-    assert!(
-        (decision.threshold - 0.2).abs() < 1e-6,
-        "threshold {} is not calibrated",
-        decision.threshold
-    );
+    assert!((model.thresholds().hostile - 0.95).abs() < 1e-6);
     Ok(())
 }
 
 /// A specialist built after the bundle on disk was replaced would be scored
-/// against the old bundle's calibrators and thresholds, so it is refused.
+/// against the old bundle's policy thresholds, so it is refused.
 #[test]
 fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -1152,6 +906,7 @@ fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
             "version": crate::features::EXPECTED_SPEC_VERSION,
             "abi_version": crate::features::EXPECTED_MODEL_ABI_VERSION,
             "base_feature_abi": 21,
+            "trait_path_depth": 3,
             "presence_vocab": ["metadata"],
             "kv_vocab": [],
             "feature_names": ["present:metadata"],
@@ -1168,7 +923,7 @@ fn a_specialist_from_a_replaced_bundle_is_refused() -> Result<()> {
     )?;
     let sidecar = |commit: &str| {
         std::fs::write(
-            root.path().join(".litmus-models.toml"),
+            root.path().join(".scan-models.toml"),
             format!(
                 "commit = \"{commit}\"\ndate = \"2026-10-29\"\nsource = \"latest\"\nversion = \"0\"\n"
             ),
@@ -1203,10 +958,10 @@ fn description_inputs_are_checked_for_general_and_specialist_models() -> Result<
             )?;
             let spec = if description {
                 serde_json::json!({"version":22,"abi_version":22,"base_feature_abi":20,
-                    "presence_vocab":["metadata"],"keyword_vocabs":{"descword":["http"]},
+                    "trait_path_depth":3,"presence_vocab":["metadata"],"keyword_vocabs":{"descword":["http"]},
                     "feature_names":["descword:http"],"total_features":1,"standardized":false})
             } else {
-                serde_json::json!({"version":20,"abi_version":20,
+                serde_json::json!({"version":20,"abi_version":20,"trait_path_depth":3,
                     "presence_vocab":["metadata"],"feature_names":["present:metadata"],
                     "total_features":1,"standardized":false})
             };

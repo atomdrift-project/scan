@@ -60,14 +60,14 @@ fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u3
         } else if !deleted || path.exists() {
             path.clone()
         } else {
-            tracing::warn!("cannot hash deleted binary: {}", path.display());
+            tracing::warn!(path = %path.display(), "cannot hash a deleted binary; not scanned");
             hash_errors += 1;
             continue;
         };
         let hash = match crate::digest::sha256_file(&source) {
             Ok(h) => h,
             Err(e) => {
-                tracing::warn!("cannot hash {} (pid {}): {e}", path.display(), pids[0]);
+                tracing::warn!(path = %path.display(), pid = pids[0], error = %e, "cannot hash a running binary; not scanned");
                 hash_errors += 1;
                 continue;
             }
@@ -87,10 +87,65 @@ fn group_by_binary(entries: &[proclist::ProcessEntry]) -> (Vec<ProcessGroup>, u3
     (by_sha.into_values().collect(), hash_errors)
 }
 
+/// Counters a process scan's rayon workers share.
+#[derive(Default)]
+struct Tally {
+    hostile: AtomicU32,
+    suspicious: AtomicU32,
+    benign: AtomicU32,
+    errors: AtomicU32,
+    dependency_gaps: AtomicU32,
+    static_flags: AtomicU32,
+    flagged_candidates: AtomicU32,
+}
+
+impl Tally {
+    fn add(counter: &AtomicU32, n: u32) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Account for one classified binary.
+    fn count(&self, result: &ScanResult) {
+        let class = match result.classification {
+            Classification::Hostile => &self.hostile,
+            Classification::Suspicious => &self.suspicious,
+            Classification::Benign => &self.benign,
+        };
+        Self::add(class, 1);
+        Self::add(&self.dependency_gaps, result.dependency_attention.gaps);
+        Self::add(&self.static_flags, u32::from(result.has_severe_findings()));
+        Self::add(
+            &self.flagged_candidates,
+            result.dependency_attention.flagged_candidates,
+        );
+    }
+
+    fn summary(&self, total_files: u32, started: Instant) -> ScanSummary {
+        let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
+        ScanSummary {
+            total_files,
+            hostile: load(&self.hostile),
+            suspicious: load(&self.suspicious),
+            benign: load(&self.benign),
+            errors: load(&self.errors),
+            dependency_attention: crate::engine::DependencyAttention {
+                gaps: load(&self.dependency_gaps),
+                flagged_candidates: load(&self.flagged_candidates),
+            },
+            static_flags: load(&self.static_flags),
+            duration_ms: crate::duration_ms(started.elapsed()),
+        }
+    }
+}
+
 /// Run a process scan: enumerate, deduplicate, classify.
+///
+/// # Errors
+/// The model could not be loaded, processes could not be enumerated, cleave
+/// could not start, or stdout closed before anything was flagged.
 pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     // Warm cleave's YARA engine + capability mapper off the rayon pool before
-    // any scan fires rayon work. See `run_scan_paths` for why this matters.
+    // any scan fires rayon work, so no worker races the one-time build.
     crate::engine::prefetch_cleave_resources();
     // Load the model before hashing every running executable, so a broken
     // bundle is reported at once rather than after the slowest step.
@@ -100,21 +155,14 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     let scan_start = Instant::now();
     let is_terminal = matches!(config.format(), OutputFormat::Terminal);
 
-    // Enumerate processes.
     let proc_result = proclist::enumerate().map_err(|e| anyhow::anyhow!("{e}"))?;
-
     let perm_denied = proc_result.stats.permission_denied;
-
-    // Warn about permission-denied processes.
     if perm_denied > 0 && !is_root() {
-        crate::output::print_permission_warning(perm_denied);
+        output::print_permission_warning(perm_denied);
     }
 
     if proc_result.entries.is_empty() {
-        let summary = ScanSummary {
-            duration_ms: crate::duration_ms(scan_start.elapsed()),
-            ..ScanSummary::default()
-        };
+        let summary = Tally::default().summary(0, scan_start);
         if is_terminal {
             output::print_summary(&summary);
         }
@@ -126,12 +174,9 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
 
     if is_terminal {
         // Detection rules already resident in memory — no extra loading.
-        // `prefetch_cleave_resources` above has fully built the YARA engine and
-        // capability mapper; the bloom signatures were loaded with the config.
         output::print_banner(crate::engine::detection_counts(config));
     }
 
-    // Scan each unique binary.
     let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
     let mut cleave_opts = cleave::AnalysisOptions {
         compact_members: true, // compact projection only
@@ -141,128 +186,67 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     };
     crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());
 
-    let progress = if is_terminal && total > 1 {
-        Some(Progress::new(total))
-    } else {
-        None
+    let progress = (is_terminal && total > 1).then(|| Progress::new(total));
+    let tally = Tally {
+        errors: AtomicU32::new(hash_errors),
+        ..Tally::default()
     };
-
-    let hostile = AtomicU32::new(0);
-    let suspicious = AtomicU32::new(0);
-    let benign = AtomicU32::new(0);
-    let errors = AtomicU32::new(hash_errors);
-    let dependency_gaps = AtomicU32::new(0);
-    let static_flags = AtomicU32::new(0);
-    let flagged_candidates = AtomicU32::new(0);
     // Set when stdout closes under the scan (`atomscan ps | head`): nobody can
     // be told the remaining verdicts, so the scan stops.
     let broken_pipe = AtomicBool::new(false);
 
-    // Map each scan path back to its process group for PID annotation.
-    let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
-    let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> = HashMap::with_capacity(groups.len());
-    for group in &groups {
-        // Known-good/known-bad short-circuit by the executable's sha256: a
-        // known-good binary is skipped here (and counted benign) unless it was
-        // created/changed/modified within the last 48h, in which case it is
-        // scanned on its own merits; known-bad and conflicted are flagged but
-        // still analyzed below.
-        if let Some(lookup) = config.bloom()
-            && let Some(digest) = burton::parse_sha256_hex(&group.sha256)
-            && let Some(n) = crate::engine::bloom_gate_fresh(
-                config,
-                &group.path,
-                lookup.decide_sha256(&digest),
-                |label, verdict| {
-                    // As with every other `ps` line, a closed stream is not an error.
-                    let _ = crate::output::print_bloom_verdict(label, verdict, config.format());
-                },
-            )
-        {
-            benign.fetch_add(n, Ordering::Relaxed);
-            if let Some(p) = &progress {
-                p.increment();
-            }
-            continue;
-        }
-
-        by_scan_path.insert(group.scan_path.clone(), group);
-        scan_paths.push(group.scan_path.clone());
-    }
+    let by_scan_path = unskipped(&groups, config, &tally, progress.as_ref());
+    let scan_paths: Vec<PathBuf> = by_scan_path.keys().cloned().collect();
 
     // Analyze the unique binaries through cleave's batch API: it loads the
     // CapabilityMapper + YARA engine once and fans the files out across a single
     // rayon pass. A hand-rolled `par_iter` over the single-file `analyze_file`
     // would nest rayon inside rayon — each file's inner parallelism multiplied
-    // by the outer fan-out oversubscribes the pool and runs *slower* than
-    // serial, at about three times the CPU. Verdict order in the output stream
-    // is completion order, which JSON/terminal consumers tolerate.
-
-    let analyze = |scan_path: &Path, result: Result<cleave::AnalysisReport>| {
+    // by the outer fan-out oversubscribes the pool and runs slower than serial
+    // at several times the CPU. Verdict order in the output stream is
+    // completion order, which JSON/terminal consumers tolerate.
+    let analyze = |scan_path: &Path, analyzed: Result<cleave::AnalysisReport>| {
         let Some(group) = by_scan_path.get(scan_path) else {
             return;
         };
         if let Some(p) = &progress {
             p.increment();
         }
-        let report = match result {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("error analyzing {}: {e}", group.path.display());
-                errors.fetch_add(1, Ordering::Relaxed);
+        let result = analyzed.and_then(|report| {
+            build_result(
+                report,
+                group,
+                &model,
+                shap.as_ref(),
+                config,
+                Some(cancellation.as_ref()),
+            )
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(path = %group.path.display(), error = %format!("{error:#}"), "process binary analysis failed");
+                Tally::add(&tally.errors, 1);
                 return;
             }
         };
-
-        match build_result(
-            report,
-            group,
-            &model,
-            shap.as_ref(),
-            config,
-            Some(cancellation.as_ref()),
-        ) {
-            Ok(result) => {
-                match result.classification {
-                    Classification::Hostile => hostile.fetch_add(1, Ordering::Relaxed),
-                    Classification::Suspicious => suspicious.fetch_add(1, Ordering::Relaxed),
-                    Classification::Benign => benign.fetch_add(1, Ordering::Relaxed),
-                };
-                // JSON, tiny, and interpret are machine/LLM payload formats:
-                // they emit every scanned process — `--show` gates only the
-                // terminal view.
-                if matches!(
-                    config.format(),
-                    OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-                ) || config.filter().shows(result.classification)
-                {
-                    let print = || match emit_result(&result, config, progress.is_some()) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                            broken_pipe.store(true, Ordering::Relaxed);
-                            cancellation.store(true, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::error!(path = %result.path, error = %e, "could not write a scan result")
-                        }
-                    };
-                    if let Some(p) = &progress {
-                        p.around_result(print);
-                    } else {
-                        print();
-                    }
-                }
-                dependency_gaps.fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
-                static_flags.fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
-                flagged_candidates.fetch_add(
-                    result.dependency_attention.flagged_candidates,
-                    Ordering::Relaxed,
-                );
+        tally.count(&result);
+        if !(config.format().emits_every_result() || config.filter().shows(result.classification)) {
+            return;
+        }
+        let print = || match crate::engine::emit_result(&result, config) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                broken_pipe.store(true, Ordering::Relaxed);
+                cancellation.store(true, Ordering::Relaxed);
             }
             Err(e) => {
-                tracing::warn!("error processing {}: {e}", group.path.display());
-                errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(path = %result.path, error = %e, "could not write a scan result");
             }
+        };
+        match &progress {
+            Some(p) => p.around_result(print),
+            None => print(),
         }
     };
 
@@ -272,30 +256,13 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         }
     })?;
 
-    let hostile = hostile.load(Ordering::Relaxed);
-    let suspicious = suspicious.load(Ordering::Relaxed);
-    let benign = benign.load(Ordering::Relaxed);
-    let errors = errors.load(Ordering::Relaxed);
-
-    let summary = ScanSummary {
-        total_files: total,
-        hostile,
-        suspicious,
-        benign,
-        errors,
-        dependency_attention: crate::engine::DependencyAttention {
-            gaps: dependency_gaps.load(Ordering::Relaxed),
-            flagged_candidates: flagged_candidates.load(Ordering::Relaxed),
-        },
-        static_flags: static_flags.load(Ordering::Relaxed),
-        duration_ms: crate::duration_ms(scan_start.elapsed()),
-    };
+    let summary = tally.summary(total, scan_start);
 
     // As a path scan does: a verdict already reached still decides the exit
     // status, so under `pipefail` a hostile process does not read as success
     // because the reader stopped reading.
     if broken_pipe.load(Ordering::Relaxed) {
-        if hostile > 0 || suspicious > 0 {
+        if summary.hostile > 0 || summary.suspicious > 0 {
             return Ok(summary);
         }
         return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
@@ -311,7 +278,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
         let line = output::summary_status_line(&summary);
         if let Some(p) = &progress {
             p.quiesce(); // stop the heartbeat before we claim the bar's line
-            eprint!("\r\x1b[2K {line}\n");
+            eprintln!("{} {line}", output::ERASE_LINE);
             let _ = std::io::stderr().flush();
         } else {
             eprintln!(" {line}");
@@ -319,6 +286,41 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     }
 
     Ok(summary)
+}
+
+/// The groups left to analyze, by the path cleave reads each from. A
+/// known-good binary is counted benign here and left out, unless it was
+/// created, changed or modified within the rescan window, when it is scanned
+/// on its own merits; known-bad and conflicted are flagged but still analyzed.
+fn unskipped<'g>(
+    groups: &'g [ProcessGroup],
+    config: &ScanConfig,
+    tally: &Tally,
+    progress: Option<&Progress>,
+) -> HashMap<PathBuf, &'g ProcessGroup> {
+    let mut by_scan_path = HashMap::with_capacity(groups.len());
+    for group in groups {
+        if let Some(lookup) = config.bloom()
+            && let Some(digest) = burton::parse_sha256_hex(&group.sha256)
+            && let Some(benign) = crate::engine::bloom_gate_fresh(
+                config,
+                &group.path,
+                lookup.decide_sha256(&digest),
+                |label, verdict| {
+                    // As with every other `ps` line, a closed stream is not an error.
+                    let _ = output::print_bloom_verdict(label, verdict, config.format());
+                },
+            )
+        {
+            Tally::add(&tally.benign, benign);
+            if let Some(p) = progress {
+                p.increment();
+            }
+            continue;
+        }
+        by_scan_path.insert(group.scan_path.clone(), group);
+    }
+    by_scan_path
 }
 
 /// Build a ScanResult from a cleave report, injecting pids and deleted state.
@@ -337,7 +339,7 @@ fn build_result(
     let bloom_mark = config
         .bloom()
         .and_then(|lk| burton::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d)))
-        .and_then(crate::output::BloomMark::from_decision);
+        .and_then(output::BloomMark::from_decision);
     let label = display_path.display().to_string();
     let cr = crate::engine::classify_report(
         report,
@@ -348,57 +350,17 @@ fn build_result(
             interpret: config.interpret(),
             fetch: config.fetch_policy(),
             zip_passwords: config.zip_passwords(),
-            needs: crate::engine::OutputNeeds {
-                // Matching scan's `--format interpret`: the live LLM query's user
-                // message, byte-for-byte, without the system prompt.
-                llm_view: matches!(config.format(), OutputFormat::Interpret),
-                fetch_progress: false, // machine-readable output; no live fetch log
-                render_context: matches!(
-                    config.format(),
-                    OutputFormat::Tiny | OutputFormat::Interpret
-                ),
-                // `--show=all` with JSON: list every member of an archive-backed image.
-                list_all_members: config.filter().is_all()
-                    && matches!(config.format(), OutputFormat::Json),
-                deps_for_upload: false, // ps has no hopper renewal
-            },
+            needs: config.output_needs(),
             bloom_mark,
             ..crate::engine::ClassifyRequest::new(&label, display_path, model)
         },
     )?;
-    let is_json = matches!(config.format(), OutputFormat::Json);
-
-    let mut result = cr.into_scan_result(label, model, is_json);
+    let mut result = cr.into_scan_result(label, model, config.keeps_report());
     result.pids = Some(group.pids.clone());
     result.deleted = group.deleted.then_some(true);
     result.sha256.clone_from(&group.sha256);
     result.bloom_mark = bloom_mark;
     Ok(result)
-}
-
-/// Emit a single result with PID annotations.
-///
-/// # Errors
-/// The write failed; `BrokenPipe` means nobody is reading any more.
-fn emit_result(r: &ScanResult, config: &ScanConfig, has_progress: bool) -> std::io::Result<()> {
-    match config.format() {
-        OutputFormat::Terminal => {
-            output::print_ps_result(r, has_progress, config.extra());
-            Ok(())
-        }
-        // Serialized before stdout is locked, so a slow serialization never
-        // holds up another thread's line.
-        OutputFormat::Json => {
-            let mut bytes = serde_json::to_vec(&r.envelope_ref())?;
-            bytes.push(b'\n');
-            std::io::stdout().lock().write_all(&bytes)
-        }
-        OutputFormat::Tiny => crate::engine::write_tiny(&mut std::io::stdout().lock(), r),
-        // The LLM payload verbatim — no verdict line, no PID annotations.
-        OutputFormat::Interpret => std::io::stdout()
-            .lock()
-            .write_all(r.rendered_context.as_bytes()),
-    }
 }
 
 /// Check if running as root/admin.

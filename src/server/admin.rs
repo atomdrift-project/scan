@@ -14,9 +14,12 @@ use crate::model::Model;
 /// How long `/_/reload` waits before answering; the reload itself runs on.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long `/_/update` waits: a backstop around the sequential models and
-/// traits pulls, then the reload.
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(21 * 60 + 120);
+/// How long `/_/update` waits for the rule pulls before the reload: a
+/// backstop, since each pull bounds its own transfers.
+const PULL_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+
+/// How long `/_/update` waits: the pulls, then the reload.
+const UPDATE_TIMEOUT: Duration = PULL_TIMEOUT.saturating_add(RELOAD_TIMEOUT);
 
 /// What a reload installed.
 struct Reloaded {
@@ -44,7 +47,10 @@ impl AppState {
         // model runs against fresh rules.
         let traits_reloaded = match cleave::reload_capability_mapper() {
             Err(e) => {
-                tracing::warn!("cleave trait reload failed (previous traits retained): {e:#}");
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "cleave trait reload failed; previous traits retained"
+                );
                 false
             }
             Ok(_) => {
@@ -121,7 +127,10 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
         }
         Ok(Ok(Err(e))) => {
             // Logged here; the caller is not told filesystem paths or model internals.
-            tracing::warn!("reload failed (previous model retained): {e:#}");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "reload failed; previous model retained"
+            );
             ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "reload_failed",
@@ -130,13 +139,13 @@ pub(super) async fn reload(State(state): State<Arc<AppState>>) -> Response {
             .into_response()
         }
         Ok(Err(e)) => {
-            tracing::warn!("reload task join error: {e}");
+            tracing::error!(error = %e, "reload task panicked");
             ApiError::internal().into_response()
         }
         Err(_elapsed) => {
             tracing::warn!(
-                "reload still running after {}s; it keeps the lock and installs when done",
-                RELOAD_TIMEOUT.as_secs()
+                timeout_secs = RELOAD_TIMEOUT.as_secs(),
+                "reload still running past its timeout; it keeps the lock and installs when done"
             );
             ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -190,13 +199,13 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
     let (failures, reloaded) = match tokio::time::timeout(UPDATE_TIMEOUT, job).await {
         Ok(Ok(done)) => done,
         Ok(Err(e)) => {
-            tracing::warn!("update task join error: {e}");
+            tracing::error!(error = %e, "update task panicked");
             return ApiError::internal().into_response();
         }
         Err(_elapsed) => {
             tracing::warn!(
-                "update still running after {}s; it keeps the lock and installs when done",
-                UPDATE_TIMEOUT.as_secs()
+                timeout_secs = UPDATE_TIMEOUT.as_secs(),
+                "update still running past its timeout; it keeps the lock and installs when done"
             );
             return ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -236,7 +245,10 @@ pub(super) async fn update(State(state): State<Arc<AppState>>) -> Response {
             // The in-memory model was not swapped, so requests continue against
             // the previous model; the on-disk bundle was validated before
             // install, so there is nothing to roll back.
-            tracing::error!("model reload failed after update: {e:#}");
+            tracing::error!(
+                error = format!("{e:#}"),
+                "model reload failed after update; previous model retained"
+            );
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({

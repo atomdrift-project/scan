@@ -1,17 +1,20 @@
 //! Route policies: which specialist answers for a file type, and how its
 //! scores become a verdict at each level.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use super::load::{BundleConfig, read_json};
+use super::verdict::{Classification, Decision, Level, Thresholds, suspicious_ceiling};
 
 /// The ensemble's top-level `config.json`, resolved at one level.
 #[derive(Debug, Default)]
 pub(super) struct EnsembleConfig {
-    /// `cleave file_type → filegroup name` map. Files whose `file_type` is
-    /// not a key here route to general only (per DESIGN.md §Runtime Decision).
+    /// `cleave file_type → filegroup name` map. A file whose `file_type` is
+    /// not a key here consults no filegroup specialist.
     pub(super) filetype_to_filegroup: HashMap<String, String>,
     /// Routes whose absence is fatal at startup. Names: `general`,
     /// `filegroups/<name>`, `filetypes/<name>` (matching the route paths in
@@ -22,8 +25,7 @@ pub(super) struct EnsembleConfig {
     /// `"filegroups/<name>"`, `"filetypes/<name>"`.
     pub(super) route_thresholds: HashMap<String, Thresholds>,
     /// General route's hostile threshold at every level, ascending by level.
-    /// Drives the verdict sweep for filetypes with no route policy. Raw score
-    /// space as written; `Model::load_ensemble` calibrates it.
+    /// Drives the verdict sweep for filetypes with no route policy.
     pub(super) general_grid: Vec<(u16, f32)>,
     /// Largest level present in the `levels[]` grid. Caps
     /// `suspicious_ceiling(level, grid_max)`.
@@ -40,9 +42,8 @@ impl EnsembleConfig {
             .iter()
             .filter_map(|entry| {
                 let threshold = *entry.hostile.thresholds.get("general")?;
-                // Outside [0, 1] is the "never fires" sentinel (or garbage).
-                // Calibration would clip it back into reach, so drop it here,
-                // as the route-policy loader does.
+                // Outside [0, 1] is the "never fires" sentinel (or garbage):
+                // drop it, as the route-policy loader does.
                 (0.0..=1.0)
                     .contains(&threshold)
                     .then_some((entry.level, threshold))
@@ -205,22 +206,14 @@ impl RoutePolicies {
         routes.dedup();
         routes
     }
-
-    /// Every policy severity, for load-time passes over the thresholds.
-    pub(super) fn severities_mut(&mut self) -> impl Iterator<Item = &mut PolicySeverity> {
-        self.by_filetype
-            .values_mut()
-            .flat_map(|policy| [&mut policy.hostile, &mut policy.suspicious])
-            .chain(self.grid.values_mut().flatten().map(|lp| &mut lp.hostile))
-    }
 }
 
 /// Look a cleave file type up in a per-filetype table: as given, then with
 /// pure-compression suffixes stripped (`tar.gz` → `tar`; the original
 /// spelling goes first so a bundle whose keys still carry the suffix keeps
 /// working), then as its container archive (`gem` → `tar`, `whl` → `zip`).
-/// Mirrors `collimator.data.normalize_archive_filetype`, and the specialist
-/// fallback in [`RouteSet::specialist_keys`], so the resolved policy and the
+/// Agrees with training's label normalization, and with the specialist
+/// fallback in `RouteSet::specialist_keys`, so the resolved policy and the
 /// specialists scored agree.
 pub(super) fn lookup_filetype<'a, V>(
     table: &'a HashMap<String, V>,
@@ -244,11 +237,10 @@ pub(super) fn lookup_filetype<'a, V>(
 
 /// Pure-compression suffixes — formats with no multi-file container of
 /// their own. Stripped from the tail of compound filetype strings (e.g.
-/// `tar.gz` → `tar`). Source of truth in
-/// `collimator/src/collimator/data.py::_PURE_COMPRESSION_SUFFIXES`; keep
-/// the two lists in sync — collimator emits training labels using this
-/// rule and scan routes scan-time files using it.
-pub(super) const PURE_COMPRESSION_SUFFIXES: &[&str] = &["gz", "bz2", "xz", "zst", "z", "lzma"];
+/// `tar.gz` → `tar`). Training labels files by the same list, so the two
+/// must agree: a suffix one strips and the other keeps routes a file to a
+/// specialist that never saw its label.
+const PURE_COMPRESSION_SUFFIXES: &[&str] = &["gz", "bz2", "xz", "zst", "z", "lzma"];
 
 /// Strip pure-compression suffixes from a cleave-reported filetype label.
 /// `tar.gz` → `tar`, `tar.bz2.xz` → `tar`. Bare compression labels
@@ -283,8 +275,8 @@ pub(super) fn normalize_archive_filetype(file_type: &str) -> Cow<'_, str> {
 /// This is the specialty-else-container half of routing: a packaged type with
 /// no specialist of its own falls back to its container's. filefacts owns the
 /// archive→container knowledge — no table is duplicated here. Unlike
-/// [`normalize_archive_filetype`] (which only strips compression suffixes for
-/// collimator parity), this also collapses specialty package types onto their
+/// [`normalize_archive_filetype`] (which only strips compression suffixes, as
+/// training does), this also collapses specialty package types onto their
 /// container, so it is consulted *after* the exact and compression-stripped
 /// lookups, never instead of them.
 pub(super) fn container_filetype(file_type: &str) -> Option<&'static str> {
@@ -310,16 +302,12 @@ pub(super) struct RoutePolicy {
 
 #[derive(Debug, Clone)]
 pub(super) struct PolicySeverity {
-    /// Route → calibrated threshold, ordered by route name. Routes absent
+    /// Route → threshold, ordered by route name. Routes absent
     /// from this list do not participate in that severity decision.
     pub(super) thresholds: Vec<(RouteId, f32)>,
-    /// Learned-blend policy. When set, ``thresholds`` is empty and this
-    /// severity is evaluated as ``sigmoid(intercept + sum(w_i * logit(p_i))) >=
-    /// threshold`` over the named routes. Mirrors what
-    /// ``azoth_route_policy_search._make_learned_blend_candidate_at_fp`` fits
-    /// — the weights live in the same calibrated probability space that
-    /// the calibrated route scores carry, so no isotonic mapping is applied at
-    /// load time.
+    /// Learned-blend policy. When set, `thresholds` is empty and this
+    /// severity is evaluated as `sigmoid(intercept + sum(w_i * logit(p_i))) >=
+    /// threshold` over the named routes' scores.
     pub(super) blend: Option<BlendPolicy>,
 }
 
@@ -332,22 +320,15 @@ impl PolicySeverity {
             .map(|&(_, t)| t)
     }
 
-    /// True iff this severity could fire on a contribution from ``route``.
+    /// True iff this severity could fire on a contribution from `route`.
     /// For OR-rule policies that's "route has a threshold"; for blend policies
     /// it's "route is one of the blend inputs."
-    pub(super) fn references_route(&self, route: RouteId) -> bool {
+    fn references_route(&self, route: RouteId) -> bool {
         self.threshold(route).is_some()
             || self
                 .blend
                 .as_ref()
                 .is_some_and(|blend| blend.routes.contains(&route))
-    }
-
-    /// True iff this severity fires given the per-route scores. Dispatches
-    /// to blend evaluation when ``blend`` is set, OR-rule otherwise.
-    #[cfg(test)]
-    pub(super) fn fires(&self, scores: &[RouteProbability]) -> bool {
-        self.fire(scores).is_some()
     }
 
     /// If this severity fires, return the deciding `(probability, threshold)`
@@ -380,36 +361,23 @@ impl PolicySeverity {
 #[derive(Debug, Clone)]
 pub(super) struct BlendPolicy {
     /// Routes consumed by the blend, in the order their weights are listed.
-    /// Both ``weights`` and the score lookup happen by index, so reordering
-    /// after load is forbidden.
+    /// `weights` pairs with them by index, so they never reorder after load.
     pub(super) routes: Vec<RouteId>,
     pub(super) weights: Vec<f32>,
     pub(super) intercept: f32,
-    /// Calibrated-space threshold on the sigmoid output. Already in the
-    /// space the blend was fit in (post-isotonic, matching the calibrated route scores),
-    /// so the per-route isotonic mapping that ``calibrate_policy_thresholds``
-    /// applies to OR-rule thresholds is intentionally NOT applied here.
+    /// Threshold on the sigmoid output.
     pub(super) threshold: f32,
 }
 
 impl BlendPolicy {
-    /// Evaluate ``sigmoid(intercept + sum(w_i * logit(clip(p_i)))) >= threshold``
-    /// over the configured routes. Missing routes (specialist not loaded for
-    /// this filetype, scoring failure, etc.) fall back to "doesn't fire" —
-    /// the blend can't be honestly evaluated with incomplete inputs and
-    /// firing on a partial blend would be a calibration mismatch.
-    #[cfg(test)]
-    pub(super) fn fires(&self, scores: &[RouteProbability]) -> bool {
-        self.fire(scores).is_some()
-    }
-
-    /// Compute the blend's sigmoid output and, if it crosses the threshold,
-    /// return `(sigmoid_output, threshold)`. Missing routes mean the blend
-    /// cannot be honestly evaluated; treat as "doesn't fire."
+    /// Evaluate `sigmoid(intercept + sum(w_i * logit(clip(p_i)))) >= threshold`
+    /// and, if it fires, return `(sigmoid_output, threshold)`. A missing route
+    /// (no specialist for this filetype, or one that failed to load) means the
+    /// blend cannot be honestly evaluated, so it does not fire.
     pub(super) fn fire(&self, scores: &[RouteProbability]) -> Option<(f32, f32)> {
         // f64 math throughout — logit blows up near 0/1, and the cumulative
         // weighted sum can drift if we stay in f32. The final compare against
-        // ``threshold`` is in f32 to match how the calibration step writes it.
+        // `threshold` is in f32, as the policy file stores it.
         const EPS: f64 = 1e-6;
         let mut z: f64 = f64::from(self.intercept);
         for (route, &weight) in self.routes.iter().zip(&self.weights) {
@@ -428,38 +396,37 @@ impl BlendPolicy {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RoutePoliciesJson {
+struct RoutePoliciesJson {
     #[serde(default)]
     pub(super) routes: HashMap<String, RoutePolicyRouteJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RoutePolicyRouteJson {
+struct RoutePolicyRouteJson {
     pub(super) filetype: String,
     #[serde(default)]
     pub(super) levels: Vec<RoutePolicyLevelJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RoutePolicyLevelJson {
+struct RoutePolicyLevelJson {
     pub(super) level: u16,
     pub(super) hostile: RoutePolicySeverityJson,
-    // Collimator may omit `suspicious`; the loader derives it from `hostile`.
+    // `suspicious` may be omitted; the loader derives it from `hostile`.
     pub(super) suspicious: Option<RoutePolicySeverityJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RoutePolicySeverityJson {
+struct RoutePolicySeverityJson {
     pub(super) best: Option<RoutePolicyBestJson>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RoutePolicyBestJson {
+struct RoutePolicyBestJson {
     #[serde(default)]
     pub(super) thresholds: HashMap<String, f32>,
-    /// Optional learned-blend variant. When set, ``thresholds`` is typically
+    /// Optional learned-blend variant. When set, `thresholds` is typically
     /// empty and the severity classifies via the blend's combined score.
-    /// Mirrors azoth_route_policy_search._make_learned_blend_candidate_at_fp.
     pub(super) blend: Option<BlendPolicyJson>,
 }
 
@@ -467,15 +434,13 @@ pub(super) struct RoutePolicyBestJson {
 /// of 0.0 would pass validation and fire on everything.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BlendPolicyJson {
+struct BlendPolicyJson {
     pub(super) routes: Vec<String>,
     pub(super) weights: Vec<f32>,
     pub(super) intercept: f32,
     pub(super) threshold: f32,
-    /// Currently only ``"logit"`` is supported; absent means logit. Future
-    /// blend variants (e.g., raw-prob linear, monotonic GAM) would advertise
-    /// themselves here so deploy refuses unknown shapes loudly rather than
-    /// silently misapplying the wrong transform.
+    /// Only `"logit"` is supported; absent means logit. Another transform is
+    /// refused at load rather than misapplied.
     pub(super) transform: Option<String>,
 }
 
@@ -483,10 +448,10 @@ pub(super) struct BlendPolicyJson {
 pub(super) struct LevelEntryJson {
     pub(super) level: u16,
     pub(super) hostile: SeverityEntryJson,
-    // Collimator may omit `suspicious`; per-route derivation happens in
+    // `suspicious` may be omitted; per-route derivation happens in
     // `thresholds_at_level`. An absent block is treated as an empty map,
     // which yields hostile-only routes (the same shape used when only some
-    // routes have a calibrated suspicious threshold).
+    // routes have a suspicious threshold of their own).
     pub(super) suspicious: Option<SeverityEntryJson>,
 }
 
@@ -516,7 +481,7 @@ pub(super) fn load_route_policies(
     for route in json.routes.into_values() {
         let context = || format!("{}: filetype {}", path.display(), route.filetype);
         // Retain the hostile policy at every level (ascending) for the verdict
-        // sweep. A level with no usable policy (collimator's `no_policy`) is
+        // sweep. A level with no usable policy (the search found none) is
         // dropped from the grid — the sweep simply can't fire there.
         let mut levels = Vec::new();
         for entry in &route.levels {
@@ -535,7 +500,7 @@ pub(super) fn load_route_policies(
         // classification in the `models[]` array. Its suspicious band is
         // derived in level-space via the suspicious-ceiling lookup: the hostile
         // policy at the loosest row within `suspicious_ceiling(level, max)`.
-        // An explicit `suspicious` block, when collimator emits one, wins; the
+        // An explicit `suspicious` block, when the file has one, wins; the
         // level's own hostile is the final fallback.
         let active = match route.levels.iter().find(|entry| entry.level == level) {
             Some(entry) => {
@@ -584,13 +549,13 @@ pub(super) fn load_route_policies(
     Ok(RoutePolicies { by_filetype, grid })
 }
 
-/// One severity's policy, or `None` when collimator found none at this level
+/// One severity's policy, or `None` when the search found none at this level
 /// (no `best`, or neither thresholds nor a blend).
 ///
-/// Thresholds outside `[0, 1]` are dropped: collimator writes one ulp above
+/// Thresholds outside `[0, 1]` are dropped: the policy search writes one ulp above
 /// 1.0 for a route that must never fire at a level, and a probability can
 /// never reach it, so dropping it decides the same way.
-pub(super) fn policy_severity_from_json(
+fn policy_severity_from_json(
     json: &RoutePolicySeverityJson,
     names: &mut RouteNames,
 ) -> Result<Option<PolicySeverity>> {
@@ -623,10 +588,7 @@ pub(super) fn policy_severity_from_json(
     Ok(Some(PolicySeverity { thresholds, blend }))
 }
 
-pub(super) fn blend_policy_from_json(
-    json: &BlendPolicyJson,
-    names: &mut RouteNames,
-) -> Result<BlendPolicy> {
+fn blend_policy_from_json(json: &BlendPolicyJson, names: &mut RouteNames) -> Result<BlendPolicy> {
     // Only the logit transform is supported. An unknown transform means the
     // writer is ahead of this deploy binary — refuse rather than misapply.
     if let Some(other) = json.transform.as_deref().filter(|t| *t != "logit") {
@@ -641,6 +603,16 @@ pub(super) fn blend_policy_from_json(
     }
     if !(0.0..=1.0).contains(&json.threshold) {
         anyhow::bail!("blend threshold {} is outside [0, 1]", json.threshold);
+    }
+    // JSON has no NaN, but a weight past f32's range parses as infinite and
+    // would turn every blend into a constant.
+    if let Some(bad) = json
+        .weights
+        .iter()
+        .chain([&json.intercept])
+        .find(|v| !v.is_finite())
+    {
+        anyhow::bail!("blend weights and intercept must be finite (got {bad})");
     }
     Ok(BlendPolicy {
         routes: json.routes.iter().map(|r| names.intern(r)).collect(),
@@ -684,7 +656,7 @@ pub(super) fn thresholds_at_level(
         // Hostile policy is primary. When the JSON carries an explicit
         // `suspicious` block but a specific route is absent from it, that
         // route stays active as hostile-only (suspicious == hostile). When
-        // collimator omits the `suspicious` block entirely, derive the
+        // the JSON omits the `suspicious` block entirely, derive the
         // suspicious cutoff from the ceiling row's hostile threshold for the
         // same route (level-space lookup, falls back to hostile-only when
         // the route is missing from the looser row).
@@ -738,19 +710,6 @@ pub(super) fn thresholds_at_level(
 pub(super) struct RouteProbability {
     pub(super) route: RouteId,
     pub(super) probability: f32,
-}
-
-#[cfg(test)]
-pub(super) fn policy_classify(policy: &RoutePolicy, scores: &[RouteProbability]) -> Classification {
-    // Each severity decides via its own rule: OR-rule per-route thresholds or
-    // learned blend. Hostile takes precedence over suspicious, same as before.
-    if policy.hostile.fires(scores) {
-        Classification::Hostile
-    } else if policy.suspicious.fires(scores) {
-        Classification::Suspicious
-    } else {
-        Classification::Benign
-    }
 }
 
 /// Run the policy against the route scores and return the deciding [`Decision`]
@@ -814,7 +773,7 @@ pub(crate) fn verdict_for_level(fired_level: u16, level: u16, grid_max: u16) -> 
 }
 
 /// Lowest level at which the general/OR fallback fires, for filetypes with no
-/// route policy. Mirrors [`Model::decide_from_scores`]: at each level a file
+/// route policy. Mirrors `Model::decide_from_scores`: at each level a file
 /// fires if any route's probability crosses that level's general hostile
 /// threshold. The highest crossing probability is reported for that level.
 pub(super) fn sweep_general_grid(
@@ -834,40 +793,6 @@ pub(super) fn sweep_general_grid(
         }
     }
     best
-}
-
-/// Push each per-route threshold in `route_policies.json` through that route's
-/// isotonic calibrator. The scoring path emits calibrated probabilities, so
-/// the policy comparison must happen in calibrated space too. Routes without
-/// a calibrator (pre-calibrator bundles) are left untouched. Routes referenced
-/// by a policy but not loaded as a specialist are also left untouched —
-/// they'll never produce a `RouteProbability` entry, so the comparison never
-/// fires.
-///
-/// Blend severities are calibrated at fit time (the policy writer applies
-/// isotonic to the per-route inputs before fitting LR), so their threshold
-/// and weights are already in calibrated-prob space. Skipping the per-route
-/// mapping is intentional — the logistic combination doesn't decompose
-/// through isotonic the way per-route OR-rule thresholds do.
-pub(super) fn calibrate_policy_thresholds<'a>(
-    policies: &mut RoutePolicies,
-    lookup: impl Fn(RouteId) -> Option<&'a IsotonicCalibrator>,
-) {
-    let mut adjusted = 0_usize;
-    for severity in policies.severities_mut() {
-        if severity.blend.is_some() {
-            continue;
-        }
-        for (route, threshold) in &mut severity.thresholds {
-            if let Some(cal) = lookup(*route) {
-                *threshold = cal.apply(*threshold);
-                adjusted += 1;
-            }
-        }
-    }
-    if adjusted > 0 {
-        tracing::debug!(adjusted, "calibrated route_policies thresholds");
-    }
 }
 
 pub(super) fn policy_route_class(

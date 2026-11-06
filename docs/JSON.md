@@ -26,7 +26,7 @@ obvious things. The tables below are the key.
 
 ## `ml` — `MlSection`
 
-`src/engine.rs`.
+`src/engine/envelope.rs`.
 
 | JSON          | Rust                      | Type                   | Meaning                                              |
 | ------------- | ------------------------- | ---------------------- | ---------------------------------------------------- |
@@ -54,7 +54,7 @@ not of your deploy setting**:
 > `lvl` is the lowest pool-adjusted false-positive level at which the model
 > flags this file as hostile.
 
-For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation. See the [shared level definition](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
+Levels are defined in [INTEGRATION.md](INTEGRATION.md#set-the-false-positive-level).
 
 A consumer reads it as:
 
@@ -172,18 +172,18 @@ specific member.
 
 ## `RouteScore`
 
-`src/model.rs`.
+`src/model/verdict.rs`.
 
 | JSON    | Rust             | Type   | Meaning                                  |
 | ------- | ---------------- | ------ | ---------------------------------------- |
 | `rte`   | `model`          | string | Route name, e.g. `az`, `az/native`, `az/elf`. |
-| `prob`  | `probability`    | f32    | This route's calibrated probability — the value thresholds live in and the verdict is decided on. |
-| `raw`   | `raw`            | f32    | Raw (pre-isotonic) score; surfaced for triage because the calibrated `prob` saturates its upper tail. |
+| `prob`  | `probability`    | f32    | This route's probability — the value thresholds live in and the verdict is decided on. |
+| `raw`   | `raw`            | f32    | The route model's own score. Scan applies no transform, so it equals `prob`; kept on the wire for existing consumers. |
 | `cls`   | `classification` | u8     | This route's classification.             |
 
 ## `SkippedRoute`
 
-`src/model.rs`.
+`src/model/verdict.rs`.
 
 | JSON  | Rust     | Type   | Meaning                              |
 | ----- | -------- | ------ | ------------------------------------ |
@@ -192,7 +192,7 @@ specific member.
 
 ## `ml.files[]` entry
 
-`src/engine.rs` (`build_ml_files`). One compact summary per analyzed
+`src/engine/envelope.rs` (`ml_files`). One compact summary per analyzed
 file: the root file (`id = 0`), plus one per archive member when the
 input is an archive. Listing-only members — carried in the raw manifest
 for `--show=all` but never classified — are excluded here.

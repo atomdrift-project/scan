@@ -44,6 +44,9 @@ vars! {
     SCAN_LLM_BACKGROUND_CONCURRENCY: Number, "Of those, how many work nobody waits on may hold.";
     SCAN_LLM_SYSTEM_PROMPT_FILE: Text, "Replace the built-in LLM grading prompt with this file.";
     SCAN_HOPPER: Text, "Hopper base URL(s), when `--hopper` is not given.";
+    SCAN_FOLLOW: Text, "Reference categories to follow, when `--follow` is not given.";
+    SCAN_REGISTRY_MAP: Text, "Registry metadata map file, when `--registry-map` is not given.";
+    ATOMDRIFT_UPLINK: Text, "`1` insists on Atomdrift Uplink, `0` keeps the open-source rules.";
     SCAN_NO_UPLOAD: Flag, "Disable CLI result and artifact uploads while retaining Hopper corpus lookups.";
     SCAN_MODELS_DIR: Text, "Use the model bundle in this directory, and never update it.";
     SCAN_NO_ANALYSIS_CACHE: Flag, "Disable every analysis cache in the stack, for benchmarks.";
@@ -76,14 +79,14 @@ pub fn path(var: Var) -> Option<PathBuf> {
 /// `1`, `true` and `yes` are on. Anything else is refused by [`check`] and
 /// read as off.
 #[must_use]
-pub fn flag(var: Var) -> bool {
+pub(crate) fn flag(var: Var) -> bool {
     text(var).is_some_and(|value| parse_flag(&value) == Some(true))
 }
 
 /// A number, or `None` when unset or empty. A value that does not parse is
 /// refused by [`check`] and read as unset.
 #[must_use]
-pub fn number<T: FromStr>(var: Var) -> Option<T> {
+pub(crate) fn number<T: FromStr>(var: Var) -> Option<T> {
     text(var).and_then(|value| value.trim().parse().ok())
 }
 
@@ -93,23 +96,6 @@ fn parse_flag(value: &str) -> Option<bool> {
         "0" | "false" | "no" => Some(false),
         _ => None,
     }
-}
-
-/// Whether `ATOMDRIFT_UPLINK` explicitly opted out (`0`, `false`, `no`, `off`),
-/// so `--uplink`'s env switch disables a held token even before cleave's own
-/// `ENABLE_ENV` advances in `Cargo.lock`.
-#[must_use]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one place the environment is read"
-)]
-pub fn uplink_opted_out() -> bool {
-    std::env::var("ATOMDRIFT_UPLINK").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off" | "n" | "f"
-        )
-    })
 }
 
 /// Refuse a flag or number that does not parse, rather than let it read as

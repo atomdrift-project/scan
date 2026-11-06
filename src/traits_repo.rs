@@ -1,4 +1,4 @@
-//! Thin wrapper over cleave's R2-backed trait updater.
+//! Thin wrapper over cleave's trait updater.
 //!
 //! cleave traits are distributed as `.tar.zst` bundles from the update bucket
 //! (`cleave::rule_update`), verified by sha256 against the bucket's own
@@ -29,7 +29,7 @@ pub fn prepare_runtime_env() {
     }
     if local {
         tracing::debug!(
-            path = %installed.display(),
+            using = %installed.display(),
             "ignoring traits/ in the working directory; set CLEAVE_TRAITS_DIR to use it"
         );
     }
@@ -44,7 +44,7 @@ fn looks_like_traits(path: &Path) -> bool {
             || path.join("metadata").is_dir())
 }
 
-/// Install or refresh cleave traits from the R2 bundle, the same path
+/// Install or refresh cleave traits from the published bundle, the same path
 /// `cleave update-rules` uses. Returns `true` when the installed commit changed.
 ///
 /// The target is read again afterwards: a refused token without `--uplink`
@@ -73,11 +73,4 @@ pub fn enriched_refusal(error: &anyhow::Error) -> Option<&str> {
         cleave::rule_update::Error::Enriched(why) => Some(why),
         cleave::rule_update::Error::Other(_) => None,
     }
-}
-
-/// Report whether newer traits are available without applying them.
-pub fn check_updates() -> Result<()> {
-    prepare_runtime_env();
-    let dir = cleave::traits_repo::install_target();
-    cleave::rule_update::check(&dir).map_err(anyhow::Error::new)
 }

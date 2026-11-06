@@ -384,8 +384,8 @@ fn provenance_documents_yield_their_subject_not_their_catalogue() {
     assert!(provenance_subject(&empty).is_none());
 }
 
-/// IPv6 literals are judged by address, not refused for their brackets,
-/// and only a *mapped* IPv4 address is read as IPv4.
+/// IPv6 literals are judged by address, not refused for their brackets, and
+/// one that embeds an IPv4 address is judged by that address.
 #[test]
 fn ipv6_literals_are_judged_by_address() {
     assert!(valid_host("http://[2606:4700:4700::1111]/payload.bin"));
@@ -402,7 +402,35 @@ fn ipv6_literals_are_judged_by_address() {
         "documentation range"
     );
     let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-    assert!(!public_ip(ip("::1")), "loopback, never the IPv4 0.0.0.1");
+    assert!(!public_ip(ip("::1")), "loopback");
     assert!(!public_ip(ip("::")));
-    assert!(public_ip(ip("::8.8.8.8")), "IPv4-compatible is plain IPv6");
+    assert!(public_ip(ip("::8.8.8.8")), "IPv4-compatible public v4");
+    assert!(!public_ip(ip("::10.0.0.1")), "IPv4-compatible private v4");
+}
+
+/// The predicate agrees with fletch's SSRF floor: every address that floor
+/// refuses at request time is refused here, so it never reaches the work list.
+#[test]
+fn public_ip_agrees_with_the_fetch_ssrf_floor() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    for refused in [
+        "0.0.0.0",
+        "0.1.2.3",            // 0.0.0.0/8, "this network"
+        "64:ff9b::7f00:1",    // NAT64 wrapping 127.0.0.1
+        "64:ff9b::a9fe:a9fe", // NAT64 wrapping 169.254.169.254
+        "64:ff9b::a00:1",     // NAT64 wrapping 10.0.0.1
+        "2002:7f00:1::",      // 6to4 wrapping 127.0.0.1
+        "2002:c0a8:101::1",   // 6to4 wrapping 192.168.1.1
+        "2002:a9fe:a9fe::",   // 6to4 wrapping 169.254.169.254
+    ] {
+        assert!(!public_ip(ip(refused)), "{refused} must not be public");
+    }
+    for public in [
+        "8.8.8.8",
+        "64:ff9b::808:808", // NAT64 wrapping 8.8.8.8
+        "2002:808:808::1",  // 6to4 wrapping 8.8.8.8
+        "2606:4700:4700::1111",
+    ] {
+        assert!(public_ip(ip(public)), "{public} is public");
+    }
 }

@@ -1,128 +1,135 @@
 //! The chat-completions wire: requests, retries, model discovery, and the
 //! on-disk verdict cache.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow};
+use reqwest::StatusCode;
+use reqwest::blocking::{Client, Response};
+use serde::{Deserialize, Serialize};
+
+use super::breaker::{Admit, BREAKER_COOLDOWN, BREAKER_TRIP_AFTER, BREAKERS, Breakers};
+use super::{
+    Attempt, InterpretConfig, LLM_CONNECT_TIMEOUT, LlmCaller, LlmGrade, MAX_TOKENS,
+    OPENROUTER_AUTO_MIN_TOKENS, OPENROUTER_DEFAULT_MODEL, OPENROUTER_MIN_TIMEOUT_SECS,
+    is_openrouter_endpoint,
+};
+use crate::output::strip_ansi;
+
+/// Timeout for `GET {base}/models`. Short: a live endpoint answers its model
+/// listing almost instantly, and a hung socket should not stall startup.
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize)]
-pub(super) struct ChatRequest<'a> {
-    pub(super) model: &'a str,
-    pub(super) messages: [ChatMessage<'a>; 2],
-    pub(super) temperature: f32,
-    pub(super) max_tokens: u32,
-    pub(super) stream: bool,
-    /// vLLM extension to disable Qwen-style chain-of-thought: without it the
-    /// model spends the token budget "thinking" and returns a null `content`.
-    /// Omitted for OpenRouter, which rejects or ignores unknown vLLM fields.
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: [ChatMessage<'a>; 2],
+    temperature: f32,
+    max_tokens: u32,
+    stream: bool,
+    /// Chat-template switch (vLLM and compatible servers) that turns off a
+    /// reasoning model's thinking phase: without it the model spends the
+    /// token budget thinking and returns a null `content`. Omitted for
+    /// OpenRouter, which rejects or ignores unknown server fields.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// OpenRouter reasoning toggle. vLLM does not take this field; OpenRouter
     /// thinking models otherwise burn [`MAX_TOKENS`] on chain-of-thought and
     /// return empty `content`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) reasoning: Option<ReasoningParam>,
+    reasoning: Option<ReasoningParam>,
     /// vLLM queue priority (see [`LlmCaller::priority`]). Omitted at 0, and
     /// never sent to OpenRouter, which does not know the field.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) priority: Option<u8>,
+    priority: Option<u8>,
 }
 
-/// Either disables reasoning outright (for a pinned model we know accepts
+/// Either disables reasoning outright (for a pinned model known to accept
 /// that) or, when the underlying model isn't known in advance, caps it to
 /// `low` effort instead: some providers reject `enabled: false` ("reasoning
 /// is mandatory for this endpoint"), but all observed ones accept `effort`
 /// and it still leaves the completion's token budget mostly for the answer.
 #[derive(Serialize, Clone, Copy)]
-pub(super) struct ReasoningParam {
+struct ReasoningParam {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) enabled: Option<bool>,
+    enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) effort: Option<&'static str>,
+    effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
-pub(super) struct ChatTemplateKwargs {
-    pub(super) enable_thinking: bool,
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
-pub(super) struct ChatMessage<'a> {
-    pub(super) role: &'a str,
-    pub(super) content: &'a str,
+struct ChatMessage<'a> {
+    role: &'a str,
+    content: &'a str,
 }
 
 /// The `GET {base}/models` listing (OpenAI shape: `{"data": [{"id": …}]}`).
-#[derive(serde::Deserialize)]
-pub(super) struct ModelList {
+#[derive(Deserialize)]
+struct ModelList {
     #[serde(default)]
-    pub(super) data: Vec<ModelEntry>,
+    data: Vec<ModelEntry>,
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct ModelEntry {
-    pub(super) id: String,
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct ChatResponse {
+#[derive(Deserialize)]
+struct ChatResponse {
     #[serde(default)]
-    pub(super) choices: Vec<Choice>,
+    choices: Vec<Choice>,
     /// Token accounting as the endpoint reports it (OpenAI-compatible
     /// servers, vLLM included, fill this in); absent on the odd proxy.
     #[serde(default)]
-    pub(super) usage: Option<Usage>,
+    usage: Option<Usage>,
 }
 
-#[derive(serde::Deserialize, Default)]
-pub(super) struct Usage {
+#[derive(Deserialize, Default)]
+struct Usage {
     #[serde(default)]
-    pub(super) prompt_tokens: u64,
+    prompt_tokens: u64,
     #[serde(default)]
-    pub(super) completion_tokens: u64,
+    completion_tokens: u64,
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct Choice {
-    pub(super) message: RespMessage,
+#[derive(Deserialize)]
+struct Choice {
+    message: RespMessage,
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct RespMessage {
+#[derive(Deserialize)]
+struct RespMessage {
     /// `null` when the model returned only chain-of-thought; tolerate it.
     #[serde(default)]
-    pub(super) content: Option<String>,
+    content: Option<String>,
     /// Fallback used by "thinking" models that put the answer here.
     #[serde(default)]
-    pub(super) reasoning_content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
-impl RespMessage {
-    /// The usable reply text: the answer `content`, else `reasoning_content`.
-    pub(super) fn text(self) -> String {
-        self.content
-            .filter(|s| !s.trim().is_empty())
-            .or(self.reasoning_content)
-            .unwrap_or_default()
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub(super) struct GradeReason {
-    pub(super) grade: String,
+#[derive(Deserialize)]
+struct GradeReason {
+    grade: String,
     #[serde(default)]
-    pub(super) reason: String,
+    reason: String,
 }
 
 /// A failed LLM call, classified by whether it implies the endpoint is unhealthy.
 #[derive(Debug)]
 pub(super) enum CallError {
-    /// Unreachable, timed out, or a 5xx — a health problem; flips the breaker.
+    /// Unreachable, timed out, or a 5xx — a health problem; counts against
+    /// the endpoint's breaker.
     Transport(anyhow::Error),
     /// The endpoint answered but the reply was unusable (4xx, undecodable, no
-    /// grade) — not a health problem; leaves the breaker closed.
+    /// grade) — not a health problem; resets the endpoint's breaker.
     BadReply(anyhow::Error),
 }
 
@@ -132,25 +139,10 @@ impl CallError {
             Self::Transport(e) | Self::BadReply(e) => e,
         }
     }
-
-    /// The underlying error, for logging a failure that is being retried
-    /// elsewhere rather than reported.
-    pub(super) fn inner(&self) -> &anyhow::Error {
-        match self {
-            Self::Transport(e) | Self::BadReply(e) => e,
-        }
-    }
-
-    /// Which half of the split this failure fell on — the one thing a reader
-    /// of a fall-over warning cannot infer from the message: `transport` trips
-    /// the endpoint's breaker, `bad-reply` leaves it closed.
-    pub(super) fn kind(&self) -> &'static str {
-        match self {
-            Self::Transport(_) => "transport",
-            Self::BadReply(_) => "bad-reply",
-        }
-    }
 }
+
+/// A failed attempt and the outcome label its call line is logged under.
+type Failure = (CallError, String);
 
 /// POST the prebuilt user message with scan's grading prompt and parse
 /// `{grade, reason}`. Also returns the model that answered, which is not
@@ -183,9 +175,9 @@ pub fn grade_render(cfg: &InterpretConfig, context: &str) -> Result<serde_json::
 }
 
 /// Send a `system` + `user` prompt to the configured endpoint and return the
-/// model's reply text. This is the shared transport used by scan's grader and
-/// by external callers (e.g. isomer's diff interpreter) that reuse scan's
-/// client, health/HTML handling, and model config with a *different* prompt.
+/// model's reply text. This is the shared transport for scan's grader and for
+/// library callers that reuse scan's client, failover, breakers and model
+/// config with a *different* prompt.
 ///
 /// # Errors
 /// Propagates transport failures (unreachable, timeout, 5xx) and bad replies
@@ -213,7 +205,7 @@ pub fn chat(
 ///
 /// The returned model name is the one that answered, not the one configured
 /// first, so the `llm` JSON section names the model that actually graded.
-pub(super) fn chat_raw(
+fn chat_raw(
     cfg: &InterpretConfig,
     system: &str,
     user: &str,
@@ -235,12 +227,11 @@ pub(super) fn chat_raw(
 /// The process's one HTTP client for LLM endpoints, built on first use.
 /// It carries only what is the same for every request — the connect timeout
 /// and the user agent; each request sets its own total timeout.
-pub(super) fn http_client() -> Result<&'static reqwest::blocking::Client> {
-    static CLIENT: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
-        OnceLock::new();
+fn http_client() -> Result<&'static Client> {
+    static CLIENT: OnceLock<std::result::Result<Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::blocking::Client::builder()
+            Client::builder()
                 .connect_timeout(LLM_CONNECT_TIMEOUT)
                 .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -253,14 +244,13 @@ pub(super) fn http_client() -> Result<&'static reqwest::blocking::Client> {
 pub(super) fn chat_raw_with(
     breakers: &Breakers,
     cfg: &InterpretConfig,
-    client: &reqwest::blocking::Client,
+    client: &Client,
     system: &str,
     user: &str,
     max_tokens: u32,
     priority: u8,
 ) -> std::result::Result<(String, String), CallError> {
     let attempts = cfg.attempts();
-    let last = attempts.len() - 1;
     let mut err = None;
     for (i, at) in attempts.iter().enumerate() {
         let admit = breakers.admit(at.base_url);
@@ -274,62 +264,60 @@ pub(super) fn chat_raw_with(
             )));
             continue;
         }
-        match chat_once(
-            client,
-            *at,
-            attempt_timeout(cfg, at.base_url),
-            system,
-            user,
-            max_tokens,
-            priority,
-        ) {
+        let timeout = attempt_timeout(cfg, at.base_url);
+        let e = match chat_once(client, *at, timeout, system, user, max_tokens, priority) {
             Ok(content) => {
                 if breakers.answered(at.base_url) {
                     tracing::info!(endpoint = %at.base_url, "LLM endpoint breaker closed");
                 }
                 return Ok((content, at.model.to_string()));
             }
-            Err(e) => {
-                match e {
-                    CallError::Transport(_) => {
-                        if breakers.failed(at.base_url) {
-                            tracing::warn!(
-                                endpoint = %at.base_url,
-                                cooldown_secs = breakers.cooldown.as_secs(),
-                                "LLM endpoint breaker opened after {BREAKER_TRIP_AFTER} \
-                                 consecutive transport failures; skipping it until a probe \
-                                 succeeds"
-                            );
-                        } else if admit == Admit::Probe {
-                            tracing::info!(
-                                endpoint = %at.base_url,
-                                "LLM endpoint probe failed; breaker stays open"
-                            );
-                        }
-                    }
-                    CallError::BadReply(_) => {
-                        breakers.answered(at.base_url);
-                    }
-                }
-                if i < last {
-                    // Worth a warning, not an error: the pass has not failed
-                    // yet. Silence here would make a fleet quietly billing
-                    // OpenRouter look identical to one served by its own box.
+            Err(e) => e,
+        };
+        // `transport` trips the endpoint's breaker, `bad-reply` resets it: the
+        // one thing a reader of the fall-over warning cannot infer from the
+        // message.
+        let (kind, cause) = match &e {
+            CallError::Transport(cause) => {
+                if breakers.failed(at.base_url) {
                     tracing::warn!(
                         endpoint = %at.base_url,
-                        next = %attempts[i + 1].base_url,
-                        kind = e.kind(),
-                        // `{:#}` walks the source chain: plain `{}` prints only
-                        // the outermost context ("posting to <url>") and drops
-                        // the cause that says *why*, which is the whole reason
-                        // this line exists.
-                        "LLM endpoint failed, falling over: {:#}",
-                        e.inner(),
+                        failures = BREAKER_TRIP_AFTER,
+                        cooldown_secs = breakers.cooldown.as_secs(),
+                        "LLM endpoint breaker opened after consecutive transport \
+                         failures; skipping it until a probe succeeds"
+                    );
+                } else if admit == Admit::Probe {
+                    tracing::info!(
+                        endpoint = %at.base_url,
+                        "LLM endpoint probe failed; breaker stays open"
                     );
                 }
-                err = Some(e);
+                ("transport", cause)
             }
+            CallError::BadReply(cause) => {
+                if breakers.answered(at.base_url) {
+                    tracing::info!(endpoint = %at.base_url, "LLM endpoint breaker closed");
+                }
+                ("bad-reply", cause)
+            }
+        };
+        if let Some(next) = attempts.get(i + 1) {
+            // Worth a warning, not an error: the pass has not failed yet.
+            // Silence here would make a deployment quietly billing its
+            // fallback look identical to one served by its primary.
+            tracing::warn!(
+                endpoint = %at.base_url,
+                next = %next.base_url,
+                kind,
+                // `{:#}` walks the source chain: plain `{}` prints only the
+                // outermost context ("posting to <url>") and drops the cause
+                // that says *why*, which is the whole reason this line exists.
+                error = %format_args!("{cause:#}"),
+                "LLM endpoint failed, falling over"
+            );
         }
+        err = Some(e);
     }
     // `attempts` is never empty, so the loop always sets this.
     Err(err.unwrap_or_else(|| CallError::Transport(anyhow!("no LLM endpoint configured"))))
@@ -348,27 +336,78 @@ pub(super) fn attempt_timeout(cfg: &InterpretConfig, base_url: &str) -> Duration
 }
 
 /// POST a system+user prompt to one endpoint and return the model's reply text,
-/// classifying failures for the caller's health accounting.
-pub(super) fn chat_once(
-    client: &reqwest::blocking::Client,
-    cfg: Attempt<'_>,
+/// classifying failures for the caller's breaker accounting.
+fn chat_once(
+    client: &Client,
+    at: Attempt<'_>,
     timeout: Duration,
     system: &str,
     user: &str,
     max_tokens: u32,
     priority: u8,
 ) -> std::result::Result<String, CallError> {
-    let openrouter = is_openrouter_endpoint(cfg.base_url);
-    // A pinned model is one we know accepts disabling reasoning outright, so
-    // it gets `enabled: false` as before. `openrouter/auto` (the default when
-    // none is pinned) routes each request to a model we can't predict, and
-    // some providers reject `enabled: false` outright ("Reasoning is
-    // mandatory for this endpoint and cannot be disabled") rather than
-    // ignoring it — but capping it to `effort: "low"` instead is accepted
-    // everywhere observed, and (unlike sending no `reasoning` field at all)
-    // keeps the model from spending the whole completion budget thinking and
-    // returning truncated or empty `content`.
-    let auto_routed = cfg.model == OPENROUTER_DEFAULT_MODEL;
+    let mut body = chat_request(at, system, user, max_tokens, priority);
+    let url = format!("{}/chat/completions", at.base_url.trim_end_matches('/'));
+    let prompt_bytes = system.len() + user.len();
+    tracing::debug!(
+        model = %at.model,
+        url = %url,
+        prompt_bytes,
+        system = %system,
+        user = %user,
+        "LLM request"
+    );
+    let started = Instant::now();
+    let reply = post(client, at, &url, timeout, &mut body).and_then(|resp| decode(resp, &url));
+    // One line per call at info, whatever the outcome: what was sent (size),
+    // what came back (tokens), and how long it took. A slow percentile that
+    // is "the LLM" is only actionable when the log says which calls were slow
+    // and why — a 50k-token prompt and a queued request look the same from
+    // outside.
+    let (usage, outcome) = match &reply {
+        Ok((_, usage)) => (usage.as_ref(), "ok"),
+        Err((_, outcome)) => (None, outcome.as_str()),
+    };
+    tracing::info!(
+        model = %at.model,
+        endpoint = %at.base_url,
+        prompt_bytes,
+        prompt_tokens = usage.map(|u| u.prompt_tokens),
+        completion_tokens = usage.map(|u| u.completion_tokens),
+        latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        outcome,
+        "LLM call"
+    );
+    match reply {
+        Ok((content, _)) => {
+            tracing::debug!(model = %at.model, content = %content, "LLM response");
+            Ok(content)
+        }
+        Err((e, _)) => Err(e),
+    }
+}
+
+/// The request body for one endpoint: the prompt, plus whichever switches that
+/// endpoint takes to answer rather than think aloud, and the queue priority
+/// where it understands one.
+fn chat_request<'a>(
+    at: Attempt<'a>,
+    system: &'a str,
+    user: &'a str,
+    max_tokens: u32,
+    priority: u8,
+) -> ChatRequest<'a> {
+    let openrouter = is_openrouter_endpoint(at.base_url);
+    // A pinned model is one known to accept disabling reasoning outright, so
+    // it gets `enabled: false`. `openrouter/auto` (the default when none is
+    // pinned) routes each request to a model nobody can predict, and some
+    // providers reject `enabled: false` outright ("Reasoning is mandatory for
+    // this endpoint and cannot be disabled") rather than ignoring it — but
+    // capping it to `effort: "low"` instead is accepted everywhere observed,
+    // and (unlike sending no `reasoning` field at all) keeps the model from
+    // spending the whole completion budget thinking and returning truncated
+    // or empty `content`.
+    let auto_routed = at.model == OPENROUTER_DEFAULT_MODEL;
     let reasoning = openrouter.then_some(if auto_routed {
         ReasoningParam {
             enabled: None,
@@ -388,209 +427,167 @@ pub(super) fn chat_once(
     } else {
         max_tokens
     };
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let prompt_bytes = system.len() + user.len();
-    tracing::debug!(
-        model = %cfg.model,
-        url = %url,
-        prompt_bytes,
-        "LLM request\n--- system ---\n{system}\n--- user ---\n{user}",
-    );
-    // One line per call at info, whatever the outcome: what was sent (size),
-    // what came back (tokens), and how long it took. A p90 that is "the LLM"
-    // is only actionable when the log says which calls were slow and why —
-    // a 50k-token prompt and a queued request look the same from outside.
-    let started = std::time::Instant::now();
-    let call_log = |outcome: &str, usage: Option<&Usage>| {
-        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match usage {
-            Some(u) => tracing::info!(
-                model = %cfg.model,
-                endpoint = %cfg.base_url,
-                prompt_bytes,
-                prompt_tokens = u.prompt_tokens,
-                completion_tokens = u.completion_tokens,
-                latency_ms,
-                outcome,
-                "LLM call"
-            ),
-            None => tracing::info!(
-                model = %cfg.model,
-                endpoint = %cfg.base_url,
-                prompt_bytes,
-                latency_ms,
-                outcome,
-                "LLM call"
-            ),
-        }
-    };
-    let post =
-        |priority: Option<u8>| -> std::result::Result<reqwest::blocking::Response, CallError> {
-            let body = ChatRequest {
-                model: cfg.model,
-                messages: [
-                    ChatMessage {
-                        role: "system",
-                        content: system,
-                    },
-                    ChatMessage {
-                        role: "user",
-                        content: user,
-                    },
-                ],
-                temperature: 0.0,
-                max_tokens,
-                stream: false,
-                chat_template_kwargs: (!openrouter).then_some(ChatTemplateKwargs {
-                    enable_thinking: false,
-                }),
-                reasoning,
-                priority,
-            };
-            // Per request, not per client: the client is shared across the chain
-            // and its own timeout is the origin's, which a hosted fallback outlives.
-            let mut req = client.post(&url).json(&body).timeout(timeout);
-            if let Some(key) = cfg.api_key.filter(|k| !k.is_empty()) {
-                req = req.bearer_auth(key);
-            }
-            req.send()
-                .with_context(|| format!("posting to {url}"))
-                .map_err(CallError::Transport)
-        };
-    // Every attempt ends in exactly one call line: content, or an error with
-    // the outcome it is logged under.
-    let attempt = || -> std::result::Result<(String, Option<Usage>), (CallError, String)> {
-        let transport = |e: CallError| {
-            let timed_out = matches!(&e, CallError::Transport(t)
-                if t.root_cause().downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout));
-            let outcome = if timed_out {
-                "timeout"
-            } else {
-                "transport-error"
-            };
-            (e, outcome.to_owned())
-        };
-        let bad_reply = |e: anyhow::Error| (CallError::BadReply(e), "bad-reply".to_owned());
-        // The queue priority goes only to our own vLLM (OpenRouter does not know
-        // the field), and only when it says something: 0 is vLLM's default.
-        let mut priority = (!openrouter && priority > 0).then_some(priority);
-        let mut resp = post(priority).map_err(transport)?;
-        if priority.is_some() && resp.status() == reqwest::StatusCode::BAD_REQUEST {
-            // A vLLM not started with `--scheduling-policy priority` refuses any
-            // non-zero priority outright. That is a deployment mismatch, not a
-            // reason to give up on the sample — and certainly not one to fall
-            // over to a paid endpoint for — so the request goes again without
-            // it. Any other 400 is the usual bad request.
-            let raw = resp.text().unwrap_or_default();
-            if !raw.contains("priority") {
-                return Err((
-                    CallError::BadReply(anyhow!(
-                        "LLM endpoint returned 400 Bad Request: {:?}",
-                        body_snippet(raw.trim())
-                    )),
-                    "http-400".to_owned(),
-                ));
-            }
-            tracing::warn!(
-                endpoint = %cfg.base_url,
-                "LLM endpoint refused the request priority (not running \
-                 --scheduling-policy priority); resending without it"
-            );
-            priority = None;
-            resp = post(priority).map_err(transport)?;
-        }
-        // 5xx, 408 and 429 are the endpoint's problem (unhealthy); any other
-        // 4xx is ours (bad request or auth). On a 4xx the body is the whole diagnosis — an over-budget
-        // prompt, an unknown model and a rejected key all arrive as a bare
-        // 400/404/401, and the endpoint explained which in the body.
-        let status = resp.status();
-        if !status.is_success() {
-            let raw = resp.text().unwrap_or_default();
-            let e = anyhow!(
-                "LLM endpoint returned {status}: {:?}",
-                body_snippet(raw.trim())
-            );
-            // 408 and 429 are the endpoint shedding load, not our request
-            // being wrong: count them against its health like a 5xx.
-            let e = if status.is_server_error()
-                || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                CallError::Transport(e)
-            } else {
-                CallError::BadReply(e)
-            };
-            return Err((e, format!("http-{}", status.as_u16())));
-        }
-        let html_content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("text/html"));
-        // Buffer the body as text before parsing so an undecodable reply can
-        // show what the endpoint actually sent (empty body, an SSE stream, a
-        // proxy's HTML error page, a "model loading" notice) instead of a bare
-        // serde position. A read failure is a dropped connection.
-        let raw = resp
-            .text()
-            .with_context(|| format!("reading response body from {url}"))
-            .map_err(|e| transport(CallError::Transport(e)))?;
-        // A 200 carrying an HTML page means the base URL points at a web UI (a
-        // dashboard, a reverse-proxy landing page), not an OpenAI-compatible
-        // API. Say so plainly rather than as a serde error over markup.
-        if html_content_type || raw.trim_start().starts_with('<') {
-            return Err(bad_reply(anyhow!(
-                "endpoint at {url} returned an HTML page, not JSON — the base URL \
-                 likely points at a web UI, not an OpenAI-compatible API; body \
-                 starts: {:?}",
-                body_snippet(&raw),
-            )));
-        }
-        let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
-            bad_reply(anyhow!(
-                "decoding LLM response ({} bytes): {e}; body starts: {:?}",
-                raw.len(),
-                body_snippet(&raw),
-            ))
-        })?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.text())
-            .unwrap_or_default();
-        Ok((content, parsed.usage))
-    };
-    match attempt() {
-        Ok((content, usage)) => {
-            call_log("ok", usage.as_ref());
-            tracing::debug!(model = %cfg.model, "LLM response\n{content}");
-            Ok(content)
-        }
-        Err((e, outcome)) => {
-            call_log(&outcome, None);
-            Err(e)
-        }
+    ChatRequest {
+        model: at.model,
+        messages: [
+            ChatMessage {
+                role: "system",
+                content: system,
+            },
+            ChatMessage {
+                role: "user",
+                content: user,
+            },
+        ],
+        temperature: 0.0,
+        max_tokens,
+        stream: false,
+        chat_template_kwargs: (!openrouter).then_some(ChatTemplateKwargs {
+            enable_thinking: false,
+        }),
+        reasoning,
+        // OpenRouter does not know the field, and 0 is vLLM's default, so it
+        // is sent only when it says something to a server that reads it.
+        priority: (!openrouter && priority > 0).then_some(priority),
     }
 }
 
-/// Lightweight health probe: `GET {base}/models` (the standard OpenAI listing,
-/// which vLLM answers when the model is loaded). Healthy iff *some* endpoint in
-/// the failover list returns 2xx — one reachable grader is all the pass needs,
-/// so a dead primary behind a live fallback must not gate the whole scan.
-pub(super) fn probe_endpoint(cfg: &InterpretConfig) -> bool {
-    let Ok(client) = http_client() else {
-        return false;
-    };
-    let timeout = cfg.timeout.min(HEALTH_PROBE_TIMEOUT);
-    cfg.attempts().iter().any(|at| {
-        let url = format!("{}/models", at.base_url.trim_end_matches('/'));
-        let mut req = client.get(&url).timeout(timeout);
+/// POST `body` and return the endpoint's success response. A server that
+/// refuses the queue priority gets the request once more without it; any
+/// other non-2xx status is classified as the endpoint's fault or ours.
+fn post(
+    client: &Client,
+    at: Attempt<'_>,
+    url: &str,
+    timeout: Duration,
+    body: &mut ChatRequest<'_>,
+) -> std::result::Result<Response, Failure> {
+    let send = |body: &ChatRequest<'_>| {
+        // Per request, not per client: the client is shared across the chain
+        // and its own timeout is the origin's, which a hosted fallback outlives.
+        let mut req = client.post(url).json(body).timeout(timeout);
         if let Some(key) = at.api_key.filter(|k| !k.is_empty()) {
             req = req.bearer_auth(key);
         }
-        req.send().is_ok_and(|r| r.status().is_success())
-    })
+        req.send()
+            .with_context(|| format!("posting to {url}"))
+            .map_err(transport)
+    };
+    let mut resp = send(body)?;
+    if body.priority.is_some() && resp.status() == StatusCode::BAD_REQUEST {
+        // A vLLM not started with `--scheduling-policy priority` refuses any
+        // non-zero priority outright. That is a deployment mismatch, not a
+        // reason to give up on the sample — and certainly not one to fall
+        // over to a paid endpoint for — so the request goes again without
+        // it. Any other 400 is the usual bad request.
+        let raw = resp.text().unwrap_or_default();
+        if !raw.contains("priority") {
+            return Err((
+                CallError::BadReply(anyhow!(
+                    "LLM endpoint returned 400 Bad Request: {:?}",
+                    body_snippet(raw.trim())
+                )),
+                "http-400".to_owned(),
+            ));
+        }
+        tracing::warn!(
+            endpoint = %at.base_url,
+            "LLM endpoint refused the request priority (not running \
+             --scheduling-policy priority); resending without it"
+        );
+        body.priority = None;
+        resp = send(body)?;
+    }
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    // On a 4xx the body is the whole diagnosis — an over-budget prompt, an
+    // unknown model and a rejected key all arrive as a bare 400/404/401, and
+    // the endpoint explained which in the body.
+    let raw = resp.text().unwrap_or_default();
+    let e = anyhow!(
+        "LLM endpoint returned {status}: {:?}",
+        body_snippet(raw.trim())
+    );
+    // 5xx, 408 and 429 are the endpoint failing or shedding load, so they
+    // count against its health; any other 4xx is our request being wrong.
+    let e = if status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+    {
+        CallError::Transport(e)
+    } else {
+        CallError::BadReply(e)
+    };
+    Err((e, format!("http-{}", status.as_u16())))
+}
+
+/// A transport failure, labelled `timeout` when the request ran out of time
+/// and `transport-error` otherwise.
+fn transport(e: anyhow::Error) -> Failure {
+    let timed_out = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    });
+    let outcome = if timed_out {
+        "timeout"
+    } else {
+        "transport-error"
+    };
+    (CallError::Transport(e), outcome.to_owned())
+}
+
+/// Read a success response and return the reply text with the endpoint's
+/// token accounting.
+fn decode(resp: Response, url: &str) -> std::result::Result<(String, Option<Usage>), Failure> {
+    let bad_reply = |e: anyhow::Error| (CallError::BadReply(e), "bad-reply".to_owned());
+    let html_content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/html"));
+    // Buffer the body as text before parsing so an undecodable reply can
+    // show what the endpoint actually sent (empty body, an SSE stream, a
+    // proxy's HTML error page, a "model loading" notice) instead of a bare
+    // serde position. A read failure is a dropped connection.
+    let raw = resp
+        .text()
+        .with_context(|| format!("reading response body from {url}"))
+        .map_err(transport)?;
+    // A 200 carrying an HTML page means the base URL points at a web UI (a
+    // dashboard, a reverse-proxy landing page), not an OpenAI-compatible
+    // API. Say so plainly rather than as a serde error over markup.
+    if html_content_type || raw.trim_start().starts_with('<') {
+        return Err(bad_reply(anyhow!(
+            "endpoint at {url} returned an HTML page, not JSON — the base URL \
+             likely points at a web UI, not an OpenAI-compatible API; body \
+             starts: {:?}",
+            body_snippet(&raw),
+        )));
+    }
+    let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
+        bad_reply(anyhow!(
+            "decoding LLM response ({} bytes): {e}; body starts: {:?}",
+            raw.len(),
+            body_snippet(&raw),
+        ))
+    })?;
+    // The answer is `content`; a thinking model that left it empty may have
+    // put the answer in `reasoning_content` instead.
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| {
+            c.message
+                .content
+                .filter(|s| !s.trim().is_empty())
+                .or(c.message.reasoning_content)
+        })
+        .unwrap_or_default();
+    Ok((content, parsed.usage))
 }
 
 /// Discover the model to grade with by listing `{base}/models` (the standard
@@ -610,7 +607,7 @@ pub fn discover_model(base_url: &str, api_key: Option<&str>) -> Result<String> {
     let client = http_client()?;
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let key = api_key.filter(|k| !k.is_empty());
-    let mut req = client.get(&url).timeout(HEALTH_PROBE_TIMEOUT);
+    let mut req = client.get(&url).timeout(MODEL_LIST_TIMEOUT);
     if let Some(key) = key {
         req = req.bearer_auth(key);
     }
@@ -667,7 +664,7 @@ pub(super) fn status_hint(status: reqwest::StatusCode, base_url: &str, keyed: bo
 /// Infer a model's parameter count in billions from its id, for choosing the
 /// largest of several served models. Reads size tokens like `27B`, `8b`, or MoE
 /// `8x7B` (→ 56); a bare `1.5B` counts as 1.5. Version numbers not followed by a
-/// `b` suffix (the `3.8` in `Qwen3.8-27B`) are ignored. `None` when the id
+/// `b` suffix (the `3.1` in `Llama-3.1-70B`) are ignored. `None` when the id
 /// encodes no size (`gpt-4`, `phi-3-mini`).
 pub(super) fn param_billions(id: &str) -> Option<f64> {
     let bytes = id.as_bytes();
@@ -703,7 +700,7 @@ pub(super) fn param_billions(id: &str) -> Option<f64> {
 /// Parse the decimal starting at `start` (digits, with an optional single `.`
 /// fraction). Returns the value and the index just past it. The caller
 /// guarantees `bytes[start]` is a digit, so `end > start`.
-pub(super) fn parse_decimal(bytes: &[u8], start: usize) -> (f64, usize) {
+fn parse_decimal(bytes: &[u8], start: usize) -> (f64, usize) {
     let mut end = start;
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         end += 1;
@@ -727,14 +724,14 @@ pub(super) fn parse_decimal(bytes: &[u8], start: usize) -> (f64, usize) {
 // analysis). Editing the prompt, the model, or the analysis invalidates it; a
 // plain rebuild does not. Only successful verdicts are cached — failures retry.
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct CachedVerdict {
-    pub(super) grade: String,
-    pub(super) reason: String,
+#[derive(Serialize, Deserialize)]
+struct CachedVerdict {
+    grade: String,
+    reason: String,
 }
 
 /// SHA-256 of the exact prompt (model + system + user), as a hex string. The
-/// system prompt is part of the key, so editing [`SYSTEM_PROMPT`] keys fresh
+/// system prompt is part of the key, so editing `SYSTEM_PROMPT` keys fresh
 /// verdicts rather than replaying ones graded under a different framing.
 pub(super) fn prompt_hash(system: &str, model: &str, user: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -754,17 +751,50 @@ pub(crate) fn cache_base() -> Option<PathBuf> {
     Some(crate::cache_dir()?.join("interpret"))
 }
 
-/// Cache file path for a prompt hash, or `None` when no cache dir is available.
-pub(super) fn cache_path(hash: &str) -> Option<PathBuf> {
-    Some(cache_base()?.join(format!("{hash}.json")))
+/// Where the verdict for this prompt is cached, and the verdict when one is.
+/// The path is `None` when caching is off or no cache directory exists.
+///
+/// Honors cleave's `CLEAVE_SKIP_CACHE=1` through cleave's own resolver, so a
+/// benchmark or prompt-tuning run re-queries the LLM (and writes nothing)
+/// exactly when the same switch makes cleave re-analyze.
+pub(super) fn cached_verdict(
+    cfg: &InterpretConfig,
+    user: &str,
+) -> (Option<PathBuf>, Option<(LlmGrade, String)>) {
+    if cleave::cache::skip_cache() {
+        return (None, None);
+    }
+    let hash = prompt_hash(&cfg.system_prompt, &cfg.cache_model_id(), user);
+    let Some(path) = cache_base().map(|base| base.join(format!("{hash}.json"))) else {
+        return (None, None);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Some(path), None),
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "LLM verdict cache unreadable; re-querying");
+            return (Some(path), None);
+        }
+    };
+    let hit = serde_json::from_slice::<CachedVerdict>(&bytes)
+        .ok()
+        .and_then(|v| Some((LlmGrade::parse(&v.grade)?, v.reason)));
+    if hit.is_none() {
+        tracing::debug!(path = %path.display(), "LLM verdict cache entry is malformed; re-querying");
+    }
+    (Some(path), hit)
 }
 
 /// Atomic cache write (temp file + rename).
-pub(super) fn cache_put(path: &Path, verdict: &CachedVerdict) -> Result<()> {
+pub(super) fn cache_put(path: &Path, grade: LlmGrade, reason: &str) -> Result<()> {
     use std::io::Write;
     let parent = path.parent().context("cache path has no directory")?;
     std::fs::create_dir_all(parent).context("creating the cache directory")?;
-    let json = serde_json::to_vec(verdict).context("serializing the verdict")?;
+    let verdict = CachedVerdict {
+        grade: grade.as_str().to_string(),
+        reason: reason.to_string(),
+    };
+    let json = serde_json::to_vec(&verdict).context("serializing the verdict")?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent).context("creating a temporary file")?;
     tmp.write_all(&json).context("writing the verdict")?;
     tmp.persist(path).context("moving the verdict into place")?;
@@ -773,10 +803,10 @@ pub(super) fn cache_put(path: &Path, verdict: &CachedVerdict) -> Result<()> {
 
 /// Longest body prefix included verbatim when a reply fails to decode — enough
 /// to recognize an HTML page or a stray streaming chunk without flooding the log.
-pub(super) const BODY_SNIPPET: usize = 512;
+const BODY_SNIPPET: usize = 512;
 
 /// A char-boundary-safe leading slice of an undecodable body, for diagnostics.
-pub(super) fn body_snippet(s: &str) -> &str {
+fn body_snippet(s: &str) -> &str {
     // A char boundary ≤ len, so the slice never misses.
     s.get(..s.floor_char_boundary(BODY_SNIPPET)).unwrap_or(s)
 }

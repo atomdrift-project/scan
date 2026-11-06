@@ -1,14 +1,13 @@
 //! The fixed feature names this extractor writes, and the metric renames
-//! that keep older specs readable.
+//! that keep reports from older cleave versions readable.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+use super::spec::{INTENT_GAP_CATEGORIES, KEY_METRICS, LOGIC_GAP_CATEGORIES};
 
 /// Group 6b's format groups: filefacts' groups in label order, the order
-/// collimator lays them out in. `unknown` is left out; a file with no
+/// training lays them out in. `unknown` is left out; a file with no
 /// identified type counts toward `format:unknown_file_fraction` instead.
 pub(super) static FORMAT_GROUPS: LazyLock<Vec<filefacts::Group>> = LazyLock::new(|| {
     let mut groups: Vec<_> = filefacts::Group::ALL
@@ -20,7 +19,7 @@ pub(super) static FORMAT_GROUPS: LazyLock<Vec<filefacts::Group>> = LazyLock::new
     groups
 });
 
-/// Expected ghosts (v16 group 23).
+/// Expected ghosts (group 23).
 pub(super) const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
     (
         "elf",
@@ -36,7 +35,7 @@ pub(super) const EXPECTED_GHOSTS: &[(&str, &[&str])] = &[
         &[
             // Names no trait, so this feature is 1 for every JavaScript file.
             // Deployed specs carry it by this name; replace it only at a
-            // retrain, in lockstep with collimator.
+            // retrain, in lockstep with the training extractor.
             "micro-behaviors/javascript/async",
             "metadata/package/versioning",
         ],
@@ -89,8 +88,7 @@ pub(super) const AGG_FEATURES: &[&str] = &[
     "agg:top1_file_hostile_density_sum",
     "agg:top1_file_suspicious_category_breadth_sum",
     "agg:top1_file_hostile_category_breadth_sum",
-    // Size-invariant crit-tier severity fractions (collimator's
-    // include_severity_fractions group).
+    // Size-invariant crit-tier severity fractions.
     "agg:confidence_mean",
     "agg:confidence_std",
     "agg:confidence_skew",
@@ -127,7 +125,7 @@ pub(super) const AGG_FEATURES: &[&str] = &[
     "agg:suspicious_2level_breadth",
     "agg:hostile_2level_breadth",
     "agg:objectives_breadth",
-    // From here to `static_signed_file_fraction`, collimator computes these
+    // From here to `static_signed_file_fraction`, training computes these
     // and scan does not: they are declared so a spec carrying them is not
     // reported as degraded, and extract as zero.
     "agg:kill_chain_span",
@@ -242,8 +240,7 @@ pub(super) const TAIL_FEATURES: &[&str] = &[
     "struct:silent_packer_signal",
 ];
 
-/// Group 24: textenc — collimator's `_apply_text_encoding_features` ratios
-/// over a file's strings. The compact report carries no strings, so these
+/// Group 24: textenc — text-encoding ratios over a file's strings. The compact report carries no strings, so these
 /// always extract as zero; they are declared so a spec carrying them is not
 /// reported as degraded.
 pub(super) const TEXTENC_FEATURES: &[&str] = &[
@@ -334,9 +331,8 @@ pub(super) static FIXED_FEATURE_NAMES: LazyLock<HashSet<String>> = LazyLock::new
     .collect()
 });
 
-// Compatibility aliases for metrics cleave has renamed since August 2026. Keep
-// in sync with collimator.features._METRIC_RENAMES: existing names (even
-// null/zero) win. Keep every entry: hopper keeps reports from every generation.
+// Compatibility aliases for metrics cleave has renamed. Keep in sync with the
+// training extractor's renames: existing names (even null/zero) win. Keep every entry: hopper keeps reports from every generation.
 pub(super) const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("archive", "total_compressed", "archive", "compressed_size"),
     (
@@ -620,9 +616,9 @@ pub(super) const METRIC_RENAMES: &[(&str, &str, &str, &str)] = &[
     ("source", "extract_panic", "source", "extract_panicked"),
 ];
 
-pub(super) type MetricAliasKey = (&'static str, &'static str);
+type MetricAliasKey = (&'static str, &'static str);
 
-// Same equivalence classes/order as collimator: canonical spelling first,
+// Same equivalence classes and order as training: canonical spelling first,
 // then historical names in the table's order. Never overwrite explicit data.
 pub(super) static METRIC_EQUIVALENTS: LazyLock<Vec<Vec<MetricAliasKey>>> = LazyLock::new(|| {
     let renames: HashMap<MetricAliasKey, MetricAliasKey> = METRIC_RENAMES

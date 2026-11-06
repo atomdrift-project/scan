@@ -8,7 +8,7 @@ use std::fmt;
 
 /// An external analysis tool that was not found by filefacts' resolver.
 #[derive(Debug, Clone)]
-pub struct MissingTool {
+pub(crate) struct MissingTool {
     /// The command name (e.g. `"upx"`).
     pub name: &'static str,
     /// What this tool enables (e.g. `"binary disassembly"`).
@@ -32,7 +32,7 @@ impl fmt::Display for MissingTool {
 ///
 /// An empty vec means the environment is fully equipped.
 #[must_use]
-pub fn missing() -> Vec<MissingTool> {
+pub(crate) fn missing() -> Vec<MissingTool> {
     let mut absent: Vec<MissingTool> = TOOLS
         .iter()
         .filter(|&&(name, _)| !tool_available(name))
@@ -56,7 +56,7 @@ pub fn missing() -> Vec<MissingTool> {
 
 /// Returns the canonical names of available external analysis tools.
 ///
-/// Compact, because postdoc's worker sends it on every `/api/next` poll. The
+/// Compact, because a worker may send it on every work poll. The
 /// names are part of hopper's scheduling contract.
 #[must_use]
 pub fn available_names() -> Vec<&'static str> {
@@ -81,8 +81,7 @@ pub fn warn_missing() {
             tool = tool.name,
             purpose = tool.purpose,
             install = tool.install,
-            "required analysis tool not found — {} will fail",
-            tool.purpose,
+            "required analysis tool not found; what it enables will fail",
         );
     }
 }
@@ -91,7 +90,7 @@ pub fn warn_missing() {
 /// that names the tool and provides an install command appropriate for this
 /// operating system.
 #[must_use]
-pub fn enrich_error(err: &anyhow::Error) -> Option<String> {
+pub(crate) fn enrich_error(err: &anyhow::Error) -> Option<String> {
     let msg = format!("{err:#}");
     let lower = msg.to_ascii_lowercase();
     let is_not_found = lower.contains("no such file or directory")

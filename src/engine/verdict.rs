@@ -10,75 +10,66 @@ use cleave::types::CompactTrait;
 use super::{EmbeddedFile, MemberEvals, compact_crit};
 use crate::model::{Classification, Decision, Level, Model};
 
+/// The confidence ladder: `(level, percent)` rungs in ascending level order.
+/// A level takes the percent of the first rung at or above it, so a level
+/// between two rungs reads as the looser one — the pessimistic side.
+///
+/// The rungs are the calibrated deploy grid. `25001`/`25002` (and
+/// `50001`/`50002` for an L50000 grid) are the trait floor's former off-grid
+/// markers (`grid_max + 1/2`); nothing places a verdict there now, but they
+/// stay ranked so a stored level reads as it always did. The `49999` rung
+/// holds the levels between the two grids above their own markers.
+const CONFIDENCE_LADDER: [(u16, u8); 34] = [
+    (0, 100),
+    (1, 99),
+    (2, 98),
+    (3, 97),
+    (4, 96),
+    (5, 95),
+    (10, 94),
+    (20, 93),
+    (30, 92),
+    (40, 91),
+    (50, 90),
+    (60, 89),
+    (70, 88),
+    (80, 87),
+    (90, 86),
+    (100, 85),
+    (200, 82),
+    (300, 80),
+    (500, 78),
+    (1000, 75),
+    (2000, 66),
+    (5000, 54),
+    (7500, 49),
+    (10000, 45),
+    (15000, 38),
+    (20000, 33),
+    (25000, 29),
+    (25001, 28),
+    (25002, 27),
+    (49999, 26),
+    (50000, 17),
+    (50001, 16),
+    (50002, 15),
+    (u16::MAX, 15),
+];
+
 /// Map a level marker (`ml.lvl`) to a pessimistic human-facing confidence percent.
 ///
 /// This is a display/export confidence, not the model probability (`ml.prob`) and
-/// not a posterior probability. The table is intentionally integer-valued and
-/// strictly separated across the calibrated deploy grid. `25001`/`25002` (and
-/// `50001`/`50002` for an L50000 grid) are the trait floor's former off-grid
-/// markers (`grid_max + 1/2`); nothing places a verdict there now, but they
-/// stay ranked so a stored level reads as it always did.
+/// not a posterior probability. The ladder is intentionally integer-valued and
+/// strictly separated across the calibrated deploy grid.
 #[must_use]
-pub const fn level_confidence(level: Level) -> Option<u8> {
+pub(crate) fn level_confidence(level: Level) -> Option<u8> {
     match level {
         Level::Manual => None,
         Level::Clean => Some(0),
-        Level::At(0) => Some(100),
-        Level::At(1) => Some(99),
-        Level::At(2) => Some(98),
-        Level::At(3) => Some(97),
-        Level::At(4) => Some(96),
-        Level::At(5) => Some(95),
-        Level::At(10) => Some(94),
-        Level::At(20) => Some(93),
-        Level::At(30) => Some(92),
-        Level::At(40) => Some(91),
-        Level::At(50) => Some(90),
-        Level::At(60) => Some(89),
-        Level::At(70) => Some(88),
-        Level::At(80) => Some(87),
-        Level::At(90) => Some(86),
-        Level::At(100) => Some(85),
-        Level::At(200) => Some(82),
-        Level::At(300) => Some(80),
-        Level::At(500) => Some(78),
-        Level::At(1000) => Some(75),
-        Level::At(2000) => Some(66),
-        Level::At(5000) => Some(54),
-        Level::At(7500) => Some(49),
-        Level::At(10000) => Some(45),
-        Level::At(15000) => Some(38),
-        Level::At(20000) => Some(33),
-        Level::At(25000) => Some(29),
-        Level::At(25001) => Some(28),
-        Level::At(25002) => Some(27),
-        Level::At(50000) => Some(17),
-        Level::At(50001) => Some(16),
-        Level::At(50002) => Some(15),
-        Level::At(n) if n > 50002 => Some(15),
-        Level::At(n) if n > 25002 => Some(26),
-        Level::At(n) if n > 20000 => Some(29),
-        Level::At(n) if n > 15000 => Some(33),
-        Level::At(n) if n > 10000 => Some(38),
-        Level::At(n) if n > 7500 => Some(45),
-        Level::At(n) if n > 5000 => Some(49),
-        Level::At(n) if n > 2000 => Some(54),
-        Level::At(n) if n > 1000 => Some(66),
-        Level::At(n) if n > 500 => Some(75),
-        Level::At(n) if n > 300 => Some(78),
-        Level::At(n) if n > 200 => Some(80),
-        Level::At(n) if n > 100 => Some(82),
-        Level::At(n) if n > 90 => Some(85),
-        Level::At(n) if n > 80 => Some(86),
-        Level::At(n) if n > 70 => Some(87),
-        Level::At(n) if n > 60 => Some(88),
-        Level::At(n) if n > 50 => Some(89),
-        Level::At(n) if n > 40 => Some(90),
-        Level::At(n) if n > 30 => Some(91),
-        Level::At(n) if n > 20 => Some(92),
-        Level::At(n) if n > 10 => Some(93),
-        Level::At(n) if n > 5 => Some(94),
-        Level::At(_) => Some(95),
+        Level::At(n) => {
+            let rung = CONFIDENCE_LADDER.partition_point(|&(top, _)| top < n);
+            CONFIDENCE_LADDER.get(rung).map(|&(_, percent)| percent)
+        }
     }
 }
 
@@ -239,44 +230,39 @@ pub(super) fn worst_member_floor(evals: &MemberEvals) -> Option<FloorDecision> {
 ///
 /// One anchor is not enough. A single crit-5 is one witness however many
 /// crit-4s sit beside it, and a single-anchor arm marks model-clean legitimate
-/// packages hostile on one trait that describes the package's own function:
-/// `ansible-core` on a PowerShell base64-exec trait — which is how its Windows
-/// connection plugin works — with `confident_hostile=1, severe=3, families=3`,
-/// and Cherry Studio (`v2.0.9.tar.gz`) at `1/4/4`. In both, the crit-4s describe
-/// the same legitimate behavior from other angles.
+/// software hostile on one trait that describes its own function — a remote
+/// management tool's encoded-command execution, say — while the crit-4s beside
+/// it describe that same legitimate behavior from other angles.
 ///
-/// The cost is real malware that carries a single hostile trait beside
-/// supporting crit-4s (`rex-powershell`, `openclaude`, and a rhadamanthys
-/// coinminer each have exactly one). Re-check those alongside the missed-sample
-/// pool before relaxing this.
+/// The cost is malware that carries a single hostile trait beside supporting
+/// crit-4s: the floor leaves it to the model and to the suspicious arm.
+/// Relaxing this trades that recall for false positives on legitimate tools.
 const TRAIT_FLOOR_HOSTILE_CRIT5: u32 = 2;
 
 /// Confident severe findings (crit-5 *or* crit-4) the hostile arm needs in
-/// total. Rejects the thin pair that family diversity alone admits: a
-/// ScreenConnect RMM signature plus `pe-large-without-material-section` is two
-/// findings in two families, but a generic PE-layout anomaly is not evidence of
-/// malice, and that pair was marking a stock `libwebp.dll` hostile.
+/// total. Rejects the thin pair that family diversity alone admits: a tool
+/// signature plus a generic binary-layout anomaly is two findings in two
+/// families, but a layout anomaly is not evidence of malice, and such pairs
+/// fire on ordinary libraries.
 const TRAIT_FLOOR_HOSTILE_SEVERE: u32 = 3;
 
 /// Distinct trait families the hostile arm's severe findings must span.
 /// Counting alone treats one behavior described three ways as three independent
-/// witnesses: the static-keys false positive presented as
-/// `rust-inline-hook-hijack`, `rust-hook-byte-copy`, and
-/// `rust-mprotect-hook-patch` — three findings, one directory, overlapping
-/// regexes over the same two tokens. Corroboration has to come from somewhere
-/// else in the tree to be corroboration at all.
+/// witnesses: three hook-patching traits in one directory, matching
+/// overlapping patterns over the same tokens, are one finding. Corroboration
+/// has to come from somewhere else in the tree to be corroboration at all.
 ///
 /// Counted over both severe tiers, so crit-5 and crit-4 families together have
 /// to reach it — the same set the arm's `severe()` total draws from.
 ///
 /// Two families is a weak claim when a family is a *kind* of behavior rather
-/// than a technique (see [`TRAIT_FLOOR_FAMILY_DEPTH`]). `PyAutoIt` — a
-/// legitimate AutoIt wrapper — reaches `confident_hostile=4, severe=5,
-/// families=2` on the input-synthesis and window-manipulation traits that are
-/// AutoIt's entire purpose. Three also keeps the arms consistent: the
-/// suspicious arm requires three (see [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`]), and
-/// the hostile arm demanding *less* diversity than the suspicious one would
-/// have no principle behind it.
+/// than a technique (see [`TRAIT_FLOOR_FAMILY_DEPTH`]): a legitimate
+/// automation library fires many confident traits across exactly two kinds of
+/// behavior, input synthesis and window manipulation, because they are its
+/// entire purpose. Three also keeps the arms consistent: the suspicious arm
+/// requires three (see [`TRAIT_FLOOR_SUSPICIOUS_FAMILIES`]), and the hostile
+/// arm demanding *less* diversity than the suspicious one would have no
+/// principle behind it.
 const TRAIT_FLOOR_HOSTILE_FAMILIES: usize = 3;
 
 /// Distinct trait families the suspicious arm's crit-4 findings must span.
@@ -295,16 +281,13 @@ const TRAIT_FLOOR_SUSPICIOUS_FAMILIES: usize = 3;
 /// Two makes a family a *kind* of behavior rather than a technique, so
 /// restating one behavior at different depths cannot corroborate itself. A
 /// deeper family is too fine to be corroboration: at four
-/// (`objectives/evasion/process/hook`), `ansible-core` reaches the hostile arm
-/// with three "independent" families that are all one idea — a PowerShell
-/// base64 decode-and-execute, which is how its Windows connection plugin works,
-/// counted once per subdirectory it is spelled in.
+/// (`objectives/evasion/process/hook`), one idea — an encoded
+/// decode-and-execute — counts once per subdirectory it is spelled in, and
+/// reads as three independent families.
 ///
-/// The cost is the `darkglitch` class of verdict: a Python RAT whose hostile
-/// traits are genuinely distinct capabilities under
-/// `command-and-control/backdoor` (`rat/multi` and `tasking/filesystem`)
-/// collapses to one family here. It is the thing to re-check first if the
-/// missed-sample pool regresses.
+/// The cost: genuinely distinct capabilities under one kind of behavior (two
+/// backdoor capabilities under `command-and-control/backdoor`) collapse to one
+/// family here.
 const TRAIT_FLOOR_FAMILY_DEPTH: usize = 2;
 
 /// The family a finding belongs to: the first [`TRAIT_FLOOR_FAMILY_DEPTH`]
@@ -325,9 +308,9 @@ pub(super) fn trait_family(id: &str) -> &str {
 /// Minimum cleave confidence (`c`) for a finding to count toward the trait floor.
 /// Low-confidence high-crit findings are exactly the incidental ones that fire on
 /// busy benign binaries (e.g. a couple of speculative crit-4s among hundreds of
-/// findings), so the floor only acts on evidence cleave is sure about. At 0.76
-/// the dropper keeps all 4 crit-4s and the PE keeps all 3 crit-5s, while no
-/// /usr/bin benign trips the crit-5 arm.
+/// findings), so the floor only acts on evidence cleave is sure about. The
+/// cut sits below the confidence cleave gives its definite severe matches and
+/// above the speculative ones that system binaries carry.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
 /// Confidence-filtered crit-5/crit-4 tallies, with the trait families each tier
@@ -501,10 +484,9 @@ fn trait_floor(
     // Whether cleave confidently recognized this sample as a named application,
     // library, tool or known dual-use utility. A sample cleave can name is one
     // whose hostile traits are far more likely to be describing the program's
-    // own advertised function: `ansible-core`'s PowerShell base64-exec *is* its
-    // Windows connection plugin, and eight `well-known/app/infrastructure`
-    // Ansible recognizers fire on the same render while the floor promotes it
-    // to hostile on that one trait.
+    // own advertised function: an automation tool's encoded remote command
+    // execution is how it manages hosts, and its own recognizers fire on the
+    // same render.
     let known_software = findings.iter().any(|f| {
         f.confidence >= TRAIT_FLOOR_MIN_CONFIDENCE
             && KNOWN_SOFTWARE_PREFIXES
@@ -625,6 +607,18 @@ pub(super) fn decision_outranks(candidate: &Decision, current: &Decision) -> boo
     }
 }
 
+/// Worst-first order, for sorting: `Less` when `a` outranks `b`, `Equal`
+/// when neither outranks the other.
+pub(super) fn worst_first(a: &Decision, b: &Decision) -> Ordering {
+    if decision_outranks(a, b) {
+        Ordering::Less
+    } else if decision_outranks(b, a) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
 /// The graver of two decisions, for folding: a tie keeps `current`, so the
 /// earliest of equals wins.
 pub(super) fn graver(current: Decision, candidate: Decision) -> Decision {
@@ -692,10 +686,9 @@ mod tests {
             trait_family("objectives/evasion/process/hook/inline::rust-hook-byte-copy"),
         );
         // ...and so does one behavior restated under sibling techniques, which
-        // is what a four-deep family missed: `ansible-core`'s base64
-        // decode-and-execute counted once per subdirectory it was spelled in,
-        // and three such counts cleared a diversity test meant to require three
-        // independent witnesses.
+        // is what a four-deep family misses: one decode-and-execute counted
+        // once per subdirectory it is spelled in, three such counts clearing a
+        // diversity test meant to require three independent witnesses.
         assert_eq!(
             trait_family("objectives/anti-static/obfuscation/string/reconstruct::a"),
             trait_family("objectives/anti-static/obfuscation/eval/scripting::b"),
@@ -705,8 +698,8 @@ mod tests {
             trait_family("objectives/evasion/process/hook/inline::a"),
             trait_family("objectives/supply-chain/install-hook/npm::b"),
         );
-        // The accepted cost: `darkglitch`'s two genuinely distinct backdoor
-        // capabilities share a family, so a verdict resting on that pair
+        // The accepted cost: two genuinely distinct backdoor capabilities
+        // share a family, so a verdict resting on that pair
         // alone does not clear the diversity test. See
         // [`TRAIT_FLOOR_FAMILY_DEPTH`].
         assert_eq!(
@@ -766,9 +759,9 @@ mod tests {
     #[test]
     fn a_crit5_with_one_thin_corroborator_stays_benign() {
         let mut d = benign();
-        // Two findings in two families still falls short of the severe count.
-        // This is the real pair that marked a stock `libwebp.dll` hostile: an
-        // RMM signature plus a generic PE-layout anomaly.
+        // Two findings in two families still falls short of the severe count:
+        // a remote-access signature plus a generic binary-layout anomaly is
+        // the shape ordinary libraries carry.
         let ts = vec![
             finding("command-and-control", 5, 0.9),
             finding("binary-anomaly", 4, 0.97),
@@ -790,11 +783,11 @@ mod tests {
     }
 
     #[test]
-    fn two_families_no_longer_reach_the_hostile_arm() {
+    fn two_families_do_not_reach_the_hostile_arm() {
         // Enough anchors and enough severe findings, but drawn from only two
-        // kinds of behavior — the `PyAutoIt` shape, where input synthesis and
-        // window manipulation are the package's whole purpose. Both arms now ask
-        // for three (see [`TRAIT_FLOOR_HOSTILE_FAMILIES`]).
+        // kinds of behavior — a legitimate automation library whose input
+        // synthesis and window manipulation are its whole purpose. Both arms
+        // ask for three (see [`TRAIT_FLOOR_HOSTILE_FAMILIES`]).
         let mut d = benign();
         let mut ts = spread(5, 0.98, 2);
         ts.extend([finding("area0", 4, 0.94), finding("area1", 4, 0.92)]);
@@ -810,11 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_crit5_beside_crit4s_no_longer_reaches_the_hostile_arm() {
-        // The `rex-powershell` shape, and the one `ansible-core` fired on: a
-        // single crit-5 anchor with two crit-4s beside it. An accepted
-        // regression — see [`TRAIT_FLOOR_HOSTILE_CRIT5`]. It does not go
-        // unremarked, only unblocked: the suspicious arm still has it.
+    fn a_lone_crit5_beside_crit4s_does_not_reach_the_hostile_arm() {
+        // A single crit-5 anchor with two crit-4s beside it: one witness,
+        // described three ways. Deliberate — see [`TRAIT_FLOOR_HOSTILE_CRIT5`].
+        // It does not go unremarked, only unescalated: the suspicious arm
+        // still has it.
         let mut d = benign();
         let mut ts = spread(5, 0.98, 1);
         ts.extend([finding("evasion", 4, 0.8), finding("execution", 4, 0.94)]);
@@ -834,8 +827,8 @@ mod tests {
         apply_trait_floor(&mut unknown, &evidence(), Some(50), 100, "test");
         assert_eq!(unknown.class, Classification::Hostile);
 
-        // ...and the same evidence does not, once it can. Blocking a named
-        // application on evidence this thin is what promoted `ansible-core`.
+        // ...and the same evidence does not, once it can: evidence this thin
+        // against a named application describes what the application does.
         let mut known = benign();
         let mut with_id = evidence();
         with_id.push(cleave::types::CompactTrait {
@@ -1144,6 +1137,88 @@ mod tests {
         for (level, want) in cases {
             assert_eq!(level_confidence(level), want, "level {level:?}");
         }
+    }
+
+    /// The match arms the ladder replaced, kept as the reference it must
+    /// reproduce.
+    const fn level_confidence_arms(level: Level) -> Option<u8> {
+        match level {
+            Level::Manual => None,
+            Level::Clean => Some(0),
+            Level::At(0) => Some(100),
+            Level::At(1) => Some(99),
+            Level::At(2) => Some(98),
+            Level::At(3) => Some(97),
+            Level::At(4) => Some(96),
+            Level::At(5) => Some(95),
+            Level::At(10) => Some(94),
+            Level::At(20) => Some(93),
+            Level::At(30) => Some(92),
+            Level::At(40) => Some(91),
+            Level::At(50) => Some(90),
+            Level::At(60) => Some(89),
+            Level::At(70) => Some(88),
+            Level::At(80) => Some(87),
+            Level::At(90) => Some(86),
+            Level::At(100) => Some(85),
+            Level::At(200) => Some(82),
+            Level::At(300) => Some(80),
+            Level::At(500) => Some(78),
+            Level::At(1000) => Some(75),
+            Level::At(2000) => Some(66),
+            Level::At(5000) => Some(54),
+            Level::At(7500) => Some(49),
+            Level::At(10000) => Some(45),
+            Level::At(15000) => Some(38),
+            Level::At(20000) => Some(33),
+            Level::At(25000) => Some(29),
+            Level::At(25001) => Some(28),
+            Level::At(25002) => Some(27),
+            Level::At(50000) => Some(17),
+            Level::At(50001) => Some(16),
+            Level::At(50002) => Some(15),
+            Level::At(n) if n > 50002 => Some(15),
+            Level::At(n) if n > 25002 => Some(26),
+            Level::At(n) if n > 20000 => Some(29),
+            Level::At(n) if n > 15000 => Some(33),
+            Level::At(n) if n > 10000 => Some(38),
+            Level::At(n) if n > 7500 => Some(45),
+            Level::At(n) if n > 5000 => Some(49),
+            Level::At(n) if n > 2000 => Some(54),
+            Level::At(n) if n > 1000 => Some(66),
+            Level::At(n) if n > 500 => Some(75),
+            Level::At(n) if n > 300 => Some(78),
+            Level::At(n) if n > 200 => Some(80),
+            Level::At(n) if n > 100 => Some(82),
+            Level::At(n) if n > 90 => Some(85),
+            Level::At(n) if n > 80 => Some(86),
+            Level::At(n) if n > 70 => Some(87),
+            Level::At(n) if n > 60 => Some(88),
+            Level::At(n) if n > 50 => Some(89),
+            Level::At(n) if n > 40 => Some(90),
+            Level::At(n) if n > 30 => Some(91),
+            Level::At(n) if n > 20 => Some(92),
+            Level::At(n) if n > 10 => Some(93),
+            Level::At(n) if n > 5 => Some(94),
+            Level::At(_) => Some(95),
+        }
+    }
+
+    /// Every level a marker can hold reads exactly as the match arms read it,
+    /// and confidence never rises as the level loosens.
+    #[test]
+    fn the_ladder_reproduces_the_arms_and_is_monotone() {
+        assert_eq!(level_confidence(Level::Manual), None);
+        assert_eq!(level_confidence(Level::Clean), Some(0));
+        let mut previous = u8::MAX;
+        for n in 0..=u16::MAX {
+            let got = level_confidence(Level::At(n));
+            assert_eq!(got, level_confidence_arms(Level::At(n)), "level {n}");
+            let got = got.expect("every placed level has a confidence");
+            assert!(got <= previous, "confidence rose at level {n}");
+            previous = got;
+        }
+        assert!(CONFIDENCE_LADDER.is_sorted_by_key(|&(top, _)| top));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! `--analyze=auto` asks Uplink for verdicts it already holds and analyzes
 //! locally whatever it does not know. The asking goes through
 //! [`crate::corpus_precheck`] — the same batched `/v1/lookup` negotiation, the
-//! same circuit breaker, the same fail-open rule hopper's fleet lookups use —
+//! same circuit breaker, the same fail-open rule hopper lookups use —
 //! armed against Uplink with the subscription token. `local` never asks,
 //! and is the reproducible mode. `remote` sends every artifact to
 //! `/v1/analyze`, uploading local files' contents.
@@ -14,7 +14,7 @@
 //!   [`crate::analysis::SMALL_JOB_MAX_BYTES`] (1 MiB) — below that, analyzing
 //!   is cheaper than asking, and such files are mostly source nobody else has;
 //! - the SHA-256 of a fetched artifact;
-//! - a PURL only when [`public_purl`] says it names a package on a mainstream
+//! - a PURL only when `public_purl` says it names a package on a mainstream
 //!   public registry.
 //!
 //! Never a URL, and never a file's contents except under `remote`. A remote
@@ -36,9 +36,9 @@ use crate::model::{Classification, Level};
 
 /// Uplink's API. Fixed: an override would let any step of a CI job send the
 /// subscription token, and every file it is shown, somewhere else.
-pub const API_URL: &str = "https://api.isotope13.ai";
+pub(crate) const API_URL: &str = "https://api.isotope13.ai";
 
-/// Beamline's upload cap.
+/// The largest body Uplink's `/v1/analyze` accepts.
 const MAX_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
 /// Connect budget: an unreachable API costs one of these per run, then the
 /// breaker opens.
@@ -65,6 +65,10 @@ pub enum Analyze {
 }
 
 /// The mode this run resolved to, and the token `remote` uploads with.
+///
+/// Process-wide: [`resolve`] sets it once, before any scan starts, and the
+/// scan paths read it through [`mode`] and [`analyze`] rather than being
+/// handed it.
 static RESOLVED: OnceLock<(Analyze, Option<cleave::enriched::Token>)> = OnceLock::new();
 
 /// Resolve `--analyze` against whether this run uses Atomdrift Uplink (a held
@@ -94,13 +98,20 @@ pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
     };
     tracing::info!(event = "remote.mode", analyze = ?resolved.0, enriched);
     let mode = resolved.0;
-    // A second resolve in one process (tests) keeps the first answer.
-    let _ = RESOLVED.set(resolved);
+    // Once per process. A second resolve keeps the first answer, which every
+    // scan already started has acted on.
+    if let Err((ignored, _)) = RESOLVED.set(resolved) {
+        tracing::warn!(
+            kept = ?self::mode(),
+            ignored = ?ignored,
+            "--analyze resolved twice in one process; keeping the first"
+        );
+    }
     Ok(mode)
 }
 
 /// The resolved mode; `local` until [`resolve`] runs.
-pub fn mode() -> Analyze {
+pub(crate) fn mode() -> Analyze {
     RESOLVED.get().map_or(Analyze::Local, |(mode, _)| *mode)
 }
 
@@ -144,7 +155,7 @@ pub(crate) fn http() -> Option<&'static reqwest::blocking::Client> {
 /// Anything else (`github`, `generic`, a type we do not know) is judged by
 /// digest or here.
 #[must_use]
-pub fn public_purl(purl: &str) -> bool {
+pub(crate) fn public_purl(purl: &str) -> bool {
     const MAINSTREAM: &[&str] = &[
         "npm",
         "pypi",
@@ -183,7 +194,7 @@ pub fn public_purl(purl: &str) -> bool {
 /// How a remote level grades at this run's operating level — the same rule a
 /// local verdict is graded by. `None` for a verdict with no level.
 #[must_use]
-pub fn classification(fires_at: Level, level: Option<u16>) -> Option<Classification> {
+pub(crate) fn classification(fires_at: Level, level: Option<u16>) -> Option<Classification> {
     match fires_at {
         Level::Manual => None,
         Level::Clean => Some(Classification::Benign),
@@ -369,8 +380,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
             serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v.get("status").is_some())
         })
         .context("Uplink's analysis stream ended without an answer")?;
-    let (sha, verdict) =
-        crate::corpus_precheck::analyzed_verdict(&answer).map_err(anyhow::Error::msg)?;
+    let (sha, verdict) = crate::corpus_precheck::analyzed_verdict(&answer)?;
     if let Some(body) = &body {
         let sent = format!("{:x}", Sha256::digest(body));
         if sent != sha {

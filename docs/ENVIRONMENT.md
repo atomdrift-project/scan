@@ -11,7 +11,8 @@ does not parse is a startup error, not a silent default.
 | --- | --- |
 | `SCAN_HOPPER` | `--hopper` |
 | `SCAN_FOLLOW` | `--follow` |
-| `ATOMDRIFT_UPLINK` | `--uplink` (shared with cleave and isomer; legacy alias: `ATOMDRIFT_ENRICHED`) |
+| `SCAN_REGISTRY_MAP` | `--registry-map` |
+| `ATOMDRIFT_UPLINK` | `--uplink`: `1` insists on Atomdrift Uplink, `0` keeps the open-source rules even when a token is held. Shared with cleave, which also accepts the older spelling `ATOMDRIFT_ENRICHED` when this one is unset. |
 
 ## LLM second opinion
 
@@ -32,7 +33,7 @@ does not parse is a startup error, not a silent default.
 | `SCAN_NO_ANALYSIS_CACHE` | `1` disables every analysis cache in the stack (scan, cleave, filefacts, stng) while keeping compiled rules, for honest benchmarks. |
 | `SCAN_NO_UPDATE_CHECK` | `1` skips the once-a-day check for a newer release. |
 | `SCAN_NO_UPLOAD` | `1` disables CLI result and artifact uploads; Hopper corpus lookups continue. |
-| `CLEAVE_RAYON_THREADS` | Width of the analysis thread pool. Default: the physical core count. |
+| `CLEAVE_RAYON_THREADS` | Width of the analysis thread pool. Default: the physical core count; on x86-64 hosts with SMT, every logical CPU below 8 cores and half again the physical count from 8 up. |
 | `CLEAVE_TRAITS_DIR` | Read traits from this directory instead of the installed ones (shared with cleave). |
 | `RUST_LOG` | Log filter, e.g. `scan=debug`. |
 | `MALLOC_CONF` | Not read for configuration; on FreeBSD, scan warns about an option known to break allocation. |

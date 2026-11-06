@@ -6,8 +6,9 @@
 //! routes.
 //!
 //! Filters live as `<kind>-<tier>.adbl` files, with a `bloom.toml` manifest, in
-//! `<data_dir>/atomdrift/scan/bloom`, which the updater fills. Never the working directory: a `bloom/` there could bless
-//! the very files being scanned.
+//! `<data_dir>/atomdrift/scan/bloom`, which the updater fills. Never the
+//! working directory: a `bloom/` there could bless the very files being
+//! scanned.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -54,7 +55,7 @@ pub fn global() -> Option<Arc<Lookup>> {
 /// Reload the installed bundle, if one was published: a long-lived process
 /// picks up refreshed filters without a restart. A probe already holding the
 /// old bundle finishes with it.
-pub fn reload() {
+pub(crate) fn reload() {
     if global().is_some() {
         set_global(Arc::new(Lookup::load()));
         tracing::info!("bloom filters reloaded");
@@ -100,21 +101,17 @@ impl Lookup {
         };
         let mut lookup = Self::load_from(&primary);
         match crate::nsrl_repo::install_dir() {
-            Ok(nsrl) => lookup.attach_nsrl(&primary, &nsrl),
+            Ok(nsrl) => lookup.attach_nsrl(&nsrl),
             Err(error) => tracing::warn!(error = format!("{error:#}"), "no NSRL filter"),
         }
         lookup
     }
 
-    fn attach_nsrl(&mut self, primary: &Path, nsrl: &Path) {
+    fn attach_nsrl(&mut self, nsrl: &Path) {
         // NSRL may bless only while our own SHA-256 revocation slot is loaded.
         // Losing the daily bundle must never leave a standalone stale allowlist.
-        let revocations = self.inner.is_active()
-            && matches!(
-                burton::read_manifest(primary),
-                Ok(Some(m)) if m.filter.contains_key("sha256-bad")
-            );
-        if !revocations || !nsrl.join("bloom.toml").is_file() {
+        // An open bundle always has that slot: burton refuses one without it.
+        if !self.inner.is_active() || !nsrl.join(burton::MANIFEST_FILE).is_file() {
             return;
         }
         match crate::nsrl_repo::open(nsrl) {
@@ -125,17 +122,19 @@ impl Lookup {
 
     /// Open a bundle from a specific directory.
     #[must_use]
-    pub fn load_from(dir: &Path) -> Self {
-        use burton::OpenError::Io;
+    pub(crate) fn load_from(dir: &Path) -> Self {
+        use burton::{ManifestError, OpenError};
         use std::io::ErrorKind::NotFound;
-        let manifest = dir.join(burton::MANIFEST_FILE);
         let mut opened = burton::Lookup::open(dir, KEY_SCHEME);
-        // A file that isn't there may be an update between its swap's two
-        // renames: let it finish and look again rather than run without filters.
-        if let Err(Io { source, .. }) = &opened
-            && source.kind() == NotFound
-            && crate::bundle::settle(dir)
-        {
+        // A file that isn't there — the manifest or a filter — may be an
+        // update between its swap's two renames: let it finish and look again
+        // rather than run without filters.
+        let missing = |e: &OpenError| {
+            matches!(e,
+                OpenError::Io { source, .. } | OpenError::Manifest(ManifestError::Io { source, .. })
+                    if source.kind() == NotFound)
+        };
+        if opened.as_ref().is_err_and(missing) && crate::bundle::settle(dir) {
             opened = burton::Lookup::open(dir, KEY_SCHEME);
         }
         match opened {
@@ -147,7 +146,9 @@ impl Lookup {
                 );
                 Self::wrap(inner)
             }
-            Err(Io { path, source }) if source.kind() == NotFound && path == manifest => {
+            Err(OpenError::Manifest(ManifestError::Io { source, .. }))
+                if source.kind() == NotFound =>
+            {
                 tracing::debug!(dir = %dir.display(), "no bloom bundle installed");
                 Self::default()
             }
@@ -164,7 +165,7 @@ impl Lookup {
 
     /// The verdict for one artifact. Supply every key you have: a blessing
     /// needs all of them to agree.
-    pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
+    pub(crate) fn decide(&self, artifact: &Artifact<'_>) -> Decision {
         let primary = self.inner.decide(artifact);
         // Every adverse decision, including an outside claim or a conflict,
         // wins outright over NSRL. Existing primary blessings also stand.
@@ -182,21 +183,21 @@ impl Lookup {
 
     /// Whether this artifact may be skipped.
     #[must_use]
-    pub fn may_skip(&self, artifact: &Artifact<'_>) -> bool {
+    pub(crate) fn may_skip(&self, artifact: &Artifact<'_>) -> bool {
         self.decide(artifact).may_skip()
     }
 
     /// The verdict for a raw PURL, canonicalized on the way in.
     ///
     /// A string that will not normalize is [`Decision::Unknown`].
-    pub fn decide_purl(&self, purl: &str) -> Decision {
+    pub(crate) fn decide_purl(&self, purl: &str) -> Decision {
         purl_key(purl).map_or(Decision::Unknown, |key| {
             self.inner.decide(&Artifact::purl(&key))
         })
     }
 
     /// The verdict for an artifact digest.
-    pub fn decide_sha256(&self, digest: &[u8; 32]) -> Decision {
+    pub(crate) fn decide_sha256(&self, digest: &[u8; 32]) -> Decision {
         self.decide(&Artifact::sha256(digest))
     }
 
@@ -208,26 +209,23 @@ impl Lookup {
     /// as it contributed none at build time.
     pub fn decide_any(&self, purl: Option<&str>, digest: Option<&[u8; 32]>) -> Decision {
         let key = purl.and_then(purl_key);
-        let mut artifact = Artifact::default();
-        if let Some(key) = key.as_deref() {
-            artifact = artifact.and_purl(key);
-        }
-        if let Some(digest) = digest {
-            artifact = artifact.and_sha256(digest);
-        }
-        let primary = self.inner.decide(&artifact);
-        if primary != Decision::Unknown {
-            return primary;
-        }
-        // NSRL contributes to the digest key only. If a caller also supplies a
-        // PURL, that key must independently be vouched by the primary bundle.
-        let purl_good = key
-            .as_deref()
-            .is_none_or(|key| self.inner.may_skip(&Artifact::purl(key)));
-        if purl_good && digest.is_some_and(|digest| self.decide_sha256(digest).may_skip()) {
-            Decision::Skip
-        } else {
-            Decision::Unknown
+        match (key.as_deref(), digest) {
+            // NSRL vouches for digests only, so beside a digest it blesses the
+            // PURL must be vouched for by the primary bundle on its own.
+            (Some(key), Some(digest)) => {
+                match self.inner.decide(&Artifact::purl(key).and_sha256(digest)) {
+                    Decision::Unknown
+                        if self.inner.may_skip(&Artifact::purl(key))
+                            && self.decide_sha256(digest).may_skip() =>
+                    {
+                        Decision::Skip
+                    }
+                    primary => primary,
+                }
+            }
+            (Some(key), None) => self.decide(&Artifact::purl(key)),
+            (None, Some(digest)) => self.decide_sha256(digest),
+            (None, None) => self.decide(&Artifact::default()),
         }
     }
 
@@ -240,7 +238,7 @@ impl Lookup {
     /// Total keys across every loaded filter. Summed into the `ps` banner's
     /// rule tally.
     #[must_use]
-    pub fn rule_count(&self) -> u64 {
+    pub(crate) fn rule_count(&self) -> u64 {
         self.inner.key_count() + self.nsrl.as_ref().map_or(0, burton::Lookup::key_count)
     }
 }
@@ -267,35 +265,22 @@ static STATS: BloomStats = BloomStats {
 
 /// A point-in-time snapshot of the bloom decision tally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BloomCounts {
+pub(crate) struct BloomCounts {
     /// Known-good artifacts skipped without analysis.
-    pub skipped: u32,
+    pub(crate) skipped: u32,
     /// Known-bad artifacts flagged (and still analyzed).
-    pub flagged: u32,
+    pub(crate) flagged: u32,
     /// Artifacts matched only by an outside claim (and still analyzed).
     /// Counted apart from [`Self::flagged`] because the two answer different
     /// questions: how often our own catalogue fired, versus somebody else's.
-    pub sighted: u32,
+    pub(crate) sighted: u32,
     /// Artifacts blessed and claimed at once (should never happen).
-    pub conflicted: u32,
+    pub(crate) conflicted: u32,
     /// Artifacts left unscanned in fast mode (in neither set).
-    pub unscanned: u32,
+    pub(crate) unscanned: u32,
     /// Artifacts analyzed because a filter could not be read when consulted,
     /// so nothing could be blessed.
-    pub unavailable: u32,
-}
-
-impl BloomCounts {
-    /// True when no bloom decisions were recorded.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.skipped == 0
-            && self.flagged == 0
-            && self.sighted == 0
-            && self.conflicted == 0
-            && self.unscanned == 0
-            && self.unavailable == 0
-    }
+    pub(crate) unavailable: u32,
 }
 
 /// Record one decision against the process-wide tally. Called from the gate so
@@ -324,7 +309,7 @@ pub(crate) fn record(decision: Decision, unscanned: bool) {
 
 /// Snapshot the bloom decision tally for reporting.
 #[must_use]
-pub fn counts() -> BloomCounts {
+pub(crate) fn counts() -> BloomCounts {
     BloomCounts {
         skipped: STATS.skipped.load(Ordering::Relaxed),
         flagged: STATS.flagged.load(Ordering::Relaxed),
@@ -381,26 +366,30 @@ mod tests {
         }
     }
 
+    /// An NSRL-shaped bundle: every slot present, only `sha256-good` keyed,
+    /// and every file content-addressed, as Pulsar publishes it.
     fn publish_nsrl(dir: &Path, digests: &[[u8; 32]]) {
         let mut sets = KeySets::new();
         for digest in digests {
             sets.insert(Tier::Good, rec(None, Some(*digest)));
         }
-        let filters: Vec<_> = sets
-            .into_filters_for(1, 1e-9)
-            .unwrap()
-            .into_iter()
-            .filter(|f| f.kind() == burton::Kind::Sha256)
-            .collect();
-        let mut manifest =
-            burton::write_bundle(dir, &filters, "2026-09-01", crate::nsrl_repo::KEY_SCHEME)
-                .unwrap();
+        let mut manifest = burton::write_bundle(
+            dir,
+            &sets.into_filters(1e-9),
+            "2026-09-01",
+            crate::nsrl_repo::KEY_SCHEME,
+        )
+        .unwrap();
         for (stem, entry) in &mut manifest.filter {
             let name = format!("{stem}-{}.adbl", entry.sha256);
             std::fs::rename(dir.join(&entry.file), dir.join(&name)).unwrap();
             entry.file = name;
         }
-        std::fs::write(dir.join("bloom.toml"), toml::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(burton::MANIFEST_FILE),
+            toml::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -419,7 +408,7 @@ mod tests {
         );
         publish_nsrl(nsrl.path(), &[digest(1), digest(2), digest(3), digest(4)]);
         let mut lookup = Lookup::load_from(primary.path());
-        lookup.attach_nsrl(primary.path(), nsrl.path());
+        lookup.attach_nsrl(nsrl.path());
         assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Skip);
         assert!(lookup.may_skip(&Artifact::sha256(&digest(1))));
         assert_eq!(lookup.decide_sha256(&digest(2)), Decision::KnownBad);
@@ -450,12 +439,12 @@ mod tests {
         let nsrl = tempfile::tempdir().unwrap();
         publish_nsrl(nsrl.path(), &[digest(1)]);
         let mut lookup = Lookup::load_from(primary.path());
-        lookup.attach_nsrl(primary.path(), nsrl.path());
+        lookup.attach_nsrl(nsrl.path());
         assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Unknown);
         publish(primary.path(), &[]);
         std::fs::remove_file(primary.path().join("sha256-bad.adbl")).unwrap();
         let mut lookup = Lookup::load_from(primary.path());
-        lookup.attach_nsrl(primary.path(), nsrl.path());
+        lookup.attach_nsrl(nsrl.path());
         assert_eq!(lookup.decide_sha256(&digest(1)), Decision::Unknown);
     }
 
@@ -467,6 +456,13 @@ mod tests {
         assert_eq!(lk.rule_count(), 0);
         assert_eq!(lk.decide_sha256(&digest(1)), Decision::Unknown);
         assert_eq!(lk.decide_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
+        // Nor does a lookup that never loaded anything.
+        let none = Lookup::default();
+        assert_eq!(
+            none.decide_purl("pkg:npm/left-pad@1.3.0"),
+            Decision::Unknown
+        );
+        assert_eq!(none.decide_sha256(&[7u8; 32]), Decision::Unknown);
     }
 
     #[test]
@@ -583,15 +579,5 @@ mod tests {
         let mut unseen = [0u8; 32];
         unseen[0] = 0xab;
         assert_eq!(lk.decide_sha256(&unseen), Decision::Unknown);
-    }
-
-    /// Without filters installed every key is `unknown` — fail closed, never
-    /// an error, so a lookup still answers.
-    #[test]
-    fn filters_absent_reads_unknown() {
-        use crate::bloom_repo::{Decision, Lookup};
-        let lk = Lookup::default();
-        assert_eq!(lk.decide_purl("pkg:npm/left-pad@1.3.0"), Decision::Unknown);
-        assert_eq!(lk.decide_sha256(&[7u8; 32]), Decision::Unknown);
     }
 }

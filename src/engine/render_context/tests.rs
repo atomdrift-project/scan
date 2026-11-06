@@ -649,7 +649,7 @@ fn terminal_fetch_context_puts_provenance_before_each_packages_traits() {
         &ReportIndex::new(&report),
     )
     .expect("hostile dependency is shown");
-    let terminal = crate::deptree::strip_ansi(&terminal);
+    let terminal = crate::output::strip_ansi(&terminal);
     let provenance = terminal.find("dependency from this file").unwrap();
     let finding = terminal.find("dependency package finding").unwrap();
     assert!(provenance < finding);

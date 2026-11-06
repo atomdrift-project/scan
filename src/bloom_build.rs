@@ -121,6 +121,7 @@ pub fn read_pool(reader: impl BufRead) -> Result<(KeySets, PoolStats)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burton::Kind;
 
     const CLEAN: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -156,17 +157,19 @@ mod tests {
         assert_eq!(stats.bad_purl, 1);
         assert_eq!(stats.other_label, 1);
 
-        assert_eq!(sets.counts(Tier::Good), (2, 1), "good purls / shas");
-        assert_eq!(sets.counts(Tier::Bad), (1, 0));
-        assert_eq!(sets.counts(Tier::SightedHostile), (1, 0));
-        assert_eq!(sets.counts(Tier::SightedSuspicious), (1, 0));
+        let counts = |tier| (sets.count(Kind::Purl, tier), sets.count(Kind::Sha256, tier));
+        assert_eq!(counts(Tier::Good), (2, 1), "good purls / shas");
+        assert_eq!(counts(Tier::Bad), (1, 0));
+        assert_eq!(counts(Tier::SightedHostile), (1, 0));
+        assert_eq!(counts(Tier::SightedSuspicious), (1, 0));
     }
 
     #[test]
     fn a_row_with_nothing_to_key_on_is_skipped() {
         let (sets, stats) = read(&[r#"{"label":"good"}"#]);
         assert_eq!(stats.records, 1);
-        assert_eq!(sets.counts(Tier::Good), (0, 0));
+        assert_eq!(sets.count(Kind::Purl, Tier::Good), 0);
+        assert_eq!(sets.count(Kind::Sha256, Tier::Good), 0);
     }
 
     #[test]

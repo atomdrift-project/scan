@@ -1,4 +1,5 @@
-//! Validation command support.
+//! `atomscan validate`: the model bundle and a benign fixture corpus, as a
+//! deploy gate.
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -14,25 +15,71 @@ const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
 
 /// Run validation: model loading, feature-layout checks, and benign fixture inference.
 ///
-/// The analyzed corpus mirrors the Atomdrift model false-positive gate: common
-/// platform utilities plus every file in the cleave traits `testdata/does-nothing`
-/// tree. Full cleave trait-rule validation remains the job of `cleave validate`;
+/// The analyzed corpus mirrors the model false-positive gate: common platform
+/// utilities plus every file in the cleave traits `testdata/does-nothing` tree.
+/// Full cleave trait-rule validation remains the job of `cleave validate`;
 /// running it here as a second uncached pass made this command too slow for a
 /// local deploy/pre-commit gate.
+///
+/// # Errors
+/// When the model bundle is unusable or degraded, a fixture cannot be
+/// analyzed, or any fixture grades hostile.
 pub fn run(config: &ScanConfig) -> Result<()> {
-    // Model validation is trait-independent: load the model and every specialist
-    // and reject a structurally incompatible bundle deterministically, before any
-    // trait corpus is touched or any file is analyzed.
+    let model = load_model(config)?;
+    check_gate_prefixes();
+
+    let targets = collect_targets()?;
+    if targets.is_empty() {
+        anyhow::bail!("no benign fixture targets found");
+    }
+    let results = scan_fixtures(config, &model, targets)?;
+    let FixtureTally {
+        passed,
+        total,
+        hostile_fps,
+        suspicious_fps,
+    } = evaluate(results, model.thresholds())?;
+
+    // Every target is a known-benign file (platform utilities + cleave's
+    // does-nothing corpus). A HOSTILE grade on any of them is a hard false
+    // positive that must block the deploy. A merely Suspicious grade is a
+    // softer signal the operator tolerates on benign input: report it, but do
+    // not fail the gate (suspicious is allowed to be suspicious).
+    if hostile_fps > 0 {
+        anyhow::bail!(
+            "{hostile_fps} benign fixture sample(s) graded HOSTILE (false positives); \
+             see the warnings above. ({suspicious_fps} graded suspicious — tolerated.)"
+        );
+    }
+
+    let models_ver = crate::models_repo::version()
+        .map(|v| format!("  models: {v}"))
+        .unwrap_or_default();
+    if suspicious_fps > 0 {
+        eprintln!(
+            "validate ok (with {suspicious_fps} suspicious — tolerated):{models_ver}  \
+             benign fixtures {passed}/{total} clean, {suspicious_fps} suspicious, 0 hostile"
+        );
+    } else {
+        eprintln!(
+            "validate ok:{models_ver}  benign fixtures {passed}/{total}  0 suspicious  0 hostile"
+        );
+    }
+    Ok(())
+}
+
+/// Load the model and every specialist route, refusing a structurally
+/// incompatible or degraded bundle before any trait corpus is touched.
+fn load_model(config: &ScanConfig) -> Result<Model> {
     let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
     model
         .validate_all_routes()
         .context("validating specialist model routes")?;
-    let thresholds = model.thresholds();
 
     // A model whose spec declares features this build's extractor cannot
     // produce is a hard failure in validate mode, not a warning: those slots
     // extract to zero, so the deployed model is silently degraded relative to
-    // its training. A normal scan only WARNs here (it degrades gracefully), but
+    // its training. A normal scan only warns here (it degrades gracefully), but
     // a deploy gate must not let a degraded model through. Absent *optional*
     // features — feature groups disabled at training, the normal subset case —
     // never appear in this list, so they stay non-fatal.
@@ -42,46 +89,52 @@ pub fn run(config: &ScanConfig) -> Result<()> {
         anyhow::bail!(
             "model degraded: feature_spec.json declares {} feature(s) this atomscan build's \
              extractor cannot produce, so they extract as zeros (e.g. {preview:?}); the model \
-             is out of sync with collimator — rebuild atomscan with matching feature extraction \
-             before deploying",
+             is out of sync with this build — rebuild atomscan with matching feature \
+             extraction before deploying",
             degraded.len(),
         );
     }
+    Ok(model)
+}
 
-    // The LLM admission gate names trait families and ids directly, so a
-    // taxonomy move breaks it silently: the prefixes still compile, match
-    // nothing, and quietly stop escalating the samples they were carrying.
-    // Check them against the installed tree whenever one resolves; a no-op
-    // when no traits are installed — there is nothing to compare against.
-    if let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
-        let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
-        if !problems.is_empty() {
-            // A warning, not a failure. A stale prefix costs the coverage of
-            // that one prefix; refusing to start costs the whole node, and
-            // this check compares against whichever traits revision happens to
-            // be installed — which the traits auto-update can change under a
-            // running fleet, with no scan release involved. Blocking on it
-            // would let a traits publish stop every node from booting, which
-            // is a far worse failure than the one being guarded against.
-            // This command is the only place the installed tree is checked:
-            // the test suite deliberately asserts nothing about it, since trait
-            // definitions are validated in the traits repo, not here.
-            eprintln!(
-                "WARNING {} LLM gate prefix(es) match nothing in {}: {}; \
-                 coverage for these prefixes is lost until the taxonomy and gate agree; \
-                 criticality, probability and level admissions still work",
-                problems.len(),
-                traits_dir.display(),
-                problems.join("; "),
-            );
-        }
+/// Warn when an LLM gate prefix matches nothing in the installed traits.
+///
+/// The gate names trait families and ids directly, so a taxonomy move breaks
+/// it silently: the prefixes still compile, match nothing, and quietly stop
+/// escalating the samples they were carrying. A no-op when no traits are
+/// installed — there is nothing to compare against.
+///
+/// A warning, not a failure. A stale prefix costs the coverage of that one
+/// prefix; refusing to start costs the whole node, and this compares against
+/// whichever traits revision happens to be installed — which the traits
+/// auto-update can change under running servers, with no scan release
+/// involved. This command is the only place the installed tree is checked:
+/// the test suite deliberately asserts nothing about it, since trait
+/// definitions are validated in the traits repo, not here.
+fn check_gate_prefixes() {
+    let Ok(traits_dir) = cleave::traits_repo::try_resolve() else {
+        return;
+    };
+    let problems = crate::interpret::validate_gate_prefixes(&traits_dir);
+    if !problems.is_empty() {
+        tracing::warn!(
+            count = problems.len(),
+            traits = %traits_dir.display(),
+            prefixes = %problems.join("; "),
+            "LLM gate prefixes match nothing in the installed traits; their coverage is \
+             lost until the taxonomy and gate agree (criticality, probability and level \
+             admissions still work)",
+        );
     }
+}
 
-    let targets = collect_targets()?;
-    if targets.is_empty() {
-        anyhow::bail!("no benign fixture targets found");
-    }
-
+/// Analyze and classify every fixture in parallel, reporting progress and
+/// slow fixtures as it goes.
+fn scan_fixtures(
+    config: &ScanConfig,
+    model: &Model,
+    targets: Vec<PathBuf>,
+) -> Result<Vec<(PathBuf, Result<ClassifiedReport>)>> {
     // Keep model fixture validation cheap and deterministic: no YARA/radare2/UPX,
     // one engine shared by all target analyses, and analysis caching enabled.
     // The cache key includes the traits revision, so current trait edits still
@@ -108,7 +161,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
     let completed = AtomicUsize::new(0);
     let slow_fixtures = AtomicUsize::new(0);
 
-    let results: Vec<(PathBuf, Result<ClassifiedReport>)> = targets
+    let results = targets
         .into_par_iter()
         .map(|path| {
             let started = Instant::now();
@@ -125,28 +178,28 @@ pub fn run(config: &ScanConfig) -> Result<()> {
                         report,
                         engine::ClassifyRequest {
                             zip_passwords: config.zip_passwords(),
-                            ..engine::ClassifyRequest::new(&label, &path, &model)
+                            ..engine::ClassifyRequest::new(&label, &path, model)
                         },
                     );
                     let classify_elapsed = classify_started.elapsed();
                     if analysis_elapsed > SLOW_FIXTURE_THRESHOLD
                         || classify_elapsed > SLOW_FIXTURE_THRESHOLD
                     {
-                        eprintln!(
-                            "SLOW fixture stages {}: analysis={:.1}s classify={:.1}s",
-                            path.display(),
-                            analysis_elapsed.as_secs_f64(),
-                            classify_elapsed.as_secs_f64()
+                        tracing::warn!(
+                            fixture = %path.display(),
+                            analysis_secs = analysis_elapsed.as_secs_f64(),
+                            classify_secs = classify_elapsed.as_secs_f64(),
+                            "slow fixture stage"
                         );
                     }
                     classified
                 });
             let elapsed = started.elapsed();
             if elapsed > SLOW_FIXTURE_THRESHOLD {
-                eprintln!(
-                    "SLOW fixture {}: {:.1}s",
-                    path.display(),
-                    elapsed.as_secs_f64()
+                tracing::warn!(
+                    fixture = %path.display(),
+                    secs = elapsed.as_secs_f64(),
+                    "slow fixture"
                 );
                 slow_fixtures.fetch_add(1, Ordering::Relaxed);
             }
@@ -160,42 +213,12 @@ pub fn run(config: &ScanConfig) -> Result<()> {
 
     let slow_count = slow_fixtures.load(Ordering::Relaxed);
     if slow_count > 0 {
-        eprintln!("validate fixtures: {slow_count} fixture(s) exceeded 15s");
-    }
-
-    let FixtureTally {
-        passed,
-        total,
-        hostile_fps,
-        suspicious_fps,
-    } = evaluate(results, thresholds)?;
-
-    // Every target is a known-benign file (platform utilities + cleave's
-    // does-nothing corpus). A HOSTILE grade on any of them is a hard false
-    // positive that must block the deploy. A merely Suspicious grade is a
-    // softer signal the operator tolerates on benign input: report it, but do
-    // not fail the gate (suspicious is allowed to be suspicious).
-    if hostile_fps > 0 {
-        anyhow::bail!(
-            "{hostile_fps} benign fixture sample(s) graded HOSTILE (false positives); \
-             see the WARN lines above. ({suspicious_fps} graded suspicious — tolerated.)"
-        );
-    }
-
-    let models_ver = crate::models_repo::version()
-        .map(|v| format!("  models: {v}"))
-        .unwrap_or_default();
-    if suspicious_fps > 0 {
         eprintln!(
-            "validate ok (with {suspicious_fps} suspicious — tolerated):{models_ver}  \
-             benign fixtures {passed}/{total} clean, {suspicious_fps} suspicious, 0 hostile"
-        );
-    } else {
-        eprintln!(
-            "validate ok:{models_ver}  benign fixtures {passed}/{total}  0 suspicious  0 hostile"
+            "validate fixtures: {slow_count} fixture(s) exceeded {}s",
+            SLOW_FIXTURE_THRESHOLD.as_secs()
         );
     }
-    Ok(())
+    Ok(results)
 }
 
 fn collect_targets() -> Result<Vec<PathBuf>> {
@@ -273,7 +296,11 @@ fn evaluate(
             Ok(classified) => classified.result,
             Err(error) => {
                 analysis_failed += 1;
-                eprintln!("FAILED {}: analysis failed: {error:#}", path.display());
+                tracing::error!(
+                    fixture = %path.display(),
+                    error = format!("{error:#}"),
+                    "fixture analysis failed"
+                );
                 continue;
             }
         };
@@ -332,31 +359,30 @@ fn evaluate(
     Ok(tally)
 }
 
-/// The WARN block for one non-benign grade on a benign fixture.
+/// The warning for one non-benign grade on a benign fixture, with the
+/// findings that drove it.
 fn warn_nonbenign(
     label: &str,
     decision: &Decision,
     thresholds: Thresholds,
     findings: &[engine::TopFinding],
 ) {
-    eprintln!(
-        "WARN {label}: grade={} level={} probability={} decision_threshold={} margin_logit={:+.3} ensemble_thresholds suspicious={} hostile={}",
-        decision.class,
-        decision.level,
-        decision.probability,
-        decision.threshold,
-        logit_margin(decision.probability, decision.threshold),
-        thresholds.suspicious,
-        thresholds.hostile,
+    let findings: Vec<String> = findings
+        .iter()
+        .map(|f| format!("l{} {}: {}", f.crit.rank(), f.id, f.desc))
+        .collect();
+    tracing::warn!(
+        fixture = label,
+        grade = %decision.class,
+        level = %decision.level,
+        probability = decision.probability,
+        decision_threshold = decision.threshold,
+        margin_logit = logit_margin(decision.probability, decision.threshold),
+        suspicious_threshold = thresholds.suspicious,
+        hostile_threshold = thresholds.hostile,
+        findings = %findings.join("; "),
+        "benign fixture graded non-benign"
     );
-    for finding in findings {
-        eprintln!(
-            "  l{} {}  {}",
-            finding.crit.rank(),
-            finding.id,
-            finding.desc
-        );
-    }
 }
 
 /// Forces cleave's analysis cache on for the life of the guard, then restores
@@ -387,11 +413,11 @@ impl Drop for CacheOverride {
 /// OpenDocument file at probability 1.031e-05 against a threshold of
 /// 8.072e-06, printing `probability=0.0000 decision_threshold=0.0000`, and the
 /// far commoner case of a threshold at 0.99954 against a score of 0.99955
-/// prints both as `0.9995`. Either way the WARN line shows a verdict with no
+/// prints both as `0.9995`. Either way the warning shows a verdict with no
 /// visible cause, on the one line an operator has to work from.
 ///
-/// Log-odds is the scale the thresholds are actually built in — collimator
-/// fits its whole per-level threshold curve in logit space — so equal steps
+/// Log-odds is the scale the thresholds are actually built in — training fits
+/// the whole per-level threshold curve in logit space — so equal steps
 /// here are equal steps of evidence, and one signed number says both which way
 /// the decision went and by how much. The raw probability and threshold are
 /// still printed alongside, at full precision.

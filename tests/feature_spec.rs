@@ -13,14 +13,7 @@ fn model_dir() -> Result<std::path::PathBuf> {
 #[test]
 #[ignore = "needs SCAN_MODELS_DIR pointing at a model bundle"]
 fn spec_version_matches_expected() -> Result<()> {
-    let dir = model_dir()?;
-    let root_spec = dir.join("feature_spec.json");
-    let ensemble_spec = dir.join("general").join("feature_spec.json");
-    let spec_path = if root_spec.exists() {
-        root_spec
-    } else {
-        ensemble_spec
-    };
+    let spec_path = model_dir()?.join("general").join("feature_spec.json");
     assert!(
         spec_path.exists(),
         "{} not found — set SCAN_MODELS_DIR or clone the models repo",
@@ -42,13 +35,11 @@ fn spec_version_matches_expected() -> Result<()> {
         "feature_spec.json ABI is v{} but atomscan expects ABI v{EXPECTED_MODEL_ABI_VERSION}",
         spec.abi_version(),
     );
+    // `load` has checked the layout itself, including a non-empty
+    // presence vocabulary.
     assert!(
         spec.total_features() > 0,
         "feature spec has 0 features — corrupt spec?",
-    );
-    assert!(
-        !spec.presence_vocab().is_empty(),
-        "feature spec has no presence_vocab — wrong spec version?",
     );
     Ok(())
 }

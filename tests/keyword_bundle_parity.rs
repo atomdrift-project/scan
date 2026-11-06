@@ -1,7 +1,7 @@
 //! Opt-in Python/ONNX parity check using real trained keyword bundles.
 use anyhow::{Context, Result};
 use scan::features::{ExtractContext, FeatureSpec};
-use scan::model::Model;
+use scan::model::{Model, Thresholds};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -34,7 +34,16 @@ fn collimator_bundles_match_features_and_probabilities() -> Result<()> {
         assert!(!bundle.cases.is_empty(), "parity fixture has no reports");
         let count = bundle.cases.len();
         let mut max_error = 0.0_f32;
-        let model = Model::load(&bundle.directory, None, None)?;
+        // Each fixture directory is one route; a model loads it as the
+        // general route of an ensemble. The thresholds only shape the class,
+        // and the comparison is on the probability.
+        let ensemble = tempfile::tempdir()?;
+        stage_general(&bundle.directory, ensemble.path())?;
+        let thresholds = Thresholds {
+            suspicious: 0.5,
+            hostile: 0.5,
+        };
+        let model = Model::load(ensemble.path(), Some(thresholds), None)?;
         let spec = FeatureSpec::load(&bundle.directory.join("feature_spec.json"))?;
         let extractor = ExtractContext::new(&spec);
         for case in bundle.cases {
@@ -93,6 +102,26 @@ fn collimator_bundles_match_features_and_probabilities() -> Result<()> {
             "{}: {count} cases, max probability error {max_error:.2e}",
             bundle.directory.display()
         );
+    }
+    Ok(())
+}
+
+/// Copy a route directory's model and spec to `<root>/general`.
+fn stage_general(route: &std::path::Path, root: &std::path::Path) -> Result<()> {
+    let general = root.join("general");
+    std::fs::create_dir_all(&general)?;
+    for entry in std::fs::read_dir(route)? {
+        let path = entry?.path();
+        if path.is_file() {
+            std::fs::copy(&path, general.join(path.file_name().context("file name")?))?;
+        } else if path.file_name().is_some_and(|n| n == "models") {
+            let seeds = general.join("models");
+            std::fs::create_dir_all(&seeds)?;
+            for seed in std::fs::read_dir(&path)? {
+                let seed = seed?.path();
+                std::fs::copy(&seed, seeds.join(seed.file_name().context("file name")?))?;
+            }
+        }
     }
     Ok(())
 }

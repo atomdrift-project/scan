@@ -12,6 +12,10 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 
+/// `Retry-After` for a refusal for want of analysis capacity: long enough for
+/// a typical analysis to finish and free its slot.
+pub(super) const BUSY_RETRY_AFTER_SECS: u32 = 30;
+
 /// One error answer. `code` is stable and machine-readable; `message` is for
 /// humans and may be reworded freely.
 #[derive(Clone, Debug)]
@@ -116,11 +120,11 @@ impl ApiError {
         if let Some(busy) = error.downcast_ref::<crate::analysis::WhaleSlotBusy>() {
             // The same shape admission refuses with before the stream starts,
             // so a router treats both as "full, try the next server".
-            return Self::at_capacity(busy.to_string(), Some("whale"), Some(30));
+            return Self::at_capacity(busy.to_string(), Some("whale"), Some(BUSY_RETRY_AFTER_SECS));
         }
         // An artifact that could not be retrieved is answered from the type
-        // rather than from any wording, because that verdict is the one this
-        // fleet cannot afford to get wrong: see [`crate::fetch::Unretrievable`].
+        // rather than from any wording, because that verdict is the one a
+        // caller cannot afford to get wrong: see [`crate::fetch::Unretrievable`].
         if let Some(fetch) = error.downcast_ref::<crate::fetch::Unretrievable>() {
             if fetch.infrastructure_failure() {
                 return Self::new(
@@ -314,11 +318,11 @@ mod tests {
         );
     }
 
-    /// An artifact the registry would not serve is a 422, not a 500. Beamline
-    /// reads a 5xx as a sick server — it opens the breaker and retries the
-    /// fleet — so answering a plain 404 from a package host with a server
-    /// fault would eject healthy servers and reach poppy as an outage instead
-    /// of a download failure.
+    /// An artifact the registry would not serve is a 422, not a 500. A router
+    /// reads a 5xx as a sick server — it opens the breaker and retries
+    /// elsewhere — so answering a plain 404 from a package host with a server
+    /// fault would eject healthy servers and reach the caller as an outage
+    /// instead of a download failure.
     #[test]
     fn unretrievable_artifact_is_422_not_500() {
         let error = anyhow::Error::new(crate::fetch::Unretrievable {

@@ -2,8 +2,7 @@
 //!
 //! Reads a labelled good/bad pool as NDJSON (stdin or `--in`), builds the
 //! known-good/known-bad filters for PURLs and SHA-256s, and writes them plus a
-//! `bloom.toml` manifest to `--out`. The `make publish-bloom` target feeds it a
-//! hopper pool export and uploads the result to R2, mirroring `publish-models`.
+//! `bloom.toml` manifest to `--out`, ready to upload beside the models.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -13,8 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
-use burton::Tier;
-use burton::{Ratio, read_manifest, verify, write_bundle};
+use burton::{Kind, Ratio, Tier, read_manifest, verify, write_bundle};
 use scan::bloom_build::read_pool;
 
 #[derive(Debug, Parser)]
@@ -38,25 +36,12 @@ struct Args {
 
     /// Target false-positive rate. Sized for accidental collisions, not grind
     /// resistance (which filter size cannot buy). 1e-9 (1-in-a-billion) keeps a
-    /// good-set FP — which skips the full scan — vanishingly rare; at the current
-    /// ~1.8M-key corpus each SHA filter lands in the 16 MiB power-of-two bucket.
-    /// At most 1e-3: burton refuses to load a filter whose effective
-    /// false-positive rate is implausibly high (a forged all-blessing filter),
-    /// and builds anything looser at its 1e-9 fallback.
+    /// good-set FP — which skips the full scan — vanishingly rare. At most
+    /// 1e-3: burton refuses to load a filter whose effective false-positive
+    /// rate is implausibly high (a forged all-blessing filter), and clamps a
+    /// looser target to 1e-3.
     #[arg(long, default_value_t = 1e-9, value_name = "P", value_parser = parse_fp)]
     fp: f64,
-
-    /// On-disk layout version to emit. Defaults to this build's
-    /// [`burton::FORMAT_VERSION`].
-    ///
-    /// Publishing an older version alongside the current one is how clients that
-    /// predate a tier keep receiving fresh data: the bundle is projected down
-    /// (see `KeySets::into_filters_for`) rather than withheld. Run once per
-    /// version over the same pool file — the pool is on disk anyway, and a
-    /// second read is far cheaper than holding a second copy of the key sets.
-    #[arg(long = "format-version", default_value_t = burton::FORMAT_VERSION,
-          value_name = "N")]
-    format_version: u16,
 
     /// Accept a filter whose row count shrank or grew past the safety ratios.
     ///
@@ -116,8 +101,14 @@ fn main() -> Result<()> {
     };
 
     let (sets, stats) = read_pool(reader)?;
-    let (good_purl, good_sha) = sets.counts(Tier::Good);
-    let (bad_purl, bad_sha) = sets.counts(Tier::Bad);
+    let (good_purl, good_sha) = (
+        sets.count(Kind::Purl, Tier::Good),
+        sets.count(Kind::Sha256, Tier::Good),
+    );
+    let (bad_purl, bad_sha) = (
+        sets.count(Kind::Purl, Tier::Bad),
+        sets.count(Kind::Sha256, Tier::Bad),
+    );
     eprintln!(
         "pool: {} records — good {good_purl} purl / {good_sha} sha, bad {bad_purl} purl / {bad_sha} sha \
          ({} malformed, {} bad-sha, {} bad-purl, {} other-label skipped)",
@@ -130,15 +121,10 @@ fn main() -> Result<()> {
     // An unreadable previous manifest is an error, not "no baseline": that
     // would silently switch off the growth checks below.
     let prev = read_manifest(&args.out).context("reading the previous bloom manifest")?;
-    let filters = sets
-        .into_filters_for(args.format_version, args.fp)
-        .context("building bloom filters")?;
-    if filters.is_empty() {
-        anyhow::bail!("the pool produced no filters");
-    }
+    let filters = sets.into_filters(args.fp);
 
     // Fail loud before writing, so a poisoned or hollow build never lands in the
-    // output dir (nor reaches `make publish-bloom`).
+    // output dir, and so is never uploaded.
     let waived = verify(
         &filters,
         prev.as_ref(),
@@ -173,7 +159,7 @@ fn main() -> Result<()> {
     eprintln!(
         "wrote {} filters + bloom.toml (format v{}) to {}",
         manifest.filter.len(),
-        args.format_version,
+        burton::FORMAT_VERSION,
         args.out.display()
     );
     Ok(())

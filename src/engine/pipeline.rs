@@ -27,9 +27,9 @@ use super::verdict::{
     worst_member_floor, worst_member_model,
 };
 use super::{
-    DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute, MemberEvals, Reason,
-    SCHEMA_VERSION, ScanResult, StoredReport, TopFinding, archive_leaf, compact_crit, is_inside,
-    now_rfc3339,
+    ARCHIVE_DELIMITER, DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute,
+    MemberEvals, Reason, SCHEMA_VERSION, ScanResult, StoredReport, TopFinding, archive_leaf,
+    compact_crit, now_rfc3339,
 };
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, ParsedReport, RawNeeds};
@@ -178,7 +178,10 @@ pub(crate) fn classify_report(
     drop(req.root_bytes.take());
     let index = ReportIndex::new(&prepared.typed);
     let mut scored = score(&prepared, &req)?;
-    scored.inject_backrefs(&mut prepared.compact);
+    // Pinned only now, after featurization: a backref is a conclusion about
+    // *another* artifact, and fed as a feature of this one it would teach the
+    // model that declaring dependencies is itself malicious.
+    inject_dependency_backrefs(&mut prepared.compact, &std::mem::take(&mut scored.backrefs));
     let top_findings =
         extract_top_findings(root_findings(&prepared.compact), scored.decision.class);
     let dependency_results = grade_dependencies(
@@ -517,19 +520,6 @@ struct Scored {
     backrefs: Vec<DepBackref>,
 }
 
-impl Scored {
-    /// Pin the dependency verdicts onto `report` as synthetic findings. A
-    /// method on the scored result, so it can only run after featurization:
-    /// a backref is a conclusion about *another* artifact, and fed as a
-    /// feature of this one it would teach the model that declaring
-    /// dependencies is itself malicious.
-    fn inject_backrefs(&mut self, report: &mut CompactReport) {
-        for backref in std::mem::take(&mut self.backrefs) {
-            inject_dependency_backref(report, &backref);
-        }
-    }
-}
-
 fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
     let (label, model) = (req.label, req.model);
     let ctx = model.ctx();
@@ -611,6 +601,64 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
         members.insert(ef.id, ef);
     }
 
+    let (backrefs, adopted) = dependency_verdicts(prepared, &members, model);
+
+    // The same fold, over the model's own readings: a member the floor raised
+    // contributes its pre-floor decision, as the root's does for the root. Adopted corpus verdicts count
+    // as model evidence — they are another scan's verdict, not this artifact's
+    // traits. Purely observational; the verdict below does not read it.
+    let model_decision = worst_member_model(&members)
+        .into_iter()
+        .chain(adopted.iter().copied())
+        .filter(|candidate| decision_outranks(candidate, &root_model))
+        .reduce(graver)
+        .unwrap_or(root_model);
+    let floor = match (root_floor, worst_member_floor(&members)) {
+        (Some(root), Some(member)) => Some(root.worse_of(member)),
+        (floor, None) | (None, floor) => floor,
+    };
+
+    // Elevate the container by its worst member and by any adopted dependency
+    // verdict, so a hostile dependency weighs the same whether this scan
+    // computed the verdict or the corpus handed it over.
+    let elevated = worst_member(&members)
+        .into_iter()
+        .chain(adopted)
+        .filter(|worst| decision_outranks(worst, &decision))
+        .reduce(graver);
+    if let Some(worst) = elevated {
+        tracing::info!(
+            path = %label,
+            original_probability = format!("{:.4}", decision.probability),
+            elevated_probability = format!("{:.4}", worst.probability),
+            elevated_classification = ?worst.class,
+            elevated_threshold = format!("{:.4}", worst.threshold),
+            "elevated archive classification due to embedded file",
+        );
+        decision = worst;
+    }
+
+    Ok(Scored {
+        decision,
+        model: model_decision,
+        floor,
+        members,
+        reasons,
+        model_scores,
+        skipped_models,
+        finding_counts,
+        backrefs,
+    })
+}
+
+/// What the fetched dependencies say about the root: a backref for each
+/// flagged dependency, to pin onto the file that declared it, and the decisions
+/// adopted from hopper's corpus for dependencies this scan never analyzed.
+fn dependency_verdicts(
+    prepared: &Prepared,
+    members: &MemberEvals,
+    model: &Model,
+) -> (Vec<DepBackref>, Vec<Decision>) {
     // A fetched dependency that classifies hostile/suspicious is pinned back
     // onto the file that declared it, at the reference byte. Keyed by the
     // content sha of the retrieved payload.
@@ -658,7 +706,7 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
         .collect();
     if !adopted.is_empty() {
         let mut type_of: HashMap<&str, &str> = HashMap::new();
-        for file in &compact.files {
+        for file in &prepared.compact.files {
             type_of.entry(file.sha.as_str()).or_insert(&file.file_type);
         }
         backrefs.extend(adopted.iter().filter_map(|(d, sha, v)| {
@@ -670,53 +718,7 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
             Some(declaration.backref(sha, file_type, d.class, adopted_detail(v)))
         }));
     }
-
-    // The same fold, over the model's own readings: a member the floor raised
-    // contributes its pre-floor decision, as the root's does for the root. Adopted corpus verdicts count
-    // as model evidence — they are another scan's verdict, not this artifact's
-    // traits. Purely observational; the verdict below does not read it.
-    let model_decision = worst_member_model(&members)
-        .into_iter()
-        .chain(adopted.iter().map(|(d, ..)| *d))
-        .filter(|candidate| decision_outranks(candidate, &root_model))
-        .reduce(graver)
-        .unwrap_or(root_model);
-    let floor = match (root_floor, worst_member_floor(&members)) {
-        (Some(root), Some(member)) => Some(root.worse_of(member)),
-        (floor, None) | (None, floor) => floor,
-    };
-
-    // Elevate the container by its worst member and by any adopted dependency
-    // verdict, so a hostile dependency weighs the same whether this scan
-    // computed the verdict or the corpus handed it over.
-    let elevated = worst_member(&members)
-        .into_iter()
-        .chain(adopted.into_iter().map(|(d, ..)| d))
-        .filter(|worst| decision_outranks(worst, &decision))
-        .reduce(graver);
-    if let Some(worst) = elevated {
-        tracing::info!(
-            path = %label,
-            original_probability = format!("{:.4}", decision.probability),
-            elevated_probability = format!("{:.4}", worst.probability),
-            elevated_classification = ?worst.class,
-            elevated_threshold = format!("{:.4}", worst.threshold),
-            "elevated archive classification due to embedded file",
-        );
-        decision = worst;
-    }
-
-    Ok(Scored {
-        decision,
-        model: model_decision,
-        floor,
-        members,
-        reasons,
-        model_scores,
-        skipped_models,
-        finding_counts,
-        backrefs,
-    })
+    (backrefs, adopted.into_iter().map(|(d, ..)| d).collect())
 }
 
 /// Where a fetched payload was declared: the file and byte that named it.
@@ -1047,6 +1049,8 @@ fn interpret(
                 &admitted,
                 ctx,
                 crate::interpret::LlmCaller::Foreground,
+                label,
+                sha256,
             );
             if let Some(Interpretation::Graded(graded)) = &interpretation {
                 log_interpretation(label, sha256, graded);
@@ -1246,7 +1250,7 @@ fn log_interpretation(file: &str, sha256: &str, graded: &Graded) {
 
 /// Hands the caller's CPU admission back before the LLM round trip.
 ///
-/// A caller such as postdoc's worker admits an analysis through a gate sized
+/// A caller such as a hosted worker admits an analysis through a gate sized
 /// for the Rayon pool and holds that permit on the blocking thread for the
 /// whole classify. The LLM second opinion at the end of `classify_report` is
 /// a 2-8 s network wait that needs no CPU, and it can be most of a permit's
@@ -1289,6 +1293,8 @@ pub fn apply_pending_interpretation(
         &pending.admitted,
         &pending.ctx,
         crate::interpret::LlmCaller::Background,
+        &result.path,
+        &result.sha256,
     ) else {
         return false;
     };
@@ -1350,12 +1356,23 @@ struct DepBackref {
 /// span. Compact paths nest with `!!`, so an ancestor is any file whose path is a
 /// `!!`-boundary prefix of the declaring file's.
 ///
+/// `declaring` indexes the files whose content is the declaring file's;
+/// `by_path` indexes every file by its compact path. A backref whose declaring
+/// file is unknown or absent from the report still names a flagged dependency
+/// of this artifact, so it is pinned to the root (without a span) and logged,
+/// never dropped.
+///
 /// The trait carries the dependency's identity twice: `desc` is prose for humans
 /// and the LLM context; `dep` ({locator, sha, type}) is the machine-readable copy
-/// that hopper forwards opaquely so prism can render a specific, clickable feed
+/// that hopper forwards opaquely so a web front end can render a specific, clickable feed
 /// chip ("depends on hostile npm: zaboodle v1.49" → /file/{sha}) without parsing
 /// the sentence.
-fn inject_dependency_backref(report: &mut CompactReport, backref: &DepBackref) {
+fn inject_dependency_backref(
+    report: &mut CompactReport,
+    backref: &DepBackref,
+    declaring: &[usize],
+    by_path: &HashMap<String, Vec<usize>>,
+) {
     let (crit, sev) = match backref.class {
         Classification::Hostile => (cleave::Criticality::Hostile.rank(), "Malicious"),
         _ => (cleave::Criticality::Suspicious.rank(), "Suspicious"),
@@ -1368,39 +1385,78 @@ fn inject_dependency_backref(report: &mut CompactReport, backref: &DepBackref) {
         desc.push_str(" — ");
         desc.push_str(detail);
     }
-    let dep = cleave::types::CompactDep {
-        locator: backref.locator.clone(),
-        sha: backref.dep_sha.clone(),
-        file_type: backref.dep_type.clone(),
+    let finding = |ev: Vec<[u64; 2]>| cleave::types::CompactTrait {
+        id: DEP_VERDICT_TRAIT_ID.to_string(),
+        criticality: crit,
+        description: desc.clone(),
+        dep: Some(cleave::types::CompactDep {
+            locator: backref.locator.clone(),
+            sha: backref.dep_sha.clone(),
+            file_type: backref.dep_type.clone(),
+        }),
+        ev,
+        ..cleave::types::CompactTrait::default()
     };
-    let span = [backref.source_offset.unwrap_or(0), backref.source_len];
 
-    // The declaring file's compact path locates every container above it.
-    let decl_path = report
-        .files
-        .iter()
-        .find(|f| Some(f.sha.as_str()) == backref.source_sha.as_deref())
-        .map(|f| f.path.clone());
-
-    for f in &mut report.files {
-        let is_decl = Some(f.sha.as_str()) == backref.source_sha.as_deref();
-        let is_ancestor = decl_path
-            .as_deref()
-            .is_some_and(|dp| is_inside(dp, &f.path));
-        if !is_decl && !is_ancestor {
-            continue;
+    let Some(&first) = declaring.first() else {
+        tracing::warn!(
+            dependency = %backref.locator,
+            dependency_sha256 = %backref.dep_sha,
+            declared_in = backref.source_sha.as_deref().unwrap_or_default(),
+            "declaring file of a flagged dependency is not in the report; pinned to the root",
+        );
+        if let Some(root) = report.files.first_mut() {
+            root.findings.push(finding(Vec::new()));
         }
-        f.findings.push(cleave::types::CompactTrait {
-            id: DEP_VERDICT_TRAIT_ID.to_string(),
-            criticality: crit,
-            description: desc.clone(),
-            dep: Some(dep.clone()),
-            // The precise declaring file cites the reference byte span; a
-            // rolled-up ancestor carries the verdict without a (meaningless)
-            // cross-file span.
-            ev: if is_decl { vec![span] } else { Vec::new() },
-            ..cleave::types::CompactTrait::default()
-        });
+        return;
+    };
+    // The precise declaring file cites the reference byte span; a rolled-up
+    // ancestor carries the verdict without a (meaningless) cross-file span.
+    let span = [backref.source_offset.unwrap_or(0), backref.source_len];
+    let decl_path = report.files[first].path.clone();
+    let ancestors = decl_path
+        .char_indices()
+        .filter_map(|(cut, _)| {
+            let (container, rest) = decl_path.split_at_checked(cut)?;
+            rest.starts_with(ARCHIVE_DELIMITER)
+                .then(|| by_path.get(container))
+                .flatten()
+        })
+        .flatten()
+        .copied();
+    let mut targets: Vec<usize> = declaring.iter().copied().chain(ancestors).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    for i in targets {
+        let ev = if declaring.contains(&i) {
+            vec![span]
+        } else {
+            Vec::new()
+        };
+        report.files[i].findings.push(finding(ev));
+    }
+}
+
+/// Pin every backref onto `report` (see [`inject_dependency_backref`]). The
+/// report is indexed once, not searched per backref: an archive declaring many
+/// flagged dependencies would otherwise cost backrefs × files.
+fn inject_dependency_backrefs(report: &mut CompactReport, backrefs: &[DepBackref]) {
+    if backrefs.is_empty() {
+        return;
+    }
+    let mut by_sha: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, file) in report.files.iter().enumerate() {
+        by_sha.entry(file.sha.clone()).or_default().push(i);
+        by_path.entry(file.path.clone()).or_default().push(i);
+    }
+    for backref in backrefs {
+        let declaring = backref
+            .source_sha
+            .as_deref()
+            .and_then(|sha| by_sha.get(sha))
+            .map_or(&[][..], Vec::as_slice);
+        inject_dependency_backref(report, backref, declaring, &by_path);
     }
 }
 
@@ -1507,7 +1563,7 @@ fn extract_top_findings(
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReportIntegrity {
     /// `from[].file` entries that don't resolve to an emitted file id — the
-    /// trait then renders downstream (hopper/prism) with no file context.
+    /// trait then renders downstream (hopper and its front ends) with no file context.
     dangling_refs: usize,
     /// `role:sidecar` files with no `pid`. A sidecar is metadata *about* a
     /// parent node, so an absent parent means it describes nothing.
@@ -1517,7 +1573,7 @@ struct ReportIntegrity {
 /// Verify the compact report's structural invariants and return the counts so
 /// callers and tests can assert on them. A finding's `from[].file` entries index
 /// into `files[]`; if a member is dropped or renumbered without remapping these,
-/// the index dangles and the trait renders downstream (hopper/prism) with no file
+/// the index dangles and the trait renders downstream (hopper and its front ends) with no file
 /// context. A `role:sidecar` must also name a parent (see [`ReportIntegrity`]).
 /// We can't repair these here, but a producer-side log turns each into a visible
 /// signal instead of a mystery on the rendering side.

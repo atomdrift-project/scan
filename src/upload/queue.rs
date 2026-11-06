@@ -6,6 +6,38 @@ use std::sync::{Arc, mpsc};
 
 use serde::{Serialize, de::DeserializeOwned};
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Why a job could not cross the queue.
+#[derive(Debug)]
+pub(super) enum Error {
+    /// The receiving side is gone: the uploader has stopped.
+    Stopped,
+    /// An overflow job could not be written to its spool file.
+    Spool(BoxError),
+    /// A spooled job could not be read back.
+    Unspool(BoxError),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("uploader stopped"),
+            Self::Spool(e) => write!(f, "spool upload: {e}"),
+            Self::Unspool(e) => write!(f, "read spooled upload: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Stopped => None,
+            Self::Spool(e) | Self::Unspool(e) => Some(e.as_ref()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Sender<T> {
     tx: mpsc::Sender<Entry<T>>,
@@ -46,7 +78,7 @@ impl<T: Serialize> Sender<T> {
     /// On failure return the original job so the caller can reclaim any
     /// artifact staging it owns. Dropping an unsent entry also reclaims its
     /// resident slot or temporary file.
-    pub(super) fn send(&self, job: T) -> Result<(), (T, String)> {
+    pub(super) fn send(&self, job: T) -> Result<(), (T, Error)> {
         if self
             .resident
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -59,17 +91,17 @@ impl<T: Serialize> Sender<T> {
                 let Entry::Memory(job, _slot) = entry else {
                     unreachable_entry()
                 };
-                (job, "uploader stopped".to_owned())
+                (job, Error::Stopped)
             });
         }
 
         let path = match spool(&job) {
             Ok(path) => path,
-            Err(error) => return Err((job, format!("spool upload: {error}"))),
+            Err(error) => return Err((job, Error::Spool(error))),
         };
         self.tx
             .send(Entry::Disk(path))
-            .map_err(|_closed| (job, "uploader stopped".to_owned()))
+            .map_err(|_closed| (job, Error::Stopped))
     }
 }
 
@@ -80,7 +112,7 @@ fn unreachable_entry() -> ! {
     panic!("channel returned a different entry variant")
 }
 
-fn spool<T: Serialize>(job: &T) -> Result<tempfile::TempPath, Box<dyn std::error::Error>> {
+fn spool<T: Serialize>(job: &T) -> Result<tempfile::TempPath, BoxError> {
     let mut file = tempfile::Builder::new()
         .prefix("scan-upload-queue-")
         .tempfile()?;
@@ -93,24 +125,24 @@ fn spool<T: Serialize>(job: &T) -> Result<tempfile::TempPath, Box<dyn std::error
 }
 
 impl<T: DeserializeOwned> Iterator for Receiver<T> {
-    type Item = Result<T, String>;
+    type Item = Result<T, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.0.recv().ok()?;
         Some(match entry {
             Entry::Memory(job, _slot) => Ok(job),
-            Entry::Disk(path) => (|| {
-                let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-                let reader = zstd::stream::read::Decoder::new(file).map_err(|e| e.to_string())?;
-                serde_json::from_reader(reader).map_err(|e| e.to_string())
-            })(),
+            Entry::Disk(path) => std::fs::File::open(&path)
+                .and_then(zstd::stream::read::Decoder::new)
+                .map_err(|e| Error::Unspool(e.into()))
+                .and_then(|reader| {
+                    serde_json::from_reader(reader).map_err(|e| Error::Unspool(e.into()))
+                }),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]
@@ -161,7 +193,10 @@ mod tests {
         }
         let (tx, _rx) = channel(0);
         let (Unserializable, error) = tx.send(Unserializable).expect_err("spooling must fail");
-        assert!(error.contains("injected serialization failure"), "{error}");
+        assert!(
+            error.to_string().contains("injected serialization failure"),
+            "{error}"
+        );
         assert_eq!(tx.resident.load(Ordering::Relaxed), 0);
     }
 }

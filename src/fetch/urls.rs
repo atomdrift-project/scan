@@ -1,15 +1,18 @@
 //! Which discovered URLs are payloads worth fetching, how to ask for them as
 //! the client that would have, and where an HTML redirect page points.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use fletch::fetch::{Fetch, FetchError, Fetched, Method, Request};
+use fletch::{RefKind, RefLocator, Reference};
+use reqwest::Url;
+
+use crate::hosts::{self, UrlHost};
 
 /// URL suffixes that are normally pages, API responses, or other site
 /// resources rather than a payload a dropper would retrieve.
-pub(super) const NON_PAYLOAD_URL_EXTENSIONS: &[&str] = &[
+const NON_PAYLOAD_URL_EXTENSIONS: &[&str] = &[
     "asp",
     "aspx",
     "atom",
@@ -46,7 +49,7 @@ pub(super) const NON_PAYLOAD_URL_EXTENSIONS: &[&str] = &[
 /// Path components that make a URL explicitly file/download-shaped. These
 /// allow extensionless payload names and file routes on otherwise API-shaped
 /// hosts, while a bare `/download` still fails the basename check.
-pub(super) const DOWNLOAD_URL_PATH_COMPONENTS: &[&str] = &[
+const DOWNLOAD_URL_PATH_COMPONENTS: &[&str] = &[
     "archive",
     "archives",
     "attachment",
@@ -63,7 +66,7 @@ pub(super) const DOWNLOAD_URL_PATH_COMPONENTS: &[&str] = &[
 ];
 
 /// Path components that are strong signs of an API or service endpoint.
-pub(super) const API_URL_PATH_COMPONENTS: &[&str] = &[
+const API_URL_PATH_COMPONENTS: &[&str] = &[
     "api", "graphql", "health", "lookup", "metrics", "oauth", "query", "rpc", "search", "status",
     "token",
 ];
@@ -146,43 +149,56 @@ pub(super) fn has_unexpanded_url_placeholder(url: &str) -> bool {
 /// fetch. This excludes RFC1918/private space and the other special-use ranges
 /// that describe the scanner's host, a lab network, or documentation rather
 /// than an external payload service.
-pub(super) fn public_ip(ip: std::net::IpAddr) -> bool {
-    // Only an IPv4-*mapped* address is an IPv4 host in disguise; the
-    // deprecated IPv4-compatible form would turn `::1` into `0.0.0.1`.
-    if let std::net::IpAddr::V6(ipv6) = ip
-        && let Some(ipv4) = ipv6.to_ipv4_mapped()
-    {
-        return public_ip(std::net::IpAddr::V4(ipv4));
-    }
+///
+/// Agrees with fletch's SSRF floor, which refuses the same addresses at
+/// request time: an address that floor refuses is never worth queueing. That
+/// floor is the real guard; this only keeps a doomed reference off the work
+/// list. Every IPv6 spelling of an IPv4 host — mapped, compatible, NAT64
+/// (`64:ff9b::/96`) and 6to4 (`2002::/16`) — is judged by the IPv4 address it
+/// carries.
+pub(super) fn public_ip(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_unspecified()
-                && !ip.is_broadcast()
-                && !ip.is_multicast()
-                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
-                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                && !(octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                && !(octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
-                && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                && octets[0] < 224
-        }
-        std::net::IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && (segments[0] & 0xfe00) != 0xfc00
-                && (segments[0] & 0xffc0) != 0xfe80
-                && (segments[0] & 0xffc0) != 0xfec0
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-        }
+        IpAddr::V4(ip) => public_ipv4(ip),
+        IpAddr::V6(ip) => public_ipv6(ip),
     }
+}
+
+fn public_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !ip.is_private()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_multicast()
+        && !ip.is_documentation()
+        && octets[0] != 0 // 0.0.0.0/8, "this network"
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1])) // CGNAT
+        && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocol assignments
+        && !(octets[0] == 198 && (18..=19).contains(&octets[1])) // benchmarking
+        && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99) // 6to4 relay anycast
+        && octets[0] < 224
+}
+
+fn public_ipv6(ip: Ipv6Addr) -> bool {
+    // Both v4-in-v6 forms: `::ffff:a.b.c.d` (mapped) and the deprecated
+    // `::a.b.c.d` (compatible). `::1` and `::` unwrap into 0.0.0.0/8.
+    if let Some(ipv4) = ip.to_ipv4() {
+        return public_ipv4(ipv4);
+    }
+    let segments = ip.segments();
+    let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return public_ipv4(embedded(segments[6], segments[7]));
+    }
+    if segments[0] == 0x2002 {
+        return public_ipv4(embedded(segments[1], segments[2]));
+    }
+    !ip.is_multicast()
+        && (segments[0] & 0xfe00) != 0xfc00
+        && (segments[0] & 0xffc0) != 0xfe80
+        && (segments[0] & 0xffc0) != 0xfec0
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
 /// Whether a discovered URL looks enough like a dropper download to spend a
@@ -197,9 +213,8 @@ pub(super) fn looks_like_dropper_download_url(url: &Url) -> bool {
     }
     let path = url.path();
     // A path ending in `/` names a directory, not a file: whatever a server
-    // returns for it is an index or a landing page, never the download itself.
-    // `https://pypi.org/project/diffusers/0.40.0/` was being fetched as a
-    // payload because the trailing component parsed as a filename.
+    // returns for it is an index or a landing page, never the download itself,
+    // even when the last component (`/project/x/0.40.0/`) parses as a filename.
     if path.ends_with('/') {
         return false;
     }
@@ -468,7 +483,8 @@ pub(super) fn is_redirect_destination(r: &Reference) -> bool {
 pub(super) const REDIRECT_PAGE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Most redirect pages a chain may pass through before depth accounting
-/// resumes; bounds the extra hops [`orchestrate`]'s redirect credit can grant.
+/// resumes; bounds the extra hops [`orchestrate`](super::orchestrate)'s
+/// redirect credit can grant.
 pub(super) const MAX_REDIRECT_HOPS: u8 = 3;
 
 /// Destinations an HTML redirect page sends its visitor to: a
@@ -587,7 +603,7 @@ pub(super) fn redirect_destinations(bytes: &[u8]) -> Vec<String> {
 
 /// The value of attribute `name` in the body of one HTML start tag, quoted or
 /// bare. Attribute names match case-insensitively.
-pub(super) fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     // ASCII lowercasing keeps every byte offset, so `lower` indexes `tag`.
     let lower = tag.to_ascii_lowercase();
     let mut from = 0;
