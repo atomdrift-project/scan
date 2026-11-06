@@ -1,8 +1,7 @@
-//! The rules, model and concurrency a long-lived server runs with, settled once
-//! at startup so every binary serving the API resolves them the same way; and
-//! the one refresh that keeps every rule source current.
+//! The rules and model a long-lived server runs with, settled once at startup
+//! so every binary serving the API resolves them the same way; and the one
+//! refresh that keeps every rule source current.
 
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -140,13 +139,13 @@ pub struct Refreshed(Vec<(Source, Result<bool>)>);
 impl Refreshed {
     /// Whether any source installed something new.
     #[must_use]
-    pub fn changed(&self) -> bool {
+    pub(crate) fn changed(&self) -> bool {
         self.0.iter().any(|(_, result)| matches!(result, Ok(true)))
     }
 
     /// Whether `source` installed something new.
     #[must_use]
-    pub fn changed_source(&self, source: Source) -> bool {
+    pub(crate) fn changed_source(&self, source: Source) -> bool {
         self.0
             .iter()
             .any(|(s, result)| *s == source && matches!(result, Ok(true)))
@@ -161,7 +160,7 @@ impl Refreshed {
 
     /// Why `--uplink` cannot be honoured, when the traits refresh says so.
     #[must_use]
-    pub fn enriched_refusal(&self) -> Option<&str> {
+    pub(crate) fn enriched_refusal(&self) -> Option<&str> {
         self.failures()
             .find_map(|(_, e)| crate::traits_repo::enriched_refusal(e))
     }
@@ -235,56 +234,5 @@ pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
     match refreshed.enriched_refusal() {
         Some(why) => anyhow::bail!("uplink rules unavailable: {why}"),
         None => Ok(()),
-    }
-}
-
-/// Default request slots: three per physical core.
-///
-/// A slot spends much of its life on the network — dependency fetches and the
-/// LLM second opinion — so one per core leaves the CPU idle. Memory is bounded
-/// by the RSS ceiling, not by the slot count.
-#[must_use]
-pub fn default_workers() -> NonZeroUsize {
-    if let Some(cores) = cleave::memory_tracker::physical_cpu_count() {
-        return NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3)))
-            .unwrap_or(NonZeroUsize::MIN);
-    }
-    let cores = cleave::memory_tracker::cpu_count().unwrap_or_else(|| {
-        tracing::warn!(
-            fallback = 4,
-            "CPU count detection failed; defaulting slot basis to 4 cores",
-        );
-        4
-    });
-    // A logical count is about twice the physical one.
-    NonZeroUsize::new(std::cmp::max(2, cores.saturating_mul(3) / 2)).unwrap_or(NonZeroUsize::MIN)
-}
-
-/// How many top-level analyses may execute at once: the rayon pool (at least
-/// 2), never more than `slots`.
-///
-/// Slots bound the requests in flight; this tighter gate bounds the
-/// memory-bandwidth-heavy cleave executions among them, held only around the
-/// blocking classify.
-pub(crate) fn cleave_concurrency(slots: usize) -> usize {
-    cleave_concurrency_from(slots, rayon::current_num_threads())
-}
-
-fn cleave_concurrency_from(slots: usize, pool: usize) -> usize {
-    let slots = slots.max(1);
-    pool.max(1).clamp(2.min(slots), slots)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::cleave_concurrency_from;
-
-    #[test]
-    fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
-        assert_eq!(cleave_concurrency_from(16, 32), 16);
-        assert_eq!(cleave_concurrency_from(16, 16), 16);
-        assert_eq!(cleave_concurrency_from(16, 8), 8);
-        assert_eq!(cleave_concurrency_from(2, 64), 2);
-        assert_eq!(cleave_concurrency_from(0, 32), 1);
     }
 }

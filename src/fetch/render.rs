@@ -1,11 +1,21 @@
 //! What a fetch says on the terminal: live progress, one row per
 //! dependency, and the summary line.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::HashSet;
+use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use fletch::fetch::{Coverage, FetchError, FetchRecord, Outcome, Served};
+use fletch::{RefKind, RefLocator, Reference, Registry};
+use reqwest::Url;
+
+use crate::deptree::{DepState, DepTree};
+use crate::hosts;
+use crate::output::{Ink, Rgb};
+
+use super::age_gate::SkipReason;
+use super::registry::registry_summary;
+use super::{Coordinate, SECS_PER_DAY, coverage_text, is_analysis_gap, locator};
 
 /// Where the fetch phase's progress is surfaced.
 ///
@@ -27,8 +37,7 @@ pub(super) enum Reporter {
         external_urls: AtomicU32,
         budget_notice: AtomicBool,
         /// Rows already printed, as `outcome + target`. One dependency named by
-        /// forty manifests is one fact, and a scan of a monorepo was spending
-        /// most of its output restating it.
+        /// many manifests is one fact, not one line per manifest.
         printed: std::sync::Mutex<HashSet<String>>,
     },
     Tree {
@@ -56,18 +65,6 @@ impl Reporter {
                 budget_notice: std::sync::Mutex::new(None),
             },
         )
-    }
-
-    /// Reveal a hop's references as pending (tree only) so the whole known set is
-    /// visible before any network work begins. `source` is the manifest they were
-    /// declared in (package-relative path), shown per row so each dependency can
-    /// be traced back to its declaring file.
-    pub(super) fn announce(&self, refs: &[Reference], source: &str) {
-        if let Self::Tree { tree, .. } = self {
-            for r in refs {
-                tree.add(locator(r), &dep_display_name(r), source);
-            }
-        }
     }
 
     /// Mark the to-fetch set in flight. The stream folds its counts into the
@@ -178,8 +175,8 @@ impl Reporter {
 
     /// Whether this row is the first of its kind, claiming it if so. A row is
     /// its outcome over its target, because that pair is the whole of what the
-    /// line says: one dependency named by forty manifests fails identically
-    /// forty times, and a scan of a monorepo was spending most of its output
+    /// line says: one dependency named by many manifests fails identically
+    /// once per manifest, and a monorepo would spend most of its output
     /// restating it. Non-stream reporters never dedup — the tree already keys
     /// its rows by locator, and `Off` prints nothing.
     pub(super) fn claim_row(&self, rec: &FetchRecord) -> bool {
@@ -220,7 +217,7 @@ impl Reporter {
             Self::Stream { .. } if matches!(reason, SkipReason::KnownGood) => {
                 tracing::debug!(
                     locator = %locator(r),
-                    age_days = reg.age_secs(now).unwrap_or(0) / 86_400,
+                    age_days = reg.age_secs(now).unwrap_or(0) / SECS_PER_DAY,
                     "fetch: known-good dependency skipped"
                 );
             }
@@ -268,12 +265,12 @@ impl Reporter {
 
 /// The fetch log's palette, matching the scan progress bar's truecolor one.
 pub(super) const LIVE: Rgb = Rgb(100, 180, 255);
-pub(super) const CACHED: Rgb = Rgb(120, 200, 140);
-pub(super) const CAUTION: Rgb = Rgb(230, 180, 80);
-pub(super) const FAILED: Rgb = Rgb(255, 90, 90);
-pub(super) const GOOD: Rgb = Rgb(80, 200, 80);
-pub(super) const MUTED: Rgb = Rgb(120, 120, 120);
-pub(super) const DETAIL: Rgb = Rgb(130, 130, 130);
+const CACHED: Rgb = Rgb(120, 200, 140);
+const CAUTION: Rgb = Rgb(230, 180, 80);
+const FAILED: Rgb = Rgb(255, 90, 90);
+const GOOD: Rgb = Rgb(80, 200, 80);
+const MUTED: Rgb = Rgb(120, 120, 120);
+const DETAIL: Rgb = Rgb(130, 130, 130);
 pub(super) const LABEL: Rgb = Rgb(160, 160, 160);
 
 /// The source manifest's path as the dep tree shows it, led by the scanned
@@ -316,7 +313,9 @@ pub(super) fn purl_display(purl: &str) -> String {
     let Some(coordinate) = Coordinate::of(purl) else {
         return purl.to_string();
     };
-    let name = coordinate.path.replace("%40", "@");
+    let name = coordinate
+        .decoded_path()
+        .unwrap_or_else(|| coordinate.path.to_owned());
     match coordinate.version.filter(|v| !v.is_empty()) {
         Some(version) => format!("{name} {version}"),
         None => name,
@@ -371,8 +370,8 @@ pub(super) fn done_state(rec: &FetchRecord) -> DepState {
 
 /// The settled tree state for an age-gate skip, mirroring [`report_removed`]'s
 /// glyph and colour with a concise reason as the detail.
-pub(super) fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
-    let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
+fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
+    let age_days = reg.age_secs(now).unwrap_or(0) / SECS_PER_DAY;
     let (glyph, color, detail) = match reason {
         SkipReason::KnownGood => ('\u{2713}', GOOD, "known-good".to_string()),
         SkipReason::Removed => ('\u{00b7}', MUTED, "removed".to_string()),
@@ -404,13 +403,16 @@ pub fn report_registry(reg: &Registry, progress: bool) {
     }
     eprintln!(
         "\n  {}  {} {}",
-        fg(Rgb(180, 160, 255), "\u{24d8}"),
-        fg(LABEL, "registry"),
-        fg(MUTED, reg.ecosystem.as_str())
+        Ink::stderr().fg(Rgb(180, 160, 255), "\u{24d8}"),
+        Ink::stderr().fg(LABEL, "registry"),
+        Ink::stderr().fg(MUTED, reg.ecosystem.as_str())
     );
     let parts = registry_summary(reg);
     if !parts.is_empty() {
-        eprintln!("    {}", fg(DETAIL, &parts.join("  \u{00b7}  ")));
+        eprintln!(
+            "    {}",
+            Ink::stderr().fg(DETAIL, &parts.join("  \u{00b7}  "))
+        );
     }
 }
 
@@ -435,7 +437,7 @@ pub(super) fn report_fetch(rec: &FetchRecord) {
         .map(|f| {
             format!(
                 "  {}",
-                fg(MUTED, &format!("\u{2192} {}", hosts::authority(&f)))
+                Ink::stderr().fg(MUTED, &format!("\u{2192} {}", hosts::authority(&f)))
             )
         })
         .unwrap_or_default();
@@ -444,8 +446,8 @@ pub(super) fn report_fetch(rec: &FetchRecord) {
         .unwrap_or_else(|| rec.size.map_or(String::new(), crate::output::human_size));
     eprintln!(
         "    {} {}  {}{redirect}",
-        fg(row.color, &format!("{} {:<6}", row.glyph, row.label)),
-        fg(DETAIL, &format!("{column:>10}")),
+        Ink::stderr().fg(row.color, &format!("{} {:<6}", row.glyph, row.label)),
+        Ink::stderr().fg(DETAIL, &format!("{column:>10}")),
         crate::output::tty_text(fetch_target(rec))
     );
     if analysis_unavailable(rec) {
@@ -460,8 +462,8 @@ pub(super) fn report_fetch(rec: &FetchRecord) {
 /// scanned. Retain their [`FetchRecord`]s for machine output and diagnostics,
 /// but keep the default human view quiet.
 ///
-/// A corpus hit (see [`corpus_hit_record`]) is quiet for the same reason: the
-/// fleet already judged those bytes, so there is nothing here to look at.
+/// A corpus hit (see [`corpus_hit_record`](super::merge::corpus_hit_record)) is quiet for the same reason: the
+/// corpus already judged those bytes, so there is nothing here to look at.
 pub(super) fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
     if analysis_unavailable(rec) {
         return true;
@@ -520,16 +522,22 @@ pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::De
 /// timeout, `5xx`, a `403` that may be an authenticated mirror) is a fetch that
 /// *should* have worked, and stays visible.
 pub(super) fn artifact_absent(rec: &FetchRecord) -> bool {
-    matches!(rec.status, Some(404 | 410))
+    rec.status.is_some_and(gone_status)
+}
+
+/// Whether an HTTP status says the artifact is not there: `404` (never
+/// published, or a name the source does not carry) or `410` (withdrawn).
+pub(super) const fn gone_status(status: u16) -> bool {
+    matches!(status, 404 | 410)
 }
 
 /// How one fetch outcome reads in the terminal: a glyph and short label in one
 /// colour, and the detail that replaces the size column when the fetch
 /// delivered no bytes.
 pub(super) struct FetchRow {
-    pub(super) glyph: char,
+    glyph: char,
     pub(super) label: &'static str,
-    pub(super) color: Rgb,
+    color: Rgb,
     pub(super) detail: Option<String>,
 }
 
@@ -621,10 +629,10 @@ pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
 ///
 /// The digest and the PURL both name this one artifact, so both are handed to
 /// the filters together and `burton` combines them: the worst claim against
-/// either wins, and the green tick requires every key to agree. Deciding here
-/// by hand is what once let this row show a blessed coordinate as clean while
-/// its digest was cited by threat intelligence.
-pub(super) fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
+/// either wins, and the green tick requires every key to agree, so a blessed
+/// coordinate never shows clean while its digest is cited by threat
+/// intelligence.
+fn bloom_fetch_verdict(rec: &FetchRecord) -> Option<FetchRow> {
     use crate::bloom_repo::Decision;
     let lookup = crate::bloom_repo::global()?;
 
@@ -669,18 +677,20 @@ pub(super) fn failure_detail(why: &FetchError) -> String {
 /// fetch progress block: the package, its age in days, and the strongest
 /// reputation signal the registry gave (downloads, else votes/rating). The
 /// other skips never reach the stream: aged-out and known-good stay at debug.
-pub(super) fn report_removed(r: &Reference, reg: &Registry, now: u64) {
-    let age_days = reg.age_secs(now).unwrap_or(0) / 86_400;
+fn report_removed(r: &Reference, reg: &Registry, now: u64) {
+    let age_days = reg.age_secs(now).unwrap_or(0) / SECS_PER_DAY;
     let signal = reg
         .downloads_recent
         .or(reg.downloads_total)
         .map(|d| format!("{d} dl"))
         .or_else(|| reg.rating_count.map(|v| format!("{v} votes")));
-    let detail = signal.map_or_else(String::new, |signal| format!("  {}", fg(MUTED, &signal)));
+    let detail = signal.map_or_else(String::new, |signal| {
+        format!("  {}", Ink::stderr().fg(MUTED, &signal))
+    });
     eprintln!(
         "    {} {}  {}{detail}",
-        fg(MUTED, &format!("\u{00b7} {:<10}", "removed")),
-        fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
+        Ink::stderr().fg(MUTED, &format!("\u{00b7} {:<10}", "removed")),
+        Ink::stderr().fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
         crate::output::tty_text(locator(r))
     );
 }
@@ -692,7 +702,6 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     let mut bytes = 0u64;
     let mut pending = 0u32;
     let mut local = 0u32;
-    let mut dev = 0u32;
     let mut incomplete = 0u32;
     for rec in records {
         bytes += rec.size.unwrap_or(0);
@@ -706,9 +715,6 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
         }
         if has(|fact| matches!(fact, Coverage::Supplied { .. })) {
             local += 1;
-        }
-        if has(|fact| matches!(fact, Coverage::DevelopmentExcluded)) {
-            dev += 1;
         }
         if has(is_analysis_gap) {
             incomplete += 1;
@@ -733,7 +739,6 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
         (failed, "failed"),
         (pending, "pending"),
         (local, "supplied locally"),
-        (dev, "development excluded"),
         (incomplete, "analysis incomplete"),
     ] {
         if count > 0 {
@@ -744,10 +749,10 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     format!(
         "  {}  {}",
         if failed + pending + incomplete > 0 {
-            fg(Rgb(220, 160, 80), "!")
+            Ink::stderr().fg(Rgb(220, 160, 80), "!")
         } else {
-            fg(Rgb(80, 220, 80), "\u{2713}")
+            Ink::stderr().fg(Rgb(80, 220, 80), "\u{2713}")
         },
-        fg(LABEL, &parts.join("  \u{b7}  "))
+        Ink::stderr().fg(LABEL, &parts.join("  \u{b7}  "))
     )
 }

@@ -1,33 +1,104 @@
 //! Atomdrift Scan (`atomscan`) — ML-powered malware classification CLI.
 
-// Doc comments on `clap` structs are user-facing `--help` text, so they carry
-// `[EXPERIMENTAL]` tags, bare URLs, and `<URL>` placeholders that rustdoc would
-// otherwise read as broken links or markup.
-#![allow(
-    rustdoc::broken_intra_doc_links,
-    rustdoc::bare_urls,
-    rustdoc::invalid_html_tags,
-    reason = "these doc comments are `--help` text, not rustdoc"
-)]
+/// Abort-on-exhaustion `malloc`/`calloc`/`realloc` for tree-sitter over one
+/// allocator family, and `route_tree_sitter`, which installs them.
+///
+/// tree-sitter's C core otherwise allocates through the system malloc, outside
+/// the process allocator's budgets, decay policy and heap profiles; on macOS
+/// the default small-object zone also keeps freed pages resident. The shims go
+/// through [`tree_sitter::set_allocator`] rather than raw `ts_set_allocator`:
+/// the crate keeps its own free function for C strings it releases, and
+/// bypassing the wrapper would free these pointers with libc `free`.
+///
+/// tree-sitter trusts a custom allocator — its array growth writes through a
+/// `realloc` result unchecked — while the allocators here return null on
+/// exhaustion. Passing that through would turn memory pressure while parsing a
+/// hostile file into a wild write, so the shims abort, as tree-sitter's own
+/// defaults do.
+macro_rules! tree_sitter_allocator {
+    ($malloc:path, $calloc:path, $realloc:path, $free:path) => {
+        /// Route tree-sitter's C-core allocations through this allocator.
+        ///
+        /// # Safety
+        ///
+        /// Inherits [`tree_sitter::set_allocator`]'s contract: no tree-sitter
+        /// API may have been called yet, no tree-sitter object may be live, and
+        /// no other thread may be in tree-sitter. Call once, first thing in
+        /// `main`.
+        pub(super) unsafe fn route_tree_sitter() {
+            // SAFETY: the four functions are one allocator family and satisfy
+            // libc malloc alignment; the ordering and thread-exclusivity
+            // clauses are this function's documented precondition.
+            unsafe {
+                tree_sitter::set_allocator(Some(tree_sitter::Allocator {
+                    malloc: ts_malloc,
+                    calloc: ts_calloc,
+                    realloc: ts_realloc,
+                    free: $free,
+                }));
+            }
+        }
+
+        /// # Safety
+        ///
+        /// The C `malloc` contract.
+        unsafe extern "C" fn ts_malloc(size: usize) -> *mut std::ffi::c_void {
+            // SAFETY: the allocator's malloc accepts any size.
+            let ptr = unsafe { $malloc(size) };
+            if ptr.is_null() && size != 0 {
+                std::process::abort();
+            }
+            ptr
+        }
+
+        /// # Safety
+        ///
+        /// The C `calloc` contract.
+        unsafe extern "C" fn ts_calloc(count: usize, size: usize) -> *mut std::ffi::c_void {
+            // SAFETY: the allocator's calloc accepts any count and size, and
+            // returns null on overflow.
+            let ptr = unsafe { $calloc(count, size) };
+            if ptr.is_null() && count != 0 && size != 0 {
+                std::process::abort();
+            }
+            ptr
+        }
+
+        /// # Safety
+        ///
+        /// The C `realloc` contract: `ptr` is null or came from this allocator.
+        unsafe extern "C" fn ts_realloc(
+            ptr: *mut std::ffi::c_void,
+            size: usize,
+        ) -> *mut std::ffi::c_void {
+            // SAFETY: forwarded under the caller's contract.
+            let grown = unsafe { $realloc(ptr, size) };
+            if grown.is_null() && size != 0 {
+                std::process::abort();
+            }
+            grown
+        }
+    };
+}
 
 /// jemalloc, plus the compile-time tuning it reads at initialization.
 ///
 /// Allocator and configuration share one `cfg` so they cannot drift apart: a
-/// build that swaps in the system allocator must not leave a `_rjem_malloc_conf`
+/// build that uses the system allocator must not leave a `_rjem_malloc_conf`
 /// symbol behind, and one that uses jemalloc must never be left unconfigured.
-/// On the excluded targets this crate uses the system allocator; on FreeBSD that
-/// *is* jemalloc, but it reads the unprefixed `MALLOC_CONF` / `/etc/malloc.conf`,
-/// so this symbol would not reach it anyway.
+/// The excluded targets ship a native allocator (see Cargo.toml); FreeBSD's
+/// *is* jemalloc, but it reads the unprefixed `MALLOC_CONF` and
+/// `/etc/malloc.conf`, so this symbol would not reach it anyway.
 ///
 /// The string lives in cleave (`cleave::JEMALLOC_CONF`) so every binary running
-/// cleave's analysis gets the same allocator behaviour; see that constant for
-/// what each option buys and the measurements behind them.
+/// cleave's analysis gets the same allocator behaviour; that constant documents
+/// each option.
 ///
 /// Runtime configuration still wins: jemalloc applies its compiled-in string
-/// first, then `/etc/malloc.conf`, then the environment, with later sources
-/// overriding earlier ones per key. The environment variable is
-/// `_RJEM_MALLOC_CONF` — `tikv-jemallocator` builds jemalloc with the `_rjem_`
-/// prefix, so plain `MALLOC_CONF` is silently ignored.
+/// first, then `/etc/malloc.conf`, then the environment, later sources
+/// overriding earlier ones per key. The variable is `_RJEM_MALLOC_CONF` —
+/// `tikv-jemallocator` builds jemalloc with the `_rjem_` prefix, so plain
+/// `MALLOC_CONF` is ignored.
 #[cfg(all(
     unix,
     not(any(
@@ -39,7 +110,7 @@
         target_os = "solaris",
     ))
 ))]
-mod jemalloc {
+mod allocator {
     #[global_allocator]
     static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -54,171 +125,53 @@ mod jemalloc {
     #[unsafe(no_mangle)]
     static _rjem_malloc_conf: SyncPtr = SyncPtr(cleave::JEMALLOC_CONF.as_ptr());
 
-    /// Route tree-sitter's C-core allocations through jemalloc. Its parse
-    /// trees otherwise go to the system malloc — outside every jemalloc
-    /// budget, decay policy, and heap profile this codebase relies on, and
-    /// on macOS the default small-object zone retains freed pages (on the
-    /// order of a gigabyte of empty MALLOC_SMALL at a large batch's peak).
-    ///
-    /// Installs via the tree-sitter crate's [`tree_sitter::set_allocator`]
-    /// rather than raw `ts_set_allocator`: the crate keeps an internal free-fn
-    /// for C strings it releases (query errors, etc.), and bypassing the
-    /// wrapper would free jemalloc pointers with libc `free`. The four entry
-    /// points come from `tikv-jemalloc-sys`, the same crate `tikv-jemallocator`
-    /// binds, so their signatures and symbol prefix track the jemalloc actually
-    /// linked in rather than a hand-copied guess.
-    ///
-    /// # Safety
-    ///
-    /// Inherits [`tree_sitter::set_allocator`]'s contract, whose unmet clauses
-    /// are the caller's to discharge: no tree-sitter API may have been called
-    /// yet, no tree-sitter object may be live, and no other thread may be in
-    /// tree-sitter concurrently. In practice: call once, first thing in `main`.
-    pub(super) unsafe fn route_tree_sitter_through_jemalloc() {
-        // SAFETY: jemalloc's malloc/calloc/realloc/free are one allocator
-        // family and satisfy libc malloc alignment; the shims below restore
-        // tree-sitter's abort-on-null contract. The ordering and
-        // thread-exclusivity clauses are this function's own documented
-        // precondition.
-        unsafe {
-            tree_sitter::set_allocator(Some(tree_sitter::Allocator {
-                malloc: ts_malloc,
-                calloc: ts_calloc,
-                realloc: ts_realloc,
-                free: tikv_jemalloc_sys::free,
-            }));
-        }
-    }
-
-    // tree-sitter's own allocators abort on null; a custom one is trusted, and
-    // its array growth (`array.h`) writes through a `realloc` result unchecked.
-    // jemalloc does return null on exhaustion (ENOMEM is real under
-    // `vm.max_map_count`), so passing it straight through would turn memory
-    // pressure while parsing a hostile source file into a wild write. Abort
-    // instead, exactly as tree-sitter's defaults do.
-
-    /// # Safety
-    ///
-    /// The C `malloc` contract.
-    unsafe extern "C" fn ts_malloc(size: usize) -> *mut std::ffi::c_void {
-        // SAFETY: jemalloc's malloc accepts any size.
-        let ptr = unsafe { tikv_jemalloc_sys::malloc(size) };
-        if ptr.is_null() && size != 0 {
-            std::process::abort();
-        }
-        ptr
-    }
-
-    /// # Safety
-    ///
-    /// The C `calloc` contract.
-    unsafe extern "C" fn ts_calloc(count: usize, size: usize) -> *mut std::ffi::c_void {
-        // SAFETY: jemalloc's calloc accepts any count and size, and returns
-        // null on overflow.
-        let ptr = unsafe { tikv_jemalloc_sys::calloc(count, size) };
-        if ptr.is_null() && count != 0 && size != 0 {
-            std::process::abort();
-        }
-        ptr
-    }
-
-    /// # Safety
-    ///
-    /// The C `realloc` contract: `ptr` is null or came from this allocator.
-    unsafe extern "C" fn ts_realloc(
-        ptr: *mut std::ffi::c_void,
-        size: usize,
-    ) -> *mut std::ffi::c_void {
-        // SAFETY: forwarded under the caller's contract.
-        let grown = unsafe { tikv_jemalloc_sys::realloc(ptr, size) };
-        if grown.is_null() && size != 0 {
-            std::process::abort();
-        }
-        grown
-    }
+    // `tikv-jemalloc-sys` is the crate `tikv-jemallocator` binds, so these
+    // signatures and the symbol prefix track the jemalloc actually linked.
+    tree_sitter_allocator!(
+        tikv_jemalloc_sys::malloc,
+        tikv_jemalloc_sys::calloc,
+        tikv_jemalloc_sys::realloc,
+        tikv_jemalloc_sys::free
+    );
 }
 
-/// Windows counterpart of [`jemalloc`]: CRT heap was 12% exclusive on the
-/// two-Go WPR profile, and 16 rayon workers convoy on the process heap.
-/// Route tree-sitter's C allocator through the same arena so parse trees
-/// are not a second heap.
-#[cfg(all(windows, not(feature = "crt-heap")))]
-mod mimalloc_alloc {
+/// mimalloc, the Windows counterpart of the jemalloc module: the CRT heap
+/// convoys under many-way archive-member analysis.
+#[cfg(windows)]
+mod allocator {
     #[global_allocator]
     static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-    /// `calloc` for tree-sitter: a zeroed `count * size` allocation from
-    /// mimalloc. Aborts on overflow or exhaustion, as tree-sitter's own
-    /// allocators do: a custom allocator is trusted, and its array growth
-    /// writes through the result unchecked.
-    ///
-    /// # Safety
-    ///
-    /// The C allocator contract: the result is freed only through `mi_free`.
-    unsafe extern "C" fn calloc_compat(count: usize, size: usize) -> *mut std::ffi::c_void {
-        let Some(bytes) = count.checked_mul(size) else {
-            std::process::abort();
-        };
-        // SAFETY: `mi_malloc` accepts any size and returns null on failure.
-        let ptr = unsafe { libmimalloc_sys::mi_malloc(bytes) };
-        if ptr.is_null() && bytes > 0 {
-            std::process::abort();
-        }
-        if bytes > 0 {
-            // SAFETY: `ptr` is a fresh, non-null allocation of `bytes` bytes.
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
-        }
-        ptr
-    }
+    tree_sitter_allocator!(
+        libmimalloc_sys::mi_malloc,
+        libmimalloc_sys::mi_calloc,
+        libmimalloc_sys::mi_realloc,
+        libmimalloc_sys::mi_free
+    );
+}
 
-    /// # Safety
-    ///
-    /// Same contract as [`super::jemalloc::route_tree_sitter_through_jemalloc`]:
-    /// call once, first thing in `main`, before any tree-sitter API.
-    pub(super) unsafe fn route_tree_sitter_through_mimalloc() {
-        // SAFETY: mimalloc's malloc/calloc/realloc/free are one allocator
-        // family; the ordering and thread-exclusivity clauses are this
-        // function's own documented precondition.
-        unsafe {
-            tree_sitter::set_allocator(Some(tree_sitter::Allocator {
-                malloc: malloc_compat,
-                calloc: calloc_compat,
-                realloc: realloc_compat,
-                free: libmimalloc_sys::mi_free,
-            }));
-        }
-    }
-
-    /// `malloc` for tree-sitter, aborting on exhaustion (see [`calloc_compat`]).
+/// The platform's own allocator, which tree-sitter already uses.
+#[cfg(not(any(
+    windows,
+    all(
+        unix,
+        not(any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    )
+)))]
+mod allocator {
+    /// Nothing to route.
     ///
     /// # Safety
     ///
-    /// The C allocator contract: the result is freed only through `mi_free`.
-    unsafe extern "C" fn malloc_compat(size: usize) -> *mut std::ffi::c_void {
-        // SAFETY: `mi_malloc` accepts any size and returns null on failure.
-        let ptr = unsafe { libmimalloc_sys::mi_malloc(size) };
-        if ptr.is_null() && size != 0 {
-            std::process::abort();
-        }
-        ptr
-    }
-
-    /// `realloc` for tree-sitter, aborting on exhaustion (see [`calloc_compat`]).
-    ///
-    /// # Safety
-    ///
-    /// `ptr` is null or came from mimalloc.
-    unsafe extern "C" fn realloc_compat(
-        ptr: *mut std::ffi::c_void,
-        size: usize,
-    ) -> *mut std::ffi::c_void {
-        // SAFETY: forwarded under the caller's contract.
-        let grown = unsafe { libmimalloc_sys::mi_realloc(ptr, size) };
-        if grown.is_null() && size != 0 {
-            std::process::abort();
-        }
-        grown
-    }
+    /// None; `unsafe` only to match the other allocators' signature.
+    pub(super) unsafe fn route_tree_sitter() {}
 }
 
 use anyhow::{Context, Result};
@@ -239,68 +192,6 @@ use tracing_subscriber::prelude::*;
 /// process exits anyway. Dropping the runtime instead waits forever, and one
 /// wedged analysis would then hold the process past every drain deadline.
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-
-const EXPECTED_YARA_CACHE_MISMATCH: &str =
-    "compiled YARA rules do not match the rule sources on disk; ignoring them and recompiling";
-
-fn is_expected_yara_cache_mismatch(target: &str, message: &str) -> bool {
-    target == "cleave::yara_engine" && message.contains(EXPECTED_YARA_CACHE_MISMATCH)
-}
-
-/// Hide one expected cache invalidation without muting real YARA errors from
-/// the same tracing target. The upstream event remains available whenever the
-/// operator explicitly asks for diagnostic logs.
-///
-/// cleave emits it as prose with no structured field to key on, so the
-/// message is matched — but only for an ERROR from that one target, so no
-/// other event pays for formatting it.
-#[derive(Debug, Clone, Copy)]
-struct ExpectedYaraCacheFilter {
-    hide: bool,
-}
-
-#[derive(Default)]
-struct EventMessage {
-    text: String,
-}
-
-impl tracing::field::Visit for EventMessage {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.text = format!("{value:?}");
-        }
-    }
-}
-
-impl<S> tracing_subscriber::layer::Filter<S> for ExpectedYaraCacheFilter
-where
-    S: tracing::Subscriber,
-{
-    fn enabled(
-        &self,
-        _metadata: &tracing::Metadata<'_>,
-        _context: &tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        true
-    }
-
-    fn event_enabled(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: &tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        let metadata = event.metadata();
-        if !self.hide
-            || *metadata.level() != tracing::Level::ERROR
-            || metadata.target() != "cleave::yara_engine"
-        {
-            return true;
-        }
-        let mut message = EventMessage::default();
-        event.record(&mut message);
-        !is_expected_yara_cache_mismatch(metadata.target(), &message.text)
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "atomscan")]
@@ -515,31 +406,27 @@ enum Commands {
         paths: Vec<PathBuf>,
 
         /// Renew each result on a hopper instance by POSTing its envelope to
-        /// `<URL>/api/result`. A SHA hopper has not ingested is negotiated over
-        /// `/api/known` and uploaded bytes-and-provenance first, so a
-        /// never-before-seen sample lands as its own row instead of being
-        /// dropped as an unknown-SHA no-op. Upload failures are reported as
-        /// errors, but never make the scan fatal. Also settable via the
-        /// `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper`; hopper rejects an
-        /// unauthenticated request with 401.
+        /// `<URL>/api/result`. A sample hopper has not seen is uploaded first,
+        /// bytes and provenance, so it lands as its own record. Upload failures
+        /// are reported as errors, but never make the scan fatal. Also settable
+        /// via the `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper`;
+        /// hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
             value_name = "URL",
-            env = "SCAN_HOPPER"
+            env = scan::env::SCAN_HOPPER.name
         )]
         hopper: Option<String>,
 
         /// Apply pre-collected registry metadata per scanned file, so an offline
         /// scan reasons over the same registry facts a live `pkg`/`url` scan would
         /// — without refetching, and even when the package has since been pulled.
-        /// Takes a JSON object mapping each file's sha256 to its complete hopper
-        /// sidecar, a `{record,sources}` fletch envelope, or a legacy bare
-        /// registry record. Complete inputs retain their raw provider data.
-        /// A file absent from the map scans normally.
-        /// Also settable via the `SCAN_REGISTRY_MAP` env var.
-        #[arg(long, value_name = "FILE", env = "SCAN_REGISTRY_MAP")]
+        /// Takes a JSON object mapping each file's sha256 to its hopper sidecar,
+        /// a `{record,sources}` envelope, or a bare registry record. A file
+        /// absent from the map scans normally. Also settable via the
+        /// `SCAN_REGISTRY_MAP` env var.
+        #[arg(long, value_name = "FILE", env = scan::env::SCAN_REGISTRY_MAP.name)]
         registry_map: Option<PathBuf>,
 
         /// Treat collector capture records (`<file>.forage.json` beside
@@ -564,17 +451,14 @@ enum Commands {
         url: String,
 
         /// Push the fetched artifact to a hopper instance: bytes and provenance
-        /// when hopper does not already have the SHA, then the verdict. A
-        /// fetched URL is exactly the never-before-seen case, so this is the
-        /// flag that gets a freshly-discovered sample into the corpus.
-        /// Also settable via the `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper`; hopper rejects an
-        /// unauthenticated request with 401.
+        /// when hopper does not already have the SHA, then the verdict. Also
+        /// settable via the `SCAN_HOPPER` env var. Authenticates with
+        /// `~/.tok/hopper`; hopper rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
             value_name = "URL",
-            env = "SCAN_HOPPER"
+            env = scan::env::SCAN_HOPPER.name
         )]
         hopper: Option<String>,
     },
@@ -588,18 +472,15 @@ enum Commands {
         purl: String,
 
         /// Push the fetched package to a hopper instance: bytes and provenance
-        /// when hopper does not already have the SHA, then the verdict. The
-        /// registry record resolved for the package rides along as the
-        /// sidecar's `registry` node, so the uploaded sample carries the same
-        /// provenance a forager-collected one would.
-        /// Also settable via the `SCAN_HOPPER` env var.
-        /// Authenticates with `~/.tok/hopper`; hopper rejects an
-        /// unauthenticated request with 401.
+        /// (including the resolved registry record) when hopper does not
+        /// already have the SHA, then the verdict. Also settable via the
+        /// `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper`; hopper
+        /// rejects an unauthenticated request with 401.
         #[arg(
             long,
             visible_alias = "upload",
             value_name = "URL",
-            env = "SCAN_HOPPER"
+            env = scan::env::SCAN_HOPPER.name
         )]
         hopper: Option<String>,
     },
@@ -653,8 +534,8 @@ struct ServeArgs {
     allow_cidr: Option<String>,
 
     /// Require `Authorization: Bearer <token>` on every route except
-    /// /_/health, reading the token from the first non-empty line of
-    /// PATH. Loopback is not exempt: behind a Cloudflare tunnel every
+    /// `/_/health`, reading the token from the first non-empty line of
+    /// PATH. Loopback is not exempt: behind a tunnel or reverse proxy every
     /// request arrives from loopback. A missing, empty, or unreadable
     /// file is a startup error — never a silent drop to unauthenticated.
     #[arg(long, value_name = "PATH")]
@@ -663,20 +544,15 @@ struct ServeArgs {
     /// The hopper this server reads from and files to.
     ///
     /// Every analyzed result (parent and members) is renewed by POSTing to
-    /// <URL>/api/result as analyses complete — the warm-server equivalent of
-    /// `scan path --hopper` — and a lookup this server's own index cannot
-    /// answer is deferred to the same place.
+    /// `<URL>/api/result` as analyses complete, and a lookup this server's
+    /// own index cannot answer is deferred to the same place.
     ///
-    /// Several addresses may be given, comma-separated, in preference
-    /// order: put the replica first and the primary behind it. Reads try
-    /// them in that order, and a retry on a write walks down the list, so a
-    /// replica that stops answering costs one attempt rather than a lost
-    /// verdict. Reads and writes deliberately take the same list — routing
-    /// them apart is a topology this server would have to know, and
-    /// hopper's write relay exists so that it does not: a replica answers
-    /// lookups locally and forwards the renewals.
+    /// Several addresses may be given, comma-separated, in preference order:
+    /// put a read replica first and the primary behind it. Reads try them in
+    /// that order, and a retried write walks down the list, so a replica that
+    /// stops answering costs one attempt rather than a lost verdict.
     ///
-    ///   --hopper https://hops-ro.example,http://hopper.internal:8081
+    /// `--hopper https://hopper-replica.example.com,https://hopper.example.com`
     ///
     /// Upload failures are reported as errors, but never make the scan
     /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
@@ -686,7 +562,7 @@ struct ServeArgs {
         long,
         visible_alias = "upload",
         value_name = "URL",
-        env = "SCAN_HOPPER"
+        env = scan::env::SCAN_HOPPER.name
     )]
     hopper: Option<String>,
 
@@ -715,63 +591,10 @@ impl Commands {
     }
 }
 
-/// Warn when `MALLOC_CONF` asks FreeBSD's in-libc jemalloc for a background
-/// purge thread, which permanently breaks allocation.
-///
-/// FreeBSD builds libc's jemalloc without `JEMALLOC_BACKGROUND_THREAD` (libc
-/// cannot depend on libthr), so `background_thread_boot0()` fails. It is called
-/// from `malloc_init_hard()` *after* `malloc_init_state` has been set to
-/// `malloc_init_recursible`, so init returns early and never reaches
-/// `malloc_init_initialized`. `malloc_initialized()` is then false for the life
-/// of the process: every allocation re-enters `malloc_init_hard()` and
-/// serializes on the global `init_lock`, collapsing a many-core box to roughly
-/// one allocating thread. jemalloc treats this as unsupported-not-invalid, so
-/// `abort_conf:true` does not catch it and nothing is written to stderr — the
-/// only symptom is throughput death, which is why this check exists.
-///
-/// Warn rather than fail: the setting is harmless (merely ignored) on the
-/// platforms that link the bundled jemalloc, and an operator override should
-/// never be able to refuse to boot a server.
-fn warn_on_broken_freebsd_malloc_conf() {
-    if !cfg!(target_os = "freebsd") {
-        return;
-    }
-    let conf = scan::env::text(scan::env::MALLOC_CONF).unwrap_or_default();
-    // Only `background_thread:true` breaks init; an explicit `:false` is fine.
-    if !conf.contains("background_thread:true") {
-        return;
-    }
-    tracing::warn!(
-        malloc_conf = %conf,
-        "MALLOC_CONF sets background_thread:true, which FreeBSD's in-libc jemalloc does not \
-         support: malloc initialization aborts partway and every allocation then serializes on \
-         jemalloc's global init_lock. Expect near-total throughput collapse and analyses that \
-         never finish. Remove background_thread from MALLOC_CONF.",
-    );
-}
-
 fn main() -> ExitCode {
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "illumos",
-            target_os = "solaris",
-        ))
-    ))]
     // SAFETY: the first statement of `main` — no tree-sitter API has run, no
     // tree-sitter object is live, and no threads have been spawned yet.
-    unsafe {
-        jemalloc::route_tree_sitter_through_jemalloc()
-    };
-    #[cfg(all(windows, not(feature = "crt-heap")))]
-    // SAFETY: first statements of `main` — no tree-sitter API has run.
-    unsafe {
-        mimalloc_alloc::route_tree_sitter_through_mimalloc()
-    };
+    unsafe { allocator::route_tree_sitter() };
     // SAFETY: still the first statements of `main`. No thread has been
     // spawned and nothing has read the environment yet.
     unsafe { scan::runtime::install() };
@@ -785,7 +608,13 @@ fn main() -> ExitCode {
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         // Ctrl-C stopped the scan: the conventional 128 + SIGINT, so a script
         // never mistakes a partial scan for a clean one.
-        Err(e) if is_interrupted(&e) => {
+        Err(e)
+            if e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+            }) =>
+        {
             eprintln!("Error: {e:#}");
             ExitCode::from(130)
         }
@@ -806,15 +635,6 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Whether `e` reports a scan stopped by Ctrl-C.
-fn is_interrupted(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
-    })
-}
-
 /// Set up the process for `command`, then run it.
 fn run(cli: Cli) -> Result<ExitCode> {
     scan::env::check()?;
@@ -825,95 +645,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cli::command().print_long_help()?;
         return Ok(ExitCode::SUCCESS);
     };
-
     if let Commands::Render { args } = &command {
-        // `--llm` grades what a live query sends, which is the interpret render.
-        let llm = global.interpret_config()?;
-        let format = if llm.is_some() {
-            scan::OutputFormat::Interpret
-        } else {
-            global.format
-        };
-        let rendered = cleave::report_input::run(args, |loaded| {
-            scan::engine::render_saved_report(loaded, format)
-        })?;
-        let out = match &llm {
-            Some(cfg) => format!("{}\n", scan::interpret::grade_render(cfg, &rendered)?),
-            None => rendered,
-        };
-        use std::io::Write as _;
-        std::io::stdout().lock().write_all(out.as_bytes())?;
-        return Ok(ExitCode::SUCCESS);
+        return render(&global, args);
     }
-
-    configure_process(&global, &command)?;
-    init_logging(&global, command.is_daemon());
-
-    // Resolved after logging is up: with no hardcoded default, the model comes
-    // from the endpoint's own listing, so which one was picked has to be
-    // visible rather than swallowed by an uninitialized subscriber.
-    let interpret = global.interpret_config()?;
-    if let Some(cfg) = &interpret {
-        tracing::info!(
-            endpoint = %cfg.base_url,
-            model = %cfg.model,
-            "LLM interpretation enabled",
-        );
-    }
-
-    // A held token picks the Uplink rules tree and `--uplink` insists on
-    // it: decided before anything resolves one.
-    cleave::enriched::resolve(global.uplink)?;
-    if !global.uplink && scan::env::uplink_opted_out() {
-        cleave::enriched::set_enabled(false);
-    }
-    // Stabilize cleave trait discovery before any cleave shared resources are
-    // initialized. This avoids clone-into-existing-directory failures when the
-    // default traits checkout was installed by cleave or another scan run.
-    scan::traits_repo::prepare_runtime_env();
-
-    warn_on_broken_freebsd_malloc_conf();
-    scan::heap_profile::report_debug_allocator();
-    scan::runtime::install_rayon_pool();
-    scan::runtime::install_diagnostics();
-
-    #[cfg(debug_assertions)]
-    tracing::warn!(
-        "DEBUG binary — scan will be very slow; use `make release` for production builds"
-    );
-
-    // Warn about missing analysis tools for commands that will run cleave.
-    if command.is_scan() || command.is_daemon() || matches!(command, Commands::Validate) {
-        scan::tools::warn_missing();
-    }
-    // Interactive commands get a once-a-day, zero-telemetry update notice. The
-    // long-running daemons are excluded — they refresh on restart and shouldn't
-    // print transient notices into their logs — and so is `validate`.
-    if !command.is_daemon() && !matches!(command, Commands::Validate) {
-        scan::update_check::maybe_notify(false);
-    }
-    // Default-on refresh: bring rules + models (+ bloom) current when the local
-    // ruleset is over 24h stale — or immediately with `-u/--update` — unless
-    // `--no-update` disables it. Scanning commands only: the
-    // daemons refresh on restart, and `version`/`update-rules` manage updates
-    // themselves.
-    if command.is_scan() {
-        // `--uplink` needs a token before the refresh below would ask for
-        // one mid-download; asked here, once.
-        if cleave::enriched::required() {
-            cleave::rule_update::sign_in()?;
-        }
-        scan::auto_update::refresh_if_stale(
-            global.refresh(),
-            global.mode,
-            global.format == scan::OutputFormat::Terminal,
-        )?;
-        // Where artifacts are judged, settled once the rules are: an uplink
-        // scan that needed a token has been asked for it by now, and one whose
-        // token was refused has fallen back to open source, and asks nothing.
-        scan::remote::resolve(global.analyze, cleave::enriched::enabled())?;
-    }
-
+    let interpret = bootstrap(&global, &command)?;
     let fetch = fetch_policy(&global, &command);
     match command {
         Commands::Render { .. } => anyhow::bail!("render must run before analysis bootstrap"),
@@ -974,6 +709,98 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// `atomscan render`: a saved report, rendered locally with no models,
+/// updates or fetching. `--llm` grades what a live query sends, which is the
+/// interpret render.
+fn render(global: &GlobalArgs, args: &cleave::report_input::RenderArgs) -> Result<ExitCode> {
+    use std::io::Write as _;
+    let llm = global.interpret_config()?;
+    let format = if llm.is_some() {
+        scan::OutputFormat::Interpret
+    } else {
+        global.format
+    };
+    let rendered = cleave::report_input::run(args, |loaded| {
+        scan::engine::render_saved_report(loaded, format)
+    })?;
+    let out = match &llm {
+        Some(cfg) => format!("{}\n", scan::interpret::grade_render(cfg, &rendered)?),
+        None => rendered,
+    };
+    std::io::stdout().lock().write_all(out.as_bytes())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Everything a command that analyzes needs before it starts: settings and
+/// logging, the rules channel, the allocator check, the Rayon pool and
+/// diagnostics, and — for interactive commands — the update notice and the
+/// stale-rules refresh. Returns the LLM configuration, if any.
+fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<InterpretConfig>> {
+    configure_process(global, command)?;
+    init_logging(global, command.is_daemon());
+
+    // Resolved after logging is up: with no hardcoded default, the model comes
+    // from the endpoint's own listing, so which one was picked has to be
+    // visible rather than swallowed by an uninitialized subscriber.
+    let interpret = global.interpret_config()?;
+    if let Some(cfg) = &interpret {
+        tracing::info!(
+            endpoint = %cfg.base_url,
+            model = %cfg.model,
+            "LLM interpretation enabled",
+        );
+    }
+
+    // A held token picks the Uplink rules tree, `--uplink` insists on it, and
+    // `ATOMDRIFT_UPLINK=0` opts out: decided before anything resolves one.
+    cleave::enriched::resolve(global.uplink)?;
+    // Stabilize cleave trait discovery before any cleave shared resources are
+    // initialized. This avoids clone-into-existing-directory failures when the
+    // default traits checkout was installed by cleave or another scan run.
+    scan::traits_repo::prepare_runtime_env();
+
+    scan::freebsd_malloc::check_settings();
+    scan::runtime::install_rayon_pool();
+    scan::runtime::install_diagnostics();
+
+    #[cfg(debug_assertions)]
+    tracing::warn!(
+        "DEBUG binary — scan will be very slow; use `make release` for production builds"
+    );
+
+    // Warn about missing analysis tools for commands that will run cleave.
+    if command.is_scan() || command.is_daemon() || matches!(command, Commands::Validate) {
+        scan::tools::warn_missing();
+    }
+    // Interactive commands get a once-a-day, zero-telemetry update notice. The
+    // long-running daemons are excluded — they refresh on restart and shouldn't
+    // print transient notices into their logs — and so is `validate`.
+    if !command.is_daemon() && !matches!(command, Commands::Validate) {
+        scan::update_check::maybe_notify();
+    }
+    // Default-on refresh: bring rules + models (+ bloom) current when the local
+    // ruleset is over 24h stale — or immediately with `-u/--update` — unless
+    // `--no-update` disables it. Scanning commands only: the daemons refresh on
+    // restart, and `version`/`update-rules` manage updates themselves.
+    if command.is_scan() {
+        // `--uplink` needs a token before the refresh below would ask for
+        // one mid-download; asked here, once.
+        if cleave::enriched::required() {
+            cleave::rule_update::sign_in()?;
+        }
+        scan::auto_update::refresh_if_stale(
+            global.refresh(),
+            global.mode,
+            global.format == scan::OutputFormat::Terminal,
+        )?;
+        // Where artifacts are judged, settled once the rules are: an uplink
+        // scan that needed a token has been asked for it by now, and one whose
+        // token was refused has fallen back to open source, and asks nothing.
+        scan::remote::resolve(global.analyze, cleave::enriched::enabled())?;
+    }
+    Ok(interpret)
+}
+
 /// Settle the process's settings from its flags, and start the cache sweeper.
 fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
     scan::settings::configure(scan::settings::Settings {
@@ -987,7 +814,7 @@ fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
         theme: theme(global, command),
         ..Default::default()
     })?;
-    // Reclaim stale/oversized caches (stng strings+r2, scan analysis+interpret,
+    // Reclaim stale/oversized caches (stng strings, scan analysis+interpret,
     // fletch blobs). One detached, self-gated sweep for a CLI run; a recurring
     // loop for the never-exiting daemons. Non-blocking either way.
     scan::cache_cleanup::start(command.is_daemon());
@@ -1012,22 +839,18 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
             tracing_subscriber::EnvFilter::new("atomscan=warn,scan=warn,cleave=error")
         }
     });
-    // Cleave rejects a stale precompiled YARA cache safely and recompiles from
-    // source. That expected maintenance path is not an operator-facing error;
-    // filter only its exact event. Explicit diagnostics still show it.
-    let quiet_expected_yara_cache = ExpectedYaraCacheFilter { hide: !explicit };
     let layer = tracing_subscriber::fmt::layer()
         .with_thread_names(true)
         .with_writer(std::io::stderr);
     if daemon {
         tracing_subscriber::registry()
             .with(filter)
-            .with(layer.with_filter(quiet_expected_yara_cache))
+            .with(layer)
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(layer.without_time().with_filter(quiet_expected_yara_cache))
+            .with(layer.without_time())
             .init();
     }
 
@@ -1180,19 +1003,6 @@ fn finish_scan(summary: &scan::ScanSummary) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// A multi-threaded runtime for a daemon.
-///
-/// Its blocking threads run small analyses inline (`classify_bytes` without a
-/// whale lane), so they get the same stack as every analysis pool
-/// ([`scan::RAYON_STACK_MB`]): a hostile sample that recurses fine on a pool
-/// must not overflow tokio's 2 MiB default and abort the whole daemon.
-fn daemon_runtime() -> Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(scan::RAYON_STACK_MB * 1024 * 1024)
-        .build()?)
-}
-
 /// `atomscan serve`.
 fn serve(
     global: &GlobalArgs,
@@ -1236,15 +1046,24 @@ fn serve(
     }
     .resolve()?;
     if let Some(url) = hopper.as_deref() {
-        eprintln!("Renewing results on hopper at {url}");
-        eprintln!("Deferring unknown lookups to the corpus at {url}");
+        tracing::info!(
+            hopper = url,
+            "renewing results on hopper and deferring unknown lookups to it"
+        );
     }
     // Serve never bloom-skips an /analyze job (Mode::Slow), but the membership
     // endpoint and the --follow dependency gate read the process-wide handle.
     // Missing files fail closed (no skip).
     publish_bloom_filters(global.mode);
-    eprintln!("Starting Atomdrift Scan server on http://{} ...", args.bind);
-    let runtime = daemon_runtime()?;
+    tracing::info!(bind = %args.bind, "starting Atomdrift Scan server");
+    // The runtime's blocking threads run small analyses inline, so they get
+    // the stack every analysis pool has ([`scan::RAYON_STACK_MB`]): a hostile
+    // sample that recurses fine on a pool must not overflow tokio's 2 MiB
+    // default and abort the whole daemon.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(scan::RAYON_STACK_MB * 1024 * 1024)
+        .build()?;
     let served = runtime.block_on(scan::server::run(config));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     served?;
@@ -1279,53 +1098,80 @@ fn print_version(format: scan::OutputFormat) -> std::io::Result<()> {
     let bloom = scan::bloom_repo::installed_manifest();
     let nsrl = scan::nsrl_repo::installed_manifest();
     if format == scan::OutputFormat::Json {
-        let bloom_json = bloom.as_ref().map(|m| {
-            let filters: serde_json::Map<String, serde_json::Value> = m
-                .filter
-                .iter()
-                .map(|(stem, e)| {
-                    (
-                        stem.clone(),
-                        serde_json::json!({
-                            "n": e.n,
-                            "format_version": e.format_version,
-                            "sha256": e.sha256,
-                        }),
-                    )
-                })
-                .collect();
-            serde_json::json!({
-                "built": m.built,
-                "schema": m.schema,
-                "filters": filters,
-            })
-        });
-        // Dates beside the commits, so a benchmark comparing two rules channels
-        // can say how fresh each one was, not only which it was.
-        let traits_date =
-            cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.date);
-        let models_date = scan::models_repo::install_target()
-            .ok()
-            .and_then(|dir| scan::model_update::installed(&dir))
-            .map(|i| i.date);
-        let version = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "models": scan::models_repo::version(),
-            "models_date": models_date,
-            "traits": cleave::traits_repo::version(),
-            "traits_date": traits_date,
-            "traits_channel": cleave::traits_repo::Edition::current().as_str(),
-            "bloom": bloom_json,
-            "nsrl": nsrl,
-            "nsrl_release": scan::nsrl_repo::installed_release(),
-        });
+        let version = version_json(bloom.as_ref(), nsrl.as_ref());
         return writeln!(std::io::stdout(), "{version}");
     }
-
-    use scan::output::SourceRow;
-
     // Counting traits/composites/YARA initialises the rule engines.
     let info = cleave::version_info();
+    let bloom_count: u64 = bloom
+        .as_ref()
+        .map_or(0, |m| m.filter.values().map(|e| e.n).sum());
+    let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
+    scan::output::print_version(
+        env!("CARGO_PKG_VERSION"),
+        &info.traits_edition.styled(),
+        bloom_count,
+        rules,
+        &version_rows(&info, bloom.as_ref(), nsrl.as_ref()),
+    )
+}
+
+/// `atomscan -f json version`: the build and each rule source's identity.
+fn version_json(
+    bloom: Option<&burton::Manifest>,
+    nsrl: Option<&burton::Manifest>,
+) -> serde_json::Value {
+    let bloom_json = bloom.map(|m| {
+        let filters: serde_json::Map<String, serde_json::Value> = m
+            .filter
+            .iter()
+            .map(|(stem, e)| {
+                (
+                    stem.clone(),
+                    serde_json::json!({
+                        "n": e.n,
+                        // One format per bundle now; kept per filter so the
+                        // JSON keeps its shape.
+                        "format_version": burton::FORMAT_VERSION,
+                        "sha256": e.sha256,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "built": m.built,
+            "schema": m.schema,
+            "filters": filters,
+        })
+    });
+    // Dates beside the commits, so a benchmark comparing two rules channels
+    // can say how fresh each one was, not only which it was.
+    let traits_date =
+        cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.date);
+    let models_date = scan::models_repo::install_target()
+        .ok()
+        .and_then(|dir| scan::model_update::installed(&dir))
+        .map(|i| i.date);
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "models": scan::models_repo::version(),
+        "models_date": models_date,
+        "traits": cleave::traits_repo::version(),
+        "traits_date": traits_date,
+        "traits_channel": cleave::traits_repo::Edition::current().as_str(),
+        "bloom": bloom_json,
+        "nsrl": nsrl,
+        "nsrl_release": scan::nsrl_repo::installed_release(),
+    })
+}
+
+/// The terminal `version` table: one row per rule source.
+fn version_rows(
+    info: &cleave::VersionInfo,
+    bloom: Option<&burton::Manifest>,
+    nsrl: Option<&burton::Manifest>,
+) -> Vec<scan::output::SourceRow> {
+    use scan::output::SourceRow;
 
     // Atomics, composites, and third-party YARA all ship in the traits repo, so
     // they share one identity and build date. Prefer the installed bundle's
@@ -1347,61 +1193,39 @@ fn print_version(format: scan::OutputFormat) -> std::io::Result<()> {
         .and_then(|i| scan::output::parse_ymd(&i.date))
         .or_else(|| traits_git.as_ref().map(|&(_, e)| e));
 
-    // Bloom: total element count and the manifest's build date.
-    let bloom_count: u64 = bloom
-        .as_ref()
-        .map_or(0, |m| m.filter.values().map(|e| e.n).sum());
-    let bloom_version = bloom
-        .as_ref()
-        .and_then(|m| m.filter.values().next())
-        .map(|e| format!("v{}", e.format_version))
-        .unwrap_or_default();
-    let bloom_epoch = bloom
-        .as_ref()
-        .and_then(|m| scan::output::parse_ymd(&m.built));
-
-    let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
-
     let mut rows = Vec::new();
     if let Some(nsrl) = nsrl {
         rows.push(SourceRow {
             label: "nsrl",
             count: nsrl.filter.values().map(|e| e.n).sum(),
             metric: None,
-            version: scan::nsrl_repo::installed_release().unwrap_or_else(|| "v1".to_owned()),
+            version: scan::nsrl_repo::installed_release()
+                .unwrap_or_else(|| format!("v{}", burton::FORMAT_VERSION)),
             epoch: scan::output::parse_ymd(&nsrl.built),
         });
     }
-    if bloom.is_some() {
+    if let Some(bloom) = bloom {
         rows.push(SourceRow {
             label: "blooms",
-            count: bloom_count,
+            count: bloom.filter.values().map(|e| e.n).sum(),
             metric: None,
-            version: bloom_version,
-            epoch: bloom_epoch,
+            version: format!("v{}", burton::FORMAT_VERSION),
+            epoch: scan::output::parse_ymd(&bloom.built),
         });
     }
-    rows.push(SourceRow {
-        label: "atomics",
-        count: info.trait_count as u64,
-        metric: None,
-        version: traits_version.clone(),
-        epoch: traits_epoch,
-    });
-    rows.push(SourceRow {
-        label: "composites",
-        count: info.composite_count as u64,
-        metric: None,
-        version: traits_version.clone(),
-        epoch: traits_epoch,
-    });
-    rows.push(SourceRow {
-        label: "third-party YARA",
-        count: info.yara_rules as u64,
-        metric: None,
-        version: traits_version,
-        epoch: traits_epoch,
-    });
+    for (label, count) in [
+        ("atomics", info.trait_count),
+        ("composites", info.composite_count),
+        ("third-party YARA", info.yara_rules),
+    ] {
+        rows.push(SourceRow {
+            label,
+            count: count as u64,
+            metric: None,
+            version: traits_version.clone(),
+            epoch: traits_epoch,
+        });
+    }
 
     // ML models: route-model count by feature dimensionality (e.g. `64 x 229`),
     // plus the bundle's commit and build date.
@@ -1423,14 +1247,7 @@ fn print_version(format: scan::OutputFormat) -> std::io::Result<()> {
                 .and_then(|i| scan::output::parse_ymd(&i.date)),
         });
     }
-
-    scan::output::print_version(
-        env!("CARGO_PKG_VERSION"),
-        &info.traits_edition.styled(),
-        bloom_count,
-        rules,
-        &rows,
-    )
+    rows
 }
 
 /// The abbreviated commit hash and committer date (Unix seconds) of `HEAD` in

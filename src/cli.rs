@@ -11,16 +11,6 @@
 //! Adding a flag here adds it to every binary that flattens this struct, and
 //! renaming one is a user-visible change to all of them.
 
-// Doc comments on `clap` structs are user-facing `--help` text, so they carry
-// `[EXPERIMENTAL]` tags, bare URLs, and `<URL>` placeholders that rustdoc would
-// otherwise read as broken links or markup.
-#![allow(
-    rustdoc::broken_intra_doc_links,
-    rustdoc::bare_urls,
-    rustdoc::invalid_html_tags,
-    reason = "these doc comments are `--help` text, not rustdoc"
-)]
-
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -66,7 +56,7 @@ pub struct LlmEnv {
     /// `SCAN_LLM_SYSTEM_PROMPT_FILE`: a grading prompt to use in place of the
     /// built-in one, for a prompt-tuning A/B.
     pub system_prompt_file: Option<PathBuf>,
-    /// `~/.tok/llm`: our own endpoint's bearer token.
+    /// `~/.tok/llm`: the bearer token for any endpoint but OpenRouter.
     pub llm_token_file: Option<PathBuf>,
     /// `~/.tok/openrouter`.
     pub openrouter_token_file: Option<PathBuf>,
@@ -140,6 +130,81 @@ pub fn operating_level(
             .or_else(|| crate::model::model_default_level(model_dir))
             .unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL),
     )
+}
+
+/// One link of an `--llm` chain, with its key and model, or why it cannot be
+/// used.
+///
+/// `explicit_key` is `SCAN_LLM_KEY`, with whether it belongs to OpenRouter;
+/// it applies only to endpoints of that kind. Otherwise each endpoint takes
+/// its own token file, and only its own: `~/.tok/openrouter` for OpenRouter,
+/// `~/.tok/llm` for everything else, so a host's credential never travels to
+/// a third party. Absent a file the request goes out unauthenticated, which is
+/// right for an endpoint that wants no key.
+///
+/// A pinned model wins. OpenRouter's catalog is large and billed, so nothing
+/// is guessed from it: it gets its own `openrouter/auto` router. Any other
+/// endpoint is asked what it serves — the one network call in resolving the
+/// flags — since a guessed name would surface as an opaque server error
+/// mid-scan instead of here.
+fn resolve_endpoint(
+    base_url: String,
+    pinned: Option<String>,
+    explicit_key: Option<(&str, bool)>,
+    env: &LlmEnv,
+) -> std::result::Result<crate::interpret::LlmEndpoint, String> {
+    let openrouter = crate::interpret::is_openrouter_endpoint(&base_url);
+    let api_key = explicit_key
+        .filter(|&(_, for_openrouter)| for_openrouter == openrouter)
+        .map(|(key, _)| key.to_owned())
+        .or_else(|| {
+            let file = if openrouter {
+                &env.openrouter_token_file
+            } else {
+                &env.llm_token_file
+            };
+            crate::interpret::read_token_file(file.as_deref()?)
+        });
+    if api_key.is_some()
+        && let Ok(url) = reqwest::Url::parse(&base_url)
+        && url.scheme() == "http"
+        && !url.host_str().is_some_and(|host| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
+        tracing::warn!(
+            llm = %base_url,
+            "the LLM key is sent to this address in cleartext; use https unless the network itself is encrypted"
+        );
+    }
+    if openrouter && api_key.is_none() {
+        return Err(format!(
+            "{base_url}: OpenRouter requires a key: SCAN_LLM_KEY or ~/.tok/openrouter"
+        ));
+    }
+    let model = match pinned {
+        Some(model) => model,
+        None if openrouter => crate::interpret::OPENROUTER_DEFAULT_MODEL.to_string(),
+        // Say which of the several ways discovery can fail this was — an
+        // unreachable host, a 404 from a base URL missing its /v1, a rejected
+        // key and an endpoint serving nothing all need different fixes, and
+        // only pinning a model is common to all of them.
+        None => crate::interpret::discover_model(&base_url, api_key.as_deref()).map_err(|e| {
+            format!(
+                "no LLM model available from {base_url}: {e}. Fix the endpoint, \
+                 or name a model with --llm-model (env: SCAN_LLM_MODEL)"
+            )
+        })?,
+    };
+    Ok(crate::interpret::LlmEndpoint {
+        base_url,
+        model,
+        api_key,
+    })
 }
 
 /// Classification values accepted by `--show`.
@@ -230,8 +295,8 @@ pub struct GlobalArgs {
     pub format: OutputFormat,
 
     /// Scan mode: `fast` (bloom matching only), `balanced` (bloom short-circuits,
-    /// then full scan), or `slow` (no bloom; always full scan). Workers are
-    /// always slow.
+    /// then full scan), or `slow` (no bloom; always full scan). `serve` always
+    /// analyzes a submitted file in full.
     #[arg(long, global = true, default_value = "balanced")]
     pub mode: crate::Mode,
 
@@ -259,17 +324,16 @@ pub struct GlobalArgs {
     #[arg(long, global = true, hide = true)]
     pub extra: bool,
 
-    /// [optional] Enable additional LLM interpretation of analyzed samples: a
-    /// second opinion blended with the ML verdict (stored in the `llm` JSON
-    /// section and shown inline). Given with no value, uses a local model (an
-    /// OpenAI-compatible endpoint at http://localhost:8000/v1). TARGET may be
-    /// `local`, `openrouter` (https://openrouter.ai/api/v1; key from
+    /// Enable additional LLM interpretation of analyzed samples: a second
+    /// opinion blended with the ML verdict (stored in the `llm` JSON section
+    /// and shown inline). Given with no value, uses a local model (an
+    /// OpenAI-compatible endpoint at `http://localhost:8000/v1`). TARGET may be
+    /// `local`, `openrouter` (`https://openrouter.ai/api/v1`; key from
     /// `SCAN_LLM_KEY` or `~/.tok/openrouter`; defaults to `openrouter/auto`
     /// unless `--llm-model` names one), or an explicit OpenAI-compatible base
-    /// URL. Endpoints that require a bearer
-    /// token take it from `~/.tok/llm` when that file exists. Comma-separate
-    /// several to fail over in order, e.g.
-    /// `https://llm.isotope13.ai/v1,openrouter`. (env: SCAN_LLM)
+    /// URL. Endpoints that require a bearer token take it from `~/.tok/llm`
+    /// when that file exists. Comma-separate several to fail over in order,
+    /// e.g. `https://llm.example.com/v1,openrouter`. (env: SCAN_LLM)
     #[arg(
         long,
         global = true,
@@ -293,7 +357,7 @@ pub struct GlobalArgs {
     #[arg(long = "zip-password", value_name = "PASSWORD", global = true)]
     pub zip_passwords: Vec<String>,
 
-    /// [EXPERIMENTAL] Follow references discovered inside the requested
+    /// Experimental: follow references discovered inside the requested
     /// artifact, analyze their payloads, and fold them into the verdict:
     ///   `dependencies` — manifest and lockfile dependencies;
     ///   `references`   — packages and URLs named by install/download commands;
@@ -316,11 +380,11 @@ pub struct GlobalArgs {
         // Keep in lockstep with `default_cli_follow_policy`, which resolves an
         // absent `--follow` to the same targets.
         default_missing_value = "references,dependencies",
-        env = "SCAN_FOLLOW"
+        env = crate::env::SCAN_FOLLOW.name
     )]
     pub follow: Option<crate::fetch::FetchPolicy>,
 
-    /// [EXPERIMENTAL] How many hops of references to follow when `--follow` is on:
+    /// Experimental: how many hops of references to follow when `--follow` is on:
     /// `1` fetches only what the scanned files reference, `2` also follows
     /// references found inside those payloads (reaching a stage-3 `curl | bash`
     /// dropper), and so on.
@@ -347,6 +411,12 @@ impl GlobalArgs {
 
     /// [`GlobalArgs::interpret_config`] against an explicit environment.
     ///
+    /// Each endpoint in a failover chain resolves on its own, which may mean
+    /// asking it what model it serves. One
+    /// endpoint must work; the rest are a cushion. So a problem is fatal when
+    /// it is the only endpoint — a misconfigured `--llm` must not be silent —
+    /// and a warning when others remain.
+    ///
     /// # Errors
     ///
     /// Returns an error when `--llm` names no endpoint, when the only
@@ -357,21 +427,19 @@ impl GlobalArgs {
         &self,
         env: &LlmEnv,
     ) -> Result<Option<crate::interpret::InterpretConfig>> {
-        use crate::interpret::{LlmEndpoint, is_openrouter_endpoint, llm_models, llm_targets};
+        use crate::interpret::{is_openrouter_endpoint, llm_models, llm_targets};
         let flag_or = |flag: &Option<String>, env: &Option<String>| -> Option<String> {
             flag.clone()
                 .or_else(|| env.clone())
                 .filter(|s| !s.is_empty())
         };
         // `--llm [TARGET]` / SCAN_LLM (the bare flag defaults TARGET to `local`)
-        // turns the pass on.
+        // turns the pass on. `local` maps to the local endpoint, `openrouter`
+        // to the public API, anything else is an OpenAI-compatible base URL;
+        // a comma-separated target is a failover chain, tried in order.
         let Some(target) = flag_or(&self.llm, &env.target) else {
             return Ok(None);
         };
-        // Resolve the target to base URLs: `local` (also the bare-flag default)
-        // maps to the local endpoint; `openrouter` is the public API; anything
-        // else is an OpenAI-compatible base URL. A comma-separated target is a
-        // failover chain, tried in order.
         let targets = llm_targets(&target);
         if targets.is_empty() {
             anyhow::bail!("--llm (env: SCAN_LLM) names no endpoint");
@@ -380,110 +448,28 @@ impl GlobalArgs {
             flag_or(&self.llm_model, &env.model).as_deref(),
             targets.len(),
         );
-        // `SCAN_LLM_KEY` wins, and applies to every endpoint in the chain —
-        // it is the operator naming one credential. Otherwise each endpoint
-        // resolves its own, and only its own: `~/.tok/openrouter` for
-        // OpenRouter, `~/.tok/llm` for everything else — our own vLLM requires
-        // one, and a host that has the file authenticates without any flag.
-        // Absent a file, the request goes out unauthenticated, which is still
-        // right for an endpoint that wants no key.
-        let explicit_key = env.key.clone().filter(|s| !s.is_empty());
-
-        // One endpoint must work; the rest are a cushion. So a config problem
-        // is fatal when it is the only endpoint (a misconfigured `--llm` must
-        // not be silent), and a warning when others remain — an OpenRouter
-        // fallback with no model pinned, or a primary that is down at startup,
-        // should cost that entry, not the scan.
+        // `SCAN_LLM_KEY` is the operator naming one credential, for the kind
+        // of endpoint named first: an OpenRouter key never goes to another
+        // host, and another host's key never to OpenRouter, whichever the
+        // chain falls back to.
+        let explicit_key = env.key.as_deref().filter(|s| !s.is_empty()).map(|key| {
+            let for_openrouter = targets
+                .first()
+                .is_some_and(|base_url| is_openrouter_endpoint(base_url));
+            (key, for_openrouter)
+        });
         let single = targets.len() == 1;
-        // A key given outright is for the kind of endpoint named first: an
-        // OpenRouter key never goes to our own vLLM, and our vLLM key never
-        // to OpenRouter, whichever the chain falls back to.
-        let explicit_for_openrouter = targets
-            .first()
-            .is_some_and(|base_url| is_openrouter_endpoint(base_url));
-        let mut resolved: Vec<LlmEndpoint> = Vec::with_capacity(targets.len());
+        let mut resolved = Vec::with_capacity(targets.len());
         let mut skipped: Vec<String> = Vec::new();
         for (base_url, pinned) in targets.into_iter().zip(pinned) {
-            let openrouter = is_openrouter_endpoint(&base_url);
-            // `~/.tok/llm` is *our* endpoint's token and must never travel to
-            // a third party, so OpenRouter takes its own file or nothing —
-            // sending the vLLM key there would hand a working credential to an
-            // unrelated host and read as a plain 401 when it did.
-            let api_key = explicit_key
-                .clone()
-                .filter(|_| openrouter == explicit_for_openrouter)
-                .or_else(|| {
-                    let file = if openrouter {
-                        &env.openrouter_token_file
-                    } else {
-                        &env.llm_token_file
-                    };
-                    crate::interpret::read_token_file(file.as_deref()?)
-                });
-            if api_key.is_some()
-                && let Ok(url) = reqwest::Url::parse(&base_url)
-                && url.scheme() == "http"
-                && !url.host_str().is_some_and(|host| {
-                    let host = host.trim_start_matches('[').trim_end_matches(']');
-                    host.eq_ignore_ascii_case("localhost")
-                        || host
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback())
-                })
-            {
-                tracing::warn!(
-                    llm = %base_url,
-                    "the LLM key is sent to this address in cleartext; use https unless the network itself is encrypted"
-                );
-            }
-            if openrouter && api_key.is_none() {
-                let why = "OpenRouter requires a key: SCAN_LLM_KEY or ~/.tok/openrouter";
-                if single {
-                    anyhow::bail!("{why}");
+            match resolve_endpoint(base_url, pinned, explicit_key, env) {
+                Ok(endpoint) => resolved.push(endpoint),
+                Err(why) if single => anyhow::bail!("{why}"),
+                Err(why) => {
+                    tracing::warn!(reason = %why, "LLM endpoint unusable, dropped from the failover chain");
+                    skipped.push(why);
                 }
-                skipped.push(format!("{base_url}: {why}"));
-                continue;
             }
-            // A pinned model wins; otherwise take what the endpoint says it
-            // serves. OpenRouter's catalog is large and billed, so nothing
-            // from it is guessed — but OpenRouter itself ships a stable
-            // `openrouter/auto` alias that picks a suitable model per
-            // request, so that's the default rather than a hard error.
-            // Nothing else is hardcoded: if a non-OpenRouter endpoint lists no
-            // model there is nothing sensible to send, and a guessed name
-            // would surface as an opaque server-side error mid-scan instead of
-            // here.
-            let model = match pinned {
-                Some(m) => m,
-                None if openrouter => crate::interpret::OPENROUTER_DEFAULT_MODEL.to_string(),
-                None => match crate::interpret::discover_model(&base_url, api_key.as_deref()) {
-                    Ok(m) => m,
-                    // Say which of the several ways discovery can fail this
-                    // was — an unreachable host, a 404 from a base URL missing
-                    // its /v1, a rejected key and an endpoint serving nothing
-                    // all need different fixes, and only pinning a model is
-                    // common to all of them.
-                    Err(e) => {
-                        let why = format!(
-                            "no LLM model available from {base_url}: {e}. Fix the endpoint, \
-                             or name a model with --llm-model (env: SCAN_LLM_MODEL)"
-                        );
-                        if single {
-                            anyhow::bail!("{why}");
-                        }
-                        skipped.push(why);
-                        continue;
-                    }
-                },
-            };
-            resolved.push(LlmEndpoint {
-                base_url,
-                model,
-                api_key,
-            });
-        }
-        for why in &skipped {
-            tracing::warn!("LLM endpoint unusable, dropped from the failover chain: {why}");
         }
         let mut resolved = resolved.into_iter();
         let primary = resolved.next().ok_or_else(|| {

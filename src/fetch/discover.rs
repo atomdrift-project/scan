@@ -2,11 +2,19 @@
 //! in code, members that carry a download, and the packages vendored
 //! alongside.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+
+use cleave::{AnalysisReport, Finding};
+use filefacts::FileType;
+use fletch::fetch::{Coverage, FetchRecord, Outcome};
+use fletch::{RefKind, RefLocator, Reference, find};
+
+use super::imports::{
+    PackageContext, PythonNamespaces, is_python_import_candidate,
+    npm_import_is_package_or_framework_provided, npm_package_contexts, static_es_module_refs,
+};
+use super::{Coordinate, Group, found, hex_len, locator, report_file_type};
 
 /// A file whose references execute only in CI, never in an installed artifact
 /// — a GitHub Actions workflow or composite `action.yml`. Its `uses:` actions
@@ -16,23 +24,13 @@ pub(super) fn is_ci_context(file: &cleave::types::FileAnalysis) -> bool {
     file.file_type == filefacts::FileType::GithubActions.label()
 }
 
-/// Whether [`collect_references`] follows references that only ever execute in
+/// Whether [`collect_references_from_input`] follows references that only ever execute in
 /// CI. Auditing an artifact and auditing the pipeline that built it are
 /// different questions, and the caller always knows which one it is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CiRefs {
     Skip,
     Include,
-}
-
-/// References to fetch, grouped by the sha256 of the file that declared them.
-#[cfg(test)]
-pub(super) fn collect_references(
-    report: &AnalysisReport,
-    root_path: &Path,
-    ci: CiRefs,
-) -> Vec<Group> {
-    collect_references_from_input(report, root_path, None, ci)
 }
 
 /// A reference that was not fetched, and why, as its record.
@@ -70,8 +68,8 @@ pub(super) fn mark_scope(refs: &mut [Reference], scope: filefacts::DependencySco
 /// that resolves inside the artifact is not fetched from a registry.
 pub(super) struct LocalModules {
     pub(super) npm: LocalNpmPackages,
-    pub(super) python: PythonNamespaces,
-    pub(super) package_contexts: HashMap<String, (String, bool)>,
+    python: PythonNamespaces,
+    package_contexts: HashMap<String, PackageContext>,
 }
 
 impl LocalModules {
@@ -90,7 +88,7 @@ impl LocalModules {
         file: &cleave::types::FileAnalysis,
         reference: &Reference,
     ) -> bool {
-        (file.file_type == "python" && file.path.ends_with(".pyi"))
+        (report_file_type(&file.file_type) == FileType::Python && file.path.ends_with(".pyi"))
             || (is_python_import_candidate(reference)
                 && self.python.resolves(&file.path, &reference.evidence))
     }
@@ -103,29 +101,76 @@ impl LocalModules {
     }
 }
 
+/// Lockfiles that pin a `pyproject.toml`'s declarations, one per tool.
+pub(super) const PYPROJECT_LOCKS: &[&str] = &["poetry.lock", "uv.lock", "pdm.lock"];
+
+/// Each manifest, and the lockfiles that are authoritative for its pins when
+/// they sit beside it, in preference order: a project normally has one, and
+/// two disagreeing locks would only make every pin ambiguous.
+const MANIFEST_LOCKS: &[(&str, &[&str])] = &[
+    ("Cargo.toml", &["Cargo.lock"]),
+    ("pyproject.toml", PYPROJECT_LOCKS),
+];
+
+/// The references of the lockfile beside the manifest at `path`, when there
+/// is one this report analyzed. Only a co-located lock: borrowing pins from
+/// another bundled package's lock would pin the wrong project. Workspace-only
+/// locks stay unconsulted until workspace ownership can be established.
+fn colocated_lock<'a>(
+    path: &str,
+    by_path: &HashMap<&str, &'a cleave::types::FileAnalysis>,
+) -> Option<&'a [Reference]> {
+    let (directory, name) = path.rsplit_once('/')?;
+    let (_, locks) = MANIFEST_LOCKS
+        .iter()
+        .find(|(manifest, _)| *manifest == name)?;
+    locks.iter().find_map(|lock| {
+        let lock = by_path.get(format!("{directory}/{lock}").as_str())?;
+        lock.filefacts
+            .as_ref()
+            .map(|view| view.references.as_slice())
+    })
+}
+
+/// Every reference the report's files declare or import, grouped by the
+/// declaring file's sha, plus the root's and flagged members' text hunts.
 pub(super) fn collect_references_from_input(
     report: &AnalysisReport,
     root_path: &Path,
     root_bytes: Option<&[u8]>,
     ci: CiRefs,
 ) -> Vec<Group> {
-    // Members under a vendored node_modules tree have already been analyzed.
-    // Fetching each of their `require("x")` targets again grafted a newer
-    // registry release onto the report and repeated work over bytes that came
-    // with the sample. Keep hunting absent imports, but resolve local packages
-    // first from the package.json members already present in this report.
+    let mut groups = declared_references(report, ci);
+    hunt_root(report, root_path, root_bytes, ci, &mut groups);
+    hunt_download_members(report, root_path, root_bytes, ci, &mut groups);
+    reconcile_go_contexts(report, &mut groups);
+    groups
+}
+
+/// Imports that stay inside the artifact, counted for one summary line each.
+#[derive(Default)]
+struct ImportSkips {
+    /// Imports a package the report already holds provides.
+    local: usize,
+    /// Imports made from inside a captured `node_modules` tree.
+    vendored: usize,
+}
+
+/// Each file's declared references and module-load calls, read from the
+/// facts the report already carries — so every archive member, not just the
+/// root, contributes its references without re-extraction.
+fn declared_references(report: &AnalysisReport, ci: CiRefs) -> Vec<Group> {
+    // Members under a vendored node_modules tree have already been analyzed,
+    // so their imports resolve first against the package.json members already
+    // present in this report rather than against today's registry release.
     let local = LocalModules::of(report);
-    // Built once: a lockfile is looked up by path, and a declaring file's
-    // nodes by sha, once per file — a scan apiece would be quadratic in the
-    // size of an archive.
+    // Built once: a lockfile is looked up by path once per file, and a scan
+    // apiece would be quadratic in the size of an archive.
     let mut by_path: HashMap<&str, &cleave::types::FileAnalysis> = HashMap::new();
-    let mut by_sha: HashMap<&str, Vec<&cleave::types::FileAnalysis>> = HashMap::new();
     for file in &report.files {
         by_path.entry(file.path.as_str()).or_insert(file);
-        by_sha.entry(file.sha256.as_str()).or_default().push(file);
     }
-    let mut local_imports_skipped = 0usize;
-    let mut vendored_imports_skipped = 0usize;
+    let mut skips = ImportSkips::default();
     let mut groups: Vec<Group> = Vec::new();
     for file in &report.files {
         // A GitHub Actions workflow is a CI-only context: its `uses:` actions
@@ -139,81 +184,20 @@ pub(super) fn collect_references_from_input(
         let Some(view) = &file.filefacts else {
             continue;
         };
-        // Declared references plus the value-driven hunt (npm lifecycle hooks),
-        // both from facts the report already carries — so every archive member,
-        // not just the root, contributes its references without re-extraction.
+        // Declared references plus the value-driven hunt (npm lifecycle hooks).
         let file_type = report_file_type(&file.file_type);
         let values = filefacts::Values::from(view.values.clone());
         let mut refs = found(
             find::references_from_facts(file_type, &values, &view.symbols, &view.references),
             &file.path,
         );
-        // A co-located lockfile is authoritative; do not borrow pins from
-        // other bundled packages. Workspace-only locks remain explicit range
-        // resolution until workspace ownership can be established.
-        if let Some((directory, _)) = file.path.rsplit_once('/') {
-            let lock_name = if file.path.ends_with("/Cargo.toml") {
-                Some("Cargo.lock")
-            } else if file.path.ends_with("/pyproject.toml") {
-                Some("poetry.lock")
-            } else {
-                None
-            };
-            if let Some(lock_name) = lock_name {
-                let lock_path = format!("{directory}/{lock_name}");
-                if let Some(lock) = by_path
-                    .get(lock_path.as_str())
-                    .and_then(|f| f.filefacts.as_ref())
-                {
-                    refs = refs
-                        .iter()
-                        .map(|r| fletch::fetch::prefer_lock_pin(r, &lock.references))
-                        .collect();
-                }
-            }
+        if let Some(lock) = colocated_lock(&file.path, &by_path) {
+            refs = refs
+                .iter()
+                .map(|r| fletch::fetch::prefer_lock_pin(r, lock))
+                .collect();
         }
-        // Module-load calls from the member's retained AST symbols — the
-        // facts-only import vector, so `require("undeclared-pkg")` inside an
-        // archive member is hunted without re-extracting its discarded bytes.
-        refs.extend(
-            find::import_calls(file_type, &view.symbols)
-                .into_iter()
-                .chain(find::python_imports(file_type, &view.symbols))
-                .chain(static_es_module_refs(&file.path, file_type, &view.values))
-                .filter(|reference| {
-                    if local.provides_python(file, reference) {
-                        return false;
-                    }
-                    let Some(package) = npm_import_name(reference) else {
-                        return true;
-                    };
-                    // `node_modules` is the installed dependency graph captured
-                    // in the artifact. If one of those files imports a package
-                    // absent from that graph, Node fails or takes the module's
-                    // own fallback path; it does not download today's registry
-                    // release. Declared package.json dependencies are collected
-                    // separately, so suppress only inferred import-call hunts.
-                    if is_vendored_node_module(&file.path) {
-                        vendored_imports_skipped += 1;
-                        tracing::debug!(
-                            source = %file.path,
-                            package,
-                            "import originates in vendored node_modules; external fetch avoided"
-                        );
-                        return false;
-                    }
-                    let present = local.provides_npm(&file.path, &package);
-                    if present {
-                        local_imports_skipped += 1;
-                        tracing::debug!(
-                            source = %file.path,
-                            package,
-                            "import resolves to vendored node_modules; skipping external fetch"
-                        );
-                    }
-                    !present
-                }),
-        );
+        refs.extend(module_imports(file, view, file_type, &local, &mut skips));
         if refs.is_empty() {
             continue;
         }
@@ -222,65 +206,132 @@ pub(super) fn collect_references_from_input(
         }
         groups.push((file.sha256.clone(), refs));
     }
-    if local_imports_skipped > 0 {
+    if skips.local > 0 {
         tracing::info!(
-            local_imports_skipped,
+            local_imports_skipped = skips.local,
             "vendored imports already present in report; external refetch avoided"
         );
     }
-    if vendored_imports_skipped > 0 {
+    if skips.vendored > 0 {
         tracing::info!(
-            vendored_imports_skipped,
+            vendored_imports_skipped = skips.vendored,
             "imports from captured node_modules kept inside artifact boundary"
         );
     }
+    groups
+}
 
-    // The root sample's imperative hunt (curl|sh, `npm install` in a RUN, a URL
-    // in a shell variable) needs its raw text, which the report doesn't carry —
-    // read it back from disk for small text-ish roots and merge, deduping
-    // against the declared references already collected for the root. The hunt
-    // reads bytes the loop above never opened, so it repeats that loop's CI
-    // gate — a workflow's raw text re-discovers the `uses:` actions just
-    // skipped.
-    if let Some(root) = report.files.first()
-        && (ci == CiRefs::Include || !is_ci_context(root))
-        && root.size <= ROOT_HUNT_MAX_BYTES
-        && let Some(bytes) = root_bytes
-            .map(std::borrow::Cow::Borrowed)
-            .or_else(|| std::fs::read(root_path).ok().map(std::borrow::Cow::Owned))
-    {
-        let name_path = if root_bytes.is_some() {
-            Path::new(&root.path)
-        } else {
-            root_path
-        };
-        let name = name_path
-            .file_name()
-            .map_or_else(|| name_path.to_string_lossy(), |n| n.to_string_lossy());
-        // A provenance document names one artifact and catalogues many. The
-        // string hunt cannot tell those apart, so it is replaced by the subject
-        // this document is *about* — see `provenance_subject`. Only when it
-        // states one: anything can be named `*.forage.json`, and a name alone
-        // must not switch the hunt off.
-        let subject = is_provenance_document(&root.file_type, &name)
-            .then(|| provenance_subject(&bytes))
-            .flatten();
-        let mut hunted = match subject {
-            Some(subject) => vec![subject],
-            None => found(find::references_in_bytes(&bytes, &*name), &root.path),
-        };
-        if is_ci_context(root) {
-            mark_scope(&mut hunted, filefacts::DependencyScope::Ci);
-        }
-        if !hunted.is_empty() {
-            merge_into_root(&mut groups, &root.sha256, hunted);
-        }
+/// Module-load calls from a member's retained AST symbols — the facts-only
+/// import vector, so `require("undeclared-pkg")` inside an archive member is
+/// hunted without re-extracting its discarded bytes — less those the artifact
+/// itself provides.
+fn module_imports(
+    file: &cleave::types::FileAnalysis,
+    view: &cleave::types::FilefactsView,
+    file_type: filefacts::FileType,
+    local: &LocalModules,
+    skips: &mut ImportSkips,
+) -> Vec<Reference> {
+    find::import_calls(file_type, &view.symbols)
+        .into_iter()
+        .chain(find::python_imports(file_type, &view.symbols))
+        .chain(static_es_module_refs(&file.path, file_type, &view.values))
+        .filter(|reference| {
+            if local.provides_python(file, reference) {
+                return false;
+            }
+            let Some(package) = npm_import_name(reference) else {
+                return true;
+            };
+            // `node_modules` is the installed dependency graph captured in the
+            // artifact. If one of those files imports a package absent from
+            // that graph, Node fails or takes the module's own fallback path;
+            // it does not download today's registry release. Declared
+            // package.json dependencies are collected separately, so suppress
+            // only inferred import-call hunts.
+            if is_vendored_node_module(&file.path) {
+                skips.vendored += 1;
+                tracing::debug!(
+                    source = %file.path,
+                    package,
+                    "import originates in vendored node_modules; external fetch avoided"
+                );
+                return false;
+            }
+            let present = local.provides_npm(&file.path, &package);
+            if present {
+                skips.local += 1;
+                tracing::debug!(
+                    source = %file.path,
+                    package,
+                    "import resolves to vendored node_modules; skipping external fetch"
+                );
+            }
+            !present
+        })
+        .collect()
+}
+
+/// The root sample's imperative hunt (curl|sh, `npm install` in a RUN, a URL
+/// in a shell variable) needs its raw text, which the report doesn't carry —
+/// read it back from disk for small text-ish roots and merge, deduping
+/// against the declared references already collected for the root. The hunt
+/// reads bytes [`declared_references`] never opened, so it repeats that CI
+/// gate — a workflow's raw text re-discovers the `uses:` actions just skipped.
+fn hunt_root(
+    report: &AnalysisReport,
+    root_path: &Path,
+    root_bytes: Option<&[u8]>,
+    ci: CiRefs,
+    groups: &mut Vec<Group>,
+) {
+    let Some(root) = report.files.first() else {
+        return;
+    };
+    if (ci == CiRefs::Skip && is_ci_context(root)) || root.size > ROOT_HUNT_MAX_BYTES {
+        return;
     }
-    hunt_download_members(report, root_path, root_bytes, ci, &mut groups);
-    // Filefacts owns Go's module/workspace semantics. Include raw root hunts
-    // in the inputs so they cannot reintroduce an unreconciled declaration.
+    let Some(bytes) = root_bytes
+        .map(std::borrow::Cow::Borrowed)
+        .or_else(|| std::fs::read(root_path).ok().map(std::borrow::Cow::Owned))
+    else {
+        return;
+    };
+    let name_path = if root_bytes.is_some() {
+        Path::new(&root.path)
+    } else {
+        root_path
+    };
+    let name = name_path
+        .file_name()
+        .map_or_else(|| name_path.to_string_lossy(), |n| n.to_string_lossy());
+    // A provenance document names one artifact and catalogues many. The
+    // string hunt cannot tell those apart, so it is replaced by the subject
+    // this document is *about* — see `provenance_subject`. Only when it
+    // states one: anything can be named `*.forage.json`, and a name alone
+    // must not switch the hunt off.
+    let subject = is_provenance_document(&root.file_type, &name)
+        .then(|| provenance_subject(&bytes))
+        .flatten();
+    let mut hunted = match subject {
+        Some(subject) => vec![subject],
+        None => found(find::references_in_bytes(&bytes, &*name), &root.path),
+    };
+    if is_ci_context(root) {
+        mark_scope(&mut hunted, filefacts::DependencyScope::Ci);
+    }
+    if !hunted.is_empty() {
+        merge_into_root(groups, &root.sha256, hunted);
+    }
+}
+
+/// Replace each group's references with the ones filefacts resolves in its Go
+/// module or workspace context. filefacts owns Go's module/workspace
+/// semantics; the raw root hunts are among its inputs so they cannot
+/// reintroduce an unreconciled declaration.
+fn reconcile_go_contexts(report: &AnalysisReport, groups: &mut [Group]) {
     let mut group_refs: HashMap<&str, &[Reference]> = HashMap::new();
-    for (sha, refs) in &groups {
+    for (sha, refs) in groups.iter() {
         group_refs.entry(sha.as_str()).or_insert(refs.as_slice());
     }
     // filefacts reads member paths as `/`-separated paths inside one
@@ -309,7 +360,12 @@ pub(super) fn collect_references_from_input(
             go_context.insert(path, resolved);
         }
     }
-    for (sha, refs) in &mut groups {
+    // A declaring file's nodes by sha, built once rather than scanned per group.
+    let mut by_sha: HashMap<&str, Vec<&cleave::types::FileAnalysis>> = HashMap::new();
+    for file in &report.files {
+        by_sha.entry(file.sha256.as_str()).or_default().push(file);
+    }
+    for (sha, refs) in groups {
         let contexts: Vec<_> = by_sha
             .get(sha.as_str())
             .into_iter()
@@ -329,36 +385,39 @@ pub(super) fn collect_references_from_input(
             }
         }
     }
-    groups
 }
+
+/// The root sample's imperative hunt re-reads it from disk and re-parses it.
+/// Skip that for large roots — the win is scripts/manifests/Dockerfiles, which
+/// are small; a multi-megabyte binary root has no imperative install commands to
+/// find and would just pay a wasted parse. Declared references are read from the
+/// report regardless, so nothing is lost for large roots.
+const ROOT_HUNT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Most archive members a single scan re-reads for a text hunt. Each read
 /// decompresses the root archive up to that member, so a crafted archive
 /// packing many flagged members cannot turn the hunt into a decompression
 /// storm; the members past the cap keep their declared references.
-pub(super) const MEMBER_HUNT_MAX: usize = 16;
+const MEMBER_HUNT_MAX: usize = 16;
 /// Largest member a text hunt reads. Bundled editor extensions commonly exceed
 /// [`ROOT_HUNT_MAX_BYTES`]; a member is still only admitted by an
 /// execution/download finding. The cap applies to the bytes actually
 /// re-extracted, not just the size the report recorded: an archive can carry
 /// two entries under one name, and re-extraction by name may return the other.
-pub(super) const MEMBER_HUNT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MEMBER_HUNT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// cleave trait ids this module reads. cleave owns the taxonomy; naming every
 /// id here keeps the module's dependence on it in one place.
-pub(super) const TRAIT_DROPPER: &str = "objectives/command-and-control/dropper/";
-pub(super) const TRAIT_DROPPER_EXECUTION: &str =
-    "objectives/command-and-control/dropper/execution/";
-pub(super) const TRAIT_STEGO_LOADER: &str =
-    "objectives/command-and-control/dropper/execution/stego-loader";
-pub(super) const TRAIT_STEGANOGRAPHY: &str = "objectives/anti-static/obfuscation/steganography/";
-pub(super) const TRAIT_SHELL_PIPELINE: &str = "micro-behaviors/process/create/shell/pipeline";
-pub(super) const TRAIT_PROCESS_CREATE: &str = "micro-behaviors/process/create/";
-pub(super) const TRAIT_AUTOINSTALL: &str = "objectives/execution/autoinstall/";
-pub(super) const TRAIT_GITHUB_RUNNER_SHELL: &str =
+const TRAIT_DROPPER: &str = "objectives/command-and-control/dropper/";
+const TRAIT_DROPPER_EXECUTION: &str = "objectives/command-and-control/dropper/execution/";
+const TRAIT_STEGO_LOADER: &str = "objectives/command-and-control/dropper/execution/stego-loader";
+const TRAIT_STEGANOGRAPHY: &str = "objectives/anti-static/obfuscation/steganography/";
+const TRAIT_SHELL_PIPELINE: &str = "micro-behaviors/process/create/shell/pipeline";
+const TRAIT_PROCESS_CREATE: &str = "micro-behaviors/process/create/";
+const TRAIT_AUTOINSTALL: &str = "objectives/execution/autoinstall/";
+const TRAIT_GITHUB_RUNNER_SHELL: &str =
     "micro-behaviors/process/create/shell/bridge::github-runner-shell-execution";
-pub(super) const TRAIT_IMAGE_FILE_URL: &str =
-    "micro-behaviors/communications/http/url/path::image-file-url";
+const TRAIT_IMAGE_FILE_URL: &str = "micro-behaviors/communications/http/url/path::image-file-url";
 pub(super) const TRAIT_BROWSER_PAC_URL: &str =
     "micro-behaviors/os/network/webextension::chrome-pac-script-literal-url";
 pub(super) const TRAIT_SECURITY_HOLD_RECORD: &str = "registry-security-hold-record";
@@ -404,7 +463,7 @@ pub(super) fn download_intent(findings: &[Finding]) -> Option<&str> {
 /// tree costs nothing; a flagged member is re-extracted from the root archive
 /// and hunted like a root. Its references keep their recognizer as `source`;
 /// the trait that justified the hunt is logged with it.
-pub(super) fn hunt_download_members(
+fn hunt_download_members(
     report: &AnalysisReport,
     root_path: &Path,
     root_bytes: Option<&[u8]>,
@@ -418,7 +477,7 @@ pub(super) fn hunt_download_members(
     let mut hunted_members = 0usize;
     // Cleave extracts from a path; materialize in-memory input only if a member
     // actually needs a text hunt, and reuse the temporary file for all members.
-    let mut staged = None;
+    let mut staged: Option<tempfile::NamedTempFile> = None;
     for file in members {
         if ci == CiRefs::Skip && is_ci_context(file) {
             continue;
@@ -457,53 +516,22 @@ pub(super) fn hunt_download_members(
             break;
         }
         hunted_members += 1;
-        let archive_path = if let Some(data) = root_bytes {
-            if staged.is_none() {
-                let stage = tempfile::NamedTempFile::new()
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, data).map(|()| file));
-                match stage {
-                    Ok(file) => staged = Some(file),
-                    Err(e) => {
-                        tracing::warn!(
-                            member,
-                            trigger,
-                            "staging archive for member hunt failed: {e}"
-                        );
-                        break;
-                    }
+        let archive_path = match (root_bytes, &staged) {
+            (None, _) => root_path,
+            (Some(_), Some(file)) => file.path(),
+            (Some(data), None) => match tempfile::NamedTempFile::new().and_then(|mut file| {
+                std::io::Write::write_all(&mut file, data)?;
+                Ok(file)
+            }) {
+                Ok(file) => staged.insert(file).path(),
+                Err(error) => {
+                    tracing::warn!(member, trigger, %error, "staging archive for member hunt failed");
+                    break;
                 }
-            }
-            let Some(file) = staged.as_ref() else {
-                break;
-            };
-            file.path()
-        } else {
-            root_path
+            },
         };
-        let bytes = match cleave::extract_member(archive_path, member) {
-            Ok(Some(bytes)) if bytes.len() as u64 <= MEMBER_HUNT_MAX_BYTES => bytes,
-            Ok(Some(bytes)) => {
-                tracing::warn!(
-                    member,
-                    trigger,
-                    recorded = file.size,
-                    extracted = bytes.len(),
-                    "re-read member exceeds the hunt ceiling (duplicate entry name?); text hunt skipped"
-                );
-                continue;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    member,
-                    trigger,
-                    "flagged member not re-readable from the root archive; text hunt skipped"
-                );
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(member, trigger, "re-reading flagged member failed: {e:#}");
-                continue;
-            }
+        let Some(bytes) = reread_member(archive_path, member, trigger, file.size) else {
+            continue;
         };
         let mut hunted = found(find::references_in_bytes(&bytes, member), member);
         if trigger == TRAIT_BROWSER_PAC_URL {
@@ -525,14 +553,49 @@ pub(super) fn hunt_download_members(
     }
 }
 
+/// A flagged member's bytes, re-extracted from the root archive; `None`, with
+/// the reason logged, when they cannot be read or exceed
+/// [`MEMBER_HUNT_MAX_BYTES`].
+fn reread_member(archive: &Path, member: &str, trigger: &str, recorded: u64) -> Option<Vec<u8>> {
+    match cleave::extract_member(archive, member) {
+        Ok(Some(bytes)) if bytes.len() as u64 <= MEMBER_HUNT_MAX_BYTES => Some(bytes),
+        Ok(Some(bytes)) => {
+            tracing::warn!(
+                member,
+                trigger,
+                recorded,
+                extracted = bytes.len(),
+                "re-read member exceeds the hunt ceiling (duplicate entry name?); text hunt skipped"
+            );
+            None
+        }
+        Ok(None) => {
+            tracing::debug!(
+                member,
+                trigger,
+                "flagged member not re-readable from the root archive; text hunt skipped"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                member,
+                trigger,
+                error = format!("{e:#}"),
+                "re-reading flagged member failed"
+            );
+            None
+        }
+    }
+}
+
 /// Image extensions a stego loader carves its payload out of.
-pub(super) const IMAGE_CARRIER_EXTENSIONS: &[&str] =
-    &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
+const IMAGE_CARRIER_EXTENSIONS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
 
 /// Whether a file's findings show it pulls a payload out of an image: a
 /// stego-loader or steganography trait, or an image URL alongside a dropper
 /// execution trait. Returns the trait that says so.
-pub(super) fn image_carrier_evidence(findings: &[Finding]) -> Option<&str> {
+fn image_carrier_evidence(findings: &[Finding]) -> Option<&str> {
     let ids = || findings.iter().map(|f| f.id.as_str());
     ids()
         .find(|id| id.starts_with(TRAIT_STEGO_LOADER) || id.starts_with(TRAIT_STEGANOGRAPHY))
@@ -545,8 +608,8 @@ pub(super) fn image_carrier_evidence(findings: &[Finding]) -> Option<&str> {
 }
 
 /// Image URLs that are payload carriers rather than page assets. An image URL
-/// is normally skipped as a site resource (see [`NON_PAYLOAD_URL_EXTENSIONS`]);
-/// it is followed only when the file that names it also carries image-carrier
+/// is normally skipped as a site resource (by its extension, in `urls`); it is
+/// followed only when the file that names it also carries image-carrier
 /// evidence, so a README badge never costs a request but a loader's
 /// `screenshot.png` with a PE appended is fetched and analyzed.
 pub(super) fn image_carrier_urls(
@@ -570,7 +633,13 @@ pub(super) fn image_carrier_urls(
             let RefLocator::Url(url) = &reference.locator else {
                 continue;
             };
-            if reference.kind != RefKind::UrlFetch || !has_image_extension(url) {
+            // The URL's path ends in an image extension.
+            let image = reqwest::Url::parse(url).is_ok_and(|parsed| {
+                parsed.path().rsplit_once('.').is_some_and(|(_, ext)| {
+                    IMAGE_CARRIER_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+                })
+            });
+            if reference.kind != RefKind::UrlFetch || !image {
                 continue;
             }
             tracing::info!(
@@ -583,16 +652,6 @@ pub(super) fn image_carrier_urls(
         }
     }
     carriers
-}
-
-/// Whether a URL's path ends in an image extension.
-pub(super) fn has_image_extension(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    parsed.path().rsplit_once('.').is_some_and(|(_, ext)| {
-        IMAGE_CARRIER_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
-    })
 }
 
 /// Whether this root is one of our own provenance records rather than a
@@ -608,13 +667,10 @@ pub(super) fn is_provenance_document(file_type: &str, name: &str) -> bool {
 /// The single artifact a provenance document is *about*, as a pinned reference.
 ///
 /// These documents embed the provider's verbatim response, and for PyPI that is
-/// the project's whole release catalogue: one 179 KB `diffusers` sidecar carries
-/// 191 `files.pythonhosted.org` URLs covering every version ever published. The
-/// string hunt has no way to tell the subject from the catalogue — it recovered
-/// all 199 URLs and started pulling `diffusers` releases from 0.0.1 upward until
-/// the URL budget stopped it. Mining our own cached metadata for dropper
-/// candidates is the bug; the document already states its subject, so read that
-/// instead of guessing from `strings`.
+/// the project's whole release catalogue: a URL for every file of every version
+/// ever published. A string hunt cannot tell the subject from the catalogue,
+/// and would spend the URL budget pulling old releases. The document states
+/// its subject, so that is read instead of guessing from `strings`.
 ///
 /// Parsed here rather than from filefacts' `values` because a large sidecar
 /// exceeds cleave's JSON parse limit (76 KB) while still being small enough to
@@ -632,7 +688,7 @@ pub(super) fn provenance_subject(bytes: &[u8]) -> Option<Reference> {
     let pinned_hash = doc
         .pointer("/artifact/sha256")
         .and_then(serde_json::Value::as_str)
-        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|d| hex_len(d) == Some(64))
         .map(|d| fletch::PinnedHash {
             algo: fletch::HashAlgo::Sha256,
             value: d.to_ascii_lowercase(),
@@ -654,15 +710,40 @@ pub(super) fn is_vendored_node_module(path: &str) -> bool {
         .any(|component| component == "node_modules")
 }
 
+/// An npm package's name and version, as its own `package.json` states them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NpmIdentity {
+    pub(super) name: String,
+    pub(super) version: String,
+}
+
+/// A member of a captured Yarn workspace: who it is, and whether any of its
+/// files were analyzed with gaps.
+#[derive(Debug, Clone)]
+pub(super) struct WorkspaceMember {
+    pub(super) identity: NpmIdentity,
+    pub(super) incomplete: bool,
+}
+
+/// Where a dependency is supplied by a captured workspace: the member paths,
+/// joined, and whether any of them was analyzed with gaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkspaceCoverage {
+    pub(super) paths: String,
+    pub(super) incomplete: bool,
+}
+
 /// Package roots physically present under `node_modules`, keyed by their full
 /// virtual path. Only roots with an analyzed package.json enter the index, so
 /// an incidental path component named node_modules is not enough.
 #[derive(Default)]
 pub(super) struct LocalNpmPackages {
     pub(super) roots: HashSet<String>,
-    pub(super) declarations: HashMap<String, (String, String)>,
-    // Exact-version members of explicit, captured Yarn workspaces.
-    pub(super) workspaces: Vec<HashMap<String, (String, String, bool)>>,
+    /// Completely analyzed vendored packages, by package root.
+    pub(super) declarations: HashMap<String, NpmIdentity>,
+    /// Exact-version members of explicit, captured Yarn workspaces, one map
+    /// per workspace root, keyed by member path.
+    pub(super) workspaces: Vec<HashMap<String, WorkspaceMember>>,
 }
 
 impl LocalNpmPackages {
@@ -693,7 +774,7 @@ impl LocalNpmPackages {
         report: &AnalysisReport,
         source_sha: &str,
         reference: &Reference,
-    ) -> Option<(String, bool)> {
+    ) -> Option<WorkspaceCoverage> {
         if reference.kind != RefKind::Dependency {
             return None;
         }
@@ -736,15 +817,20 @@ impl LocalNpmPackages {
                 .iter()
                 .filter(|members| members.contains_key(&directory))
                 .flat_map(|members| members.iter())
-                .filter(|(_, (name, supplied, _))| name == &package && supplied == version)
+                .filter(|(_, member)| {
+                    member.identity.name == package && member.identity.version == version
+                })
                 .collect();
-            if local.len() != 1 {
+            let [(path, member)] = local.as_slice() else {
                 return None;
-            }
-            covered.push(local[0].0.clone());
-            incomplete |= local[0].1.2;
+            };
+            covered.push((*path).clone());
+            incomplete |= member.incomplete;
         }
-        Some((covered.join(", "), incomplete))
+        Some(WorkspaceCoverage {
+            paths: covered.join(", "),
+            incomplete,
+        })
     }
 
     pub(super) fn declared_coverage(
@@ -789,8 +875,8 @@ impl LocalNpmPackages {
                     dir = virtual_parent(&dir)?;
                 }
             };
-            let (name, supplied_version) = self.declarations.get(&root)?;
-            if name != &package || supplied_version != version {
+            let supplied = self.declarations.get(&root)?;
+            if supplied.name != package || supplied.version != version {
                 return None;
             }
             covered.push(root);
@@ -823,7 +909,7 @@ impl LocalNpmPackages {
 fn vendored_declarations(
     report: &AnalysisReport,
     incomplete: &HashSet<String>,
-) -> HashMap<String, (String, String)> {
+) -> HashMap<String, NpmIdentity> {
     let mut declarations = HashMap::new();
     let analyzed: HashSet<_> = report
         .files
@@ -883,18 +969,24 @@ fn vendored_declarations(
                         .any(|ext| analyzed.contains(&format!("{path}{ext}"))))
         });
         if complete {
-            declarations.insert(root, (name.to_owned(), version.to_owned()));
+            declarations.insert(
+                root,
+                NpmIdentity {
+                    name: name.to_owned(),
+                    version: version.to_owned(),
+                },
+            );
         }
     }
     declarations
 }
 
 /// Members of explicit, captured Yarn workspaces, one map per workspace root,
-/// keyed by member path: `(name, version, incomplete)`.
+/// keyed by member path.
 fn yarn_workspaces(
     report: &AnalysisReport,
     incomplete: &HashSet<String>,
-) -> Vec<HashMap<String, (String, String, bool)>> {
+) -> Vec<HashMap<String, WorkspaceMember>> {
     // An exact literal Yarn workspace declaration is stronger evidence of
     // local resolution than a same-named registry record. Only use complete
     // members with captured source; ambiguous/globbed workspaces remain
@@ -1029,7 +1121,16 @@ fn yarn_workspaces(
             });
             let gaps = archive_incomplete || incomplete.iter().any(|p| p.starts_with(&prefix));
             if present && manifest.analysis_gaps.is_empty() {
-                members.insert(member, (name.to_owned(), version.to_owned(), gaps));
+                members.insert(
+                    member,
+                    WorkspaceMember {
+                        identity: NpmIdentity {
+                            name: name.to_owned(),
+                            version: version.to_owned(),
+                        },
+                        incomplete: gaps,
+                    },
+                );
             }
         }
         if !members.is_empty() {
@@ -1053,7 +1154,7 @@ pub(super) fn virtual_parent(path: &str) -> Option<String> {
     path.rsplit_once('/').map(|(parent, _)| parent.to_owned())
 }
 
-pub(super) fn safe_package_path(root: &str, target: &str) -> Option<String> {
+fn safe_package_path(root: &str, target: &str) -> Option<String> {
     let target = target.replace('\\', "/");
     if target.starts_with('/') || target.contains([':', '!', '*']) {
         return None;
@@ -1075,7 +1176,7 @@ pub(super) fn safe_package_path(root: &str, target: &str) -> Option<String> {
 }
 
 /// Return the virtual package root for an analyzed node_modules/package.json.
-pub(super) fn npm_package_root(path: &str) -> Option<String> {
+fn npm_package_root(path: &str) -> Option<String> {
     let normalized = path.replace('\\', "/");
     let root = normalized.strip_suffix("/package.json")?;
     let (_, package) = root
@@ -1092,21 +1193,16 @@ pub(super) fn npm_package_root(path: &str) -> Option<String> {
     valid.then(|| root.to_string())
 }
 
-/// Extract the npm package name from a reference produced by
-/// `find::import_calls`. Such PURLs are normally versionless; tolerating a
+/// The npm package name an npm PURL names, percent escapes decoded. Import
+/// PURLs from `find::import_calls` are normally versionless; tolerating a
 /// version keeps this correct if fletch later learns one from the symbol.
 pub(super) fn npm_import_name(reference: &Reference) -> Option<String> {
     let RefLocator::Purl(purl) = &reference.locator else {
         return None;
     };
-    let coordinate = Coordinate::of(purl).filter(|c| c.typ == "npm")?;
-    Some(
-        coordinate
-            .path
-            .replace("%40", "@")
-            .replace("%2F", "/")
-            .replace("%2f", "/"),
-    )
+    Coordinate::of(purl)
+        .filter(|c| c.typ == "npm")?
+        .decoded_path()
 }
 
 /// Merge the root's hunted references into its group (creating it if the root

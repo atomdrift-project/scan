@@ -1,17 +1,29 @@
 //! The feature spec a model was trained with: its vocabularies, groups and
 //! layout, and the checks that a spec matches what this extractor emits.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+
+use anyhow::{Context, Result};
+
+use super::names::{
+    AGG_FEATURES, EXT_FEATURES, FORMAT_FEATURE_NAMES, FORMAT_SUMMARY_FEATURES, FORMULA_FEATURES,
+    GAP_FEATURE_NAMES, INTENT_GAP_FEATURE_NAMES, MISSING_FEATURE_NAMES, SCORE_FEATURES,
+    STRUCT_EXTENSION_FEATURES, STRUCT_FEATURES, TAIL_FEATURES, TEXTENC_FEATURES,
+    metric_base_feature_names,
+};
+use super::structure::known_metric_getter;
+use super::{
+    EXPECTED_MODEL_ABI_VERSION, EXPECTED_SPEC_VERSION, EXTENDED_KEYWORD_ABI, KEYWORD_ABI,
+    METRIC_TRANSFORM_ABI, MIN_LOADABLE_SPEC_VERSION, MIN_MODEL_ABI_VERSION,
+};
 
 /// Key metrics extracted from the report's `metrics` object.
 /// Each entry is (group, field, use_log1p).
 ///
-/// `use_log1p` matches collimator's choice in `_TEXT_FULL_FIELDS` / `_BATCH1_OVERLAY`
-/// (count/size fields get log1p; ratios/entropies do not). These entries are
+/// `use_log1p` matches training: count and size fields get log1p, ratios and
+/// entropies do not. These entries are
 /// always extracted regardless of `metric_vocab` because routes like
 /// filetypes/c and filetypes/go reference them in `feature_names` without
 /// listing them in the dynamic `metric_vocab` array.
@@ -25,7 +37,7 @@ pub(super) const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("binary", "max_complexity", false),
     ("binary", "normalized_string_count", false),
     ("binary", "high_entropy_regions", false),
-    // Binary overlay (collimator `_BATCH1_OVERLAY`).
+    // Binary overlay
     ("binary", "overlay_ratio", false),
     ("binary", "overlay_entropy", false),
     ("binary", "overlay_size", true),
@@ -36,7 +48,7 @@ pub(super) const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("text", "whitespace_ratio", false),
     ("text", "most_common_ratio", false),
     ("text", "total_lines", true),
-    // Text full-shape fields (collimator `_TEXT_FULL_FIELDS`).
+    // Text full-shape fields
     ("text", "non_ascii_ratio", false),
     ("text", "non_printable_ratio", false),
     ("text", "null_byte_count", true),
@@ -66,19 +78,67 @@ pub(super) const KEY_METRICS: &[(&str, &str, bool)] = &[
     ("pe", "rsrc_size", true),
 ];
 
-/// Feature specification loaded from feature_spec.json (v16).
+/// A keyword family: where its words come from, and the `<source>:` prefix
+/// of its feature names. Keys a spec's `keyword_vocabs`, so a source this
+/// build does not know is a parse error rather than a silently empty family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+pub(super) enum KeywordSource {
+    /// Words of the rule part of a finding ID (after `::`, or its last segment).
+    #[serde(rename = "ruleword")]
+    RuleId,
+    /// Words of finding descriptions.
+    #[serde(rename = "descword")]
+    Description,
+    /// Words of the whole finding ID.
+    #[serde(rename = "fullword")]
+    FullId,
+    /// The whole-ID and description words, pooled.
+    #[serde(rename = "ruletextword")]
+    IdAndDescription,
+    /// Words of the decoded context windows.
+    #[serde(rename = "contextword")]
+    Context,
+}
+
+impl KeywordSource {
+    /// Every source, in feature-layout order.
+    pub(super) const ALL: [Self; 5] = [
+        Self::RuleId,
+        Self::Description,
+        Self::FullId,
+        Self::IdAndDescription,
+        Self::Context,
+    ];
+
+    /// The source's name as a spec spells it, which prefixes its features.
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::RuleId => "ruleword",
+            Self::Description => "descword",
+            Self::FullId => "fullword",
+            Self::IdAndDescription => "ruletextword",
+            Self::Context => "contextword",
+        }
+    }
+
+    /// The first ABI that reads this source.
+    const fn min_abi(self) -> u32 {
+        match self {
+            Self::RuleId | Self::Description => KEYWORD_ABI,
+            Self::FullId | Self::IdAndDescription | Self::Context => EXTENDED_KEYWORD_ABI,
+        }
+    }
+}
+
+/// Feature specification loaded from `feature_spec.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FeatureSpec {
-    #[serde(default)]
     pub(super) version: u32,
-    /// 0 when omitted; `load` then inherits the spec version, never the
-    /// serving version.
-    #[serde(default)]
     pub(super) abi_version: u32,
     #[serde(default)]
     pub(super) base_feature_abi: Option<u32>,
     #[serde(default)]
-    pub(super) keyword_vocabs: HashMap<String, Vec<String>>,
+    pub(super) keyword_vocabs: HashMap<KeywordSource, Vec<String>>,
     #[serde(default)]
     pub(super) presence_vocab: Vec<String>,
     #[serde(default)]
@@ -141,7 +201,6 @@ pub struct FeatureSpec {
     pub(super) feature_stds: Option<Vec<f32>>,
     #[serde(default = "default_standardized")]
     pub(super) standardized: bool,
-    #[serde(default = "default_trait_path_depth")]
     pub(super) trait_path_depth: usize,
     #[serde(default = "default_tiered_min_crit")]
     pub(super) tiered_min_crit: [u32; 3],
@@ -153,42 +212,41 @@ pub(super) const fn default_tiered_min_crit() -> [u32; 3] {
     [3; 3]
 }
 
-pub(super) fn default_trait_path_depth() -> usize {
-    3
-}
-
-pub(super) const fn default_standardized() -> bool {
+const fn default_standardized() -> bool {
     true
 }
 
 impl FeatureSpec {
     /// Load feature specification from a JSON file.
+    ///
+    /// # Errors
+    /// When the file cannot be read or parsed, its version is outside what
+    /// this build reads, or it fails [`Self::validate`].
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
-        let mut spec: Self = serde_json::from_str(&data).context("parsing feature spec")?;
+        let spec: Self = serde_json::from_str(&data).context("parsing feature spec")?;
 
-        if spec.version < MIN_LOADABLE_SPEC_VERSION || spec.version > EXPECTED_SPEC_VERSION {
+        if !(MIN_LOADABLE_SPEC_VERSION..=EXPECTED_SPEC_VERSION).contains(&spec.version) {
             anyhow::bail!(
                 "feature spec version mismatch: this installed model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
                  The model is incompatible with this build. Run 'atomscan update-rules' to install a matching model bundle.",
                 spec.version,
             );
         }
+        // An ensemble loads many specs of one version, some concurrently:
+        // note an older one once per version for the process.
+        static WARNED_OLD_VERSIONS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
         if spec.version < EXPECTED_SPEC_VERSION
-            && WARNED_OLD_SPEC_VERSIONS
+            && WARNED_OLD_VERSIONS
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(spec.version)
         {
             tracing::warn!(
                 version = spec.version,
                 expected = EXPECTED_SPEC_VERSION,
-                "loading older feature spec; features added since this version are absent from the model; retrain at v{EXPECTED_SPEC_VERSION} to use them"
+                "loading an older feature spec; features added since its version are absent from the model",
             );
-        }
-
-        if spec.abi_version == 0 {
-            spec.abi_version = spec.version;
         }
         spec.validate()?;
         Ok(spec)
@@ -206,12 +264,6 @@ impl FeatureSpec {
         self.abi_version
     }
 
-    /// Path vocabulary for presence and max-criticality features.
-    #[must_use]
-    pub fn presence_vocab(&self) -> &[String] {
-        &self.presence_vocab
-    }
-
     /// Names of all features in model input order.
     #[must_use]
     pub fn feature_names(&self) -> &[String] {
@@ -226,10 +278,10 @@ impl FeatureSpec {
 
     /// Apply z-score standardization using training statistics.
     ///
-    /// Mirrors collimator's `standardize`: a feature whose training stats are
-    /// exactly `(mean 0, std 1)` was constant during training, and collimator
-    /// zeroes it rather than pass through a raw value the model never saw. A
-    /// zero std is zeroed too, instead of dividing by it.
+    /// As in training, a feature whose stats are exactly `(mean 0, std 1)` was
+    /// constant during training and is zeroed rather than passed through as a
+    /// raw value the model never saw. A zero std is zeroed too, instead of
+    /// dividing by it.
     pub fn standardize(&self, features: &mut [f32]) {
         if !self.standardized {
             return;
@@ -250,165 +302,166 @@ impl FeatureSpec {
         }
     }
 
+    /// The ABI whose base (non-keyword) feature semantics this spec uses.
     pub(super) fn feature_semantics_abi(&self) -> u32 {
         self.base_feature_abi.unwrap_or(self.abi_version)
     }
 
+    /// Check the spec is one this extractor can fill: a supported ABI, its
+    /// keyword families and metric contract, and a consistent layout.
     pub(super) fn validate(&self) -> Result<()> {
-        if self.abi_version >= 22 {
-            anyhow::ensure!(
-                self.base_feature_abi
-                    .is_some_and(|v| (18..=21).contains(&v)),
-                "v22 requires a supported base_feature_abi (18..=21)"
-            );
-        } else {
-            anyhow::ensure!(
-                self.base_feature_abi.is_none() && self.keyword_vocabs.is_empty(),
-                "keyword extensions require ABI 22"
+        if !(MIN_MODEL_ABI_VERSION..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
+            anyhow::bail!(
+                "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{MIN_MODEL_ABI_VERSION}..=v{EXPECTED_MODEL_ABI_VERSION}",
+                self.abi_version,
             );
         }
-        anyhow::ensure!(
-            self.keyword_vocabs
-                .keys()
-                .all(|s| matches!(s.as_str(), "ruleword" | "descword")
-                    || (self.abi_version >= 23
-                        && matches!(s.as_str(), "fullword" | "ruletextword" | "contextword"))),
-            "unknown keyword source"
-        );
+        self.validate_keywords()?;
         anyhow::ensure!(
             self.trait_path_depth > 0,
             "trait_path_depth must be positive"
         );
-        if self.presence_vocab.is_empty() {
-            anyhow::bail!("feature spec missing presence_vocab entries");
+        anyhow::ensure!(
+            !self.presence_vocab.is_empty(),
+            "feature spec missing presence_vocab entries"
+        );
+        anyhow::ensure!(
+            self.feature_names.len() == self.total_features,
+            "feature spec feature_names length {} does not match total_features {}",
+            self.feature_names.len(),
+            self.total_features
+        );
+        self.validate_metrics()?;
+        self.validate_standardization()?;
+        self.note_unknown_features();
+        Ok(())
+    }
+
+    /// Keyword families need a keyword ABI, a base ABI this build extracts,
+    /// and only the sources their ABI defines.
+    fn validate_keywords(&self) -> Result<()> {
+        let abi = self.abi_version;
+        if abi < KEYWORD_ABI {
+            anyhow::ensure!(
+                self.base_feature_abi.is_none() && self.keyword_vocabs.is_empty(),
+                "keyword features require ABI v{KEYWORD_ABI} or later (spec is ABI v{abi})"
+            );
+            return Ok(());
         }
-        if self.feature_names.len() != self.total_features {
-            anyhow::bail!(
-                "feature spec feature_names length {} does not match total_features {}",
-                self.feature_names.len(),
-                self.total_features
+        anyhow::ensure!(
+            self.base_feature_abi
+                .is_some_and(|base| (MIN_MODEL_ABI_VERSION..=METRIC_TRANSFORM_ABI).contains(&base)),
+            "an ABI v{abi} spec requires base_feature_abi in {MIN_MODEL_ABI_VERSION}..={METRIC_TRANSFORM_ABI} (got {:?})",
+            self.base_feature_abi,
+        );
+        for source in self.keyword_vocabs.keys() {
+            anyhow::ensure!(
+                abi >= source.min_abi(),
+                "keyword source {} requires ABI v{} (spec is ABI v{abi})",
+                source.name(),
+                source.min_abi(),
+            );
+        }
+        Ok(())
+    }
+
+    /// From ABI 21 every `metrics:` feature names its transform, and every
+    /// metric getter is one this build computes.
+    fn validate_metrics(&self) -> Result<()> {
+        let Some(transforms) = &self.metric_transforms else {
+            anyhow::ensure!(
+                self.feature_semantics_abi() < METRIC_TRANSFORM_ABI,
+                "an ABI v{METRIC_TRANSFORM_ABI} feature spec requires metric_transforms"
+            );
+            return Ok(());
+        };
+        for name in self
+            .feature_names
+            .iter()
+            .filter_map(|n| n.strip_prefix("metrics:"))
+        {
+            anyhow::ensure!(
+                matches!(
+                    transforms.get(name).map(String::as_str),
+                    Some("identity" | "log1p_abs")
+                ),
+                "missing or invalid metric transform: {name}"
             );
         }
         anyhow::ensure!(
-            self.feature_semantics_abi() < 21 || self.metric_transforms.is_some(),
-            "v21 feature spec requires metric_transforms"
+            !self.metric_getters.iter().any(|g| g == "pe_year_distance")
+                || (1970..=9999).contains(&self.metric_reference_year),
+            "pe_year_distance requires its training reference year"
         );
-        if let Some(transforms) = &self.metric_transforms {
-            for name in self
-                .feature_names
-                .iter()
-                .filter_map(|n| n.strip_prefix("metrics:"))
-            {
-                anyhow::ensure!(
-                    matches!(
-                        transforms.get(name).map(String::as_str),
-                        Some("identity" | "log1p_abs")
-                    ),
-                    "missing or invalid metric transform: {name}"
-                );
-            }
+        for getter in &self.metric_getters {
             anyhow::ensure!(
-                !self.metric_getters.iter().any(|g| g == "pe_year_distance")
-                    || (1970..=9999).contains(&self.metric_reference_year),
-                "pe_year_distance requires its training reference year"
-            );
-            for getter in &self.metric_getters {
-                anyhow::ensure!(
-                    known_metric_getter(getter)
-                        || self
-                            .metric_correlations
-                            .get(getter)
-                            .is_some_and(|pair| pair.iter().flatten().all(|s| !s.is_empty())),
-                    "unknown metric getter: {getter}"
-                );
-            }
-        }
-
-        if !(MIN_MODEL_ABI_VERSION..=EXPECTED_MODEL_ABI_VERSION).contains(&self.abi_version) {
-            anyhow::bail!(
-                "feature spec ABI mismatch: spec has ABI v{} but Atomdrift Scan requires ABI v{}",
-                self.abi_version,
-                EXPECTED_MODEL_ABI_VERSION
+                known_metric_getter(getter)
+                    || self
+                        .metric_correlations
+                        .get(getter)
+                        .is_some_and(|pair| pair.iter().flatten().all(|s| !s.is_empty())),
+                "unknown metric getter: {getter}"
             );
         }
+        Ok(())
+    }
 
-        let expected_feature_names = self.expected_feature_names();
-        if self.feature_names != expected_feature_names {
-            // The spec is allowed to be a SUBSET of what this extractor knows
-            // (some feature groups disabled at training via
-            // COLLIMATOR_DISABLE_FEATURE_GROUPS), AND it is allowed to contain
-            // features this extractor doesn't yet implement — those slots are
-            // filled with zeros at extraction time and the model degrades
-            // gracefully on them rather than refusing to load.
-            //
-            // Refusing to load on unknown features would tie every
-            // collimator-side feature innovation to a synchronous scan
-            // update. That's the wrong trade: deploying a model with
-            // dozens of unknown features that extract as zeros costs at most a
-            // measurable accuracy delta; refusing to deploy costs the whole
-            // model. So the load warns, naming the features, and
-            // `atomscan validate` treats the same list as fatal; an operator
-            // sees the degradation and decides whether to add extraction.
-            let unknown_features = self.unknown_feature_names(&expected_feature_names);
-            if !unknown_features.is_empty() {
-                let preview: Vec<&str> = unknown_features.iter().copied().take(5).collect();
-                // WARN-level (not ERROR): graceful degradation, not a deploy
-                // blocker. Unknown features extract as zeros — the model has
-                // those slots in its input vector but the runtime fills them
-                // with the same default it would see for a sample with no
-                // signal. Deploy verification (which fails on ERROR-level
-                // anomalies for inverted thresholds, ABI mismatch, etc.)
-                // intentionally lets this through. Engineer adds proper
-                // extraction when they want to recover the model accuracy
-                // those features were providing.
-                tracing::warn!(
-                    spec_features = self.feature_names.len(),
-                    expected_max = expected_feature_names.len(),
-                    unknown_count = unknown_features.len(),
-                    sample = ?preview,
-                    "feature spec contains features unknown to this extractor — they will extract as zeros (model accuracy may degrade for those slots)"
-                );
-            } else {
-                tracing::debug!(
-                    "feature spec has {} features (extractor knows {} optional-inclusive features) — {} optional features absent from this model",
-                    self.feature_names.len(),
-                    expected_feature_names.len(),
-                    expected_feature_names
-                        .len()
-                        .saturating_sub(self.feature_names.len()),
-                );
-            }
-        }
-
+    /// Standardization stats come as a pair, one entry per feature, and a
+    /// standardized spec must carry them.
+    fn validate_standardization(&self) -> Result<()> {
         match (
             self.feature_means.as_ref(),
             self.feature_stds.as_ref(),
             self.standardized,
         ) {
-            (Some(means), Some(stds), _) => {
-                if means.len() != self.total_features || stds.len() != self.total_features {
-                    anyhow::bail!(
-                        "feature spec standardization stats must each have {} entries (got means={}, stds={})",
-                        self.total_features,
-                        means.len(),
-                        stds.len()
-                    );
-                }
-            }
+            (Some(means), Some(stds), _) => anyhow::ensure!(
+                means.len() == self.total_features && stds.len() == self.total_features,
+                "feature spec standardization stats must each have {} entries (got means={}, stds={})",
+                self.total_features,
+                means.len(),
+                stds.len()
+            ),
             (None, None, false) => {}
-            (None, None, true) => {
-                anyhow::bail!(
-                    "feature spec is marked standardized but feature_means/feature_stds are missing"
-                );
-            }
-            (Some(_), None, _) | (None, Some(_), _) => {
-                anyhow::bail!(
-                    "feature spec must include both feature_means and feature_stds together"
-                );
-            }
+            (None, None, true) => anyhow::bail!(
+                "feature spec is marked standardized but feature_means/feature_stds are missing"
+            ),
+            (Some(_), None, _) | (None, Some(_), _) => anyhow::bail!(
+                "feature spec must include both feature_means and feature_stds together"
+            ),
         }
-
         Ok(())
+    }
+
+    /// Log how the spec's layout differs from what this extractor emits.
+    ///
+    /// A spec may be a subset of the extractor's layout (feature groups
+    /// disabled at training), and it may name features this build does not
+    /// extract: those slots stay zero, as for a sample with no signal. A load
+    /// warns and continues, so a model with a few unknown features costs some
+    /// accuracy rather than the whole model; `atomscan validate` treats the
+    /// same list as fatal (see [`Self::degraded_feature_names`]).
+    fn note_unknown_features(&self) {
+        let expected = self.expected_feature_names();
+        if self.feature_names == expected {
+            return;
+        }
+        let unknown = self.unknown_feature_names(&expected);
+        if unknown.is_empty() {
+            tracing::debug!(
+                spec_features = self.feature_names.len(),
+                extractor_features = expected.len(),
+                absent_optional = expected.len().saturating_sub(self.feature_names.len()),
+                "feature spec is a subset of the extractor's layout",
+            );
+        } else {
+            tracing::warn!(
+                spec_features = self.feature_names.len(),
+                expected_max = expected.len(),
+                unknown_count = unknown.len(),
+                sample = ?unknown.iter().take(5).collect::<Vec<_>>(),
+                "feature spec contains features unknown to this extractor — they will extract as zeros (model accuracy may degrade for those slots)"
+            );
+        }
     }
 
     /// Feature names this spec declares that the extractor built into this
@@ -416,9 +469,8 @@ impl FeatureSpec {
     /// feature-name list. Each returned slot extracts to zero at runtime, so
     /// the model receives no signal where it expects some. Empty in the normal
     /// case (the spec is a clean subset of what the extractor knows).
-    pub(super) fn unknown_feature_names<'a>(&'a self, expected: &[String]) -> Vec<&'a str> {
-        let expected_set: std::collections::HashSet<&str> =
-            expected.iter().map(String::as_str).collect();
+    fn unknown_feature_names<'a>(&'a self, expected: &[String]) -> Vec<&'a str> {
+        let expected_set: HashSet<&str> = expected.iter().map(String::as_str).collect();
         self.feature_names
             .iter()
             .map(String::as_str)
@@ -446,7 +498,7 @@ impl FeatureSpec {
     /// vocabularies — the canonical layout that `feature_names` is checked
     /// against. The fixed-name families come from the same tables that
     /// [`FeatureWriter::set`] checks its names against.
-    pub(super) fn expected_feature_names(&self) -> Vec<String> {
+    fn expected_feature_names(&self) -> Vec<String> {
         fn vocab(names: &mut Vec<String>, prefix: &str, vocab: &[String]) {
             names.extend(vocab.iter().map(|v| format!("{prefix}{v}")));
         }
@@ -504,23 +556,17 @@ impl FeatureSpec {
         vocab(&mut names, "symbol:", &self.symbol_vocab);
         vocab(&mut names, "symbol_bi:", &self.symbol_bigram_vocab);
         vocab(&mut names, "symbol_tri:", &self.symbol_trigram_vocab);
-        for source in [
-            "ruleword",
-            "descword",
-            "fullword",
-            "ruletextword",
-            "contextword",
-        ] {
-            if let Some(words) = self.keyword_vocabs.get(source) {
-                vocab(&mut names, &format!("{source}:"), words);
+        for source in KeywordSource::ALL {
+            if let Some(words) = self.keyword_vocabs.get(&source) {
+                vocab(&mut names, &format!("{}:", source.name()), words);
             }
         }
         names
     }
 }
 
-/// Logic gap categories (v16 group 19).
+/// Logic gap categories (group 19).
 pub(super) const LOGIC_GAP_CATEGORIES: &[&str] = &["crypto", "network", "process"];
 
-/// Intent gap categories (v16 group 22).
+/// Intent gap categories (group 22).
 pub(super) const INTENT_GAP_CATEGORIES: &[&str] = &["network", "filesystem", "execution", "crypto"];

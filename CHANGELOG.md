@@ -28,17 +28,23 @@ All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions foll
 - Resolve dependencies on members of explicit Yarn workspaces to their local source instead of a same-named registry package.
 - Apply the known-good/known-bad filters to `sys` scans, as `ps` and path scans already did.
 - Breaking: remove the worker subcommand; pull-based workers now live in postdoc.
+- Breaking: read burton filter format 3 and manifest schema 2, fetched from `bloom/v3/` and `nsrl/modern/v2/`; earlier builds keep reading `bloom/v2/` and `nsrl/modern/v1/`.
 - Breaking: remove the legacy analyze, analyze-path, analyze-purl, lookup and status endpoints; use the v1 API.
 - Breaking: replace --allowed-dirs with a repeatable `--allow-local-paths`, refused off loopback without CIDR and token.
 - Breaking: drop the hopper token environment variables; hopper tokens come from `~/.tok/hopper`, LLM keys from `SCAN_LLM_KEY` or `~/.tok`.
 - Breaking: remove flags `--model-dir`, `--traits-dir`, `--threshold-hostile`, `--threshold-suspicious`, `--interpret`, `--llm-key`, `--llm-min-level` and `--llm-min-prob` (and their `--interpret-min-*` aliases), `--llm-benign-notable-cap`, `--llm-timeout`, `--rizin-timeout-secs`, `--rizin-retry-timeout-secs`, `--registry-ttl`, `--fetch` and `--fetch-depth` (use `--follow`/`--follow-depth`), every other `--fetch-*` flag, `serve --idle-worker-slots`, `update-rules --check`/`--models-only` and `validate --skip-traits`.
 - Breaking: remove the rizin integration; binary reverse engineering uses binform.
+- Breaking: load only routed model bundles at feature ABI 20 or newer; older single-file bundles, calibrators and `evaluation.json` are no longer read, and a bundle without thresholds fails to load instead of falling back to fixed ones.
+- Breaking: fetch models, bloom and NSRL filters from `updates.atomdrift.org/scan/` and the release notice from `atomdrift.org/updates/scan.toml`; installed models are recorded in `.scan-models.toml`, so they download once more after upgrading.
 - Breaking: refuse analyses past the concurrency limit with 429 instead of queuing them.
 
 ### Fixes
 
 - Time out request headers after 30 seconds and cap the server at 1,024 connections.
 - Treat DNS and transport failures as retryable outages, not as verdicts about the package.
+- Pair `uv.lock` and `pdm.lock` with a co-located `pyproject.toml`, as `poetry.lock` already was.
+- Refuse to follow discovered URLs whose host is a NAT64, 6to4 or `0.0.0.0/8` form of a private address.
+- Decode every percent escape in npm package names.
 - Keep the package type of fetched downloads in model input, even when cached by digest.
 - Score every route a file type's policy names, matching the reference model scores.
 - Invalidate cached verdicts when cleave's compact report schema changes.

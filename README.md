@@ -5,7 +5,7 @@
 
 Atomdrift Scan is a modern ML-based malware scanner designed to detect 0-day attacks against the software supply-chain. 
 
-It's designed to be deterministic, fast, and flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. 
+It's designed to be fast, flexible, and embeddable in any workflow or security tool you have in mind, and can operate against files, archives, URLs, PURLs, or processes. For a given rules version, a verdict is deterministic.
 
 Rather than waiting for someone to report a sample and publish its signature or hash, Atomdrift Scan judges never-before-seen code by what it does. See [how it compares](https://atomdrift.org/compare/) with other scanners.
 
@@ -59,7 +59,7 @@ On Unix-like systems, install upstream 7-Zip (`brew install sevenzip`, `apt inst
 ## Usage
 
 ```bash
-# Scan a file, directory, or archive recusively:
+# Scan a file, directory, or archive recursively:
 atomscan ./project
 atomscan release.tgz
 
@@ -124,16 +124,14 @@ For a pool of `N` benign files, L0 allows zero observed false positives. Every p
 
 These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk.
 
-Only detection regressions at L0 through L25 (inclusive) can block model acceptance. Changes above L25 remain reportable but do not block installation. Calibration FP allowances still apply at every level; empirical test FP overruns are reported and do not block installation by default.
-
-The shared definition is in [Collimator’s level contract](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md). Existing model thresholds and reported measurements are unchanged by this documentation correction.
+The shared definition is in [Collimator’s level contract](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
 
 ### Optional local LLM (interpretation)
 
 For additional interpretation, users can provide access to an LLM via the `--llm` flag. This flag serves two purposes:
 
 * Provides a large-language model text interpretation of the results
-* Steer edge cases based on agreement/disagreement with the ML model ( p to 33%)
+* Steer edge cases based on agreement/disagreement with the ML model (up to 33%)
 
 By default, atomscan sends the interpreted evidence (not the original file) to `http://localhost:8000/v1` - to be used with a local service like Ollama or vLLM; but it can also be setup to use a remote service like Claude, ChatGPT, or DeepSeek.
 
@@ -175,29 +173,31 @@ The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, illumos,
 varies by target; see the [build workflow](.github/workflows/build.yml) for the
 current matrix.
 
+## NSRL Modern allowlist
+
+`atomscan update-rules` installs the NSRL Modern allowlist as its own Bloom
+bundle, versioned separately from the daily known-good/known-bad filters. The
+first download is about 512 MiB; after that, the daily rules check downloads
+filter bytes only when the NSRL manifest changes.
+
+An NSRL SHA-256 hit is an additional good signal. A bad, sighted-hostile,
+sighted-suspicious, or conflicted match in Scan's primary bundle always takes
+precedence. The primary SHA-256 revocation filter must be loaded before NSRL
+can permit skipping. When both PURL and digest are supplied, each key still
+needs a good match. Slow mode continues to analyze all inputs.
+
+`atomscan version` reports NSRL separately, and NSRL content changes invalidate cached analysis verdicts.
+
 ## Documentation
 
-Measure model loading with `make bench-model-load MODEL_LOAD_DIR=../azoth`.
-It reports the first load and repeated timings, and fails if any load exceeds
-`MODEL_LOAD_MAX_MS` (300 ms by default). Add `EAGER=1` to include every specialist;
-normal startup loads specialists on demand. These timings exclude trait loading,
-file analysis, and process/thread-pool startup, and repeated runs use the OS file
-cache. On Linux, `make profile-model-load` records a CPU profile with `perf`.
-
-`scripts/build-balanced-pgo.sh CORPUS OUTPUT_DIR [CARGO_CONFIG]` builds a scanner
-for the current CPU, trains it on cache-disabled analysis, and rebuilds
-with the resulting Rust profile. `PGO_TRAIN_SECONDS` optionally bounds training;
-an interrupted training run never counts as a passing benchmark. Set
-`PGO_USE_EXISTING=1` to rebuild from the retained profile, and `LLVM_PROFDATA` to the tool matching
-`rustc -vV`; use a Cargo config override when testing edited sibling dependencies.
 - [Integration guide](docs/INTEGRATION.md) — CLI, server, library, exit codes,
   and deployment choices
 - [JSON report schema](docs/JSON.md) — machine-readable output fields
 - [Server API](docs/SERVER_API.md) — long-running HTTP service
 - [Environment variables](docs/ENVIRONMENT.md) — the few settings read from the
   environment
-- [Dependency behavior](docs/DEPENDENCIES.md) — fetched dependency graph and
-  provenance
+- [Dependency storage design](docs/design/dependencies.md) — a proposal, not yet
+  implemented, for storing fetched dependencies as independent artifacts
 
 ## Related projects
 
@@ -219,21 +219,8 @@ under the UnRAR license: its source may be used to handle RAR archives, but
 not to develop a RAR-compatible archiver or to re-create the RAR compression
 algorithm.
 
-All contributions welcome!
+## Contributing
 
-## NSRL Modern allowlist
-
-NSRL's separate, independently versioned Bloom bundle installs with
-`atomscan update-rules`. The initial download is approximately 512 MiB at the current
-corpus size. The daily rules check also installs and refreshes it, downloading
-filter bytes only when its own NSRL manifest changes.
-Pulsar publishes it under `litmus/nsrl/modern/v1/`, independently of the daily
-known-good/known-bad filters.
-
-An NSRL SHA-256 hit is an additional good signal. A bad, sighted-hostile,
-sighted-suspicious, or conflicted match in Scan's primary bundle always takes
-precedence. The primary SHA-256 revocation filter must be loaded before NSRL
-can permit skipping. When both PURL and digest are supplied, each key still
-needs a good match. Slow mode continues to analyze all inputs.
-
-`atomscan version` reports NSRL separately, and NSRL content changes invalidate cached analysis verdicts.
+Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+toolchain, `make lint` and `make test`. Report security issues as described in
+[SECURITY.md](SECURITY.md).

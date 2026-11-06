@@ -45,7 +45,7 @@ pub fn upload_collector() -> &'static str {
 /// artifacts are queued before the result so a never-seen top-level file's row
 /// exists before its verdict lands. Blocking (reads sidecars from disk); callers
 /// on an async runtime must run it off the executor.
-pub(crate) fn upload_scan_result(
+fn upload_scan_result(
     uploader: &Uploader,
     origin: Origin<'_>,
     sha256: String,

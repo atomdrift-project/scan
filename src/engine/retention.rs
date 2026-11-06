@@ -56,11 +56,10 @@ const MAX_DIAGNOSTIC_ONLY_NODES: usize = 4096;
 /// Capped at [`MAX_IDENTITY_ONLY_NODES`] — it is the one rule whose survivor
 /// count an attacker controls directly.
 ///
-/// Everything else is removed outright — no stub rows. On the benchmark
-/// corpus that is ~77% of nodes and ~56% of stored report bytes, almost all
-/// of it `facts`/`ctx` that only trait evaluation and featurization (both
-/// already complete) ever consume. Collimator's retraining featurizer reads
-/// `facts` from the nodes that remain.
+/// Everything else is removed outright — no stub rows. That is most of a
+/// typical report's nodes and bytes, almost all of it `facts`/`ctx` that only
+/// trait evaluation and featurization (both already complete) ever consume. A
+/// retraining featurizer reads `facts` from the nodes that remain.
 pub(crate) fn apply_report_retention(report: &mut CompactReport) {
     let notable = |f: &CompactFile| {
         f.findings

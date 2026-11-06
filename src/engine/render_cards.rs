@@ -11,61 +11,17 @@ use cleave::{Criticality, FileAnalysis, Finding};
 use fletch::fetch::FetchRecord;
 
 use super::render_context::{Fetched, ReportIndex, fetched_subjects, registry_only};
-use super::verdict::{decision_outranks, graver, trait_family};
+use super::verdict::{graver, trait_family, worst_first};
 use super::{
     ARCHIVE_DELIMITER, EmbeddedFile, MemberEvals, Reason, ScanResult, archive_leaf, is_inside,
 };
 use crate::fetch::DependencyRegistry;
 use crate::interpret::Interpretation;
 use crate::model::{Classification, Decision, Level};
-use crate::output::{self, BloomMark, Rgb, TerminalTrait};
-
-/// Append full ML diagnostics (route scores + SHAP reasons) under the rendered
-/// context, for `--extra`. Shows which route drove the grade and the top SHAP
-/// features behind the top-level featurization. Embedded archive members list
-/// their route scores; per-member SHAP reasons are not computed (reasons exist
-/// only for the top-level file), so to attribute an embedded hit, scan the
-/// extracted member directly — it then becomes the top-level file.
-pub(crate) fn write_extra_diagnostics(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<()> {
-    // Lead with the level, as `output::print_extra` does. It is the only place
-    // the loose tail above the suspicious ceiling (L3000..=L25000) is legible:
-    // those files grade benign, so nothing else in this render names the rung
-    // they fired on.
-    writeln!(out, "  level: {}", r.level)?;
-    if !r.model_scores.is_empty() {
-        writeln!(
-            out,
-            "  routes (raw): {}",
-            output::format_route_scores(&r.model_scores),
-        )?;
-    }
-    if !r.reasons.is_empty() {
-        writeln!(out, "  shap (top features by importance):")?;
-        for reason in r.reasons.iter().take(12) {
-            writeln!(
-                out,
-                "    imp={:.4} val={:.4}  {}  [{}]",
-                reason.importance, reason.value, reason.feature, reason.description,
-            )?;
-        }
-    }
-    // A top-10 view of the evaluation table; the table itself is complete.
-    for ef in EmbeddedFile::top_offenders(&r.embedded_files, 10) {
-        if !ef.model_scores.is_empty() {
-            writeln!(
-                out,
-                "  embedded {} ({}): routes (raw) {}",
-                output::tty_text(&ef.path),
-                ef.file_type,
-                output::format_route_scores(&ef.model_scores),
-            )?;
-        }
-    }
-    Ok(())
-}
+use crate::output::{self, BloomMark, Ink, TerminalTrait};
 
 /// Write the `--format tiny` view (machine/LLM-facing, never colored): one
-/// ML-verdict line — the gate, calibrated confidence, matched false-positive
+/// ML-verdict line — the gate, the model probability, matched false-positive
 /// level — then cleave's annotated context.
 pub(crate) fn write_tiny(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<()> {
     let class = r.classification;
@@ -91,52 +47,40 @@ pub(crate) fn write_tiny(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<
         r.probability
     )?;
     if let Some(llm) = &r.interpretation {
-        out.write_all(format_llm_line(llm, false).as_bytes())?;
+        out.write_all(format_llm_line(llm, Ink::plain()).as_bytes())?;
     }
     out.write_all(r.rendered_context.as_bytes())
 }
 
 /// One-line LLM verdict, colored by the blended outcome. Shown under the ML
-/// verdict in terminal output when `--llm` produced a result. `color` is
-/// false for `--format tiny` (LLM-facing output is never colored).
-pub(crate) fn format_llm_line(llm: &Interpretation, color: bool) -> String {
-    use colored::Colorize;
+/// verdict in terminal output when `--llm` produced a result; `ink` is
+/// [`Ink::plain`] for `--format tiny` (LLM-facing output is never colored).
+fn format_llm_line(llm: &Interpretation, ink: Ink) -> String {
+    let p = output::palette();
     let graded = match llm {
-        Interpretation::Failed(failed) if !color => {
-            return format!("llm error  {}\n", failed.error);
-        }
         Interpretation::Failed(failed) => {
             return format!(
                 "llm {}  {}\n",
-                "error".truecolor(255, 175, 0),
-                failed.error.bright_black(),
+                ink.fg(p.suspicious, "error"),
+                ink.fg(p.dim, &failed.error),
             );
         }
         Interpretation::Graded(graded) => graded,
     };
-    let grade = graded.grade.as_str();
-    if !color {
-        return format!(
-            "llm {grade} → {} blended={:.3}  {}\n",
-            graded.outcome, graded.blended, graded.interpretation,
-        );
-    }
-    let (r, g, b) = match graded.outcome {
-        Classification::Hostile => (215, 95, 95),
-        Classification::Suspicious => (255, 175, 0),
-        Classification::Benign => (95, 175, 95),
-    };
-    let outcome = graded.outcome.to_string().truecolor(r, g, b).bold();
+    let outcome = ink.fg_bold(
+        output::class_color(graded.outcome),
+        &graded.outcome.to_string(),
+    );
     format!(
-        "llm {} → {outcome} blended={:.3}  {}\n",
-        grade.bright_black(),
+        "llm {} \u{2192} {outcome} blended={:.3}  {}\n",
+        ink.fg(p.dim, graded.grade.as_str()),
         graded.blended,
-        graded.interpretation.bright_black(),
+        ink.fg(p.dim, &graded.interpretation),
     )
 }
 
 fn terminal_safe_text(text: &str) -> String {
-    crate::deptree::strip_ansi(text)
+    output::strip_ansi(text)
         .chars()
         .filter(|&c| !output::tty_hostile(c))
         .collect::<String>()
@@ -580,8 +524,8 @@ fn member_grid(
 /// file is which. Instead each top-level package inside the archive that scored
 /// suspicious+ on its own is framed as its own card (verdict stamp, package
 /// name, its findings), clearly nested under the archive banner. The archive's
-/// own card is added only when it carries a non-inherited hostile finding of its
-/// own, or outscores every package it contains.
+/// own card is added only when it carries a hostile finding of its own (see
+/// [`archive_own_rows`]).
 ///
 /// `None` (fall back to the single-card render) when the archive holds fewer
 /// than two independently-notable packages — an ordinary single-package scan is
@@ -592,50 +536,7 @@ fn render_archive_cards(
     members: &MemberEvals,
 ) -> Option<String> {
     let by_id: HashMap<u32, &FileAnalysis> = files.iter().map(|f| (f.id, *f)).collect();
-
-    // Group every file under its top-level package (its depth-1 ancestor).
-    let roots: Vec<(u32, &str)> = files
-        .iter()
-        .filter(|f| f.depth == 1)
-        .map(|f| (f.id, f.path.as_str()))
-        .collect();
-    let mut members_of: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for file in files {
-        if let Some(pkg) = top_package_id(file, &roots) {
-            members_of.entry(pkg).or_default().push(file.id);
-        }
-    }
-    if members_of.is_empty() {
-        return None;
-    }
-
-    // Each package's verdict is the worst independent verdict among its files —
-    // exactly how a first-hand scan of that package alone would resolve.
-    let mut packages: Vec<Package> = members_of
-        .into_iter()
-        .filter_map(|(pkg, package_members)| {
-            let decision = package_members
-                .iter()
-                .filter_map(|id| members.get(&u64::from(*id)).map(EmbeddedFile::decision))
-                .reduce(graver)?;
-            Some(Package {
-                id: pkg,
-                decision,
-                members: package_members,
-            })
-        })
-        .collect();
-
-    // Worst first, so the reader meets the most dangerous package immediately.
-    packages.sort_by(|a, b| {
-        if decision_outranks(&a.decision, &b.decision) {
-            std::cmp::Ordering::Less
-        } else if decision_outranks(&b.decision, &a.decision) {
-            std::cmp::Ordering::Greater
-        } else {
-            a.id.cmp(&b.id)
-        }
-    });
+    let packages = ranked_packages(files, members);
     let notable: Vec<&Package> = packages
         .iter()
         .filter(|p| p.decision.class >= Classification::Suspicious)
@@ -646,33 +547,6 @@ fn render_archive_cards(
     if notable.len() < 2 {
         return None;
     }
-
-    // Does a root finding belong to the archive itself? It must be non-inherited
-    // (native to the container — no `src` child pointing into a member) *and*
-    // native to nothing below it: a trait that also fired natively on some member
-    // (a package's own atomic trait re-evaluated at container scope, or a
-    // composite native to one package's container node) is that member's story,
-    // already told by its card. What survives is genuinely the archive's own — an
-    // atomic match on the container's own bytes, or a composite that spans
-    // packages and so is native to no single one. This mirrors cleave's own
-    // "native deeper down belongs to the member" rule.
-    let member_native: HashSet<&str> = files
-        .iter()
-        .filter(|f| f.depth > 0)
-        .flat_map(|f| {
-            f.findings
-                .iter()
-                .filter(|x| x.src.is_none())
-                .map(|x| x.id.as_str())
-        })
-        .collect();
-    let root = files.first().copied();
-    let is_archive_own = |f: &Finding| f.src.is_none() && !member_native.contains(f.id.as_str());
-    let archive_card = root.is_some_and(|root| {
-        root.findings
-            .iter()
-            .any(|f| f.crit >= Criticality::Hostile && is_archive_own(f))
-    });
 
     // ── Banner: verdict rule → 📦 name · TYPE · size → hash ──
     let mut out = card_head(files, head, true);
@@ -703,17 +577,37 @@ fn render_archive_cards(
             .is_some_and(|file| decoded_region_display_path(&file.path).is_some())
     });
 
-    // ── One independently notable child, worst first ──
-    let render_child = |pkg: &Package, last: bool| -> String {
+    // The root's own conclusion belongs directly beneath the root metadata in a
+    // decoded tree. A second card repeating the root filename would imply a
+    // sibling object where none exists.
+    if let Some(root) = files.first().copied()
+        && let Some(rows) = archive_own_rows(files, root)
+    {
+        if embedded_tree {
+            out.push_str(&rows);
+            out.push('\n');
+        } else {
+            out.push('\n');
+            out.push_str(&output::terminal_card(
+                head.decision.class,
+                head.label,
+                &root.file_type,
+                root.size,
+                &rows,
+            ));
+        }
+    }
+
+    // One independently notable child per card or branch, worst first.
+    for (index, pkg) in notable.iter().enumerate() {
         let file = by_id.get(&pkg.id);
         let name = file.map_or_else(String::new, |f| package_display_path(&f.path));
         let ptype = file.map_or("", |f| f.file_type.as_str());
         let psize = file.map_or(0, |f| f.size);
-        let member_ids: HashSet<u32> = pkg.members.iter().copied().collect();
-
         // Rank over every member in the package, then spend exactly three rows
         // on its strongest distinct traits. A large package reads like one
         // artifact instead of a transcript of its member traversal.
+        let member_ids: HashSet<u32> = pkg.members.iter().copied().collect();
         let package: Vec<&FileAnalysis> = files
             .iter()
             .copied()
@@ -724,65 +618,25 @@ fn render_archive_cards(
             terminal_width().saturating_sub(2),
         );
         if embedded_tree {
-            output::terminal_embedded_branch(pkg.decision.class, &name, ptype, psize, &rows, last)
+            let last = index + 1 == notable.len();
+            out.push_str(&output::terminal_embedded_branch(
+                pkg.decision.class,
+                &name,
+                ptype,
+                psize,
+                &rows,
+                last,
+            ));
         } else {
-            output::terminal_card(pkg.decision.class, &name, ptype, psize, &rows)
-        }
-    };
-
-    // The root's own conclusion belongs directly beneath the root metadata in a
-    // decoded tree. A second card repeating the root filename would imply a
-    // sibling object where none exists.
-    if archive_card && let Some(root) = root {
-        // The archive's own findings, and the member files their cross-package
-        // trails point at — the members must stay in the view so those `↳` legs
-        // resolve to real paths, but only the root's findings block is kept.
-        let own: HashSet<&str> = root
-            .findings
-            .iter()
-            .filter(|f| is_archive_own(f))
-            .map(|f| f.id.as_str())
-            .collect();
-        let referenced: HashSet<u32> = own
-            .iter()
-            .filter_map(|id| root.composite_sources.get(*id))
-            .flatten()
-            .map(|s| s.file)
-            .collect();
-        let mut own_root = root.clone();
-        own_root.findings.retain(|f| own.contains(f.id.as_str()));
-        let view: Vec<&FileAnalysis> = files
-            .iter()
-            .filter(|f| f.id == root.id || referenced.contains(&f.id))
-            .map(|&f| if f.id == root.id { &own_root } else { f })
-            .collect();
-        let rows = output::terminal_trait_rows(
-            &terminal_top_traits(&view),
-            terminal_width().saturating_sub(2),
-        );
-        if !rows.trim().is_empty() {
-            if embedded_tree {
-                out.push_str(&rows);
-                out.push('\n');
-            } else {
-                let file_type = root.file_type.as_str();
-                out.push('\n');
-                out.push_str(&output::terminal_card(
-                    head.decision.class,
-                    head.label,
-                    file_type,
-                    root.size,
-                    &rows,
-                ));
-            }
-        }
-    }
-
-    for (index, pkg) in notable.iter().enumerate() {
-        if !embedded_tree {
             out.push('\n');
+            out.push_str(&output::terminal_card(
+                pkg.decision.class,
+                &name,
+                ptype,
+                psize,
+                &rows,
+            ));
         }
-        out.push_str(&render_child(pkg, index + 1 == notable.len()));
     }
 
     // Note quiet packages omitted from the detailed cards.
@@ -790,13 +644,108 @@ fn render_archive_cards(
     if omitted > 0 {
         let plural = if omitted == 1 { "package" } else { "packages" };
         let note = format!("{omitted} clean {plural} not shown");
-        let _ = writeln!(out, "\n {}", output::fg(Rgb(100, 100, 100), &note));
+        let _ = writeln!(out, "\n {}", output::fg(output::palette().dim, &note));
     }
 
     while out.ends_with("\n\n") {
         out.pop();
     }
     Some(out)
+}
+
+/// Every top-level package inside the archive (each depth-1 member and the
+/// files beneath it), worst first. A package's verdict is the worst
+/// independent verdict among its files — exactly how a first-hand scan of that
+/// package alone would resolve. A package with no evaluated file is left out.
+fn ranked_packages(files: &[&FileAnalysis], members: &MemberEvals) -> Vec<Package> {
+    let roots: Vec<(u32, &str)> = files
+        .iter()
+        .filter(|f| f.depth == 1)
+        .map(|f| (f.id, f.path.as_str()))
+        .collect();
+    let mut members_of: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for file in files {
+        if let Some(pkg) = top_package_id(file, &roots) {
+            members_of.entry(pkg).or_default().push(file.id);
+        }
+    }
+    let mut packages: Vec<Package> = members_of
+        .into_iter()
+        .filter_map(|(pkg, package_members)| {
+            let decision = package_members
+                .iter()
+                .filter_map(|id| members.get(&u64::from(*id)).map(EmbeddedFile::decision))
+                .reduce(graver)?;
+            Some(Package {
+                id: pkg,
+                decision,
+                members: package_members,
+            })
+        })
+        .collect();
+    // Worst first, so the reader meets the most dangerous package immediately.
+    packages.sort_by(|a, b| worst_first(&a.decision, &b.decision).then(a.id.cmp(&b.id)));
+    packages
+}
+
+/// The trait rows for what the archive `root` says on its own, or `None` when
+/// it carries no hostile finding of its own.
+///
+/// A root finding is the archive's own when it is non-inherited (native to the
+/// container — no `src` child pointing into a member) *and* native to nothing
+/// below it: a trait that also fired natively on some member (a package's own
+/// atomic trait re-evaluated at container scope, or a composite native to one
+/// package's container node) is that member's story, already told by its
+/// card. What survives is genuinely the archive's own — an atomic match on the
+/// container's own bytes, or a composite that spans packages and so is native
+/// to no single one. This mirrors cleave's own "native deeper down belongs to
+/// the member" rule.
+fn archive_own_rows(files: &[&FileAnalysis], root: &FileAnalysis) -> Option<String> {
+    let member_native: HashSet<&str> = files
+        .iter()
+        .filter(|f| f.depth > 0)
+        .flat_map(|f| {
+            f.findings
+                .iter()
+                .filter(|x| x.src.is_none())
+                .map(|x| x.id.as_str())
+        })
+        .collect();
+    let is_archive_own = |f: &Finding| f.src.is_none() && !member_native.contains(f.id.as_str());
+    if !root
+        .findings
+        .iter()
+        .any(|f| f.crit >= Criticality::Hostile && is_archive_own(f))
+    {
+        return None;
+    }
+    // The archive's own findings, and the member files their cross-package
+    // trails point at — the members must stay in the view so those `↳` legs
+    // resolve to real paths, but only the root's findings block is kept.
+    let own: HashSet<&str> = root
+        .findings
+        .iter()
+        .filter(|f| is_archive_own(f))
+        .map(|f| f.id.as_str())
+        .collect();
+    let referenced: HashSet<u32> = own
+        .iter()
+        .filter_map(|id| root.composite_sources.get(*id))
+        .flatten()
+        .map(|s| s.file)
+        .collect();
+    let mut own_root = root.clone();
+    own_root.findings.retain(|f| own.contains(f.id.as_str()));
+    let view: Vec<&FileAnalysis> = files
+        .iter()
+        .filter(|f| f.id == root.id || referenced.contains(&f.id))
+        .map(|&f| if f.id == root.id { &own_root } else { f })
+        .collect();
+    let rows = output::terminal_trait_rows(
+        &terminal_top_traits(&view),
+        terminal_width().saturating_sub(2),
+    );
+    (!rows.trim().is_empty()).then_some(rows)
 }
 
 /// Collapse cleave's decoded-region path duplication for display. A region

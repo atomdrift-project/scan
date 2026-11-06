@@ -6,11 +6,23 @@
     reason = "feature values are narrowed to the model's f32 input dtype"
 )]
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use rayon::prelude::*;
+
+use super::keywords::{self, FileKeywords};
+use super::names::METRIC_EQUIVALENTS;
+use super::structure::{
+    MetricMap, file_symbols, finding_paths, kv_tokens_with_options, merge_metric_summaries,
+};
+use super::write::{FileRiskStats, crit_category_tokens};
+use super::{CRIT_HOSTILE, CRIT_NOTABLE, CRIT_SUSPICIOUS, MIN_CONFIDENCE, trait_path};
+
+/// The trait-path depth the shared parse summarizes findings at. A route
+/// trained at another depth reads a variant rebuilt from the same findings
+/// (see [`ParsedReport::at_trait_path_depth`]).
+pub(super) const BASE_TRAIT_PATH_DEPTH: usize = 3;
 
 /// The finding fields retained for cross-file aggregation: ID dedup and
 /// ATT&CK/MBC code rollups. Keeping just these avoids cloning the whole
@@ -72,7 +84,6 @@ pub(super) struct FileSummary {
     pub(super) metrics: HashMap<String, HashMap<String, f64>>,
     pub(super) findings: FindingSummary,
     pub(super) risk: FileRiskStats,
-    pub(super) unique_3level_paths: Vec<String>,
     /// Import tokens (`name` and `lib!name`) for the logic-gap features.
     pub(super) imports: HashSet<String>,
     /// Full `kv:` feature names from the metrics block. Empty unless a route
@@ -83,7 +94,7 @@ pub(super) struct FileSummary {
     pub(super) symbols: Vec<String>,
     /// Findings reduced to the fields used for cross-file aggregation.
     pub(super) raw_findings: Vec<RawFinding>,
-    pub(super) keywords: keywords::FileKeywords,
+    pub(super) keywords: FileKeywords,
 }
 
 /// Which optional feature families are active for this route, so
@@ -143,7 +154,8 @@ impl RawNeeds {
 #[derive(Debug)]
 pub(crate) struct ParsedReport {
     pub(super) trait_path_depth: usize,
-    pub(super) depth_variants: std::sync::Mutex<HashMap<usize, std::sync::Arc<ParsedReport>>>,
+    /// This parse rebuilt at other trait-path depths, built on first use.
+    pub(super) depth_variants: Mutex<HashMap<usize, Arc<ParsedReport>>>,
     pub(super) summaries: Vec<FileSummary>,
     pub(super) combined: FindingSummary,
     pub(super) merged_metrics: MetricMap,
@@ -152,8 +164,6 @@ pub(crate) struct ParsedReport {
     pub(super) sample_score: i64,
     /// Sorted `tier:category[/sub]` tokens for the `crit:` n-grams.
     pub(super) crit_tokens: Vec<String>,
-    /// Sorted `tier:path` tokens for the `tierbi:`/`tiertri:` families.
-    pub(super) tiered_tokens: Vec<String>,
     /// Distinct ATT&CK technique and MBC behavior codes, sorted.
     pub(super) attack_codes: Vec<String>,
     pub(super) mbc_codes: Vec<String>,
@@ -162,19 +172,19 @@ pub(crate) struct ParsedReport {
 impl ParsedReport {
     /// Reuse decoded facts while rebuilding depth-dependent summaries for a
     /// route. The shared default-depth parse remains untouched for other routes.
-    pub(super) fn at_trait_path_depth(&self, depth: usize) -> std::sync::Arc<Self> {
+    pub(super) fn at_trait_path_depth(&self, depth: usize) -> Arc<Self> {
         let mut variants = self
             .depth_variants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::sync::Arc::clone(
+            .unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
             variants
                 .entry(depth)
-                .or_insert_with(|| std::sync::Arc::new(self.rebuild_at_trait_path_depth(depth))),
+                .or_insert_with(|| Arc::new(self.rebuild_at_trait_path_depth(depth))),
         )
     }
 
-    pub(super) fn rebuild_at_trait_path_depth(&self, depth: usize) -> Self {
+    fn rebuild_at_trait_path_depth(&self, depth: usize) -> Self {
         let mut summaries = self.summaries.clone();
         for file in &mut summaries {
             file.findings = summarize_findings_at_depth(&file.raw_findings, depth);
@@ -244,10 +254,7 @@ impl ParsedReport {
         Self::from_summaries(file_summaries, primary)
     }
 
-    pub(super) fn from_summaries(
-        file_summaries: Vec<FileSummary>,
-        primary: Option<(&str, i64)>,
-    ) -> Self {
+    fn from_summaries(file_summaries: Vec<FileSummary>, primary: Option<(&str, i64)>) -> Self {
         let summaries = if file_summaries.is_empty() {
             vec![FileSummary::default()]
         } else {
@@ -269,9 +276,6 @@ impl ParsedReport {
         let combined = summarize_report_summaries(&summaries);
         let merged_metrics = merge_metric_summaries(&summaries);
         let crit_tokens = crit_category_tokens(&combined);
-        // Sorted `tier:path` tokens shared by the tiered bigram and trigram
-        // feature builders.
-        let tiered_tokens = tiered_path_tokens_with_options(&combined, 3, &HashMap::new());
         let mut attack_codes: HashSet<&str> = HashSet::new();
         let mut mbc_codes: HashSet<&str> = HashSet::new();
         for finding in summaries.iter().flat_map(|s| &s.raw_findings) {
@@ -290,8 +294,8 @@ impl ParsedReport {
         let attack_codes = sorted(attack_codes);
         let mbc_codes = sorted(mbc_codes);
         Self {
-            trait_path_depth: default_trait_path_depth(),
-            depth_variants: std::sync::Mutex::default(),
+            trait_path_depth: BASE_TRAIT_PATH_DEPTH,
+            depth_variants: Mutex::default(),
             summaries,
             combined,
             merged_metrics,
@@ -299,7 +303,6 @@ impl ParsedReport {
             elements_str,
             sample_score,
             crit_tokens,
-            tiered_tokens,
             attack_codes,
             mbc_codes,
         }
@@ -352,15 +355,6 @@ impl FileSummary {
             max_crit,
         };
 
-        let mut unique_3level_paths: Vec<String> = raw_findings
-            .iter()
-            .filter(|f| f.conf >= MIN_CONFIDENCE && f.crit >= CRIT_NOTABLE)
-            .map(|f| trait_path(&f.id).to_string())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        unique_3level_paths.sort();
-
         let metrics_value = facts
             .metrics
             .as_ref()
@@ -396,7 +390,6 @@ impl FileSummary {
             metrics,
             findings,
             risk,
-            unique_3level_paths,
             imports,
             kv_tokens: if needs.kv {
                 kv_tokens_with_options(metrics_value, needs.kv_shape, needs.kv_split)
@@ -486,7 +479,7 @@ pub(super) fn numeric_metrics(source: Option<&serde_json::Value>) -> MetricMap {
 }
 
 /// The tokens a `(library, name)` import pair contributes: the bare name and
-/// the `lib!name` form, each subject to collimator's per-token `len >= 2`
+/// the `lib!name` form, each subject to training's per-token `len >= 2`
 /// gate.
 pub(super) fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(2);
@@ -507,10 +500,10 @@ pub(super) fn import_tokens_from_parts(lib: &str, name: &str) -> Vec<String> {
 }
 
 pub(super) fn summarize_findings(findings: &[RawFinding]) -> FindingSummary {
-    summarize_findings_at_depth(findings, default_trait_path_depth())
+    summarize_findings_at_depth(findings, BASE_TRAIT_PATH_DEPTH)
 }
 
-pub(super) fn summarize_findings_at_depth(findings: &[RawFinding], depth: usize) -> FindingSummary {
+fn summarize_findings_at_depth(findings: &[RawFinding], depth: usize) -> FindingSummary {
     let mut summary = FindingSummary::default();
     let mut suspicious_ids: HashSet<&str> = HashSet::new();
     let mut hostile_ids: HashSet<&str> = HashSet::new();
@@ -618,12 +611,11 @@ pub(super) fn category_breadth(sample_paths: &HashMap<String, u32>) -> (usize, u
     (susp_cats.len(), host_cats.len())
 }
 
-pub(super) fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
+fn summarize_report_summaries(summaries: &[FileSummary]) -> FindingSummary {
     let mut combined = FindingSummary::default();
 
-    // Deduplicate unique IDs across all files (matching Python's second pass
-    // in _summarize_report_files which iterates all findings again). The
-    // finding IDs borrow from `summaries` for the lifetime of this function,
+    // Deduplicate unique IDs across all files, as training does in a second
+    // pass over every finding. The finding IDs borrow from `summaries` for the lifetime of this function,
     // so the sets hold `&str` — matching `summarize_findings`'s shape — and
     // avoid one `String` allocation per qualifying finding per criticality
     // tier.

@@ -1,45 +1,36 @@
-//! Fleet-shared skip for fetched-dependency analysis, backed by hopper's corpus.
+//! A shared skip for fetched-dependency analysis, backed by hopper's corpus.
 //!
-//! `crate::analysis_cache` already memoizes dependency analyses — but per
-//! host, namespaced by ruleset version. A fleet release therefore invalidates
-//! every host's cache at once, and each host rebuilds a private copy of the
-//! same shared dependency universe: thousands of redundant re-scans per hour,
-//! every one stored by hopper with "result renewed with no analyzer change;
-//! the re-analysis learned nothing".
+//! `crate::analysis_cache` memoizes dependency analyses per host, keyed by
+//! ruleset version, so a ruleset change invalidates every host's cache at
+//! once and each host re-analyzes the same dependencies. Hopper holds the one
+//! cache every scanner shares, so this module asks it first, before analyzing
+//! a fetched payload or resolving a package coordinate:
 //!
-//! This module asks the one cache the whole fleet shares — hopper — before
-//! analyzing a fetched payload or resolving a package coordinate:
-//!
-//!   1. TRAITS MATCH: the stored verdict was produced under this process's own
-//!      analyzer version (`traits_version` equals our 5-char traits commit,
-//!      the same truncation the /api/next heartbeat sends). Re-analysis by the
-//!      same analyzer learns nothing — hopper logs exactly that when it
-//!      happens — so this skips ANY verdict, hostile included.
-//!   2. BENIGN AND FRESH: `fires_at` is `-1` (clean), analyzed within the last 30 days
-//!      (see `DEFAULT_MAX_AGE_DAYS` for why that long), regardless of
-//!      analyzer version. This applies only to package-coordinate lookups
-//!      before fetching. Once bytes have been fetched, another analyzer's
-//!      clean verdict cannot replace analysis under the current rules.
-//!      The coarse rule that keeps working through a
-//!      mixed-version fleet or a release that just bumped every traits hash:
-//!      dependency universes are overwhelmingly benign.
+//!   1. SAME ANALYZER: the stored verdict was produced under this process's
+//!      traits (`traits_version` equals our 5-char traits commit). Analyzing
+//!      the same bytes under the same rules reaches the same verdict, so this
+//!      adopts any verdict, hostile included.
+//!   2. BENIGN AND FRESH: `fires_at` is `-1` (clean) and the record was
+//!      analyzed within `DEFAULT_MAX_AGE_DAYS`, whatever analyzer produced
+//!      it. This applies only to package coordinates, before fetching: once
+//!      bytes are in hand, another analyzer's clean verdict cannot stand in
+//!      for analysis under the current rules. It keeps working while
+//!      scanners run different trait versions, because dependency universes
+//!      are overwhelmingly benign.
 //!
 //! Anything neither rule covers — not found, not fresh, hostile under a
 //! different analyzer, unreachable — falls through to a normal analysis:
 //! fail-open, never fail-closed.
 //!
-//! Enabled automatically whenever `--hopper` is: [`configure`] is called with
-//! the process's own hopper URL whenever an uploader is built, so there is no
-//! second setting to keep in sync — the hopper you submit to is the hopper you
-//! ask. (Hopper serves `/v1/lookup` from an in-memory pool on both the primary
-//! and the read replica, so whichever the process talks to answers cheaply.)
-//! No `--hopper`, no precheck. Auth reuses the process's hopper bearer token
-//! (see [`crate::hopper::token`]).
+//! Armed whenever `--hopper` is: `configure` runs wherever an uploader is
+//! built, so the hopper a process files to is the hopper it asks, with no
+//! second setting to keep in sync. No `--hopper`, no precheck. Requests carry
+//! the process's hopper bearer token ([`crate::hopper::token`]).
 //!
 //! # Atomdrift Uplink
 //!
 //! `--uplink` scans arm the same precheck against Uplink's API instead
-//! ([`configure_uplink`]), with the subscription token. The wire is the
+//! (`configure_uplink`), with the subscription token. The wire is the
 //! same `/v1/lookup`; what changes is whose judgment it is. Hopper is a corpus
 //! of other runs, so only the same analyzer's verdict is ours. Uplink is the
 //! service the subscriber asked to judge for them, so an analyzed verdict
@@ -77,16 +68,14 @@ const PURL_BATCH: usize = 50;
 
 /// How fresh a benign verdict must be to stand in for a re-analysis.
 ///
-/// 30 rather than something tighter because this window is NOT the safety net
-/// against a benign verdict going bad — the threat-feed path is (a cited
-/// dependency is force-rescanned via cyclotron regardless of this cache), and
-/// hopper's own stale-traits rescan makes corpus rows re-analysis-eligible
-/// after 30 days (--rescan-age, aligned with this window), resetting analyzed_at whenever it drains to
-/// them. A verdict only ever reaches this age if every corpus refresh channel
-/// left it alone; the residual exposure is a detector improvement on an
-/// uncited, never-requeued dep, which self-heals when the rescan tier reaches
-/// it. Known gap, deliberately not this module's job: nothing yet refreshes a
-/// package when its dependency RECORDS change.
+/// This window is not the safety net against a benign verdict going bad:
+/// hopper re-analyzes a dependency a threat feed cites whatever this cache
+/// holds, and makes every row re-analysis-eligible after the same 30 days,
+/// resetting `analyzed_at` when it does. A verdict reaches this age only if
+/// every refresh left it alone, so the remaining exposure is a detector
+/// improvement on an uncited dependency, which the periodic re-analysis
+/// catches up with. A package whose dependency records change is not
+/// refreshed by anything here.
 const DEFAULT_MAX_AGE_DAYS: u64 = 30;
 
 /// Consecutive transport failures, kept as a half-open circuit breaker. At
@@ -141,9 +130,11 @@ impl Breaker {
         self.opened_at.store(now, Ordering::Relaxed);
         if n == BREAKER_LIMIT {
             tracing::warn!(
-                error = %error,
-                "{what}: {BREAKER_LIMIT} consecutive transport failures; \
-                 pausing for {BREAKER_COOLDOWN_SECS}s"
+                what,
+                %error,
+                failures = BREAKER_LIMIT,
+                cooldown_secs = BREAKER_COOLDOWN_SECS,
+                "consecutive transport failures; pausing lookups"
             );
         }
         true
@@ -152,7 +143,7 @@ impl Breaker {
 
 /// The hopper this process asks, and how it weighs the answers.
 #[derive(Debug)]
-pub struct Precheck {
+pub(crate) struct Precheck {
     lookup_url: String,
     max_age: Duration,
     breaker: Breaker,
@@ -169,18 +160,28 @@ enum Backend {
     Uplink(cleave::enriched::Token),
 }
 
-/// The armed precheck. Every [`configure`] replaces it, so the last hopper a
-/// process was pointed at is the one it asks.
+/// The armed precheck.
+///
+/// Process-wide on purpose: every fetch path in the process consults it, and
+/// none of them is handed configuration. Written only by [`configure`] and
+/// [`configure_uplink`], which run at startup before any scan; each replaces
+/// what was there, so the last backend a process was pointed at is the one
+/// it asks. Read only through [`armed`], which hands out a snapshot: a
+/// precheck in use is never mutated, only replaced.
 static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
+
+/// [`DEFAULT_MAX_AGE_DAYS`] as a duration.
+const DEFAULT_MAX_AGE: Duration =
+    Duration::from_secs(DEFAULT_MAX_AGE_DAYS * crate::civil::SECS_PER_DAY.unsigned_abs());
 
 /// Arm the precheck against Uplink's API, for an `--uplink` scan in
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
-pub fn configure_uplink(token: cleave::enriched::Token) {
+pub(crate) fn configure_uplink(token: cleave::enriched::Token) {
     let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck {
         lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
-        max_age: Duration::from_secs(max_age_days.saturating_mul(86_400)),
+        max_age: DEFAULT_MAX_AGE,
         breaker: Breaker::default(),
         backend: Backend::Uplink(token),
     };
@@ -197,12 +198,9 @@ pub fn configure_uplink(token: cleave::enriched::Token) {
 /// Arm the precheck against the hopper this process already talks to. Called
 /// where the uploader is built — the one place every `--hopper` mode passes
 /// through — so enablement follows `--hopper` with no second setting.
-pub fn configure(hopper_base_url: &str) {
+pub(crate) fn configure(hopper_base_url: &str) {
     let max_age_days = DEFAULT_MAX_AGE_DAYS;
-    let precheck = Precheck::new(
-        hopper_base_url,
-        Duration::from_secs(max_age_days.saturating_mul(86_400)),
-    );
+    let precheck = Precheck::new(hopper_base_url, DEFAULT_MAX_AGE);
     let mut armed = ARMED.write().unwrap_or_else(PoisonError::into_inner);
     if let Some(p) = &precheck
         && armed
@@ -219,7 +217,7 @@ pub fn configure(hopper_base_url: &str) {
 }
 
 /// The armed precheck, or `None` when this process has no hopper.
-pub fn armed() -> Option<Arc<Precheck>> {
+pub(crate) fn armed() -> Option<Arc<Precheck>> {
     ARMED.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
@@ -234,8 +232,8 @@ enum Lookup {
 /// A verdict this build may adopt as its own: the corpus produced it under the
 /// analyzer we are running, so re-deriving it locally would reach the same
 /// answer. `fires_at` is the tightest false-positive budget at which the
-/// artifact grades hostile; grading it against a caller's budget is
-/// Postdoc's request handler's job, never this module's.
+/// artifact grades hostile; grading it against a caller's budget is the
+/// caller's job, never this module's.
 #[derive(Debug, Clone, Default)]
 pub struct Verdict {
     pub fires_at: Level,
@@ -279,7 +277,7 @@ pub enum Standing {
 impl Standing {
     /// Whether this standing spares us the analysis at all.
     #[must_use]
-    pub const fn skips_analysis(&self) -> bool {
+    pub(crate) const fn skips_analysis(&self) -> bool {
         !matches!(self, Self::Analyze)
     }
 }
@@ -288,14 +286,14 @@ impl Standing {
 /// records the fetch edge, and what the corpus lets us skip for it — never
 /// [`Standing::Analyze`].
 #[derive(Debug, Clone)]
-pub struct PurlHit {
-    pub sha: String,
-    pub standing: Standing,
+pub(crate) struct PurlHit {
+    pub(crate) sha: String,
+    pub(crate) standing: Standing,
 }
 
-/// This process's 5-char traits commit prefix — the same value the /api/next
-/// heartbeat sends, truncated the way hopper truncates, so string equality
-/// against a stored `traits_version` means "same analyzer".
+/// This process's traits commit, truncated to the 5 characters hopper stores
+/// in `traits_version`, so string equality against a stored record means
+/// "same analyzer".
 pub fn local_traits() -> Option<&'static str> {
     static TRAITS: OnceLock<Option<String>> = OnceLock::new();
     TRAITS
@@ -307,9 +305,8 @@ impl Precheck {
     /// A precheck against the first hopper `hopper_base_url` names, or `None`
     /// when it names none.
     fn new(hopper_base_url: &str, max_age: Duration) -> Option<Self> {
-        // HOPPER may be a comma list, replica first ("https://ro,…"): lookups
-        // belong on the first entry — the replica when one is named, which is
-        // exactly where a cheap read should land.
+        // `--hopper` may be a comma list, replica first: lookups belong on the
+        // first entry, which is where a cheap read should land.
         let base = crate::hopper::endpoints(hopper_base_url)
             .into_iter()
             .next()?;
@@ -322,11 +319,11 @@ impl Precheck {
     }
 
     /// Whether this precheck asks Uplink (`--uplink`) rather than hopper.
-    pub fn is_uplink(&self) -> bool {
+    pub(crate) fn is_uplink(&self) -> bool {
         matches!(self.backend, Backend::Uplink(_))
     }
 
-    /// Per-request ceiling: tight for a hopper replica on the fleet's network,
+    /// Per-request ceiling: tight for a hopper on the operator's own network,
     /// roomier for a public API across the internet.
     fn timeout(&self) -> Duration {
         match self.backend {
@@ -400,7 +397,8 @@ impl Precheck {
                     reason,
                     status = status.as_u16(),
                     tid = %self.tid(),
-                    "{what}: Uplink lookups paused; analyzing locally"
+                    what,
+                    "Uplink lookups paused; analyzing locally"
                 );
             }
         }
@@ -428,7 +426,7 @@ impl Precheck {
     /// verdict from another analyzer does not cover the current rules. Any
     /// failure — unreachable, non-200, unparseable, or an answer about bytes
     /// other than `content_sha` — also means analyze.
-    pub fn standing(&self, content_sha: &str) -> Standing {
+    pub(crate) fn standing(&self, content_sha: &str) -> Standing {
         if content_sha.len() != 64 || !self.breaker.allows(crate::civil::now_secs()) {
             return Standing::Analyze;
         }
@@ -480,7 +478,7 @@ impl Precheck {
     /// own `sha256` and must name a digest that was asked, so an answer about
     /// other bytes can never stand in for this file. Fail-open everywhere; an
     /// open breaker stops the batch.
-    pub fn shas(&self, shas: &[String]) -> HashMap<String, Standing> {
+    pub(crate) fn shas(&self, shas: &[String]) -> HashMap<String, Standing> {
         let mut out = HashMap::new();
         let Some(http) = self.http() else {
             return out;
@@ -564,7 +562,7 @@ impl Precheck {
     /// with no usable sha is dropped — the fetch edge (`source → content sha`)
     /// must stay recordable — so the dependency falls through to a normal fetch.
     /// Fail-open everywhere; an open breaker stops the batch.
-    pub fn purls(&self, purls: &[String]) -> HashMap<String, PurlHit> {
+    pub(crate) fn purls(&self, purls: &[String]) -> HashMap<String, PurlHit> {
         let mut out = HashMap::new();
         if purls.is_empty() {
             return out;
@@ -641,32 +639,73 @@ impl Precheck {
     }
 }
 
+/// Why a `/v1/analyze` answer line is not a verdict.
+#[derive(Debug)]
+pub(crate) enum AnswerError {
+    /// The line is not a JSON record.
+    Unreadable(serde_json::Error),
+    /// The service did not analyze the artifact, or gave it no level.
+    NotAnalyzed {
+        status: Option<Status>,
+        cause: Option<String>,
+    },
+    /// The answer names no SHA-256 digest; what it named instead.
+    NoDigest(String),
+}
+
+impl std::fmt::Display for AnswerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(e) => write!(f, "unreadable analysis answer: {e}"),
+            Self::NotAnalyzed { status, cause } => {
+                write!(
+                    f,
+                    "Uplink could not analyze it ({}",
+                    status.map_or("", Status::as_str)
+                )?;
+                if let Some(cause) = cause {
+                    write!(f, ": {cause}")?;
+                }
+                f.write_str(")")
+            }
+            Self::NoDigest(sha) => write!(f, "analysis answer names no SHA-256 digest ({sha:?})"),
+        }
+    }
+}
+
+impl std::error::Error for AnswerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable(e) => Some(e),
+            Self::NotAnalyzed { .. } | Self::NoDigest(_) => None,
+        }
+    }
+}
+
 /// The verdict in one `/v1/analyze` answer line, and the digest it names:
 /// Uplink's judgment of an artifact it was asked to analyze, so it stands
 /// as long as it is an analyzed verdict with a level.
 ///
 /// # Errors
 /// An unreadable line, or an answer that is not an analyzed verdict.
-pub fn analyzed_verdict(line: &str) -> Result<(String, Verdict), String> {
+pub(crate) fn analyzed_verdict(line: &str) -> Result<(String, Verdict), AnswerError> {
     #[derive(serde::Deserialize)]
     struct Answer {
         cause: Option<String>,
         #[serde(flatten)]
         record: Record,
     }
-    let answer: Answer =
-        serde_json::from_str(line).map_err(|e| format!("unreadable analysis answer: {e}"))?;
+    let answer: Answer = serde_json::from_str(line).map_err(AnswerError::Unreadable)?;
     let mut rec = answer.record;
     if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
-        return Err(format!(
-            "Uplink could not analyze it ({}{})",
-            rec.status.map_or("", Status::as_str),
-            answer.cause.map(|c| format!(": {c}")).unwrap_or_default()
-        ));
+        return Err(AnswerError::NotAnalyzed {
+            status: rec.status,
+            cause: answer.cause,
+        });
     }
     let sha = rec.sha256.take().unwrap_or_default().to_ascii_lowercase();
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("analysis answer names no SHA-256 digest ({sha:?})"));
+        return Err(AnswerError::NoDigest(sha));
     }
     Ok((sha, rec.into()))
 }
@@ -679,17 +718,6 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
     } else {
         serde_json::from_slice(body).ok().map(|one| vec![one])
     }
-}
-
-/// Most a record's `analyzed_at` may lie ahead of this clock (skew between
-/// hosts) and still count as when it was analyzed.
-const MAX_CLOCK_SKEW_S: u64 = 300;
-
-/// Whether a clean verdict analyzed at `at` is within `max_age_s` of `now`. A
-/// time further ahead than clock skew explains is not a time at all: read as
-/// "now", it would keep the verdict fresh until that date.
-fn fresh_at(at: u64, max_age_s: u64, now: u64) -> bool {
-    at <= now.saturating_add(MAX_CLOCK_SKEW_S) && now.saturating_sub(at) <= max_age_s
 }
 
 /// Uplink's policy, pure for the same reason as [`standing_of`]: an
@@ -706,7 +734,7 @@ fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
             .analyzed_at
             .as_deref()
             .and_then(parse_rfc3339_epoch)
-            .is_some_and(|at| fresh_at(at, max_age_s, now));
+            .is_some_and(|at| crate::civil::fresh_at(at, max_age_s, now));
         if !fresh {
             return Standing::Analyze;
         }
@@ -759,7 +787,7 @@ fn standing_of(
     let Some(at) = rec.analyzed_at.as_deref().and_then(parse_rfc3339_epoch) else {
         return Standing::Analyze;
     };
-    if fresh_at(at, max_age_s, now) {
+    if crate::civil::fresh_at(at, max_age_s, now) {
         Standing::SkipBenign
     } else {
         Standing::Analyze
@@ -824,6 +852,8 @@ fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY: u64 = crate::civil::SECS_PER_DAY.unsigned_abs();
 
     #[test]
     fn parses_fixed_points_and_what_the_engine_writes() {
@@ -896,7 +926,7 @@ mod tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let precheck = Precheck::new(
             &format!("http://{}", listener.local_addr().expect("addr")),
-            Duration::from_secs(86_400),
+            Duration::from_secs(DAY),
         )
         .expect("a hopper");
         for _ in 0..BREAKER_LIMIT {
@@ -914,8 +944,7 @@ mod tests {
 
     #[test]
     fn a_batch_answer_pairs_by_purl_and_drops_unusable_items() {
-        let precheck =
-            Precheck::new("http://unused", Duration::from_secs(86_400)).expect("a hopper");
+        let precheck = Precheck::new("http://unused", Duration::from_secs(DAY)).expect("a hopper");
         let fresh = crate::engine::now_rfc3339();
         let sha = "AB".repeat(32);
         let body = format!(
@@ -937,8 +966,7 @@ mod tests {
 
     #[test]
     fn an_answer_is_keyed_by_the_purl_as_asked() {
-        let precheck =
-            Precheck::new("http://unused", Duration::from_secs(86_400)).expect("a hopper");
+        let precheck = Precheck::new("http://unused", Duration::from_secs(DAY)).expect("a hopper");
         let fresh = crate::engine::now_rfc3339();
         let sha = "ab".repeat(32);
         let answer = |purl: &str| {
@@ -968,7 +996,7 @@ mod tests {
             ..Record::default()
         };
         let now = parse_rfc3339_epoch("2026-08-24T00:00:00Z").unwrap();
-        let week = 7 * 86_400;
+        let week = 7 * DAY;
         let fresh = Some("2026-08-23T00:00:00Z"); // 1 day old
         let stale = Some("2026-08-01T00:00:00Z"); // 23 days old
         let standing = |r: Record, mine: Option<&str>| {
@@ -1039,7 +1067,7 @@ mod tests {
         )
         .expect("parse");
         let now = parse_rfc3339_epoch("2026-08-24T00:00:00Z").unwrap();
-        let v = match standing_of(rec, Some("b8c1c"), 7 * 86_400, now, Lookup::DownloadedBytes) {
+        let v = match standing_of(rec, Some("b8c1c"), 7 * DAY, now, Lookup::DownloadedBytes) {
             Standing::Adopt(v) => Some(v),
             _ => None,
         }
@@ -1067,7 +1095,7 @@ mod tests {
                 standing_of(
                     record(traits),
                     Some("local"),
-                    30 * 86_400,
+                    30 * DAY,
                     now,
                     Lookup::DownloadedBytes
                 ),
@@ -1077,7 +1105,7 @@ mod tests {
                 standing_of(
                     record(traits),
                     Some("local"),
-                    30 * 86_400,
+                    30 * DAY,
                     now,
                     Lookup::PackageCoordinate
                 ),
@@ -1088,7 +1116,7 @@ mod tests {
             standing_of(
                 record(Some("local")),
                 Some("local"),
-                30 * 86_400,
+                30 * DAY,
                 now,
                 Lookup::DownloadedBytes
             ),
@@ -1099,7 +1127,7 @@ mod tests {
     fn uplink() -> Precheck {
         Precheck {
             lookup_url: "https://unused.invalid/v1/lookup".into(),
-            max_age: Duration::from_secs(30 * 86_400),
+            max_age: Duration::from_secs(30 * DAY),
             breaker: Breaker::default(),
             backend: Backend::Uplink(
                 cleave::enriched::Token::parse("i13_test_token").expect("a token"),
@@ -1113,7 +1141,7 @@ mod tests {
     #[test]
     fn uplink_adopts_analyzed_verdicts_but_not_stale_clean_ones() {
         let now = parse_rfc3339_epoch("2026-10-22T00:00:00Z").unwrap();
-        let month = 30 * 86_400;
+        let month = 30 * DAY;
         let rec = |status: &str, fires: Level, at: &str| Record {
             fires_at: fires,
             analyzed_at: Some(at.to_string()),
@@ -1205,7 +1233,7 @@ mod tests {
         assert_eq!(v.engine_version.as_deref(), Some("2.13.0"));
 
         let err = analyzed_verdict(r#"{"status":"unavailable","cause":"no workers"}"#).unwrap_err();
-        assert!(err.contains("unavailable: no workers"), "{err}");
+        assert!(err.to_string().contains("unavailable: no workers"), "{err}");
         assert!(
             analyzed_verdict(r#"{"status":"analyzed"}"#).is_err(),
             "no level"

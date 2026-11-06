@@ -1,11 +1,22 @@
 //! Loading a model bundle: its config, backends, specialists, and the
 //! routes that load lazily on first use.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use rayon::prelude::*;
+
+use super::backend::{Backend, OnnxModel};
+use super::policy::{
+    LevelEntryJson, RouteId, RouteKind, RouteNames, RoutePolicies, container_filetype,
+    normalize_archive_filetype,
+};
+use super::verdict::Thresholds;
+use crate::features::{ExtractContext, FeatureSpec};
 
 /// Parse `path` as JSON. `Ok(None)` when the file does not exist; a read or
 /// parse failure is an error.
@@ -20,13 +31,10 @@ pub(super) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<O
         .with_context(|| format!("parsing {}", path.display()))
 }
 
-/// A bundle's `config.json`, parsed once. The single-bundle layout carries
-/// top-level `suspicious`/`hostile`; an ensemble carries the routing map and
-/// the per-level threshold grid. Keys this loader does not read are ignored.
+/// A bundle's `config.json`, parsed once: the routing map and the per-level
+/// threshold grid. Keys this loader does not read are ignored.
 #[derive(Debug, Default, serde::Deserialize)]
 pub(super) struct BundleConfig {
-    pub(super) suspicious: Option<f32>,
-    pub(super) hostile: Option<f32>,
     /// `cleave file_type → filegroup name`.
     #[serde(default)]
     pub(super) filetype_to_group: HashMap<String, String>,
@@ -35,8 +43,7 @@ pub(super) struct BundleConfig {
     pub(super) required_routes: Vec<String>,
     #[serde(default)]
     pub(super) levels: Vec<LevelEntryJson>,
-    /// Deploy tuning goal prescribed by the model (collimator bakes its
-    /// `DEFAULT_SEVERITY_LEVEL` here). Absent on older bundles.
+    /// The level the model was calibrated to operate at.
     pub(super) default_severity_level: Option<u16>,
 }
 
@@ -45,95 +52,18 @@ impl BundleConfig {
     pub(super) fn load(dir: &Path) -> Result<Option<Self>> {
         read_json(&dir.join("config.json"))
     }
-
-    /// The single-bundle top-level thresholds. `suspicious` defaults to
-    /// `hostile` (hostile-only): the level-space derivation needs a level
-    /// table, which this block does not have.
-    pub(super) fn thresholds(&self) -> Result<Option<Thresholds>> {
-        let Some(hostile) = self.hostile else {
-            return Ok(None);
-        };
-        let t = Thresholds {
-            suspicious: self.suspicious.unwrap_or(hostile),
-            hostile,
-        };
-        t.validate().context("config.json thresholds are invalid")?;
-        Ok(Some(t))
-    }
 }
 
-/// `evaluation.json`: the legacy home of recommended thresholds.
-#[derive(Debug, serde::Deserialize)]
-pub(super) struct EvaluationJson {
-    #[serde(default = "default_model_abi_version")]
-    pub(super) model_abi_version: u32,
-    pub(super) recommended_thresholds: Option<EvaluationThresholds>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub(super) struct EvaluationThresholds {
-    pub(super) suspicious: Option<f32>,
-    pub(super) hostile: Option<f32>,
-}
-
-pub(super) const fn default_model_abi_version() -> u32 {
-    EXPECTED_MODEL_ABI_VERSION
-}
-
-/// Recommended thresholds from `<dir>/evaluation.json`, or `None` when the
-/// file or its recommendation is absent. As with `config.json`, a missing
-/// `suspicious` collapses to hostile-only.
-pub(super) fn load_evaluation_thresholds(dir: &Path) -> Result<Option<Thresholds>> {
-    let path = dir.join("evaluation.json");
-    let Some(eval) = read_json::<EvaluationJson>(&path)? else {
-        return Ok(None);
-    };
-    if !(crate::features::MIN_MODEL_ABI_VERSION..=EXPECTED_MODEL_ABI_VERSION)
-        .contains(&eval.model_abi_version)
-    {
-        anyhow::bail!(
-            "{} has model_abi_version {} but this build expects {EXPECTED_MODEL_ABI_VERSION}",
-            path.display(),
-            eval.model_abi_version,
-        );
-    }
-    let Some(EvaluationThresholds {
-        suspicious,
-        hostile: Some(hostile),
-    }) = eval.recommended_thresholds
-    else {
-        return Ok(None);
-    };
-    let t = Thresholds {
-        suspicious: suspicious.unwrap_or(hostile),
-        hostile,
-    };
-    t.validate()
-        .with_context(|| format!("{} recommended thresholds are invalid", path.display()))?;
-    Ok(Some(t))
-}
-
-/// Output of the per-bundle loader: backend, spec, resolved thresholds, plus
-/// where the thresholds came from for the load-time log line.
+/// One route's model and the feature spec it was trained with.
 pub(super) struct LoadedBundle {
     pub(super) backend: Backend,
     pub(super) spec: FeatureSpec,
-    pub(super) thresholds: Thresholds,
-    pub(super) threshold_source: &'static str,
-    /// Per-route isotonic calibrator from `calibrator.json`. Optional —
-    /// pre-calibrator bundles return `None` here and skip calibration.
-    pub(super) calibrator: Option<IsotonicCalibrator>,
 }
 
-/// Load the inference backend for a bundle directory. Multi-seed bundles
-/// store every member at `models/seed_NN.onnx` (one file per seed); the
-/// single-bundle layout has a single `model.onnx` directly under the bundle
-/// dir. Both layouts are accepted; the multi-seed layout is preferred when the
-/// `models/` subdirectory is present and non-empty.
-///
-/// Mixing the single-bundle and multi-seed layouts in the same bundle is
-/// rejected.
-pub(super) fn load_backend(bundle_dir: &Path) -> Result<Backend> {
+/// Load the inference backend for a route directory: every member at
+/// `models/seed_NN.onnx`, or a single `model.onnx`. A route holding both is
+/// ambiguous and rejected.
+fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     let multi_dir = bundle_dir.join("models");
     let multi = if multi_dir.is_dir() {
         collect_multi_seed_paths(&multi_dir)?
@@ -141,9 +71,6 @@ pub(super) fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         Vec::new()
     };
 
-    // Single-model layout: model.onnx directly under bundle_dir. The native
-    // model.txt (LightGBM) / model.json (XGBoost) layouts were retired — the
-    // deploy ships ONNX-only.
     let single_onnx = bundle_dir.join("model.onnx");
 
     if !multi.is_empty() && single_onnx.is_file() {
@@ -165,14 +92,8 @@ pub(super) fn load_backend(bundle_dir: &Path) -> Result<Backend> {
         )
     };
 
-    // Load seeds serially rather than with `into_par_iter`. This runs inside a
-    // specialist route's `OnceLock` initializer (`RouteStore::get`), which is
-    // itself reached from the rayon parallel classify. A nested rayon call here
-    // lets the initializing worker thread steal another classify task that needs
-    // the *same* route, re-enter the in-progress `OnceLock`, and deadlock forever
-    // on its wait semaphore, hanging the scan intermittently. A bundle is at
-    // most a few small ONNX seeds, so serial loading costs
-    // nothing measurable and removes the re-entrancy entirely.
+    // Serially: a route is a few small seeds, so parallel loading buys
+    // nothing measurable.
     let mut paths = model_paths.into_iter();
     let Some(first_path) = paths.next() else {
         anyhow::bail!("model bundle contains no loadable model")
@@ -199,10 +120,9 @@ pub(super) fn load_backend(bundle_dir: &Path) -> Result<Backend> {
     Ok(Backend { first, rest })
 }
 
-/// Pick up every `seed_*.onnx` under a `models/` directory. Native
-/// `.txt`/`.json` seeds are ignored — only ONNX is loadable. Output is
-/// sorted (so seed_42 lands before seed_43) and deterministic across runs.
-pub(super) fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Every `seed_*.onnx` under a `models/` directory, sorted (seed_42 before
+/// seed_43) so the averaged ensemble loads in a deterministic order.
+fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(multi_dir)
         .with_context(|| format!("reading multi-seed models dir {}", multi_dir.display()))?
@@ -216,145 +136,47 @@ pub(super) fn collect_multi_seed_paths(multi_dir: &Path) -> Result<Vec<PathBuf>>
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // Tolerate bystander files (READMEs, hashes) and retired native dumps
-        // so they don't break loading; only ONNX seeds are members.
+        // Bystander files (READMEs, hashes) are not members.
         if name.starts_with("seed_") && path.extension().and_then(|e| e.to_str()) == Some("onnx") {
             paths.push(path);
         }
     }
-    // Sorted for a deterministic load order of the averaged ensemble.
     paths.sort();
     Ok(paths)
 }
 
-/// Load one model bundle (model file + feature spec + thresholds).
-///
-/// `is_general` controls how missing artifacts are reported: for the general
-/// route they're fatal load errors; for specialists callers handle the error
-/// non-fatally (drop with a warning).
-///
-/// Threshold resolution: `explicit` → the bundle's `config.json` →
-/// `evaluation.json` recommendations → [`Thresholds::default`].
-pub(super) fn load_bundle(
-    bundle_dir: &Path,
-    explicit: Option<Thresholds>,
-    is_general: bool,
-) -> Result<LoadedBundle> {
+/// Load one route: its model and feature spec, which must agree on the
+/// feature count. This is the one place that agreement is checked: every
+/// vector a route scores is extracted at its spec's length.
+pub(super) fn load_bundle(bundle_dir: &Path) -> Result<LoadedBundle> {
     let spec_path = bundle_dir.join("feature_spec.json");
-    if !spec_path.is_file() {
-        if is_general {
-            anyhow::bail!(
-                "model bundle is incomplete: missing {}. Run 'atomscan update-rules' to refresh the installed models.",
-                spec_path.display(),
-            );
-        }
-        anyhow::bail!("missing {}", spec_path.display());
-    }
-
+    anyhow::ensure!(
+        spec_path.is_file(),
+        "model bundle is incomplete: missing {}. Run 'atomscan update-rules' to refresh the installed models.",
+        spec_path.display(),
+    );
     let backend = load_backend(bundle_dir)?;
-
     tracing::debug!(path = %spec_path.display(), "loading feature spec");
     let spec = FeatureSpec::load(&spec_path)
         .with_context(|| format!("loading feature spec from {}", spec_path.display()))?;
-
-    if spec.total_features() != backend.num_features() {
-        anyhow::bail!(
-            "feature count mismatch: feature_spec.json has {} features but the model expects {} — \
-             these artifacts are from different training runs",
-            spec.total_features(),
-            backend.num_features(),
-        );
-    }
-
-    let (thresholds, threshold_source) = if let Some(explicit) = explicit {
-        explicit
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid thresholds: {error}"))?;
-        if let Some(recommended) = load_evaluation_thresholds(bundle_dir)? {
-            explicit.warn_if_divergent(&recommended);
-        }
-        (explicit, "explicit")
-    } else if let Some(t) = BundleConfig::load(bundle_dir)?
-        .map(|cfg| cfg.thresholds())
-        .transpose()?
-        .flatten()
-    {
-        (t, "config.json")
-    } else if let Some(t) = load_evaluation_thresholds(bundle_dir)? {
-        (t, "evaluation.json")
-    } else {
-        tracing::error!(
-            bundle = %bundle_dir.display(),
-            "no config.json or evaluation.json thresholds found — using conservative \
-             fallback (suspicious={}, hostile={})",
-            Thresholds::FALLBACK_SUSPICIOUS,
-            Thresholds::FALLBACK_HOSTILE,
-        );
-        (Thresholds::default(), "fallback")
-    };
-
-    let calibrator = IsotonicCalibrator::load_optional(bundle_dir)
-        .with_context(|| format!("loading optional calibrator from {}", bundle_dir.display()))?;
-    // When a calibrator is present, push the bundle-level thresholds through
-    // it so threshold comparisons happen in the same (calibrated) probability
-    // space as the calibrated route scores.  Isotonic is monotone, so this
-    // is decision-equivalent to comparing raw_score >= raw_threshold — but
-    // every emitted probability is now on a meaningful [0,1] scale matching
-    // the empirical malware fraction we observed at training time.
-    //
-    // Per-route policy thresholds (in `route_policies.json`, used by the
-    // OR-of-routes deployment policies) live in a different on-disk file and
-    // can't be calibrated here — the per-route calibrators aren't all loaded
-    // yet at this point. They get a second pass in `Model::load_ensemble`
-    // via `calibrate_policy_thresholds`, after every specialist has been
-    // loaded and its calibrator is available for lookup.
-    let thresholds = if let Some(cal) = calibrator.as_ref() {
-        let calibrated = Thresholds {
-            suspicious: cal.apply(thresholds.suspicious),
-            hostile: cal.apply(thresholds.hostile),
-        };
-        // Re-validate: a calibrator could in principle push hostile below
-        // suspicious (it shouldn't given monotonicity, but defense in depth)
-        // or out of [0,1]. We'd rather refuse to load than ship a bundle
-        // whose decision boundaries are nonsensical.
-        calibrated.validate().with_context(|| {
-            format!(
-                "calibrated thresholds for {} are invalid (suspicious={}, hostile={}); \
-             check the calibrator at {}/calibrator.json",
-                bundle_dir.display(),
-                calibrated.suspicious,
-                calibrated.hostile,
-                bundle_dir.display(),
-            )
-        })?;
-        tracing::debug!(
-            bundle = %bundle_dir.display(),
-            breakpoints = cal.x.len(),
-            "loaded isotonic calibrator (thresholds calibrated to match)"
-        );
-        calibrated
-    } else {
-        thresholds
-    };
-
-    Ok(LoadedBundle {
-        backend,
-        spec,
-        thresholds,
-        threshold_source,
-        calibrator,
-    })
+    anyhow::ensure!(
+        spec.total_features() == backend.num_features(),
+        "feature count mismatch: feature_spec.json has {} features but the model expects {} — \
+         these artifacts are from different training runs",
+        spec.total_features(),
+        backend.num_features(),
+    );
+    Ok(LoadedBundle { backend, spec })
 }
 
 /// Walk a `filegroups/` or `filetypes/` directory and register each
-/// subdirectory as a lazily loaded specialist. A directory the deployment
-/// config does not mention, or whose calibrator is invalid, is recorded as
-/// skipped rather than failing the whole load.
+/// subdirectory as a lazily built specialist. A directory the deployment
+/// config and policies do not mention is recorded as skipped.
 ///
 /// `category` is the path prefix used in the ensemble config's route names —
 /// either `"filegroups"` or `"filetypes"` — so specialist thresholds can be
 /// looked up under e.g. `"filegroups/native"`.
-pub(super) fn load_specialists(
+fn load_specialists(
     parent: &Path,
     pin: &Arc<BundlePin>,
     route_thresholds: &HashMap<String, Thresholds>,
@@ -372,8 +194,8 @@ pub(super) fn load_specialists(
         }
     };
 
-    // Building each specialist's runnable tract plan is the expensive part,
-    // so scans keep lazy descriptors after cheap calibrator validation.
+    // Building a specialist's runnable plan is the expensive part, so
+    // routes are registered here and built on first use.
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -384,36 +206,21 @@ pub(super) fn load_specialists(
         };
         let name = name.to_owned();
         let route_name = format!("{category}/{name}");
-        // Skip on-disk subdirectories that the deployment config doesn't list.
-        // These are common as artifacts of experimentation; loading them with
-        // fallback thresholds would put uncalibrated routes in the OR. Every
-        // route the config or the policies name was interned before this runs.
-        let route_t = route_thresholds.get(&route_name).copied();
+        // A directory the deployment config doesn't list was never
+        // calibrated, and must not join the OR. Every route the config or
+        // the policies name was interned before this runs.
+        let thresholds = route_thresholds.get(&route_name).copied();
         let Some(id) = names
             .id(&route_name)
-            .filter(|&id| route_t.is_some() || route_policies.contains_route(id))
+            .filter(|&id| thresholds.is_some() || route_policies.contains_route(id))
         else {
             tracing::debug!(
-                category = %category,
+                category,
                 name = %name,
                 "skipping specialist directory: no thresholds in ensemble config"
             );
             out.skipped.insert(name);
             continue;
-        };
-        let calibrator = match IsotonicCalibrator::load_optional(&path) {
-            Ok(calibrator) => calibrator,
-            Err(error) => {
-                tracing::warn!(
-                    category = %category,
-                    name = %name,
-                    path = %path.display(),
-                    error = ?error,
-                    "dropping specialist with invalid calibrator",
-                );
-                out.skipped.insert(name);
-                continue;
-            }
         };
         out.lazy.insert(
             name.clone(),
@@ -422,8 +229,7 @@ pub(super) fn load_specialists(
                 name,
                 category,
                 id,
-                thresholds: route_t.unwrap_or_default(),
-                calibrator,
+                thresholds,
                 pin: Arc::clone(pin),
                 loaded: OnceLock::new(),
             },
@@ -432,29 +238,7 @@ pub(super) fn load_specialists(
     out
 }
 
-/// Load and validate one specialist bundle (its spec's ABI range is enforced
-/// by [`FeatureSpec::load`]).
-/// Errors here are recoverable — the specialist is dropped, not fatal.
-pub(super) fn load_specialist(
-    bundle_dir: &Path,
-    name: &str,
-    thresholds: Thresholds,
-) -> Result<Route> {
-    let bundle = load_bundle(bundle_dir, Some(thresholds), /* is_general = */ false)
-        .with_context(|| format!("specialist {name}"))?;
-
-    let ctx = ExtractContext::new(&bundle.spec);
-
-    Ok(Route {
-        backend: bundle.backend,
-        spec: bundle.spec,
-        ctx,
-        thresholds: bundle.thresholds,
-        calibrator: bundle.calibrator,
-    })
-}
-
-/// One inference path (general, a filegroup specialist, or a filetype specialist).
+/// One specialist route: its model, spec and extraction tables.
 ///
 /// Specialists may have their own feature space. Route scoring extracts and
 /// standardizes features with the route's own spec before calling its backend.
@@ -463,21 +247,17 @@ pub(super) struct Route {
     pub(super) backend: Backend,
     pub(super) spec: FeatureSpec,
     pub(super) ctx: ExtractContext,
-    pub(super) thresholds: Thresholds,
-    /// Optional isotonic calibrator. When present, the route's raw
-    /// probability is mapped through this before any downstream consumer
-    /// (threshold check, OR aggregation, JSON output) sees it. Older
-    /// bundles without `calibrator.json` carry `None` and behave like
-    /// before — backward compatible.
-    pub(super) calibrator: Option<IsotonicCalibrator>,
+    /// The route's thresholds at the diagnostic level, when the config has
+    /// them; a route named only by policies has none.
+    pub(super) thresholds: Option<Thresholds>,
 }
 
 /// The installed bundle a model was loaded from.
 ///
 /// A specialist is built on first use, which may be days after load, and an
 /// update swaps the whole bundle directory meanwhile. A specialist read from
-/// the new bundle would be scored against the old one's calibrators and
-/// policy thresholds, so it is refused instead until the next reload. A
+/// the new bundle would be scored against the old one's policy thresholds,
+/// so it is refused instead until the next reload. A
 /// working tree without the install sidecar reads `None` throughout.
 #[derive(Debug)]
 pub(super) struct BundlePin {
@@ -505,37 +285,40 @@ impl BundlePin {
 
 /// A specialist registered at load and built on first use.
 #[derive(Debug)]
-pub(super) struct LazyRoute {
-    pub(super) bundle_dir: PathBuf,
-    pub(super) name: String,
-    pub(super) category: &'static str,
-    pub(super) id: RouteId,
-    pub(super) thresholds: Thresholds,
-    pub(super) calibrator: Option<IsotonicCalibrator>,
-    pub(super) pin: Arc<BundlePin>,
-    pub(super) loaded: OnceLock<RouteLoad>,
+struct LazyRoute {
+    bundle_dir: PathBuf,
+    name: String,
+    category: &'static str,
+    id: RouteId,
+    thresholds: Option<Thresholds>,
+    pin: Arc<BundlePin>,
+    loaded: OnceLock<RouteLoad>,
 }
 
 #[derive(Debug)]
-pub(super) enum RouteLoad {
+enum RouteLoad {
     Loaded(Arc<Route>),
     Failed(String),
 }
 
 impl LazyRoute {
-    pub(super) fn load_once(&self) -> &RouteLoad {
+    fn load_once(&self) -> &RouteLoad {
         self.loaded.get_or_init(|| {
-            // Checked after the read, so a swap that lands mid-read is caught.
-            let loaded =
-                load_specialist(&self.bundle_dir, &self.name, self.thresholds).and_then(|route| {
-                    anyhow::ensure!(
-                        self.pin.holds(),
-                        "the model bundle was replaced on disk after it was loaded; \
-                         reload to use the new one"
-                    );
-                    Ok(route)
-                });
-            match loaded {
+            // Built on a thread of its own. The first use is reached from a
+            // rayon worker; were the build to run there, any rayon call inside
+            // it would let that worker steal another file's task that needs
+            // this same route, re-enter the `OnceLock` it is initializing, and
+            // deadlock. The worker instead blocks on the join without stealing.
+            let built = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name(format!("route-{}", self.name))
+                    .stack_size(crate::RAYON_STACK_MB * 1024 * 1024)
+                    .spawn_scoped(scope, || self.build())
+                    .context("spawning the specialist build thread")?
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("specialist build panicked")))
+            });
+            match built {
                 Ok(route) => RouteLoad::Loaded(Arc::new(route)),
                 Err(error) => {
                     let message = format!("{error:#}");
@@ -552,23 +335,38 @@ impl LazyRoute {
         })
     }
 
-    pub(super) fn get(&self) -> Option<Arc<Route>> {
+    fn build(&self) -> Result<Route> {
+        let bundle =
+            load_bundle(&self.bundle_dir).with_context(|| format!("specialist {}", self.name))?;
+        // Checked after the read, so a swap that lands mid-read is caught.
+        anyhow::ensure!(
+            self.pin.holds(),
+            "the model bundle was replaced on disk after it was loaded; reload to use the new one"
+        );
+        Ok(Route {
+            ctx: ExtractContext::new(&bundle.spec),
+            backend: bundle.backend,
+            spec: bundle.spec,
+            thresholds: self.thresholds,
+        })
+    }
+
+    fn get(&self) -> Option<Arc<Route>> {
         match self.load_once() {
             RouteLoad::Loaded(route) => Some(Arc::clone(route)),
             RouteLoad::Failed(_) => None,
         }
     }
 
-    pub(super) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         match self.load_once() {
             RouteLoad::Loaded(_) => Ok(()),
             RouteLoad::Failed(message) => {
                 anyhow::bail!(
-                    "specialist {}/{} at {} failed to load: {}",
+                    "specialist {}/{} at {} failed to load: {message}",
                     self.category,
                     self.name,
                     self.bundle_dir.display(),
-                    message
                 )
             }
         }
@@ -578,8 +376,8 @@ impl LazyRoute {
 /// The specialists of one category (`filegroups` or `filetypes`), by name.
 #[derive(Debug, Default)]
 pub(super) struct RouteStore {
-    pub(super) lazy: HashMap<String, LazyRoute>,
-    /// On-disk specialists that were not registered (uncalibrated or invalid).
+    lazy: HashMap<String, LazyRoute>,
+    /// On-disk specialists the deployment config does not register.
     pub(super) skipped: HashSet<String>,
 }
 
@@ -591,12 +389,10 @@ impl RouteStore {
         Some((lazy.id, lazy.get()?))
     }
 
+    /// Whether the specialist is registered. Never builds it: route
+    /// selection asks this for every file, and a build belongs to scoring.
     pub(super) fn contains(&self, name: &str) -> bool {
-        self.get(name).is_some()
-    }
-
-    pub(super) fn calibrator(&self, name: &str) -> Option<&IsotonicCalibrator> {
-        self.lazy.get(name)?.calibrator.as_ref()
+        self.lazy.contains_key(name)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -607,24 +403,16 @@ impl RouteStore {
         self.lazy.is_empty()
     }
 
-    pub(super) fn validate_all(&self) -> Result<()> {
+    fn validate_all(&self) -> Result<()> {
         self.lazy
             .par_iter()
             .try_for_each(|(_, route)| route.validate())
     }
-
-    pub(super) fn validate_route(&self, name: &str) -> Result<()> {
-        match self.lazy.get(name) {
-            Some(route) => route.validate(),
-            None => anyhow::bail!("route {name:?} is not available"),
-        }
-    }
 }
 
-/// Routing decision: which route to consult for a file of type `T` in group `G`.
-///
-/// DESIGN.md says: filetype if present → filegroup if present → general always.
-/// Each present route contributes to the OR over thresholds.
+/// Every route of a bundle beyond general. A file of type `T` in group `G`
+/// consults general always, plus the `G` filegroup and `T` filetype
+/// specialists that exist, and any other route its policy names.
 #[derive(Debug, Default)]
 pub(super) struct RouteSet {
     /// Filegroup name → specialist model or lazy descriptor.
@@ -641,6 +429,69 @@ pub(super) struct RouteSet {
 }
 
 impl RouteSet {
+    /// Register the bundle's specialists and resolve its policies' routes.
+    pub(super) fn load(
+        model_dir: &Path,
+        pin: &Arc<BundlePin>,
+        route_thresholds: &HashMap<String, Thresholds>,
+        filetype_to_filegroup: HashMap<String, String>,
+        policies: RoutePolicies,
+        names: RouteNames,
+    ) -> Self {
+        let started = Instant::now();
+        let register = |category| {
+            load_specialists(
+                &model_dir.join(category),
+                pin,
+                route_thresholds,
+                &policies,
+                &names,
+                category,
+            )
+        };
+        let (filegroups, filetypes) =
+            rayon::join(|| register("filegroups"), || register("filetypes"));
+        tracing::info!(
+            filegroups = filegroups.len(),
+            filetypes = filetypes.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "prepared specialist routes",
+        );
+        Self {
+            filegroups,
+            filetypes,
+            filetype_to_filegroup,
+            policies,
+            names,
+        }
+    }
+
+    /// Fail unless every route the config marks required is present and
+    /// builds. `general` was loaded already.
+    pub(super) fn check_required(&self, required: &[String]) -> Result<()> {
+        for name in required {
+            let (store, kind, specialist) = match RouteKind::parse(name) {
+                Some(RouteKind::General) => continue,
+                Some(RouteKind::Group(specialist)) => (&self.filegroups, "filegroup", specialist),
+                Some(RouteKind::Type(specialist)) => (&self.filetypes, "filetype", specialist),
+                None => anyhow::bail!(
+                    "unknown required-route name {name:?} in ensemble config; \
+                     expected `general`, `filegroups/<name>`, or `filetypes/<name>`"
+                ),
+            };
+            match store.lazy.get(specialist) {
+                Some(route) => route.validate(),
+                None => Err(anyhow::anyhow!("route {specialist:?} is not available")),
+            }
+            .with_context(|| {
+                format!(
+                    "ensemble config marks {kind} {specialist:?} as required but it failed to load"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// True when there are no specialist routes available; routed prediction
     /// then degrades to the general route alone.
     pub(super) fn is_empty(&self) -> bool {
@@ -651,8 +502,8 @@ impl RouteSet {
     /// format rather than compression. A compressed label collapses onto its
     /// container (`tar.gz` → `tar`, `tar.bz2.xz` → `tar`) so the compressed
     /// variant reaches the same filetype/filegroup specialists — and the same
-    /// per-route policy thresholds — that collimator trained and calibrated
-    /// under the normalized label. Returns `(filetype key, filegroup)`.
+    /// per-route policy thresholds — that training calibrated under the
+    /// normalized label. Returns `(filetype key, filegroup)`.
     /// Agrees with [`lookup_filetype`], so route selection and the policy's
     /// per-route threshold keys agree.
     pub(super) fn specialist_keys<'a>(
@@ -693,19 +544,6 @@ impl RouteSet {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The isotonic calibrator of a route, if it has one.
-    pub(super) fn calibrator<'a>(
-        &'a self,
-        general: Option<&'a IsotonicCalibrator>,
-        route: RouteId,
-    ) -> Option<&'a IsotonicCalibrator> {
-        match RouteKind::parse(self.names.name(route))? {
-            RouteKind::General => general,
-            RouteKind::Group(name) => self.filegroups.calibrator(name),
-            RouteKind::Type(name) => self.filetypes.calibrator(name),
-        }
     }
 
     pub(super) fn validate_all(&self) -> Result<()> {

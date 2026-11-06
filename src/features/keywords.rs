@@ -1,7 +1,12 @@
 //! Model-local words from rule IDs, descriptions and decoded context windows.
-use super::{
-    ExtractContext, FeatureWriter, HashSet, MIN_CONFIDENCE, ParsedReport, RawNeeds, Result,
-};
+use std::collections::HashSet;
+
+use anyhow::Result;
+
+use super::context::ExtractContext;
+use super::report::{ParsedReport, RawNeeds};
+use super::spec::KeywordSource;
+use super::{FeatureWriter, MIN_CONFIDENCE};
 
 /// Add the keywords of `text` to `into`: lowercased runs of ASCII letters and
 /// digits, at least two long and holding a letter.
@@ -36,7 +41,9 @@ pub(super) struct FileKeywords {
     descriptions: HashSet<String>,
     full_ids: HashSet<String>,
     context: HashSet<String>,
-    error: Option<String>,
+    /// The first finding whose description is blank, which a description
+    /// model trained before ABI 23 cannot score.
+    missing_description: Option<String>,
 }
 
 pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) -> FileKeywords {
@@ -71,13 +78,15 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
             add_words(&finding.id, &mut result.full_ids);
         }
         if needs.description_keywords {
+            // Blank as Python's `str.isspace` has it, which training used:
+            // Unicode whitespace plus the separators U+001C..=U+001F.
             if finding
                 .description
                 .chars()
                 .all(|c| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
             {
-                if result.error.is_none() {
-                    result.error = Some(finding.id.clone());
+                if result.missing_description.is_none() {
+                    result.missing_description = Some(finding.id.clone());
                 }
             } else {
                 add_words(&finding.description, &mut result.descriptions);
@@ -91,8 +100,8 @@ impl ExtractContext {
     /// Checked extraction, including the input contract of description models.
     ///
     /// # Errors
-    /// Legacy ABI 22 description models reject missing descriptions. ABI 23
-    /// treats absent description text as empty and retains other features.
+    /// An ABI 22 description model refuses a finding with no description;
+    /// from ABI 23 absent text reads as empty and the other features remain.
     pub fn try_extract(&self, report: &cleave::types::CompactReport) -> Result<Vec<f32>> {
         let parsed = ParsedReport::from_compact_report(report, self.raw_needs(), None);
         self.validate_keyword_inputs(&parsed)?;
@@ -100,9 +109,9 @@ impl ExtractContext {
     }
 
     pub(crate) fn validate_keyword_inputs(&self, parsed: &ParsedReport) -> Result<()> {
-        if self.strict_keyword_descriptions && self.keyword_slots.contains_key("descword") {
+        if self.strict_keyword_descriptions && self.reads(KeywordSource::Description) {
             for summary in &parsed.summaries {
-                if let Some(id) = &summary.keywords.error {
+                if let Some(id) = &summary.keywords.missing_description {
                     anyhow::bail!("description keywords require descriptions; missing for {id}");
                 }
             }
@@ -118,13 +127,14 @@ impl ExtractContext {
         for (source, slots) in &self.keyword_slots {
             for summary in &parsed.summaries {
                 let keywords = &summary.keywords;
-                let sets: &[&HashSet<String>] = match source.as_str() {
-                    "ruleword" => &[&keywords.ids],
-                    "descword" => &[&keywords.descriptions],
-                    "fullword" => &[&keywords.full_ids],
-                    "ruletextword" => &[&keywords.full_ids, &keywords.descriptions],
-                    "contextword" => &[&keywords.context],
-                    _ => &[],
+                let sets: &[&HashSet<String>] = match source {
+                    KeywordSource::RuleId => &[&keywords.ids],
+                    KeywordSource::Description => &[&keywords.descriptions],
+                    KeywordSource::FullId => &[&keywords.full_ids],
+                    KeywordSource::IdAndDescription => {
+                        &[&keywords.full_ids, &keywords.descriptions]
+                    }
+                    KeywordSource::Context => &[&keywords.context],
                 };
                 for words in sets {
                     for word in *words {
@@ -141,7 +151,7 @@ impl ExtractContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::FeatureSpec;
+    use crate::features::spec::FeatureSpec;
     use std::collections::HashMap;
 
     #[test]
@@ -181,7 +191,7 @@ mod tests {
     #[test]
     fn confidence_boundary_agrees_between_base_and_keyword_features() -> Result<()> {
         let spec: FeatureSpec = serde_json::from_value(serde_json::json!({
-            "version":23, "abi_version":23, "base_feature_abi":20,
+            "version":23, "abi_version":23, "base_feature_abi":20, "trait_path_depth":3,
             "presence_vocab":["metadata"], "keyword_vocabs":{"descword":["boundary"]},
             "feature_names":["present:metadata", "agg:notable_findings_log", "descword:boundary"],
             "total_features":3, "standardized":false
@@ -297,7 +307,7 @@ mod tests {
         ] {
             let spec: FeatureSpec = serde_json::from_value(serde_json::json!({
                 "version":abi,"abi_version":abi,"base_feature_abi":base,
-                "presence_vocab":["metadata"],"feature_names":["present:metadata"],
+                "trait_path_depth":3,"presence_vocab":["metadata"],"feature_names":["present:metadata"],
                 "total_features":1,"standardized":false,
                 "metric_transforms":if transforms {Some(HashMap::<String,String>::new())} else {None}
             }))?;

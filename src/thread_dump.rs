@@ -23,7 +23,7 @@
 //! taken on a process that is already wedged or about to exit, never as
 //! routine telemetry.
 //!
-//! Triggered by an operator sending `SIGUSR1`, or by Postdoc's stalled-job
+//! Triggered by an operator sending `SIGUSR1`, or by a daemon's stalled-job
 //! abort immediately before exit. It is never called on a healthy process. On
 //! platforms without per-thread signalling (macOS) it prints a pointer to the
 //! breadcrumb/wait-channel census instead.

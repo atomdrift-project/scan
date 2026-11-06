@@ -210,6 +210,12 @@ impl fmt::Display for Fingerprint {
     }
 }
 
+/// Longest `X-Request-Id` logged: room for a UUID or a trace id, no more.
+const TRACE_ID_MAX: usize = 64;
+
+/// Longest `User-Agent` logged: a product and version, with room to spare.
+const USER_AGENT_MAX: usize = 120;
+
 /// A header value trusted enough to log: printable ASCII only, length-capped.
 ///
 /// Header values cannot contain newlines (the HTTP parser rejects them), but
@@ -281,14 +287,14 @@ pub(super) async fn access_log(
         .map(|c| c.0.ip());
     let fwd = forwarded_for(req.headers());
     let req_bytes = content_length(req.headers());
-    // Callers propagating their own correlation id (beamline does) get it
-    // echoed into the line, which is what joins the two services' logs.
+    // A caller propagating its own correlation id gets it echoed into the
+    // line, which is what joins the two services' logs.
     let trace = loggable(
         req.headers(),
         header::HeaderName::from_static("x-request-id"),
-        64,
+        TRACE_ID_MAX,
     );
-    let ua = loggable(req.headers(), header::USER_AGENT, 120);
+    let ua = loggable(req.headers(), header::USER_AGENT, USER_AGENT_MAX);
 
     let response = next.run(req).await;
 
@@ -458,15 +464,15 @@ mod tests {
     fn user_agent_is_bounded_and_stripped() {
         let h = headers(&[("user-agent", "beam\tline/0.3")]);
         assert_eq!(
-            loggable(&h, header::USER_AGENT, 120).as_deref(),
+            loggable(&h, header::USER_AGENT, USER_AGENT_MAX).as_deref(),
             Some("beamline/0.3")
         );
 
         let long = "x".repeat(500);
         let h = headers(&[("user-agent", &long)]);
         assert_eq!(
-            loggable(&h, header::USER_AGENT, 120).map(|s| s.len()),
-            Some(120)
+            loggable(&h, header::USER_AGENT, USER_AGENT_MAX).map(|s| s.len()),
+            Some(USER_AGENT_MAX)
         );
     }
 }

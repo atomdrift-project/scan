@@ -19,9 +19,8 @@ fn stored(raw: &str) -> StoredReport {
 const FORMER_EMBEDDED_FILE_LIMIT: usize = 100;
 
 /// Grading needs a real model to score against. Point SCAN_MODELS_DIR at a
-/// bundle — a single model (`model.onnx`) or a routed one (`config.json`) —
-/// to run these; without one there is nothing to exercise, so they skip
-/// rather than fail.
+/// routed bundle (`config.json` and its `general/` route) to run these;
+/// without one there is nothing to exercise, so they skip rather than fail.
 fn model_bundle() -> Option<std::path::PathBuf> {
     let p = crate::env::path(crate::env::SCAN_MODELS_DIR)?;
     (p.join("model.onnx").is_file() || p.join("config.json").is_file()).then_some(p)
@@ -470,7 +469,7 @@ fn finding_counts_bucket_every_criticality() {
 }
 
 /// A container, the manifest that declared the dependency, and an unrelated
-/// sibling — the shape `inject_dependency_backref` walks.
+/// sibling — the shape `inject_dependency_backrefs` walks.
 fn compact_fixture() -> cleave::types::CompactReport {
     serde_json::from_value(serde_json::json!({"files": [
             {"id": 0, "size": 1, "type": "npm", "sha": "r".repeat(64), "path": "pkg.tgz",
@@ -482,7 +481,7 @@ fn compact_fixture() -> cleave::types::CompactReport {
 }
 
 /// The wire form of a report, which is what the backref assertions are
-/// about: prism and hopper read these keys.
+/// about: hopper and its front ends read these keys.
 fn wire(report: &cleave::types::CompactReport) -> serde_json::Value {
     serde_json::to_value(report).unwrap()
 }
@@ -490,7 +489,7 @@ fn wire(report: &cleave::types::CompactReport) -> serde_json::Value {
 #[test]
 fn declarer_gets_span_and_structured_dep() {
     let mut report = compact_fixture();
-    inject_dependency_backref(&mut report, &backref(Classification::Hostile));
+    inject_dependency_backrefs(&mut report, &[backref(Classification::Hostile)]);
     let report_json = wire(&report);
 
     let t = &report_json["files"][1]["traits"][0];
@@ -520,7 +519,7 @@ fn declarer_gets_span_and_structured_dep() {
 #[test]
 fn ancestor_carries_dep_without_span_and_siblings_stay_clean() {
     let mut report = compact_fixture();
-    inject_dependency_backref(&mut report, &backref(Classification::Hostile));
+    inject_dependency_backrefs(&mut report, &[backref(Classification::Hostile)]);
     let report_json = wire(&report);
 
     let root_traits = report_json["files"][0]["traits"].as_array().unwrap();
@@ -545,7 +544,7 @@ fn ancestor_carries_dep_without_span_and_siblings_stay_clean() {
 #[test]
 fn suspicious_dependency_pins_at_crit_4() {
     let mut report = compact_fixture();
-    inject_dependency_backref(&mut report, &backref(Classification::Suspicious));
+    inject_dependency_backrefs(&mut report, &[backref(Classification::Suspicious)]);
     let report_json = wire(&report);
 
     let t = &report_json["files"][1]["traits"][0];
@@ -563,13 +562,35 @@ fn suspicious_dependency_pins_at_crit_4() {
     );
 }
 
+/// A backref whose declaring file the report does not hold still names a
+/// flagged dependency of this artifact: it lands on the root, without a span,
+/// instead of vanishing.
+#[test]
+fn unplaceable_backref_pins_to_the_root() {
+    let mut report = compact_fixture();
+    let mut b = backref(Classification::Hostile);
+    b.source_sha = None;
+    let mut elsewhere = backref(Classification::Suspicious);
+    elsewhere.source_sha = Some("x".repeat(64));
+    inject_dependency_backrefs(&mut report, &[b, elsewhere]);
+    let report_json = wire(&report);
+
+    let root_traits = report_json["files"][0]["traits"].as_array().unwrap();
+    assert_eq!(root_traits.len(), 3, "both land beside the existing trait");
+    for t in &root_traits[1..] {
+        assert_eq!(t["id"], "fetch/dependency-verdict");
+        assert!(t.get("spans").is_none(), "no declaring byte to cite");
+    }
+    assert!(report_json["files"][1].get("traits").is_none());
+}
+
 #[test]
 fn url_locator_flows_through_verbatim() {
     let mut report = compact_fixture();
     let mut b = backref(Classification::Hostile);
     b.locator = "http://x.y.z/x.exe".to_string();
     b.dep_type = "pe".to_string();
-    inject_dependency_backref(&mut report, &b);
+    inject_dependency_backrefs(&mut report, &[b]);
     let report_json = wire(&report);
 
     let t = &report_json["files"][1]["traits"][0];

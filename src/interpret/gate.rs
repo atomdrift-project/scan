@@ -1,32 +1,26 @@
 //! Which samples get a second opinion: the trait prefixes that admit one, and
 //! the admission decision itself.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::HashSet;
+use std::path::Path;
+
+use super::{InterpretConfig, LevelContext};
+use crate::model::Classification;
 
 /// Default raw-probability floor for sending a sample to the LLM.
 ///
 /// One of several independent admissions (see [`admit`]); an **OR**, so it
-/// can only ever send more, never block. Over a 1072-sample corpus — 417 malicious
-/// (`mspd`, `compendium-dirty`) against 655 benign (`scan-purls`,
-/// `compendium-clean`) — this is an elbow, not a compromise. Malicious
-/// admission is flat at 395/417 across the whole span 0.4621..0.5677 while
-/// benign admission falls steadily from 169 to 150 through it, so every
-/// thousandth below 0.55 is pure volume. The first sample lost above it costs
-/// 19 benign admissions' worth of nothing, and past 0.80 the trade is roughly
-/// one benign saved per malicious given up.
+/// can only ever send more, never block. The floor sits at the elbow of the
+/// admission curve on a labeled corpus: below it malicious admission is flat
+/// while benign admission keeps climbing, so every step lower buys volume and
+/// no coverage; well above it, each benign sample saved costs a malicious one.
 ///
 /// A floor this high is affordable only because this test does not carry the
-/// gate alone: [`LLM_GATE_PREFIXES`] covers the low-probability tail with a
-/// far better exchange rate. Together with the criticality and level tests the
-/// whole gate reaches 94.7% of the malicious corpus on 21.8% of the benign one,
-/// against 91.1% on 47.2% for a lone floor of 0.04.
-///
-/// Lower it to buy the overlap region back at about 50 benign samples per
-/// malicious one; raise it to shed roughly four benign per malicious.
+/// gate alone: the gate prefixes cover the low-probability tail at a far
+/// better exchange rate. A lone floor low enough to match the whole gate's
+/// coverage would send more than twice the benign volume and still reach
+/// fewer malicious samples. `docs/interpret-tuning.md` describes how to
+/// re-measure it.
 pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 
 /// Trait families and ids that admit a sample to the LLM on their own, at
@@ -34,33 +28,25 @@ pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 ///
 /// These exist because the criticality and probability tests are blind in the
 /// same place: a package whose only signal is one notable finding. Each entry
-/// was selected by leave-one-out over the 1072-sample corpus described on
-/// [`DEFAULT_LLM_MIN_PROB`], keeping only prefixes that still pay on top of the
-/// anchor **and** the rest of the set. Together with
-/// [`LLM_GATE_SYNTHESIZED_PREFIXES`] they lift malicious coverage from 85.9% to
-/// 94.7% for 6.4 points of benign volume.
+/// earned its place by leave-one-out measurement on a labeled corpus: it must
+/// still admit malicious samples that nothing else, the other entries
+/// included, admits, at little benign cost.
 ///
 /// An entry is either a family (matching every id at or below it) or a
 /// `family::leaf` id, where the leaf may use `*` to match a run of characters
 /// (`family::curl-*`). Prefer a family or a glob to an exact leaf: leaf names
 /// are renamed in passing, and an exact one that stops matching costs its
-/// coverage silently. Note how narrow they are. The obvious wide families do
-/// not survive: at family level `micro-behaviors/communications/http/url`
-/// admits 52% of the benign corpus for six malicious samples, because nearly
-/// every package builds a URL, so only its `scheme` and `query` leaves are
-/// listed. Two more were dropped outright once the floor moved to 0.55 —
-/// `micro-behaviors/communications/ip/direct` became fully redundant (zero
-/// marginal samples either way) and `metadata/binary/anomaly` bought one
-/// malicious sample for six benign. Prefer measuring a candidate over adding
-/// one that reads plausible.
+/// coverage silently. Keep entries narrow, though: wide families fail the
+/// measurement. `micro-behaviors/communications/http/url` as a family admits
+/// most benign packages, because nearly every package builds a URL, so only
+/// its `scheme` and `query` leaves are listed. Measure a candidate rather than
+/// adding one that reads plausible.
 ///
 /// Every id here is declared in the cleave traits tree, which is what lets
 /// [`validate_gate_prefixes`] prove the taxonomy has not moved underneath them.
-pub const LLM_GATE_PREFIXES: &[&str] = &[
-    // Encrypted archive members: 154 malicious against 1 benign in the original
-    // gate corpus. Cleave moved this trait from micro-behaviors/data/archive/member
-    // into metadata/file/archive; name the leaf so unrelated archive metadata
-    // does not enter the gate.
+pub(super) const LLM_GATE_PREFIXES: &[&str] = &[
+    // Encrypted archive members: almost never benign. Named by leaf so the
+    // rest of the archive metadata family does not enter the gate.
     "metadata/file/archive::archive-encrypted-member",
     // Agent/editor config paths — where prompt-injection payloads in agent
     // skills and editor extensions live.
@@ -77,16 +63,13 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
     // the package points at — the shape of a squatted or impersonated
     // extension, which is otherwise invisible: the code is usually lifted
     // wholesale from the project it impersonates, so nothing in it reads as
-    // hostile and no other rule fires. 25 malicious against 1 benign over the
-    // 1071-sample corpus, and every one of those 25 that another rule already
-    // caught means this costs nothing to add: marginal +1 malicious, +0 benign,
-    // +0 mixed.
+    // hostile and no other rule fires.
     //
-    // A glob, and a narrow one. The sibling `npm-name-repo-mismatch` in this
-    // same family is the opposite trade — +0 malicious for +18 benign, because
-    // monorepos, forks and scoped renames all disagree with their repository —
-    // so `*mismatch*` would have been 1:18. Publisher-is-not-repo-owner is the
-    // specific claim worth reading.
+    // An exact leaf, deliberately. The sibling `npm-name-repo-mismatch` in this
+    // family is the opposite trade — monorepos, forks and scoped renames all
+    // disagree with their repository — so a `*mismatch*` glob would admit
+    // mostly benign packages. Publisher-is-not-repo-owner is the specific
+    // claim worth reading.
     "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
     "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
     "micro-behaviors/communications/http/url/query::query-serializer-call",
@@ -102,31 +85,28 @@ pub const LLM_GATE_PREFIXES: &[&str] = &[
 /// less plainly. Both lists admit identically: [`admit`] does not
 /// distinguish them.
 ///
-/// `metadata/encoded-payload/*` is built by cleave's encoded-payload pass. The
-/// `url` arm was narrowed from the parent family, which held no extra malicious
-/// sample and cost three benign.
-pub const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
+/// `metadata/encoded-payload/*` is built by cleave's encoded-payload pass. Only
+/// its `url` arm is listed: the rest of the family admitted benign samples and
+/// no malicious one the gate did not already reach.
+pub(super) const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
 
 /// Notable-or-above findings above which an ML-benign sample with no hostile
 /// finding is *not* sent to the LLM, whatever else admitted it. `0` disables
 /// the veto.
 ///
 /// The admissions above all fire on volume: a large legitimate package
-/// accumulates notable findings until it crosses the probability floor, trips
-/// a suspicious composite, or carries one of the gate prefixes — and the LLM
-/// then reads a long prompt to move nothing. Over 826 benchmark samples
-/// (403 benign, 423 malicious), scoring each call by whether
-/// the interpretation moved the outcome a level in the right direction: the
-/// non-placed admissions produced 118 correct shifts from 264 calls, 102 of
-/// them on benign samples. The correct shifts sit on small samples (90 of 118
-/// carry at most 100 notable findings, 7 more than 300) and the benign calls on
-/// large ones (65 of 102 above 300). This veto at 300 kept 116 of the 118
-/// shifts (118 with [`LLM_GATE_STRONG_PREFIXES`]) on 194 calls, 44 benign;
-/// 150 lost seven shifts, 500 gave back twelve benign calls for nothing.
+/// accumulates notable findings until it crosses the probability floor or
+/// carries one of the gate prefixes — and the LLM then reads a long prompt to
+/// move nothing. Scored by whether each call moved
+/// the outcome in the right direction, the calls that correct a verdict sit on
+/// small samples and the wasted benign calls on large ones. This cap keeps
+/// nearly every correction and drops most of the wasted calls; a lower one
+/// starts losing corrections, a higher one keeps benign calls that correct
+/// nothing.
 ///
-/// A count of findings rather than prompt tokens: the token proxy lost nine
-/// shifts at the same benign volume. Level-placed samples are never vetoed —
-/// an interpretation is wanted for everything on the grid.
+/// A count of findings rather than prompt tokens: the token proxy lost more
+/// corrections at the same benign volume. Level-placed samples are never
+/// vetoed — an interpretation is wanted for everything on the grid.
 pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
 
 /// Gate prefixes that override the size veto ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]).
@@ -134,12 +114,11 @@ pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
 /// The ordinary gate prefixes were chosen for coverage and several of them
 /// (`*curl*` uploads, encoded-payload URLs) sit on exactly the big benign
 /// packages the veto exists to skip, so the veto has to outrank them. These
-/// are the prefixes with (as near as the corpus can show) no benign carrier at
-/// all — 1 benign against 207 malicious across the 826 — so a sample carrying
-/// one is worth a read however large it is. Two of the entries are here for
-/// the two shifts the bare veto lost: a 580-finding Debian package the LLM
-/// called hostile off a base64-decode-to-file step, and a 571-finding agent
-/// skill that points the agent at an off-vendor API base URL.
+/// are the prefixes with, as near as a labeled corpus can show, no benign
+/// carrier at all, so a sample carrying one is worth a read however large it
+/// is. Some are here for corrections the bare veto lost: a large package that
+/// decodes a payload to a file from a shell command, and an agent skill that
+/// points the agent at an off-vendor API base URL.
 ///
 /// Prefer families and narrow globs where their whole match set is useful.
 /// The encrypted-member trait moved into a broad family, so its exact id keeps
@@ -147,22 +126,20 @@ pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
 /// are atomic traits under a shared family; the narrow glob covers their
 /// provider-specific ids without admitting other URL configuration findings.
 /// [`validate_gate_prefixes`] checks these entries against installed traits.
-pub const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
-    // Password-protected payload droppers: 154 malicious, 0 benign in the
-    // original size-veto corpus.
+pub(super) const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
+    // Password-protected payload droppers.
     "metadata/file/archive::archive-encrypted-member",
-    // Publisher is not the owner of the repository it points at: 25 vs 1.
+    // Publisher is not the owner of the repository it points at.
     "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
-    // Agent instruction files (CLAUDE.md, AGENTS.md, rules): 5 vs 0.
+    // Agent instruction files (CLAUDE.md, AGENTS.md, rules).
     "micro-behaviors/fs/path/agent-instructions",
     // Editor/agent *project* settings and tasks — the per-repository files an
-    // extension or skill drops to run on open: 23 vs 0.
+    // extension or skill drops to run on open.
     "micro-behaviors/fs/path/config/app::*project-*",
-    // An off-vendor LLM API base URL assignment can redirect agent traffic.
-    // The original agent-specific prefix carried 2 malicious vs 0 benign
-    // samples; this emitted atomic shape also covers other provider settings.
+    // An off-vendor LLM API base URL assignment can redirect agent traffic;
+    // the glob covers every provider's setting of that shape.
     "micro-behaviors/os/env/provider::*base-url-off-vendor",
-    // Decoding a payload to a file from a shell command: 4 vs 0.
+    // Decoding a payload to a file from a shell command.
     "micro-behaviors/data/decode/command::*to-file*",
 ];
 
@@ -206,33 +183,16 @@ pub(super) fn leaf_matches(pattern: &str, id: &str) -> bool {
     true
 }
 
-/// Whether any gate prefix admits `id`.
+/// Whether any of `prefixes` admits trait `id`.
 ///
-/// A prefix carrying `::` names one exact trait and matches only itself. A
-/// prefix without it names a family and matches every id at or below it,
-/// compared against the id's head so that `.../archive/member` admits
+/// A prefix carrying `::` names one trait (its leaf possibly a glob, see
+/// [`leaf_matches`]) and matches only within its own family. A prefix without
+/// it names a family and matches every id at or below it, compared against the
+/// id's head so that `.../archive/member` admits
 /// `.../archive/member::archive-encrypted-member` without also admitting a
 /// sibling family whose name merely starts with the same letters
 /// (`.../archive/members-of-interest`). A synthesized id has no `::` at all, so
 /// it is its own head and the same comparison places it.
-#[must_use]
-pub(super) fn id_admits(id: &str) -> bool {
-    prefix_admits(
-        LLM_GATE_PREFIXES
-            .iter()
-            .chain(LLM_GATE_SYNTHESIZED_PREFIXES)
-            .copied(),
-        id,
-    )
-}
-
-/// Whether any [`LLM_GATE_STRONG_PREFIXES`] entry admits `id`.
-#[must_use]
-pub(super) fn id_strong(id: &str) -> bool {
-    prefix_admits(LLM_GATE_STRONG_PREFIXES.iter().copied(), id)
-}
-
-/// The prefix matcher behind [`id_admits`] and [`id_strong`].
 pub(super) fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id: &str) -> bool {
     let head = crate::features::trait_path(id);
     prefixes.into_iter().any(|prefix| {
@@ -247,7 +207,7 @@ pub(super) fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id:
     })
 }
 
-/// Check every [`LLM_GATE_PREFIXES`] entry against an installed cleave traits
+/// Check every gate prefix entry against an installed cleave traits
 /// tree, returning one message per broken prefix. An empty vector means the gate
 /// still matches what the matcher will emit.
 ///
@@ -260,12 +220,12 @@ pub(super) fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id:
 ///
 /// A family prefix must still be a directory. An exact `family::leaf` id must
 /// additionally be declared by some YAML directly in that directory.
-/// [`LLM_GATE_SYNTHESIZED_PREFIXES`] has no directory to point at and is not
-/// checked here.
+/// Synthesized prefixes have no directory to point at and are not checked
+/// here.
 #[must_use]
 pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut checked = std::collections::HashSet::new();
+    let mut checked = HashSet::new();
     for prefix in LLM_GATE_PREFIXES.iter().chain(LLM_GATE_STRONG_PREFIXES) {
         if !checked.insert(prefix) {
             continue;
@@ -295,7 +255,7 @@ pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
 /// indentation, and recognizing that costs nothing next to loading a parser to
 /// answer one yes/no question. False negatives are the safe direction — they
 /// fail the check loudly rather than passing a broken prefix.
-pub(super) fn trait_declared(dir: &Path, id: &str) -> bool {
+fn trait_declared(dir: &Path, id: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -335,21 +295,19 @@ pub(super) fn trait_declared(dir: &Path, id: &str) -> bool {
 /// `addresses_the_analyzer`, which ask about the bytes the model will see.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FindingSeverity {
-    /// cleave surfaced a suspicious- or hostile-criticality finding.
-    pub elevated: bool,
     /// cleave surfaced a hostile-criticality finding.
     pub hostile: bool,
-    /// cleave surfaced a notable-or-above finding under [`LLM_GATE_PREFIXES`].
+    /// cleave surfaced a notable-or-above finding under a gate prefix.
     ///
-    /// Separate from `elevated` because it answers a different question: not
+    /// Separate from `hostile` because it answers a different question: not
     /// "how bad did this look" but "is this one of the specific behaviours a
     /// reader catches and criticality does not". It is the admission that
     /// carries the low-probability tail — packages whose only signal is a
-    /// single notable finding — and it is why the probability floor can sit at
-    /// 0.55 instead of 0.04.
+    /// single notable finding — and it is why the probability floor
+    /// ([`DEFAULT_LLM_MIN_PROB`]) can sit as high as it does.
     pub gate_trait: bool,
-    /// cleave surfaced a notable-or-above finding under
-    /// [`LLM_GATE_STRONG_PREFIXES`]: admitted past the size veto.
+    /// cleave surfaced a notable-or-above finding under a strong gate prefix:
+    /// admitted past the size veto.
     pub strong_trait: bool,
     /// Notable-or-above findings across the whole report — every member file,
     /// duplicates included. The size the veto reads.
@@ -357,8 +315,8 @@ pub struct FindingSeverity {
 }
 
 impl FindingSeverity {
-    /// Read the highest criticality cleave reached anywhere in the report, and
-    /// whether any finding sits under an [`LLM_GATE_PREFIXES`] entry.
+    /// Read whether cleave reached hostile criticality anywhere in the report,
+    /// and whether any finding sits under a gate prefix.
     #[must_use]
     pub fn from_report(report: &cleave::AnalysisReport) -> Self {
         Self::from_findings(report.files.iter().flat_map(|file| file.findings.iter()))
@@ -376,20 +334,20 @@ impl FindingSeverity {
         let mut out = Self::default();
         for finding in findings {
             if finding.crit >= cleave::Criticality::Hostile {
-                out.elevated = true;
                 out.hostile = true;
-            } else if finding.crit >= cleave::Criticality::Suspicious {
-                out.elevated = true;
             }
             // Notable is the floor: below it sit baseline noise and the
             // component legs of composites, which fire on ordinary packages and
             // would turn every prefix into a volume tax.
             if finding.crit >= cleave::Criticality::Notable {
                 out.notable += 1;
-                if id_admits(&finding.id) {
+                let gate = LLM_GATE_PREFIXES
+                    .iter()
+                    .chain(LLM_GATE_SYNTHESIZED_PREFIXES);
+                if prefix_admits(gate.copied(), &finding.id) {
                     out.gate_trait = true;
                 }
-                if id_strong(&finding.id) {
+                if prefix_admits(LLM_GATE_STRONG_PREFIXES.iter().copied(), &finding.id) {
                     out.strong_trait = true;
                 }
             }
@@ -402,12 +360,13 @@ impl FindingSeverity {
 /// opinion off the analysis path and must ration a saturated endpoint.
 ///
 /// `Required` is every admission that can change a verdict: a hostile cleave
-/// finding, a finding under [`LLM_GATE_PREFIXES`], a non-benign ML class, or a
+/// finding, a finding under a gate prefix, a non-benign ML class, or a
 /// raw score above the probability floor — unless the size veto
 /// ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]) withholds it. `Optional` is the routine
 /// case — ML placed the file on its grid but nothing else says so — where the
-/// second opinion is context for the reader rather than a correction. Under load such a caller
-/// serves `Required` first and skips `Optional`; unloaded, both run.
+/// second opinion is context for the reader rather than a correction. Under
+/// load such a caller serves `Required` first and skips `Optional`; unloaded,
+/// both run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmAdmission {
     /// Can change the verdict: never skipped.
@@ -417,7 +376,8 @@ pub enum LlmAdmission {
 }
 
 /// A sample the LLM gate admitted, carrying the ML verdict and the cleave
-/// evidence it was admitted on. [`interpret_admitted`] consumes it, so a caller
+/// evidence it was admitted on. [`interpret_admitted`](super::interpret_admitted)
+/// consumes it, so a caller
 /// that defers the LLM call does not run the gate a second time.
 #[derive(Debug, Clone, Copy)]
 pub struct Admitted {
@@ -431,19 +391,20 @@ pub struct Admitted {
 }
 
 /// The LLM gate: whether a sample gets a second opinion, answered without
-/// running the model. Returns the token [`interpret_admitted`] takes, so a
-/// caller that defers the call does not run the gate twice; `None` when the
-/// sample is not admitted at all.
+/// running the model. Returns the token
+/// [`interpret_admitted`](super::interpret_admitted) takes, so a caller that
+/// defers the call does not run the gate twice; `None` when the sample is not
+/// admitted at all.
 ///
-/// Five independent admissions, all `OR`, because they fail on different files:
-/// a raw score at or above [`DEFAULT_LLM_MIN_PROB`]; a suspicious-or-hostile
-/// cleave finding; a notable-or-above finding under [`LLM_GATE_PREFIXES`]; a
-/// strong-trait finding past the size veto; and a non-benign verdict class, which catches a container carrying a member's hostile class
-/// on its own near-zero score.
-///
-/// Over the 1072-sample corpus (see [`DEFAULT_LLM_MIN_PROB`]) this admits 94.7%
-/// of the malicious corpus on 21.8% of the benign one. The criticality test
-/// alone would be 79.4% on 12.2%; the prefixes buy most of the rest.
+/// Five independent admissions, all `OR`, because they fail on different
+/// files: a raw score at or above the configured floor
+/// ([`DEFAULT_LLM_MIN_PROB`] by default); a hostile cleave finding; a
+/// notable-or-above finding under a gate prefix; one under a strong gate
+/// prefix; and a non-benign verdict class, which catches a container carrying
+/// a member's hostile class on its own near-zero score. Any of them makes the
+/// sample [`LlmAdmission::Required`] unless the size veto
+/// ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]) withholds it; a level placement alone
+/// makes it [`LlmAdmission::Optional`].
 #[must_use]
 pub fn admit(
     cfg: &InterpretConfig,
@@ -457,12 +418,12 @@ pub fn admit(
     // surfaced a hostile finding that ML scored below it —
     // that disagreement is exactly where a second opinion pays off, and it is how
     // an ML-blind packed binary (prob ≈ 0 yet flagged by cleave) still reaches the
-    // LLM. Truly-clean files (no elevated finding, no calibrated ML signal) skip.
+    // LLM. Truly-clean files (no hostile finding, no calibrated ML signal) skip.
     //
     // The verdict class is a third admission on its own: a container whose
     // hostile call came from a member elevation carries the member's class but
-    // its own raw score, which can sit far below the cutoff (windows-bindgen:
-    // class hostile at level 0, prob 9e-6, and no elevated finding left in the
+    // its own raw score, which can sit far below the cutoff (class hostile at
+    // level 0 with a raw score near zero, and no hostile finding left in the
     // render). Gating that out publishes a hostile verdict with no
     // interpretation and no error trace; anything the scan itself calls
     // non-benign must reach the LLM.
@@ -482,10 +443,9 @@ pub fn admit(
     // Deliberately a floor on the raw score rather than another level knob: the
     // point is to cover the case where there is no level to reason about.
     // Two independent ML admissions, because they fail on different files. A
-    // placed level is the precise one — nothing benign in the measured corpus
-    // is placed at all — but it is silent for the 82 samples the grid never
-    // reached. The probability floor covers those at a known volume cost. See
-    // [`DEFAULT_LLM_MIN_PROB`].
+    // placed level is the precise one, but it is silent on every file the grid
+    // never reached. The probability floor covers those at a known volume
+    // cost. See [`DEFAULT_LLM_MIN_PROB`].
     //
     // Every admission is evaluated, not short-circuited, so the log line can
     // say which ones fired — the question a reader asks of a skipped sample is
@@ -496,8 +456,8 @@ pub fn admit(
     if ml_prob >= cfg.min_prob {
         reasons.push("prob");
     }
-    // Hostile, not suspicious: a suspicious-only finding was six benign calls
-    // and no shift on the measured corpus (see `DEFAULT_LLM_BENIGN_NOTABLE_CAP`).
+    // Hostile, not suspicious: suspicious-only findings admit benign samples
+    // without ever moving a verdict.
     if hostile {
         reasons.push("hostile-finding");
     }
@@ -545,7 +505,6 @@ pub fn admit(
         ml_level = %levels.fired,
         min_prob = cfg.min_prob,
         hostile_finding = hostile,
-        elevated_finding = findings.elevated,
         gate_trait = findings.gate_trait,
         strong_trait = findings.strong_trait,
         notable_findings = findings.notable,

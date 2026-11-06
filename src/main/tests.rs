@@ -1,6 +1,6 @@
 use super::{
-    Cli, Commands, MaxRssPolicy, default_cli_follow_policy, fetch_policy,
-    is_expected_yara_cache_mismatch, resolve_hopper_value, with_default_subcommand,
+    Cli, Commands, MaxRssPolicy, default_cli_follow_policy, fetch_policy, resolve_hopper_value,
+    with_default_subcommand,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -27,21 +27,6 @@ fn a_closed_pipe_anywhere_in_the_chain_exits_quietly() {
     assert!(super::is_broken_pipe(&pipe));
     let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
     assert!(!super::is_broken_pipe(&other));
-}
-
-#[test]
-fn only_expected_yara_cache_mismatch_is_quietable() {
-    let expected = "compiled YARA rules do not match the rule sources on disk; \
-                        ignoring them and recompiling";
-    assert!(is_expected_yara_cache_mismatch(
-        "cleave::yara_engine",
-        expected
-    ));
-    assert!(!is_expected_yara_cache_mismatch(
-        "cleave::yara_engine",
-        "YARA bucket scan failed, skipping bucket"
-    ));
-    assert!(!is_expected_yara_cache_mismatch("scan::engine", expected));
 }
 
 #[test]

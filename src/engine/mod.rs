@@ -1,5 +1,5 @@
 //! Scanning and classification: the CLI scan drivers ([`run`], [`run_paths`],
-//! [`run_bytes`]), the pipeline every front end classifies through
+//! `run_bytes`), the pipeline every front end classifies through
 //! (`classify_report`), and the result and JSON envelope it produces.
 
 use std::path::{Path, PathBuf};
@@ -31,11 +31,10 @@ pub use self::envelope::{
     ScanResultEnvelopeRef, StoredFile, StoredReport, TopFinding,
 };
 pub use self::pipeline::PendingLlm;
-pub use self::run::{
-    Fetched, FetchedKind, report_remote, run, run_bytes, run_paths, run_paths_with, run_with,
-    scan_bytes, scan_file,
-};
-pub use self::verdict::{FloorArm, FloorDecision, level_confidence, synthesized_level};
+pub(crate) use self::run::{Fetched, FetchedKind, report_remote, run_bytes, run_with};
+pub use self::run::{run, run_paths};
+pub(crate) use self::verdict::level_confidence;
+pub use self::verdict::{FloorArm, FloorDecision, synthesized_level};
 
 pub(crate) use self::envelope::dep_envelope;
 pub(crate) use self::hopper::artifact_filename;
@@ -46,12 +45,12 @@ pub(crate) use self::pipeline::{ClassifiedReport, ClassifyRequest, OutputNeeds, 
 pub use self::pipeline::{CpuLease, apply_pending_interpretation};
 pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,
-    print_above_bar, term_dims,
+    print_above_bar,
 };
-pub(crate) use self::render_cards::{format_llm_line, write_tiny};
 pub(crate) use self::render_context::{recategorize_annotations, split_annotation};
 pub(crate) use self::run::{
-    DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, tiny_opts_for,
+    DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, emit_result,
+    scan_bytes, scan_file, tiny_opts_for,
 };
 
 use self::retention::UNANALYZED_MEMBER_RISK;
@@ -73,7 +72,7 @@ pub struct DisplayFilter {
 impl DisplayFilter {
     /// Include only hostile and suspicious files.
     #[must_use]
-    pub const fn alerts_only() -> Self {
+    pub(crate) const fn alerts_only() -> Self {
         Self {
             hostile: true,
             suspicious: true,
@@ -105,7 +104,7 @@ impl DisplayFilter {
     /// the cue to emit a complete archive manifest in JSON output — every member,
     /// including the ones cleave never analyzed because they carry no findings.
     #[must_use]
-    pub fn is_all(&self) -> bool {
+    fn is_all(&self) -> bool {
         self.hostile && self.suspicious && self.benign
     }
 }
@@ -132,6 +131,8 @@ pub struct ScanConfig {
     interpret: Option<crate::interpret::InterpretConfig>,
     fetch: crate::fetch::FetchPolicy,
     hopper: Option<String>,
+    /// `SCAN_NO_UPLOAD`, read once: hopper is consulted but never written.
+    no_upload: bool,
     zip_passwords: crate::ArchivePasswords,
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
@@ -155,8 +156,8 @@ impl ScanConfig {
     /// slow-rule warning and no extra diagnostics; the `with_*` methods
     /// change the rest.
     ///
-    /// `thresholds` may be `None` to use the model's recommended thresholds
-    /// from `evaluation.json`, or `Some(t)` to override with explicit values.
+    /// `thresholds` may be `None` to use the thresholds the model's severity
+    /// level selects, or `Some(t)` to override them with explicit values.
     ///
     /// # Example
     /// ```
@@ -188,6 +189,7 @@ impl ScanConfig {
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             hopper: None,
+            no_upload: crate::env::flag(crate::env::SCAN_NO_UPLOAD),
             zip_passwords: crate::ArchivePasswords::default(),
             // Bloom short-circuiting is opt-in via `with_bloom`; an unconfigured
             // config runs a full scan (slow mode), so server/fs paths are unaffected.
@@ -249,10 +251,36 @@ impl ScanConfig {
         self.hopper.as_deref()
     }
 
-    /// A read-only scan still consults Hopper, but never prepares upload work.
+    /// The hopper results are renewed on: [`Self::hopper`], unless
+    /// `SCAN_NO_UPLOAD` makes this a read-only scan that still consults hopper
+    /// but never prepares upload work.
     pub(crate) fn upload_hopper(&self) -> Option<&str> {
-        self.hopper()
-            .filter(|_| !crate::env::flag(crate::env::SCAN_NO_UPLOAD))
+        self.hopper().filter(|_| !self.no_upload)
+    }
+
+    /// What each result must be classified with to be written in this
+    /// format and renewed on hopper.
+    pub(crate) fn output_needs(&self) -> OutputNeeds {
+        let format = self.format;
+        OutputNeeds {
+            llm_view: format == OutputFormat::Interpret,
+            // The live fetch log renders only on the interactive terminal;
+            // the machine formats stay clean (the edges ride along in the JSON
+            // `fetched` array regardless).
+            fetch_progress: format == OutputFormat::Terminal,
+            render_context: format != OutputFormat::Json,
+            // `--show=all` with JSON output: list every archive member, even
+            // the no-finding ones cleave skipped analyzing.
+            list_all_members: format == OutputFormat::Json && self.filter.is_all(),
+            deps_for_upload: self.upload_hopper().is_some(),
+        }
+    }
+
+    /// Whether results keep cleave's report: JSON output and hopper renewals
+    /// carry it (hopper stores it and explodes archive members); the terminal
+    /// never reads it.
+    pub(crate) fn keeps_report(&self) -> bool {
+        self.format == OutputFormat::Json || self.upload_hopper().is_some()
     }
 
     /// Set the external-reference fetch policy: which kinds of reference
@@ -461,7 +489,7 @@ pub(crate) fn now_rfc3339() -> String {
 /// This scan build, stamped into every `ml` envelope (`eng`) so a stored result
 /// records which engine produced it. Distinct from `version` (the ML model) and
 /// `raw.tv` (the traits-repo commit); together they pin the build behind a report.
-pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `ml.v` envelope schema this build writes.
 pub(crate) const SCHEMA_VERSION: &str = "7";
@@ -469,7 +497,7 @@ pub(crate) const SCHEMA_VERSION: &str = "7";
 /// The criticality a [`cleave::Criticality::rank`] encodes, or `None` for a
 /// byte no rank produces. Decoded through `rank` itself, so the two cannot
 /// disagree; `Exception` shares rank 0 with `Filtered` and reads back as it.
-pub(crate) fn crit_from_rank(rank: u8) -> Option<cleave::Criticality> {
+fn crit_from_rank(rank: u8) -> Option<cleave::Criticality> {
     use cleave::Criticality;
     [
         Criticality::Filtered,

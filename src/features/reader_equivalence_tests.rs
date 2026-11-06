@@ -1,4 +1,4 @@
-use super::{FileSummary, RawNeeds};
+use super::report::{FileSummary, RawNeeds};
 use cleave::types::{CompactReport, compact_from_files};
 
 /// Build a report with the shapes that actually vary: findings at several

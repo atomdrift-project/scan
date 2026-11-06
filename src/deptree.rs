@@ -29,8 +29,8 @@ use std::thread::JoinHandle;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::engine::{PROGRESS_TICK, SPINNER, bar_active, term_dims};
-use crate::output::{Rgb, fg, tty_text};
+use crate::engine::{PROGRESS_TICK, SPINNER, bar_active};
+use crate::output::{ERASE_LINE, Ink, Keep, Rgb, elide, palette, strip_ansi, tty_text};
 
 /// The lifecycle state a caller drives a dependency through. `Fetching` and
 /// `Analyzing` render with a live spinner; `Done` is terminal and carries its
@@ -69,15 +69,29 @@ const RESERVE_ROWS: usize = 3;
 /// terminal width (a wrapped row breaks the in-place redraw).
 const NAME_MAX: usize = 34;
 
-/// Erase the current line and return to its start.
-const CLEAR_LINE: &str = "\r\x1b[2K";
+/// Narrowest the trailing `from <manifest>` column is worth showing at.
+const SOURCE_MIN: usize = 20;
 
-const DIM: Rgb = Rgb(110, 110, 110);
-const DETAIL: Rgb = Rgb(130, 130, 130);
-const SOURCE: Rgb = Rgb(90, 90, 90);
-const LABEL: Rgb = Rgb(160, 160, 160);
-const IN_FLIGHT: Rgb = Rgb(100, 180, 255);
-const SETTLED: Rgb = Rgb(80, 200, 80);
+/// The terminal's height in rows, `None` when stderr is not a terminal or
+/// does not say. The tree must know it: a region taller than the viewport
+/// cannot be cursor-moved back to its top once the terminal scrolls. No crate
+/// this one already depends on reports a height (cleave's helper reports only
+/// the width), hence the ioctl.
+fn term_rows() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: an all-zero `winsize` is a valid value, and TIOCGWINSZ
+        // writes only into the one it is handed; it is read only on success.
+        let ws = unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            (libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0).then_some(ws)
+        };
+        if let Some(ws) = ws.filter(|ws| ws.ws_row > 0) {
+            return Some(usize::from(ws.ws_row));
+        }
+    }
+    None
+}
 
 /// One dependency's row: its display name, current status, and a monotonic
 /// sequence stamped on each change so the focused view can pick the most
@@ -204,10 +218,8 @@ impl DepTree {
         if tracing::enabled!(target: "scan", tracing::Level::INFO) {
             return None;
         }
-        let (cols, rows) = term_dims();
-        if rows < MIN_TERM_ROWS {
-            return None;
-        }
+        let rows = term_rows().filter(|&rows| rows >= MIN_TERM_ROWS)?;
+        let cols = cleave::output::terminal_width();
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 entries: Vec::new(),
@@ -231,13 +243,19 @@ impl DepTree {
                     if beat.stopped.load(Ordering::Relaxed) {
                         break;
                     }
-                    let mut state = beat.lock();
-                    state.tick = state.tick.wrapping_add(1);
-                    // Spinners animate; a settled tree redraws only on change.
-                    if state.dirty
-                        || state.entries.iter().any(|e| matches!(e.status, Status::Active(_)))
-                    {
-                        render(&mut state, false);
+                    // Composed under the lock, written after it is released:
+                    // a stalled terminal must not block the fetch workers
+                    // that update the tree.
+                    let frame = {
+                        let mut state = beat.lock();
+                        state.tick = state.tick.wrapping_add(1);
+                        // Spinners animate; a settled tree redraws only on change.
+                        (state.dirty
+                            || state.entries.iter().any(|e| matches!(e.status, Status::Active(_))))
+                        .then(|| render(&mut state, false))
+                    };
+                    if let Some(frame) = frame {
+                        draw(&frame);
                     }
                 }
             })
@@ -286,11 +304,13 @@ impl DepTree {
         if state.entries.is_empty() {
             return;
         }
-        render(&mut state, true);
+        let mut frame = render(&mut state, true);
         drop(state);
         if !summary.is_empty() {
-            eprintln!("{summary}");
+            frame.push_str(summary);
+            frame.push('\n');
         }
+        draw(&frame);
     }
 
     /// Stop and join the heartbeat, so no redraw can follow.
@@ -315,9 +335,19 @@ impl Drop for DepTree {
     }
 }
 
-/// Paint the region in place from the top down, then leave the cursor on the
-/// blank line just beneath it.
-fn render(state: &mut State, finished: bool) {
+/// Write a frame [`render`] composed. The tree is cosmetic: a failed write
+/// must not stop the fetch, so its errors are ignored.
+fn draw(frame: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr
+        .write_all(frame.as_bytes())
+        .and_then(|()| stderr.flush());
+}
+
+/// The frame that repaints the region in place from the top down and leaves
+/// the cursor on the blank line just beneath it. Records what it drew, so the
+/// next frame knows how far up to move.
+fn render(state: &mut State, finished: bool) -> String {
     let lines = compose(state, finished);
     let mut out = String::new();
     // Move up to the top of the previously drawn region.
@@ -326,7 +356,7 @@ fn render(state: &mut State, finished: bool) {
     }
     // Repaint each line, clearing whatever it overwrites.
     for line in &lines {
-        out.push_str(CLEAR_LINE);
+        out.push_str(ERASE_LINE);
         out.push_str(line);
         out.push('\n');
     }
@@ -334,7 +364,7 @@ fn render(state: &mut State, finished: bool) {
     // the cursor rests just beneath the new content.
     let leftover = state.drawn.saturating_sub(lines.len());
     for _ in 0..leftover {
-        out.push_str(CLEAR_LINE);
+        out.push_str(ERASE_LINE);
         out.push('\n');
     }
     if leftover > 0 {
@@ -342,8 +372,7 @@ fn render(state: &mut State, finished: bool) {
     }
     state.drawn = lines.len();
     state.dirty = false;
-    eprint!("{out}");
-    let _ = std::io::stderr().flush();
+    out
 }
 
 /// Build the region's lines: a header, then either the whole (small) graph or —
@@ -434,10 +463,11 @@ fn compose(state: &State, finished: bool) -> Vec<String> {
 /// The region's header: an arrow (or a check, once finished), the running
 /// `done/total` count, and how many references are in flight right now.
 fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize) -> String {
+    let (ink, p) = (Ink::stderr(), palette());
     let (glyph, color) = if finished {
-        ('\u{2713}', SETTLED)
+        ('\u{2713}', p.benign)
     } else {
-        ('\u{2b07}', IN_FLIGHT)
+        ('\u{2b07}', p.live)
     };
     let mut text = format!("dependencies  {done}/{total}");
     if active > 0 {
@@ -445,8 +475,8 @@ fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize)
     }
     let line = format!(
         "  {}  {}",
-        fg(color, glyph.encode_utf8(&mut [0; 4])),
-        fg(LABEL, &text)
+        ink.fg(color, glyph.encode_utf8(&mut [0; 4])),
+        ink.fg(p.label, &text)
     );
     clip(&line, 4 + char_width(glyph) + text.width(), cols)
 }
@@ -455,20 +485,25 @@ fn header(done: usize, total: usize, active: usize, finished: bool, cols: usize)
 /// not-yet-started remainder). Dim, so the eye stays on the active rows above.
 fn footer(hidden: usize, cols: usize) -> String {
     let text = format!("\u{2026} {hidden} more");
-    clip(&format!("    {}", fg(DIM, &text)), 4 + text.width(), cols)
+    clip(
+        &format!("    {}", Ink::stderr().fg(palette().dim, &text)),
+        4 + text.width(),
+        cols,
+    )
 }
 
 /// One dependency row: a status glyph (spinner while in flight), the name padded
 /// to the shared column, and a dim trailing detail.
 fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
+    let (ink, p) = (Ink::stderr(), palette());
     let (glyph, color, detail) = match &entry.status {
-        Status::Pending => ('\u{00b7}', DIM, "pending".to_string()),
+        Status::Pending => ('\u{00b7}', p.dim, "pending".to_string()),
         Status::Active(label) => (
             SPINNER[tick as usize % SPINNER.len()],
-            IN_FLIGHT,
+            p.live,
             format!("{label}\u{2026}"),
         ),
-        Status::Hidden => (' ', Rgb(0, 0, 0), String::new()),
+        Status::Hidden => (' ', p.dim, String::new()),
         Status::Done {
             glyph,
             color,
@@ -476,20 +511,19 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
         } => (*glyph, *color, tty_text(detail).into_owned()),
     };
     // Names, sources and details come from hostile manifests and servers.
-    let name = elide_middle(&tty_text(&entry.name), namew);
+    let name = elide(&tty_text(&entry.name), namew, Keep::Ends);
     let namecol = namew.max(name.width());
     let pad = " ".repeat(namecol - name.width());
     let detail_col = if detail.is_empty() {
         String::new()
     } else {
-        format!("  {}", fg(DETAIL, &detail))
+        format!("  {}", ink.fg(p.dim, &detail))
     };
     // Trailing dim source: `from <manifest>`, so a reader can trace each
     // dependency back to the file that declared it. Sized to the columns left
     // after the name and result, and middle-elided only when it won't fit — a
     // long package-relative path keeps its telling head and its filename tail
     // (`github.com-…/package-lock.json`) rather than being chopped to a stub.
-    const SOURCE_MIN: usize = 20;
     let glyph_width = char_width(glyph);
     let detail_width = if detail.is_empty() {
         0
@@ -501,20 +535,20 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
     let source = if entry.source.is_empty() || avail < SOURCE_MIN {
         String::new()
     } else {
-        elide_middle(&tty_text(&entry.source), avail)
+        elide(&tty_text(&entry.source), avail, Keep::Ends)
     };
     let (source_col, source_width) = if source.is_empty() {
         (String::new(), 0)
     } else {
         (
-            format!("  {}", fg(SOURCE, &format!("from {source}"))),
+            format!("  {}", ink.fg(p.very_dim, &format!("from {source}"))),
             2 + 5 + source.width(),
         )
     };
     clip(
         &format!(
             "    {} {name}{pad}{detail_col}{source_col}",
-            fg(color, glyph.encode_utf8(&mut [0; 4]))
+            ink.fg(color, glyph.encode_utf8(&mut [0; 4]))
         ),
         used + source_width,
         cols,
@@ -524,66 +558,6 @@ fn row(entry: &Entry, tick: u32, namew: usize, cols: usize) -> String {
 /// Display columns a glyph takes: two for an emoji flag, one otherwise.
 fn char_width(c: char) -> usize {
     c.width().unwrap_or(1)
-}
-
-/// Truncate `text` to `width` display columns, marking a cut with an ellipsis.
-fn truncate(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let w = char_width(c);
-        if used + w + 1 > width {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out.push('\u{2026}');
-    out
-}
-
-/// Shorten a name to `width` display columns by eliding the *middle*, keeping a
-/// balanced head and tail around a central ellipsis. For a URL or a scoped
-/// package the tail (a filename, a version) is as telling as the head (a host, a
-/// scope), so a middle cut reads more than a trailing one:
-/// `github.com/be5inv…aCurlySlab-34.7.0.zip` says "a versioned zip from github"
-/// where a tail cut (`github.com/be5invis/Iosevka/relea…`) hides both.
-fn elide_middle(name: &str, width: usize) -> String {
-    if name.width() <= width {
-        return name.to_string();
-    }
-    if width <= 1 {
-        return "\u{2026}".to_string();
-    }
-    let keep = width - 1;
-    let head_budget = keep.div_ceil(2);
-    let tail_budget = keep - head_budget;
-    let mut head = String::new();
-    let mut used = 0;
-    for c in name.chars() {
-        let w = char_width(c);
-        if used + w > head_budget {
-            break;
-        }
-        head.push(c);
-        used += w;
-    }
-    let mut tail: Vec<char> = Vec::new();
-    let mut used = 0;
-    for c in name.chars().rev() {
-        let w = char_width(c);
-        if used + w > tail_budget {
-            break;
-        }
-        tail.push(c);
-        used += w;
-    }
-    head.push('\u{2026}');
-    head.extend(tail.into_iter().rev());
-    head
 }
 
 /// Clip a coloured line whose *visible* width is `visible` so it never exceeds
@@ -597,31 +571,7 @@ fn clip(line: &str, visible: usize, cols: usize) -> String {
     }
     // Fall back to a plain, hard-truncated form; colour is sacrificed for
     // correctness of the region geometry.
-    truncate(&strip_ansi(line), cols)
-}
-
-/// Remove ANSI CSI escape sequences (`ESC [ … <final>`), and any other
-/// lone `ESC`. Only the sequence itself goes: text after a non-SGR sequence
-/// (`ESC [2J`) is kept, not eaten up to the next `m`.
-pub(crate) fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // Skip a CSI sequence: ESC '[' params... final byte in '@'..='~'.
-        if chars.clone().next() == Some('[') {
-            chars.next();
-            for n in chars.by_ref() {
-                if ('@'..='~').contains(&n) {
-                    break;
-                }
-            }
-        }
-    }
-    out
+    elide(&strip_ansi(line), cols, Keep::Head)
 }
 
 #[cfg(test)]
@@ -665,7 +615,7 @@ mod tests {
             name,
             Status::Done {
                 glyph: '\u{2713}',
-                color: SETTLED,
+                color: palette().benign,
                 detail: "1 KB".into(),
             },
             0,
@@ -758,7 +708,7 @@ mod tests {
                     "日本語のパッケージ名がとても長い場合のテスト",
                     Status::Done {
                         glyph: '\u{1f6a9}',
-                        color: SETTLED,
+                        color: palette().benign,
                         detail: "1 KB".into(),
                     },
                     0,
@@ -782,33 +732,5 @@ mod tests {
         assert!(!s.dirty);
         s.stamp();
         assert!(s.dirty);
-    }
-
-    #[test]
-    fn strip_ansi_removes_color_codes() {
-        assert_eq!(strip_ansi("\x1b[38;2;1;2;3mhi\x1b[0m"), "hi");
-    }
-
-    #[test]
-    fn elide_middle_keeps_head_and_tail() {
-        // Fits within the width: returned untouched.
-        assert_eq!(elide_middle("short", 10), "short");
-        // A long URL keeps its host prefix and its filename tail around the
-        // ellipsis, so the version and extension survive the cut.
-        let url = "github.com/be5invis/Iosevka/releases/download/v34.7.0/PkgTTF-IosevkaCurlySlab-34.7.0.zip";
-        let out = elide_middle(url, 34);
-        assert_eq!(
-            out.chars().count(),
-            34,
-            "elided name must fill exactly the column"
-        );
-        assert!(out.starts_with("github.com/"), "host prefix lost: {out}");
-        assert!(out.ends_with(".zip"), "filename tail lost: {out}");
-        assert!(
-            out.contains('\u{2026}'),
-            "no ellipsis marking the cut: {out}"
-        );
-        // Wide characters count double.
-        assert!(elide_middle("ああああああああああ", 9).width() <= 9);
     }
 }

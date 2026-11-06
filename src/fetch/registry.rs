@@ -1,11 +1,23 @@
 //! Fetching one artifact, and what its registry says about it: lookups,
 //! the lookup memo, and the registry record grafted beside a package.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::sync::{Mutex, OnceLock, PoisonError, RwLock};
+
+use cleave::{AnalysisOptions, AnalysisReport};
+use fletch::fetch::{
+    BlobCache, CandidateSource, Coverage, Fetch, FetchError, FetchRecord, Fetched, Outcome,
+    RecordedSource, Request, fetch_ref,
+};
+use fletch::{RefKind, RefLocator, Reference, Registry};
+
+use crate::output::fg;
+
+use super::age_gate::Lookup;
+use super::merge::{Graft, apply_package_composites, merge_registry, payload_name, sub_findings};
+use super::render::{
+    LABEL, LIVE, delivered_bytes, failure_detail, fetch_target, gone_status, report_fetch,
+};
+use super::{Resources, SECS_PER_DAY, locator, shared_resources};
 
 /// The artifact could not be retrieved: the registry refused it, the locator
 /// resolved to no URL, the transport failed, or the budget ran out. The typed
@@ -13,13 +25,13 @@ use super::*;
 ///
 /// A distinct type rather than a message, because the difference between "this
 /// artifact is not available" and "this server is broken" decides an HTTP
-/// status, and a status decides what every caller upstream does next. Beamline
-/// reads a 5xx as a sick server: it opens that server's circuit breaker, moves
-/// the request to the next one, and reports `unavailable` once the fleet is
-/// exhausted — so a package nobody can download, misreported as a 5xx, ejects
-/// healthy servers from the pool and arrives at poppy as an outage rather than
-/// a download failure. A substring of a `Debug`-formatted outcome can be
-/// reworded by accident; the type cannot.
+/// status, and a status decides what every caller upstream does next. A load
+/// balancer reads a 5xx as a sick server: it opens that server's circuit
+/// breaker and moves the request to the next one — so a package nobody can
+/// download, misreported as a 5xx, ejects healthy servers from the pool and
+/// reaches the client as an outage rather than a download failure. A
+/// substring of a `Debug`-formatted outcome can be reworded by accident; the
+/// type cannot.
 #[derive(Debug)]
 pub struct Unretrievable {
     /// What was asked for: the resolved URL, or the locator when there was
@@ -35,13 +47,14 @@ impl Unretrievable {
     /// such release, or there is nothing to fetch it from. Only then is the
     /// registry's record all there is to scan.
     pub(crate) fn gone(&self) -> bool {
-        matches!(
-            &self.outcome,
-            Outcome::Failed(FetchError::Status(404 | 410))
-                | Outcome::Unresolved(
-                    fletch::fetch::Unresolved::NoRelease | fletch::fetch::Unresolved::Unsupported
-                )
-        )
+        match &self.outcome {
+            Outcome::Failed(FetchError::Status(status)) => gone_status(*status),
+            Outcome::Unresolved(reason) => matches!(
+                reason,
+                fletch::fetch::Unresolved::NoRelease | fletch::fetch::Unresolved::Unsupported
+            ),
+            _ => false,
+        }
     }
 
     /// Whether a healthier server may retrieve this artifact. Infrastructure
@@ -55,7 +68,7 @@ impl Unretrievable {
     }
 }
 
-pub(super) fn fetch_infrastructure_failure(error: &FetchError) -> bool {
+fn fetch_infrastructure_failure(error: &FetchError) -> bool {
     matches!(
         error,
         FetchError::Transport(_)
@@ -68,9 +81,9 @@ pub(super) fn fetch_infrastructure_failure(error: &FetchError) -> bool {
 // Registry resolution can turn a failed metadata request into NoRelease.
 // Keep its typed failure scoped to this fetch, without changing Fletch's
 // optional metadata API or mistaking a DNS outage for a missing package.
-pub(super) struct FetchAttempt<'a> {
-    pub(super) net: &'a dyn Fetch,
-    pub(super) failure: Mutex<Option<FetchError>>,
+struct FetchAttempt<'a> {
+    net: &'a dyn Fetch,
+    failure: Mutex<Option<FetchError>>,
 }
 
 impl Fetch for FetchAttempt<'_> {
@@ -178,30 +191,17 @@ pub fn registry_document(reg: &Registry) -> Option<(String, Vec<u8>)> {
 /// from, with relative age stamped. Used by one-shot packages and memo-hit
 /// dependency scans; fletch's blob cache prevents a network refetch.
 #[must_use]
-pub fn registry_with_sources(
-    locator: &RefLocator,
-) -> (Option<Registry>, Vec<fletch::fetch::RecordedSource>) {
-    registry_lookup(locator).map_or((None, Vec::new()), |(record, sources)| {
-        (record.ok(), sources)
-    })
-}
-
-/// [`registry_with_sources`], keeping why there is no record, so a caller can
-/// tell a registry that has no such package ([`fletch::RegistryError::NotFound`])
-/// from one it could not ask. `None` when scan has no fetcher at all.
-#[must_use]
-pub fn registry_lookup(
-    locator: &RefLocator,
-) -> Option<(
-    Result<Registry, fletch::RegistryError>,
-    Vec<fletch::fetch::RecordedSource>,
-)> {
-    let res = shared_resources()?;
+pub fn registry_with_sources(locator: &RefLocator) -> (Option<Registry>, Vec<RecordedSource>) {
+    let Some(res) = shared_resources() else {
+        return (None, Vec::new());
+    };
     let (record, sources) = fletch::registry::lookup_recorded(locator, &*res.net, &res.cache);
-    Some((
-        record.map(|reg| reg.with_age(crate::civil::now_secs())),
+    (
+        record
+            .ok()
+            .map(|reg| reg.with_age(crate::civil::now_secs())),
         sources,
-    ))
+    )
 }
 
 /// One-shot `pkg:`/`url`: graft the root artifact's own registry metadata into
@@ -313,14 +313,13 @@ pub(super) const REGISTRY_MEMO_TTL_SECS: u64 = 30 * 60;
 /// alone is 40-80 KB). Dependency sets cluster in time, so an LRU of a few
 /// thousand serves the same hit rate; a miss falls through to fletch's blob
 /// cache.
-pub(super) const REGISTRY_MEMO_CAPACITY: std::num::NonZeroUsize =
-    match std::num::NonZeroUsize::new(4096) {
-        Some(n) => n,
-        None => std::num::NonZeroUsize::MIN,
-    };
+const REGISTRY_MEMO_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(4096) {
+    Some(n) => n,
+    None => std::num::NonZeroUsize::MIN,
+};
 
-/// Release-cadence window `Registry::with_age` looks back over (48 h).
-pub(super) const RELEASE_CADENCE_WINDOW_SECS: u64 = 172_800;
+/// Release-cadence window `Registry::with_age` looks back over: two days.
+const RELEASE_CADENCE_WINDOW_SECS: u64 = 2 * SECS_PER_DAY;
 
 /// Look up each declared dependency's registry record, returning one slot per
 /// input ref in `selected` order. A non-dependency ref, or one whose record
@@ -329,7 +328,7 @@ pub(super) const RELEASE_CADENCE_WINDOW_SECS: u64 = 172_800;
 /// Fresh misses use `registry_with_sources` once, so the normalized record and
 /// provenance come from one lookup. The process memo deliberately retains only
 /// the small record; a memo hit leaves the provider documents in fletch's blob
-/// cache, read again only for a record that is kept (see [`Gated::sources`])
+/// cache, read again only for a record that is kept (see [`Gated::sources`](super::age_gate::Gated::sources))
 /// rather than pinned in a long-lived daemon's heap or re-read for every hit.
 pub(super) fn lookup_registries(
     selected: &[Reference],
@@ -442,7 +441,7 @@ pub(super) fn registry_node(reg: &Registry, opts: &AnalysisOptions) -> Option<An
             Some(sub)
         }
         Err(e) => {
-            tracing::warn!(package = %reg.name, "registry metadata analysis failed: {e:#}");
+            tracing::warn!(package = %reg.name, error = format!("{e:#}"), "registry metadata analysis failed");
             None
         }
     }
@@ -452,7 +451,7 @@ pub(super) fn registry_node(reg: &Registry, opts: &AnalysisOptions) -> Option<An
 /// .json`, with path-unsafe characters folded to `_` so a scoped or `vendor/pkg`
 /// name can't escape into a directory. The `.registry.json` suffix is what
 /// filefacts detects.
-pub(super) fn registry_doc_name(reg: &Registry) -> String {
+fn registry_doc_name(reg: &Registry) -> String {
     let stem = if reg.version.is_empty() {
         reg.name.clone()
     } else {

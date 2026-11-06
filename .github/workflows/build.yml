@@ -294,14 +294,14 @@ jobs:
         if: matrix.test
         run: cargo test --locked --lib
 
-      - name: CLI integration tests (including live R2 updates)
+      - name: CLI integration tests (including live rule updates)
         if: matrix.test
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
           if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
-          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
+          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke -- --include-ignored
 
       # --- macOS signing ------------------------------------------------------
       # Unsigned path: an ad-hoc signature, matching what `make release` does on
@@ -1293,13 +1293,13 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: file "target/$TARGET/$PROFILE/atomscan.exe"
 
-      - name: CLI integration tests (including live R2 updates)
+      - name: CLI integration tests (including live rule updates)
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
           if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
-          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
+          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke -- --include-ignored
 
       - name: Smoke test
         env:

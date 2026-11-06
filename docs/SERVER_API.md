@@ -124,9 +124,7 @@ this server's `--level`. `decision` is `block` when `fires_at` is at or below
 the budget. `severity` is `benign`, `suspicious` or `hostile`, independent of
 the budget.
 
-For a pool of `N` benign files, L0 allows zero observed false positives. Every positive level `L` has a continuous allowance of `1 + (L - 1) * N / 100_000_000`; an integer FP-count budget rounds this down. L1 allows one FP. L25 means one FP plus an estimated additional 24 per 100 million benign files (approximately “one plus 25 per 100 million”). The initial FP belongs to the decision pool, not to each component model or each scan invocation.
-
-These are calibration targets, not guaranteed future rates. Small pools need interpolation or extrapolation to estimate finer rate differences; observed counts, estimated rates, and uncertainty must remain separate. L0 means zero observed calibration FPs, not zero future risk. See the [shared level definition](https://github.com/atomdrift-project/collimator/blob/main/LEVELS.md).
+Levels are defined in [INTEGRATION.md](INTEGRATION.md#set-the-false-positive-level).
 
 ### `POST /v1/analyze`
 

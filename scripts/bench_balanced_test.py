@@ -1,6 +1,5 @@
 """Exercise the benchmark runner without scanning real samples."""
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,7 +9,6 @@ import unittest
 RUNNER = Path(__file__).resolve().parent / 'bench-balanced.py'
 
 
-@unittest.skipUnless(sys.platform == 'linux', 'Linux helper affinity')
 class BalancedBenchmarkTest(unittest.TestCase):
     def test_training_interrupt_flushes_but_never_passes(self):
         with tempfile.TemporaryDirectory(prefix='balanced-interrupt-') as tmp:
@@ -65,54 +63,24 @@ class BalancedBenchmarkTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, expected, result.stderr)
 
-    def test_helper_environment_and_failed_series(self):
-        with tempfile.TemporaryDirectory(prefix='balanced-harness-') as tmp:
+    def test_a_series_fails_when_any_run_misses_the_limit(self):
+        with tempfile.TemporaryDirectory(prefix='balanced-series-') as tmp:
             root = Path(tmp)
-            corpus = root / 'corpus'
-            corpus.mkdir()
-            with (corpus / 'large.bin').open('wb') as sample:
-                sample.truncate(17 * 1024 * 1024)
-            helper = root / 'fake rizin'
-            helper.write_text(
-                f'#!{sys.executable}\nimport os,json\n'
-                'print(json.dumps(sorted(os.sched_getaffinity(0))))\n'
-            )
-            helper.chmod(0o755)
+            sample = root / 'sample.bin'
+            sample.write_bytes(b'test')
             scanner = root / 'scanner'
-            scanner.write_text(
-                f'#!{sys.executable}\nimport os,json,subprocess,sys\n'
-                'from pathlib import Path\n'
-                'p=next(Path(sys.argv[-1]).iterdir())\n'
-                'r=subprocess.check_output(["rizin",str(p)],'
-                'env={"PATH":os.environ["PATH"]},text=True)\n'
-                'print(json.dumps(dict(scanner_affinity=sorted(os.sched_getaffinity(0)),'
-                'helper_affinity=json.loads(r))))\n'
-            )
+            scanner.write_text(f'#!{sys.executable}\nprint("{{}}")\n')
             scanner.chmod(0o755)
-            core = min(os.sched_getaffinity(0))
-            topology = Path(f'/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list')
-            siblings = set()
-            for part in topology.read_text().strip().split(','):
-                bounds = part.split('-')
-                siblings.update(range(int(bounds[0]), int(bounds[-1]) + 1))
-            if not os.sched_getaffinity(0) - siblings:
-                self.skipTest('requires a second physical core')
             prefix = root / 'result'
             result = subprocess.run(
-                [sys.executable, str(RUNNER), str(corpus), '--binary', str(scanner),
-                 '--rizin', str(helper), '--native-cpus', str(core), '--runs', '2',
-                 '--limit', '0.000001', '--output', str(prefix)],
+                [sys.executable, str(RUNNER), str(sample), '--binary', str(scanner),
+                 '--runs', '2', '--limit', '0.000001', '--output', str(prefix)],
                 capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
             summary = json.loads(Path(f'{prefix}.series.json').read_text())
             self.assertEqual(len(summary['measurements']), 2)
             self.assertFalse(summary['all_passed'])
-            for run in (1, 2):
-                record = json.loads(Path(f'{prefix}.run{run}.jsonl').read_text())
-                self.assertEqual(record['helper_affinity'], [core])
-                self.assertTrue(siblings.isdisjoint(record['scanner_affinity']))
-                self.assertTrue(Path(f'{prefix}.run{run}.rizin/starts.jsonl').exists())
 
 
 if __name__ == '__main__':

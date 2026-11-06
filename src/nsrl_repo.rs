@@ -8,21 +8,21 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use burton::{Filter, Manifest};
+use burton::{Kind, MANIFEST_FILE, Manifest, Tier};
 
 use crate::bundle::{self, Bundle};
 
 /// NSRL's digest-only identity; deliberately separate from Scan's PURL bundle.
-pub const KEY_SCHEME: &str = "nsrl/sha256/v1";
-const PREFIX: &str = "nsrl/modern/v1";
-/// The manifest, published and installed beside the filters.
-const SIDECAR: &str = "bloom.toml";
+pub(crate) const KEY_SCHEME: &str = "nsrl/sha256/v1";
+/// Moves with the bundle format, so a build never fetches a bundle it cannot
+/// read: `v1` carries the format-1 bundles pre-release builds read.
+const PREFIX: &str = "nsrl/modern/v2";
 
 /// Where the separately installed NSRL bundle lives.
 ///
 /// # Errors
 /// When there is no override and no data directory; see [`crate::data_dir`].
-pub fn install_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn install_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::data_dir()?.join("nsrl-modern"))
 }
 
@@ -39,17 +39,14 @@ pub fn installed_manifest() -> Option<Manifest> {
 /// Upstream NSRL release version, independent of Scan and the ADBL layout.
 #[must_use]
 pub fn installed_release() -> Option<String> {
-    let text = std::fs::read_to_string(install_dir().ok()?.join(SIDECAR)).ok()?;
-    source_release(&text)
+    let manifest = burton::read_manifest(install_dir().ok()?).ok()??;
+    source_release(&manifest).map(str::to_owned)
 }
 
-fn source_release(text: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Version {
-        release: String,
-    }
-    let version = toml::from_str::<Version>(text).ok()?.release;
-    release_key(&version)?;
+/// The NIST release Pulsar recorded in the manifest's provenance, if valid.
+fn source_release(manifest: &Manifest) -> Option<&str> {
+    let version = manifest.provenance.get("release")?.as_str()?;
+    release_key(version)?;
     Some(version)
 }
 
@@ -72,22 +69,28 @@ pub(crate) fn open(dir: &Path) -> Result<burton::Lookup> {
     burton::Lookup::open(dir, KEY_SCHEME).context("opening NSRL bundle")
 }
 
+/// NSRL vouches for digests and nothing else: every slot of the bundle is
+/// present, as burton requires, but only `sha256-good` holds keys. Each file
+/// is named for its content, so a client mid-update never mixes releases.
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
-    if manifest.schema != 1
-        || manifest.key_scheme.as_deref() != Some(KEY_SCHEME)
-        || manifest.filter.len() != 2
+    if manifest.schema != burton::MANIFEST_SCHEMA
+        || manifest.key_scheme != KEY_SCHEME
+        || manifest.filter.len() != Kind::ALL.len() * Tier::ALL.len()
         || crate::output::parse_ymd(&manifest.built).is_none()
     {
         bail!("unsupported NSRL manifest identity or schema");
     }
-    for (stem, must_be_empty) in [("sha256-good", false), ("sha256-bad", true)] {
-        let entry = manifest.filter.get(stem).context("missing NSRL filter")?;
-        if entry.format_version != 1
-            || burton::parse_sha256_hex(&entry.sha256).is_none()
-            || entry.file != format!("{stem}-{}.adbl", entry.sha256)
-            || (entry.n == 0) != must_be_empty
-        {
-            bail!("invalid NSRL filter {stem}");
+    for kind in Kind::ALL {
+        for tier in Tier::ALL {
+            let stem = format!("{kind}-{tier}");
+            let entry = manifest.filter.get(&stem).context("missing NSRL filter")?;
+            let must_be_empty = (kind, tier) != (Kind::Sha256, Tier::Good);
+            if burton::parse_sha256_hex(&entry.sha256).is_none()
+                || entry.file != format!("{stem}-{}.adbl", entry.sha256)
+                || (entry.n == 0) != must_be_empty
+            {
+                bail!("invalid NSRL filter {stem}");
+            }
         }
     }
     Ok(())
@@ -98,23 +101,15 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
 ///
 /// # Errors
 /// Returns download, integrity, format, or installation failures.
-pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
+pub(crate) fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
     bundle::update::<Nsrl>(dir, force, quiet)
-}
-
-/// Check availability without downloading the filter bit arrays.
-///
-/// # Errors
-/// Returns manifest download or validation errors.
-pub fn check(dir: &Path) -> Result<()> {
-    bundle::check::<Nsrl>(dir)
 }
 
 /// The NSRL filters, as [`bundle::update`] installs them.
 struct Nsrl;
 
-/// A validated manifest, with its text: the sidecar keeps the release and
-/// provenance fields beyond Burton's shared filter schema.
+/// A validated manifest, with its text as published, written back verbatim
+/// as the sidecar.
 struct Release {
     manifest: Manifest,
     text: String,
@@ -125,8 +120,8 @@ impl Release {
     fn parse(text: String) -> Result<Self> {
         let manifest: Manifest = toml::from_str(&text).context("parsing NSRL manifest")?;
         validate_manifest(&manifest)?;
-        let release = source_release(&text)
-            .and_then(|version| release_key(&version))
+        let release = source_release(&manifest)
+            .and_then(release_key)
             .context("missing or invalid NSRL release version")?;
         Ok(Self {
             manifest,
@@ -142,13 +137,13 @@ impl Bundle for Nsrl {
     type Remote = Release;
 
     fn installed(dir: &Path) -> Option<Release> {
-        Release::parse(std::fs::read_to_string(dir.join(SIDECAR)).ok()?).ok()
+        Release::parse(std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()
     }
 
     fn fetch(http: &bundle::Http) -> Result<Release> {
         Release::parse(bundle::manifest(
             http,
-            &bundle::url(&format!("{PREFIX}/{SIDECAR}")),
+            &bundle::url(&format!("{PREFIX}/{MANIFEST_FILE}")),
         )?)
     }
 
@@ -191,10 +186,6 @@ impl Bundle for Nsrl {
             remote.manifest.built
         )
     }
-
-    fn describe_installed(have: &Release) -> String {
-        Self::describe(have)
-    }
 }
 
 fn release_name([year, month, patch]: [u32; 3]) -> String {
@@ -204,20 +195,8 @@ fn release_name([year, month, patch]: [u32; 3]) -> String {
 /// Download, verify, and validate both filters into `staging` from `base`,
 /// then write the manifest beside them, and prove the whole bundle opens.
 fn stage(staging: &Path, http: &bundle::Http, base: &str, remote: &Release) -> Result<()> {
-    for (stem, entry) in &remote.manifest.filter {
-        // `validate_manifest` pinned the name to `<stem>-<sha256>.adbl`.
-        let path = staging.join(&entry.file);
-        let url = format!("{base}/{}", entry.file);
-        bundle::download_to(http, &url, &entry.sha256, &path)?;
-        let filter = Filter::load(std::fs::read(&path)?).context("invalid NSRL filter")?;
-        if filter.stem() != *stem
-            || filter.version() != entry.format_version
-            || filter.len() != entry.n
-        {
-            bail!("NSRL filter header disagrees with manifest");
-        }
-    }
-    std::fs::write(staging.join(SIDECAR), &remote.text).context("writing NSRL sidecar")?;
+    bundle::stage_filters(staging, http, base, &remote.manifest)?;
+    std::fs::write(staging.join(MANIFEST_FILE), &remote.text).context("writing NSRL sidecar")?;
     open(staging)?;
     Ok(())
 }
@@ -226,40 +205,47 @@ fn stage(staging: &Path, http: &bundle::Http, base: &str, remote: &Release) -> R
 mod tests {
     use super::*;
 
+    /// Every slot of an NSRL manifest, content-addressed, with `sha256-good`
+    /// holding `good` keys and the rest empty.
+    fn manifest(built: &str, version: &str, good: u64) -> Manifest {
+        let mut filter = std::collections::BTreeMap::new();
+        for kind in Kind::ALL {
+            for tier in Tier::ALL {
+                let stem = format!("{kind}-{tier}");
+                let n = if (kind, tier) == (Kind::Sha256, Tier::Good) {
+                    good
+                } else {
+                    0
+                };
+                let sha256 = "a".repeat(64);
+                let file = format!("{stem}-{sha256}.adbl");
+                filter.insert(stem, burton::Entry { file, sha256, n });
+            }
+        }
+        Manifest {
+            schema: burton::MANIFEST_SCHEMA,
+            built: built.to_owned(),
+            key_scheme: KEY_SCHEME.to_owned(),
+            provenance: toml::from_str(&format!("release = \"{version}\"")).unwrap(),
+            filter,
+        }
+    }
+
+    fn release(built: &str, version: &str) -> Release {
+        Release::parse(toml::to_string(&manifest(built, version, 100)).unwrap()).unwrap()
+    }
+
     #[test]
     fn release_order_is_numeric_and_independent_of_layout_and_build_date() {
         assert!(release_key("2026.09.10") > release_key("2026.09.2"));
         assert!(release_key("2027.03.1") > release_key("2026.12.1"));
         assert!(release_key("2026.13.1").is_none());
         assert!(release_key("2026.09").is_none());
-        assert_eq!(
-            source_release("release = \"2026.09.1\"\n"),
-            Some("2026.09.1".to_owned())
-        );
-    }
-
-    fn release(built: &str, version: &str) -> Release {
-        let entry = |stem: &str, n: u64| burton::Entry {
-            file: format!("{stem}-{}.adbl", "a".repeat(64)),
-            sha256: "a".repeat(64),
-            format_version: 1,
-            n,
-        };
-        let manifest = Manifest {
-            schema: 1,
-            built: built.to_owned(),
-            key_scheme: Some(KEY_SCHEME.to_owned()),
-            filter: [
-                ("sha256-good".to_owned(), entry("sha256-good", 100)),
-                ("sha256-bad".to_owned(), entry("sha256-bad", 0)),
-            ]
-            .into(),
-        };
-        let text = format!(
-            "release = \"{version}\"\n{}",
-            toml::to_string(&manifest).unwrap()
-        );
-        Release::parse(text).unwrap()
+        let m = manifest("2026-09-01", "2026.09.1", 1);
+        assert_eq!(source_release(&m), Some("2026.09.1"));
+        let mut unreleased = m;
+        unreleased.provenance.clear();
+        assert_eq!(source_release(&unreleased), None);
     }
 
     #[test]
@@ -308,39 +294,57 @@ mod tests {
 
     #[test]
     fn reads_the_pulsar_go_builders_adbl_wire_vector() {
-        // Same independent fixture as pulsar/cmd/nsrl-bloom's wire test.
+        // The vector pulsar/cmd/nsrl-bloom's wire test and burton's
+        // matches_the_shared_wire_vector share, computed from burton's
+        // FORMAT.md by a separate implementation: format 3, a one-block
+        // `sha256-good` holding the key with lanes 5, 2, 0, 0, and every other
+        // slot empty.
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
-        let good = vec![
-            b'A', b'D', b'B', b'L', 1, 0, 3, 1, 10, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0x49, 0x92, 0x24, 0x01, 0, 0, 0,
-        ];
-        let mut bad = good.clone();
-        bad[7] = 2;
-        bad[20] = 0;
-        bad[36..].fill(0);
-        let mut manifest = Manifest {
-            schema: 1,
-            built: "2026-09-01".to_owned(),
-            key_scheme: Some(KEY_SCHEME.to_owned()),
-            filter: Default::default(),
-        };
-        for (stem, bytes, n) in [("sha256-good", good, 1), ("sha256-bad", bad, 0)] {
-            let sha256 = format!("{:x}", Sha256::digest(&bytes));
-            let file = format!("{stem}-{sha256}.adbl");
-            std::fs::write(dir.path().join(&file), bytes).unwrap();
-            manifest.filter.insert(
-                stem.to_owned(),
-                burton::Entry {
-                    file,
-                    sha256,
-                    n,
-                    format_version: 1,
-                },
-            );
+        let mut good = vec![0u8; 2 * 4096];
+        good[..21].copy_from_slice(&[
+            b'A', b'D', b'B', b'L', 3, 0, 3, 1, 10, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        for (at, byte) in [
+            (280, 4),
+            (2153, 8),
+            (2317, 32),
+            (2432, 1),
+            (3018, 4),
+            (3290, 64),
+            (3741, 32),
+            (3755, 1),
+            (3942, 4),
+            (4057, 128),
+        ] {
+            good[4096 + at] = byte;
+        }
+        let mut manifest = manifest("2026-09-01", "2026.09.1", 1);
+        for (kind_byte, kind) in [(1u8, Kind::Purl), (3, Kind::Sha256)] {
+            for (tier_byte, tier) in [
+                (1u8, Tier::Good),
+                (2, Tier::Bad),
+                (4, Tier::SightedHostile),
+                (5, Tier::SightedSuspicious),
+            ] {
+                let mut bytes = good.clone();
+                if (kind, tier) != (Kind::Sha256, Tier::Good) {
+                    bytes[6] = kind_byte;
+                    bytes[7] = tier_byte;
+                    bytes[20] = 0;
+                    bytes[4096..].fill(0);
+                }
+                let stem = format!("{kind}-{tier}");
+                let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                let file = format!("{stem}-{sha256}.adbl");
+                std::fs::write(dir.path().join(&file), bytes).unwrap();
+                let entry = manifest.filter.get_mut(&stem).unwrap();
+                entry.file = file;
+                entry.sha256 = sha256;
+            }
         }
         std::fs::write(
-            dir.path().join("bloom.toml"),
+            dir.path().join(MANIFEST_FILE),
             toml::to_string(&manifest).unwrap(),
         )
         .unwrap();
@@ -361,27 +365,25 @@ mod tests {
 
     #[test]
     fn accepts_only_content_addressed_digest_filters_from_nsrl() {
-        let entry = |stem: &str, n: u64| burton::Entry {
-            file: format!("{stem}-{}.adbl", "a".repeat(64)),
-            sha256: "a".repeat(64),
-            format_version: 1,
-            n,
-        };
-        let mut manifest = Manifest {
-            schema: 1,
-            built: "2026-09-01".to_owned(),
-            key_scheme: Some(KEY_SCHEME.to_owned()),
-            filter: [
-                ("sha256-good".to_owned(), entry("sha256-good", 100)),
-                ("sha256-bad".to_owned(), entry("sha256-bad", 0)),
-            ]
-            .into(),
-        };
+        let mut manifest = manifest("2026-09-01", "2026.09.1", 100);
         assert!(validate_manifest(&manifest).is_ok());
-        manifest.key_scheme = Some(crate::bloom_repo::KEY_SCHEME.to_owned());
+        manifest.key_scheme = crate::bloom_repo::KEY_SCHEME.to_owned();
         assert!(validate_manifest(&manifest).is_err());
-        manifest.key_scheme = Some(KEY_SCHEME.to_owned());
+        manifest.key_scheme = KEY_SCHEME.to_owned();
         manifest.filter.get_mut("sha256-good").unwrap().file = "../../bad.adbl".to_owned();
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    /// NSRL holds digests only: keys in any other slot, or a missing slot,
+    /// mean the bundle is not the one Pulsar publishes.
+    #[test]
+    fn an_nsrl_bundle_keys_only_sha256_good_and_has_every_slot() {
+        let mut keyed = manifest("2026-09-01", "2026.09.1", 100);
+        keyed.filter.get_mut("purl-good").unwrap().n = 3;
+        assert!(validate_manifest(&keyed).is_err());
+        let mut partial = manifest("2026-09-01", "2026.09.1", 100);
+        partial.filter.remove("sha256-sighted-suspicious");
+        assert!(validate_manifest(&partial).is_err());
+        assert!(validate_manifest(&manifest("2026-09-01", "2026.09.1", 0)).is_err());
     }
 }

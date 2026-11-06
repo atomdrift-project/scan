@@ -6,11 +6,22 @@
     reason = "feature values are narrowed to the model's f32 input dtype"
 )]
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+
+use super::report::{FileSummary, FindingSummary, ParsedReport, RawNeeds, ranked_ngram_paths};
+use super::spec::{FeatureSpec, KEY_METRICS, KeywordSource};
+use super::structure::{
+    MetricMap, derived_metric, write_derived_metric_features, write_external_summary_features,
+    write_format_hint_features, write_intent_gap_features, write_logic_gap_features,
+    write_negative_space_features, write_silent_packer_signal, write_structural_extensions,
+    write_structural_features, write_suspicious_ngram_counts, write_symbol_features,
+};
+use super::write::{
+    ranked_tiered_path_tokens, write_aggregate_features, write_crit_ngrams, write_ngrams,
+    write_optional_finding_features,
+};
+use super::{CRIT_BASELINE, EXTENDED_KEYWORD_ABI, FeatureWriter, METRIC_TRANSFORM_ABI};
 
 /// One `metrics:` feature resolved to its slot: the value at
 /// `metrics[group][field]`, optionally `ln(|v| + 1)`-scaled.
@@ -27,9 +38,10 @@ pub(super) struct MetricSlot {
 /// Pre-built lookup tables for fast repeated extraction against a spec.
 #[derive(Debug)]
 pub struct ExtractContext {
+    /// A description-keyword model refuses a finding with no description.
     pub(super) strict_keyword_descriptions: bool,
-    pub(super) keyword_slots: HashMap<String, HashMap<String, usize>>,
-    pub(super) ranked_ngrams: bool,
+    pub(super) keyword_slots: HashMap<KeywordSource, HashMap<String, usize>>,
+    /// Archive structure is measured relative to the sample, not absolutely.
     pub(super) relative_structure: bool,
     pub(super) explicit_metrics: bool,
     pub(super) metric_reference_year: u32,
@@ -87,41 +99,7 @@ impl ExtractContext {
             .enumerate()
             .map(|(i, s)| (s.clone(), i))
             .collect();
-
-        // Optimized bigram/trigram lookups
-        let mut path_to_id = HashMap::new();
-        let mut next_id = 0u32;
-        let mut get_id = |path: &str| {
-            if let Some(&id) = path_to_id.get(path) {
-                id
-            } else {
-                let id = next_id;
-                path_to_id.insert(path.to_string(), id);
-                next_id += 1;
-                id
-            }
-        };
-
-        let mut bigram_id_lookup = HashMap::new();
-        for (i, bi_str) in spec.bigram_vocab.iter().enumerate() {
-            let parts: Vec<&str> = bi_str.split(" + ").collect();
-            if parts.len() == 2 {
-                let id1 = get_id(parts[0]);
-                let id2 = get_id(parts[1]);
-                bigram_id_lookup.insert((id1.min(id2), id1.max(id2)), i);
-            }
-        }
-
-        let mut trigram_id_lookup = HashMap::new();
-        for (i, tri_str) in spec.trigram_vocab.iter().enumerate() {
-            let parts: Vec<&str> = tri_str.split(" + ").collect();
-            if parts.len() == 3 {
-                let mut ids = [get_id(parts[0]), get_id(parts[1]), get_id(parts[2])];
-                ids.sort_unstable();
-                trigram_id_lookup.insert((ids[0], ids[1], ids[2]), i);
-            }
-        }
-
+        let (path_to_id, bigram_id_lookup, trigram_id_lookup) = ngram_id_lookups(spec);
         let absolute_lookup: HashMap<String, usize> = spec
             .feature_names
             .iter()
@@ -131,18 +109,11 @@ impl ExtractContext {
 
         // Resolve each offset-written family (presence, max-crit, bigram, trigram,
         // unsigned-bigram) to the real `feature_names` slot of every vocab member,
-        // by NAME, rather than assuming a contiguous `base + idx` run. This is
-        // robust to any model layout the spec presents:
-        //   * fully absent  — the family was pruned/disabled in the spec; every
-        //     entry maps to `None` and the writer skips it (model trained without
-        //     it — correct, not an error).
-        //   * a SUBSET of its (often shared) vocab — e.g. an allowlist prune drops
-        //     some `maxcrit:`/`unsigned_bigram:` names while keeping the
-        //     `present:`/`bigrams:` ones that share the same vocab. The dropped
-        //     entries map to `None`; the present ones each map to their true slot,
-        //     so writes never land on the wrong feature. No 1:1 contiguous block
-        //     is required, so scan accepts pruned/reordered bundles instead of
-        //     rejecting them.
+        // by NAME, rather than assuming a contiguous `base + idx` run. A family
+        // pruned from the spec maps every entry to `None` and is skipped; a
+        // family that keeps only a SUBSET of its (often shared) vocab maps each
+        // kept member to its true slot, so writes never land on the wrong
+        // feature.
         let family_slots = |prefix: &str, vocab: &[String]| -> Vec<Option<usize>> {
             vocab
                 .iter()
@@ -157,28 +128,11 @@ impl ExtractContext {
 
         let has_prefix = |prefix: &str| spec.feature_names.iter().any(|n| n.starts_with(prefix));
         let has_name = |name: &str| absolute_lookup.contains_key(name);
-
-        let keyword_slots = spec
-            .keyword_vocabs
-            .iter()
-            .filter_map(|(source, words)| {
-                let slots: HashMap<String, usize> = words
-                    .iter()
-                    .filter_map(|word| {
-                        absolute_lookup
-                            .get(&format!("{source}:{word}"))
-                            .map(|&slot| (word.clone(), slot))
-                    })
-                    .collect();
-                (!slots.is_empty()).then(|| (source.clone(), slots))
-            })
-            .collect();
         Self {
-            strict_keyword_descriptions: spec.abi_version < 23,
-            keyword_slots,
+            strict_keyword_descriptions: spec.abi_version < EXTENDED_KEYWORD_ABI,
+            keyword_slots: keyword_slots(spec, &absolute_lookup),
             trait_path_depth: spec.trait_path_depth,
-            ranked_ngrams: spec.feature_semantics_abi() >= 20,
-            relative_structure: spec.feature_semantics_abi() >= 21,
+            relative_structure: spec.feature_semantics_abi() >= METRIC_TRANSFORM_ABI,
             explicit_metrics: spec.metric_transforms.is_some(),
             metric_reference_year: spec.metric_reference_year,
             tiered_min_crit: spec.tiered_min_crit,
@@ -202,17 +156,7 @@ impl ExtractContext {
             symbols: has_prefix("symbol:") || has_prefix("symbol_bi:") || has_prefix("symbol_tri:"),
             symbol_bigrams: has_prefix("symbol_bi:"),
             symbol_trigrams: has_prefix("symbol_tri:"),
-            tiered_slots: spec
-                .feature_names
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, name)| {
-                    let (family, value) = name.split_once(':')?;
-                    ["tierbi", "tiertri", "tierquad"]
-                        .contains(&family)
-                        .then(|| (slot, value.split(" + ").map(str::to_owned).collect()))
-                })
-                .collect(),
+            tiered_slots: tiered_slots(spec),
             optional_finding_features: has_prefix("mbc:")
                 || has_prefix("agg:docobf_")
                 || [
@@ -253,13 +197,18 @@ impl ExtractContext {
             kv_shape: self.kv_shape,
             kv_split: self.kv_split,
             symbol: self.symbols,
-            rule_keywords: self.keyword_slots.contains_key("ruleword"),
-            description_keywords: self.keyword_slots.contains_key("descword")
-                || self.keyword_slots.contains_key("ruletextword"),
-            full_rule_keywords: self.keyword_slots.contains_key("fullword")
-                || self.keyword_slots.contains_key("ruletextword"),
-            context_keywords: self.keyword_slots.contains_key("contextword"),
+            rule_keywords: self.reads(KeywordSource::RuleId),
+            description_keywords: self.reads(KeywordSource::Description)
+                || self.reads(KeywordSource::IdAndDescription),
+            full_rule_keywords: self.reads(KeywordSource::FullId)
+                || self.reads(KeywordSource::IdAndDescription),
+            context_keywords: self.reads(KeywordSource::Context),
         }
+    }
+
+    /// Whether this route has a slot for any word of `source`.
+    pub(super) fn reads(&self, source: KeywordSource) -> bool {
+        self.keyword_slots.contains_key(&source)
     }
 
     /// Allocate and fill this route's feature vector from a shared [`ParsedReport`].
@@ -277,7 +226,7 @@ impl ExtractContext {
     /// The parse is route-independent (see [`ParsedReport`]); only the writes
     /// below depend on this context's vocab/slots. Families are written in
     /// layout order.
-    pub(super) fn write_features(&self, parsed: &ParsedReport, vec: &mut [f32]) {
+    fn write_features(&self, parsed: &ParsedReport, vec: &mut [f32]) {
         let summaries = parsed.summaries.as_slice();
         let combined = &parsed.combined;
         let w = &mut FeatureWriter {
@@ -296,7 +245,8 @@ impl ExtractContext {
         write_ngrams(w, &parsed.mbc_codes, "mbcbi:", "mbctri:", "MBC");
         write_external_summary_features(combined, w); // G4
         self.write_metric_features(&parsed.merged_metrics, summaries, w); // G5
-        // G6 (filetype one-hots) is blindfolded since v16.
+        // G6 (filetype one-hots) is never written: models are trained blind
+        // to the file type.
         write_format_hint_features(summaries, w); // G6b
         write_structural_features(w, summaries, combined.filtered_finding_count); // G7
         self.write_formula_features(parsed, w); // G8–G10, G12–G14
@@ -309,25 +259,12 @@ impl ExtractContext {
             {
                 continue;
             }
-            let tokens = if self.ranked_ngrams {
-                std::borrow::Cow::Owned(ranked_tiered_path_tokens(
-                    combined,
-                    self.tiered_min_crit[index],
-                    &self.tiered_branch_min_crit,
-                    order,
-                ))
-            } else if self.tiered_min_crit[index] == 3 && self.tiered_branch_min_crit.is_empty() {
-                std::borrow::Cow::Borrowed(parsed.tiered_tokens.as_slice())
-            } else {
-                std::borrow::Cow::Owned(tiered_path_tokens_with_options(
-                    combined,
-                    self.tiered_min_crit[index],
-                    &self.tiered_branch_min_crit,
-                ))
-            };
-            if tokens.len() > if order == 4 { 64 } else { 512 } {
-                continue;
-            }
+            let tokens = ranked_tiered_path_tokens(
+                combined,
+                self.tiered_min_crit[index],
+                &self.tiered_branch_min_crit,
+                order,
+            );
             for (slot, parts) in &self.tiered_slots {
                 if parts.len() == order
                     && parts.iter().all(|part| tokens.binary_search(part).is_ok())
@@ -369,7 +306,7 @@ impl ExtractContext {
 
     /// G1 presence and G2 max-criticality, per sample path, weighted by the
     /// sample's risk score and the path's best confidence.
-    pub(super) fn write_path_features(
+    fn write_path_features(
         &self,
         summary: &FindingSummary,
         sample_score: i64,
@@ -400,7 +337,7 @@ impl ExtractContext {
     }
 
     /// G5: the base [`KEY_METRICS`] then the spec's extended metric vocab.
-    pub(super) fn write_metric_features(
+    fn write_metric_features(
         &self,
         metrics: &MetricMap,
         summaries: &[FileSummary],
@@ -425,7 +362,8 @@ impl ExtractContext {
                     .copied()
                     .unwrap_or(0.0)
             };
-            // Legacy models retain their f32-before-log contract.
+            // A spec without explicit transforms was trained on the f32 value,
+            // logged after narrowing.
             let output = if self.explicit_metrics {
                 (if m.log { value.abs().ln_1p() } else { value }) as f32
             } else {
@@ -443,7 +381,7 @@ impl ExtractContext {
     /// G8 elements, G9 formula, G10 score, G12 ghost, G13 skeleton and G14
     /// rare elements: the families read off the primary file's formula and
     /// risk score.
-    pub(super) fn write_formula_features(&self, parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
+    fn write_formula_features(&self, parsed: &ParsedReport, w: &mut FeatureWriter<'_>) {
         let combined = &parsed.combined;
         let formula_str = parsed.formula_str.as_str();
         let elements_str = parsed.elements_str.as_str();
@@ -528,10 +466,6 @@ impl ExtractContext {
         for s in summaries {
             let ids = self.sorted_path_ids(s, 512);
             let n = ids.len();
-            if n > 512 {
-                tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping bigram generation for file");
-                continue;
-            }
             let mut mark = |idx: usize| {
                 if let Some(&Some(slot)) = slots.get(idx) {
                     w.set_slot(slot, 1.0);
@@ -558,17 +492,11 @@ impl ExtractContext {
         }
     }
 
-    /// The vocab ids of the file's n-gram base paths, ascending — the order
-    /// the bigram and trigram lookup keys are built in.
+    /// The vocab ids of the file's strongest `rank_limit` n-gram base paths,
+    /// ascending — the order the bigram and trigram lookup keys are built in.
+    /// The limit bounds the pair and triple probes.
     fn sorted_path_ids(&self, s: &FileSummary, rank_limit: usize) -> Vec<u32> {
-        let ranked;
-        let paths = if self.ranked_ngrams {
-            ranked = ranked_ngram_paths(&s.raw_findings, rank_limit);
-            &ranked
-        } else {
-            &s.unique_3level_paths
-        };
-        let mut ids: Vec<u32> = paths
+        let mut ids: Vec<u32> = ranked_ngram_paths(&s.raw_findings, rank_limit)
             .iter()
             .filter_map(|p| self.path_to_id.get(p).copied())
             .collect();
@@ -585,10 +513,6 @@ impl ExtractContext {
         for s in summaries {
             let ids = self.sorted_path_ids(s, 128);
             let n = ids.len();
-            if n > 256 {
-                tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
-                continue;
-            }
             let mut mark = |idx: usize| {
                 if let Some(&Some(slot)) = self.trigram_slots.get(idx) {
                     w.set_slot(slot, 1.0);
@@ -616,10 +540,83 @@ impl ExtractContext {
     }
 }
 
+/// Interned ids of the n-gram base paths, and the bigram and trigram vocabs
+/// keyed by their sorted id tuples, so a file's pairs are probed by integer.
+#[expect(
+    clippy::type_complexity,
+    reason = "the three tables move straight into ExtractContext's fields"
+)]
+fn ngram_id_lookups(
+    spec: &FeatureSpec,
+) -> (
+    HashMap<String, u32>,
+    HashMap<(u32, u32), usize>,
+    HashMap<(u32, u32, u32), usize>,
+) {
+    let mut path_to_id: HashMap<String, u32> = HashMap::new();
+    let mut id = |path: &str| {
+        let next = u32::try_from(path_to_id.len()).unwrap_or(u32::MAX);
+        *path_to_id.entry(path.to_owned()).or_insert(next)
+    };
+    let mut bigrams = HashMap::new();
+    for (i, bigram) in spec.bigram_vocab.iter().enumerate() {
+        if let [a, b] = bigram.split(" + ").collect::<Vec<_>>()[..] {
+            let (a, b) = (id(a), id(b));
+            bigrams.insert((a.min(b), a.max(b)), i);
+        }
+    }
+    let mut trigrams = HashMap::new();
+    for (i, trigram) in spec.trigram_vocab.iter().enumerate() {
+        if let [a, b, c] = trigram.split(" + ").collect::<Vec<_>>()[..] {
+            let mut ids = [id(a), id(b), id(c)];
+            ids.sort_unstable();
+            trigrams.insert((ids[0], ids[1], ids[2]), i);
+        }
+    }
+    (path_to_id, bigrams, trigrams)
+}
+
+/// Each keyword family's words that have a slot in this spec; a family with
+/// none is left out.
+fn keyword_slots(
+    spec: &FeatureSpec,
+    lookup: &HashMap<String, usize>,
+) -> HashMap<KeywordSource, HashMap<String, usize>> {
+    spec.keyword_vocabs
+        .iter()
+        .filter_map(|(&source, words)| {
+            let slots: HashMap<String, usize> = words
+                .iter()
+                .filter_map(|word| {
+                    lookup
+                        .get(&format!("{}:{word}", source.name()))
+                        .map(|&slot| (word.clone(), slot))
+                })
+                .collect();
+            (!slots.is_empty()).then_some((source, slots))
+        })
+        .collect()
+}
+
+/// The `tierbi:`/`tiertri:`/`tierquad:` features: each slot with the
+/// `tier:path` tokens that must all be present to set it.
+fn tiered_slots(spec: &FeatureSpec) -> Vec<(usize, Vec<String>)> {
+    spec.feature_names
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, name)| {
+            let (family, value) = name.split_once(':')?;
+            ["tierbi", "tiertri", "tierquad"]
+                .contains(&family)
+                .then(|| (slot, value.split(" + ").map(str::to_owned).collect()))
+        })
+        .collect()
+}
+
 /// Resolve the `metrics:` family to slots: every [`KEY_METRICS`] entry, then
 /// each extended-vocab key (`<group>_<field>`) that is not a base metric.
 /// Extended keys are log-scaled when the field names a count or size.
-pub(super) fn metric_slots(lookup: &HashMap<String, usize>, spec: &FeatureSpec) -> Vec<MetricSlot> {
+fn metric_slots(lookup: &HashMap<String, usize>, spec: &FeatureSpec) -> Vec<MetricSlot> {
     if let Some(transforms) = &spec.metric_transforms {
         return lookup
             .iter()

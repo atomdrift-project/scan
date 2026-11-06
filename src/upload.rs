@@ -1,8 +1,8 @@
 //! Best-effort upload of scan results to a hopper instance.
 //!
-//! Mirrors the `/api/result` contract of postdoc's pull-based worker — the
-//! same `ResultPayload` wire shape, the same zstd-compressed envelope — but
-//! driven by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
+//! Speaks hopper's `/api/result` contract — the `ResultPayload` wire shape, a
+//! zstd-compressed envelope — that its pull-based workers speak, but driven
+//! by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
 //! uses it to *renew* a sample hopper has already ingested with this build's
 //! traits and model: hopper's `/api/result` is a lease-free `UPDATE ... WHERE
 //! sha256 = ?`, so posting a result for an already-scanned SHA replaces its
@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 mod queue;
 
 use crate::engine::ScanResultEnvelope;
-use crate::hopper::{Route, bearer, endpoints, error_chain, is_permanent};
-use crate::retry::{backoff, fuzz, parse_retry_after};
+use crate::hopper::{Route, bearer, endpoints, error_chain};
+use crate::retry::{backoff, fuzz, is_transient, parse_retry_after};
 
 /// Hopper bounds the decompressed result body at 512 MiB (`maxResultBodyBytes`
 /// in hopper's api.go); a larger document is truncated mid-stream and rejected
@@ -93,7 +93,7 @@ const HOPPER_MAX_UPLOAD_ARTIFACT_BYTES: u64 = 8 << 30;
 /// Hopper's ingestion lane header. A result renewed by `serve --hopper` is
 /// one-shot: the caller that asked for the scan is already holding the verdict
 /// in its own cache, so it will never ask again, and a renewal that does not
-/// land means the artifact never enters the corpus at all. A fleet worker's
+/// land means the artifact never enters the corpus at all. A queue worker's
 /// result is retryable for free — the job returns to the queue and is
 /// dispatched again.
 ///
@@ -125,7 +125,7 @@ const MAX_WORKER_NAME_LEN: usize = 64;
 /// The JSON body POSTed to hopper's `/api/result`. The `{ml, llm?, raw}`
 /// envelope is flattened onto the payload so the wire form is
 /// `{sha256, worker, duration_ms, ml, llm, raw}` — byte-for-byte the shape
-/// postdoc's pull-based worker sends, so hopper handles both identically.
+/// hopper's pull-based workers send, so hopper handles both identically.
 #[derive(Debug, Serialize)]
 pub struct ResultPayload {
     /// SHA-256 of the analyzed artifact.
@@ -380,8 +380,7 @@ struct Tally {
     /// Renewals hopper accepted.
     uploaded: AtomicUsize,
     /// Renewals that never reached hopper. Every one is a verdict that is lost,
-    /// and until this counter existed the only trace was a warning in a log
-    /// nobody was reading.
+    /// so it is counted where an operator will see it, not only logged.
     failed: AtomicUsize,
 }
 
@@ -411,6 +410,44 @@ pub struct UploadStats {
     pub failed: usize,
     /// Renewals hopper accepted.
     pub uploaded: usize,
+}
+
+/// Why an artifact could not be handed to the uploader. Its message names
+/// local paths: log it, do not serve it.
+#[derive(Debug)]
+pub enum StageError {
+    /// The staging directory could not be created.
+    Create(std::io::Error),
+    /// A file could not be copied into the staging directory.
+    Copy(PathBuf, std::io::Error),
+    /// Caller-supplied bytes could not be written to the staging directory.
+    Write(std::io::Error),
+    /// The uploader has stopped, or its queue refused the job.
+    Queue,
+}
+
+impl std::fmt::Display for StageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create(e) => write!(f, "create durable upload staging directory: {e}"),
+            Self::Copy(path, e) => write!(
+                f,
+                "copy {} into durable upload staging: {e}",
+                path.display()
+            ),
+            Self::Write(e) => write!(f, "write durable upload staging file: {e}"),
+            Self::Queue => f.write_str("could not queue durable artifacts for hopper"),
+        }
+    }
+}
+
+impl std::error::Error for StageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Create(e) | Self::Copy(_, e) | Self::Write(e) => Some(e),
+            Self::Queue => None,
+        }
+    }
 }
 
 impl Uploader {
@@ -524,11 +561,11 @@ impl Uploader {
     /// before `/api/known` says hopper needs it.
     ///
     /// # Errors
-    /// Returns a message when staging fails or the uploader has stopped.
+    /// Returns an error when staging fails or the uploader has stopped.
     pub fn submit_artifacts_durable(
         &self,
         mut artifacts: Vec<UploadArtifact>,
-    ) -> Result<(), String> {
+    ) -> Result<(), StageError> {
         if artifacts.is_empty() {
             return Ok(());
         }
@@ -536,7 +573,7 @@ impl Uploader {
         let staging = tempfile::Builder::new()
             .prefix("scan-upload-")
             .tempdir()
-            .map_err(|error| format!("create durable upload staging directory: {error}"))?;
+            .map_err(StageError::Create)?;
         for (index, artifact) in artifacts.iter_mut().enumerate() {
             let ArtifactBytes::File(source) = &artifact.bytes else {
                 continue;
@@ -549,12 +586,8 @@ impl Uploader {
                     |name| name.to_string_lossy().into_owned(),
                 );
             let destination = staging.path().join(format!("{index}-{filename}"));
-            std::fs::copy(source, &destination).map_err(|error| {
-                format!(
-                    "copy {} into durable upload staging: {error}",
-                    source.display()
-                )
-            })?;
+            std::fs::copy(source, &destination)
+                .map_err(|error| StageError::Copy(source.clone(), error))?;
             artifact.bytes = ArtifactBytes::File(destination);
         }
 
@@ -564,7 +597,7 @@ impl Uploader {
         if self.enqueue_artifacts(artifacts, vec![staging_path]) {
             Ok(())
         } else {
-            Err("could not queue durable artifacts for hopper".to_string())
+            Err(StageError::Queue)
         }
     }
 
@@ -574,26 +607,25 @@ impl Uploader {
     /// artifact row that the verdict belongs to.
     ///
     /// # Errors
-    /// Returns a message when staging fails or the uploader has stopped.
+    /// Returns an error when staging fails or the uploader has stopped.
     pub fn submit_artifact_bytes_durable(
         &self,
         mut artifact: UploadArtifact,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), StageError> {
         let staging = tempfile::Builder::new()
             .prefix("scan-upload-")
             .tempdir()
-            .map_err(|error| format!("create durable upload staging directory: {error}"))?;
+            .map_err(StageError::Create)?;
         let destination = staging.path().join("artifact");
-        std::fs::write(&destination, bytes)
-            .map_err(|error| format!("write durable upload staging file: {error}"))?;
+        std::fs::write(&destination, bytes).map_err(StageError::Write)?;
         artifact.bytes = ArtifactBytes::File(destination);
 
         let staging_path = staging.keep();
         if self.enqueue_artifacts(vec![artifact], vec![staging_path]) {
             Ok(())
         } else {
-            Err("could not queue durable artifact for hopper".to_string())
+            Err(StageError::Queue)
         }
     }
 
@@ -659,8 +691,10 @@ impl Drop for Uploader {
     fn drop(&mut self) {
         // Dropping the sender ends the thread's `for job in jobs` loop.
         self.tx = None;
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("upload: uploader thread panicked; queued uploads were lost");
         }
     }
 }
@@ -785,12 +819,11 @@ impl Hopper {
                 seen.clear();
             }
             match job {
-                // Posted unconditionally. Asking first cost a round trip on
-                // the same three-slot renew lane the post uses, to avoid a
-                // write that hopper now declines in one indexed read — and the
-                // answer aged the moment it arrived, because only the store is
-                // ordered against the other producers pushing the same
-                // dependency (hopper's `unchangedStore`).
+                // Posted unconditionally. Asking first would cost a round trip
+                // on the same renew lane the post uses, to avoid a write hopper
+                // declines in one indexed read — and the answer would age the
+                // moment it arrived, because only the store is ordered against
+                // the other producers pushing the same dependency.
                 Job::Result { sha256, purl, body } => publish(Renewal { sha256, purl, body }),
                 Job::Artifacts {
                     artifacts,
@@ -927,13 +960,12 @@ impl Hopper {
         // dropped silently — an unevaluated dependency is a coverage gap worth
         // seeing, not a routine skip.
         //
-        // Every dependency's verdict is posted. Asking hopper first — the
-        // `traits_version` probe this replaced — could only ever answer for the
-        // instant it was asked: the popular dependencies it was meant to spare
-        // (inherits, x/tools, setup-go) are exactly the ones several scans push at
-        // once, so each probe returned "not current" and each scan posted anyway.
-        // The store settles it now, in one indexed read, because the store is the
-        // only place ordered against the other producers.
+        // Every dependency's verdict is posted. Asking hopper first whether it
+        // is current could only answer for the instant it was asked: the
+        // popular dependencies such a probe would spare are exactly the ones
+        // several scans push at once. Hopper's store settles it in one indexed
+        // read, because the store is the only place ordered against the other
+        // producers.
         for dep in fresh {
             let Some(body) = dep.result else {
                 tracing::info!(
@@ -1055,7 +1087,7 @@ impl Hopper {
                 }
                 Ok(resp) => {
                     let status = resp.status();
-                    if is_permanent(status) {
+                    if !is_transient(status) {
                         let body = resp.text().unwrap_or_default();
                         tracing::error!(
                             sha256 = %art.sha256,
@@ -1085,74 +1117,81 @@ impl Hopper {
         let encoding = encoded.zstd.then_some("zstd");
         // Shared, not copied, across attempts: a compressed report can be large.
         let body = bytes::Bytes::from(encoded.bytes);
+        let _span = tracing::info_span!("renew", sha256, purl).entered();
 
         let started = Instant::now();
-        let mut retry_after: Option<Duration> = None;
-        for attempt in 0.. {
-            if attempt > 0 {
-                match renew_delay(attempt, retry_after, started.elapsed(), fuzz()) {
-                    Some(delay) => std::thread::sleep(delay),
-                    None => break,
-                }
-            }
+        let mut attempts = 0;
+        let outcome = crate::retry::send("hopper result renewal", RENEW_BUDGET, |attempt| {
+            attempts = attempt;
+            // Each attempt runs only until the budget ends, but never shorter
+            // than RENEW_MIN_ATTEMPT, so a late one still has time to land.
             let remaining = RENEW_BUDGET.saturating_sub(started.elapsed());
-            let mut request = bearer(self.http.post(self.result.at(attempt)), self.token)
+            let request = bearer(self.http.post(self.result.at(attempt - 1)), self.token)
                 .timeout(remaining.max(RENEW_MIN_ATTEMPT))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 // Claim hopper's reserved lane: this renewal is one-shot, and the
                 // caller is already holding the verdict in its cache.
                 .header(HOPPER_LANE_HEADER, HOPPER_LANE_RENEW)
                 .body(body.clone());
-            if let Some(enc) = encoding {
-                request = request.header(reqwest::header::CONTENT_ENCODING, enc);
+            match encoding {
+                Some(enc) => request.header(reqwest::header::CONTENT_ENCODING, enc),
+                None => request,
             }
-            retry_after = None;
-            match request.send() {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(
-                        sha256 = %sha256,
-                        purl,
-                        attempt,
-                        waited_ms = started.elapsed().as_millis(),
-                        "upload: result renewed on hopper",
-                    );
-                    self.tally.uploaded.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if is_permanent(status) {
-                        let body = resp.text().unwrap_or_default();
-                        self.tally.failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(sha256 = %sha256, purl, %status, body = %body_excerpt(&body), "upload: hopper rejected result; not retrying");
-                        return;
-                    }
-                    // Hopper sends Retry-After when it sheds; it knows when its
-                    // slots free, so honour it rather than guessing shorter.
-                    retry_after = parse_retry_after(resp.headers());
-                    tracing::warn!(sha256 = %sha256, purl, %status, attempt, "upload: non-success response");
-                }
-                Err(e) => {
-                    tracing::warn!(sha256 = %sha256, purl, error = %error_chain(&e), attempt, "upload: send failed");
-                }
+        });
+        match outcome {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    sha256 = %sha256,
+                    purl,
+                    attempts,
+                    waited_ms = started.elapsed().as_millis(),
+                    "upload: result renewed on hopper",
+                );
+                self.tally.uploaded.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(resp) if !is_transient(resp.status()) => {
+                let status = resp.status();
+                let body = resp.text().unwrap_or_default();
+                self.tally.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(sha256 = %sha256, purl, %status, body = %body_excerpt(&body), "upload: hopper rejected result; not retrying");
+            }
+            Ok(resp) => {
+                self.tally.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    sha256 = %sha256,
+                    purl,
+                    status = %resp.status(),
+                    attempts,
+                    budget_s = RENEW_BUDGET.as_secs(),
+                    "upload: failed to renew result on hopper; giving up after the renewal budget",
+                );
+            }
+            Err(e) => {
+                self.tally.failed.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    sha256 = %sha256,
+                    purl,
+                    error = %error_chain(&e),
+                    attempts,
+                    budget_s = RENEW_BUDGET.as_secs(),
+                    "upload: failed to renew result on hopper; giving up after the renewal budget",
+                );
             }
         }
-        tracing::error!(
-            sha256 = %sha256,
-            purl,
-            budget_s = RENEW_BUDGET.as_secs(),
-            "upload: failed to renew result on hopper; giving up after the renewal budget",
-        );
-        self.tally.failed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Bound and flatten untrusted response bodies before writing them to logs.
+/// Bound an untrusted response body and escape its control and bidi
+/// characters before it reaches a log, where an ANSI sequence would rewrite
+/// the operator's terminal.
 fn body_excerpt(body: &str) -> String {
     const MAX_CHARS: usize = 512;
-    let compact = body.replace(['\r', '\n', '\t'], " ");
-    let mut excerpt: String = compact.chars().take(MAX_CHARS).collect();
-    if compact.chars().count() > MAX_CHARS {
+    let end = body
+        .char_indices()
+        .nth(MAX_CHARS)
+        .map_or(body.len(), |(at, _)| at);
+    let mut excerpt = crate::output::tty_text(body.get(..end).unwrap_or(body)).into_owned();
+    if end < body.len() {
         excerpt.push_str("...");
     }
     excerpt
@@ -1171,7 +1210,7 @@ fn cleanup_upload_dirs(dirs: Vec<PathBuf>) {
 }
 
 /// Mirror a result's fetched dependencies into a hopper instance from a caller
-/// that has no [`Uploader`] (postdoc's pull-based worker). Dedups within this call,
+/// that has no [`Uploader`] (a pull-based queue worker). Dedups within this call,
 /// and reconciles bytes + provenance before posting each verdict. Best-effort:
 /// every failure is logged, never propagated, so a dependency sync never
 /// disturbs the result it followed.
@@ -1290,551 +1329,5 @@ fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
     true
 }
 
-/// [`backoff`] within the renewal budget, or `None` once the budget is spent;
-/// see [`crate::retry::delay_within`].
-fn renew_delay(
-    attempt: usize,
-    retry_after: Option<Duration>,
-    elapsed: Duration,
-    fuzz: f64,
-) -> Option<Duration> {
-    crate::retry::delay_within(RENEW_BUDGET, attempt, retry_after, elapsed, fuzz)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    /// A hopper with every route at `bases`, no token, and a plain client.
-    fn hopper_at(bases: &str) -> Hopper {
-        Hopper::new(
-            reqwest::blocking::Client::new(),
-            bases,
-            "test".to_string(),
-            Arc::default(),
-        )
-    }
-
-    /// One request off `listener`, answered with `response`; returns the raw
-    /// request. Reads the body by its Content-Length, which a sized upload
-    /// must send.
-    fn serve_one(
-        listener: TcpListener,
-        response: &'static [u8],
-    ) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let request = read_request(&mut stream);
-            stream.write_all(response).expect("respond");
-            request
-        })
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        let mut request = Vec::new();
-        let mut buf = [0u8; 8192];
-        let body_start = loop {
-            let n = stream.read(&mut buf).expect("read");
-            assert!(n > 0, "connection closed before the headers ended");
-            request.extend_from_slice(&buf[..n]);
-            if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
-        let length: usize = head
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .map_or(0, |v| v.trim().parse().expect("content-length"));
-        while request.len() < body_start + length {
-            let n = stream.read(&mut buf).expect("read body");
-            assert!(n > 0, "connection closed mid-body");
-            request.extend_from_slice(&buf[..n]);
-        }
-        request
-    }
-
-    const NO_CONTENT: &[u8] =
-        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-    #[test]
-    fn renewal_workers_preserve_order_and_keep_other_lanes_moving() {
-        let lane = |sha: &str| {
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            sha.hash(&mut hash);
-            usize::try_from(hash.finish() % RENEW_WORKERS as u64).unwrap_or_default()
-        };
-        let slow = "a".repeat(64);
-        let fast = (0..100)
-            .map(|n| format!("{n:064x}"))
-            .find(|sha| lane(sha) != lane(&slow))
-            .expect("a different FIFO lane");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("address"));
-        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observed = Arc::clone(&completed);
-        let fast_arrived = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let server_overlap = Arc::clone(&overlapped);
-        let slow_sha = slow.clone();
-        let server = std::thread::spawn(move || {
-            let mut handlers = Vec::new();
-            for _ in 0..5 {
-                let (mut stream, _) = listener.accept().expect("accept renewal");
-                let observed = Arc::clone(&observed);
-                let fast_arrived = Arc::clone(&fast_arrived);
-                let overlapped = Arc::clone(&server_overlap);
-                let slow_sha = slow_sha.clone();
-                handlers.push(std::thread::spawn(move || {
-                    let request = read_request(&mut stream);
-                    let offset = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-                    let value: serde_json::Value =
-                        serde_json::from_slice(&request[offset..]).unwrap();
-                    let sha = value["sha256"].as_str().unwrap().to_owned();
-                    let sequence = value["sequence"].as_u64().unwrap();
-                    let (ready, wake) = &*fast_arrived;
-                    if sha == slow_sha && sequence == 0 {
-                        // Hold the first lane until the other lane reaches HTTP.
-                        // A blocking lane queue stalls on this digest's third
-                        // update and never submits the independent verdict.
-                        let (arrived, _) = wake
-                            .wait_timeout_while(
-                                ready.lock().unwrap(),
-                                Duration::from_secs(5),
-                                |v| !*v,
-                            )
-                            .unwrap();
-                        overlapped.store(*arrived, Ordering::Relaxed);
-                    } else if sha != slow_sha {
-                        *ready.lock().unwrap() = true;
-                        wake.notify_all();
-                    }
-                    observed.lock().unwrap().push((sha, sequence));
-                    stream.write_all(NO_CONTENT).expect("acknowledge");
-                }));
-            }
-            for handler in handlers {
-                handler.join().expect("HTTP handler");
-            }
-        });
-        let (tx, jobs) = queue::channel(1);
-        for (sha, count) in [(&slow, 3), (&fast, 2)] {
-            for sequence in 0..count {
-                tx.send(Job::Result {
-                    sha256: sha.clone(),
-                    purl: None,
-                    body: EncodedResult {
-                        bytes: serde_json::to_vec(
-                            &serde_json::json!({"sha256": sha, "sequence": sequence}),
-                        )
-                        .unwrap(),
-                        zstd: false,
-                    },
-                })
-                .expect("enqueue");
-            }
-        }
-        drop(tx);
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let hopper = hopper_at(&base);
-            let pending = AtomicUsize::new(5);
-            hopper.serve(jobs, &pending);
-            done.send((
-                pending.load(Ordering::Relaxed),
-                hopper.tally.uploaded.load(Ordering::Relaxed),
-                hopper.tally.failed.load(Ordering::Relaxed),
-            ))
-            .unwrap();
-        });
-        assert_eq!(
-            finished
-                .recv_timeout(Duration::from_secs(10))
-                .expect("drain all workers"),
-            (0, 5, 0)
-        );
-        server.join().expect("HTTP server");
-        assert!(
-            overlapped.load(Ordering::Relaxed),
-            "one stalled digest blocked another lane"
-        );
-        let completed = std::mem::take(&mut *completed.lock().unwrap());
-        for (sha, count) in [(&slow, 3), (&fast, 2)] {
-            let sequence: Vec<_> = completed
-                .iter()
-                .filter(|(s, _)| s == sha)
-                .map(|(_, n)| *n)
-                .collect();
-            assert_eq!(sequence, (0..count).collect::<Vec<_>>());
-        }
-    }
-
-    fn artifact(sha: &str, size: u64, bytes: ArtifactBytes) -> UploadArtifact {
-        UploadArtifact {
-            sha256: sha.to_string(),
-            size,
-            filename: "x.bin".to_string(),
-            bytes,
-            sidecar: br#"{"schema_version":"1.0"}"#.to_vec(),
-            backfill: false,
-        }
-    }
-
-    /// The budget is the whole point: a renewal is one-shot, so it must outlive
-    /// a saturated hopper rather than give up after a few seconds.
-    #[test]
-    fn renew_delay_respects_the_budget() {
-        assert!(renew_delay(1, None, Duration::ZERO, 0.5).is_some());
-        assert!(renew_delay(9, None, RENEW_BUDGET - Duration::from_secs(1), 0.5).is_some());
-        assert!(renew_delay(9, None, RENEW_BUDGET, 0.5).is_none());
-        assert!(renew_delay(9, None, RENEW_BUDGET + Duration::from_secs(1), 0.5).is_none());
-    }
-
-    /// A sleep must never outlive the budget, or the give-up log arrives late
-    /// and the ceiling stops meaning anything.
-    #[test]
-    fn renew_delay_never_sleeps_past_the_budget() {
-        let elapsed = RENEW_BUDGET - Duration::from_millis(400);
-        let d = renew_delay(12, Some(Duration::from_secs(60)), elapsed, 1.0).unwrap();
-        assert!(
-            d <= Duration::from_millis(400),
-            "slept past the budget: {d:?}"
-        );
-    }
-
-    /// Hopper knows when its slots free; a shorter sleep just burns a
-    /// slot-acquire on a pool that has already said it is full. Uploads and
-    /// renewals share the rule.
-    #[test]
-    fn backoff_honours_retry_after_as_a_floor() {
-        let hint = Duration::from_secs(30);
-        assert!(backoff(1, Some(hint), 0.0) >= hint);
-        assert!(renew_delay(1, Some(hint), Duration::ZERO, 0.0).unwrap() >= hint);
-    }
-
-    /// Claiming hopper's reserved lane is what keeps a one-shot renewal from
-    /// competing with the retryable worker firehose.
-    #[test]
-    fn lane_header_matches_hoppers_contract() {
-        assert_eq!(HOPPER_LANE_HEADER, "X-Hopper-Lane");
-        assert_eq!(HOPPER_LANE_RENEW, "renew");
-    }
-
-    /// The wire body round-trips through zstd back to the exact JSON serde
-    /// produced: this is the same shape hopper's `/api/result` decodes, so an fs
-    /// upload is byte-identical to postdoc's worker uploading the same payload.
-    #[test]
-    fn encode_result_body_round_trips_through_zstd() {
-        let payload = ResultPayload {
-            sha256: "a".repeat(64),
-            worker: "scan-fs".to_string(),
-            error: None,
-            duration_ms: 0,
-            envelope: None,
-        };
-        let expected = serde_json::to_vec(&payload).unwrap();
-        let (body, encoding) = encode_result_body(payload, "test").expect("encodes");
-        assert_eq!(encoding, Some("zstd"));
-        let decoded = zstd::decode_all(body.as_slice()).expect("valid zstd");
-        assert_eq!(decoded, expected);
-
-        // The flattened payload carries the transport fields and omits `error`
-        // (skip_serializing_if), matching postdoc's worker's wire form.
-        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(value["worker"], "scan-fs");
-        assert_eq!(value["duration_ms"], 0);
-        assert!(value.get("error").is_none());
-    }
-
-    #[test]
-    fn encode_result_body_preserves_the_full_typed_report() {
-        let raw: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
-            "files": [
-                {"id": 0, "path": "fixture.zip", "type": "zip", "sha": "root", "size": 128, "depth": 0},
-                {"id": 1, "parent": 0, "path": format!("fixture.zip!!{}.py", "member".repeat(4096)),
-                 "type": "python", "sha": "child", "size": 32, "depth": 1}
-            ]
-        }))
-        .expect("typed raw report");
-        assert_eq!(raw.files.len(), 2);
-        let raw = crate::engine::StoredReport::new(&raw)
-            .expect("serializes")
-            .json;
-        let raw_json = raw.get().to_owned();
-        let payload = ResultPayload {
-            sha256: "a".repeat(64),
-            worker: "fixture".into(),
-            error: None,
-            duration_ms: 42,
-            envelope: Some(ScanResultEnvelope {
-                ml: crate::engine::MlSection {
-                    v: "7",
-                    probability: 0.0,
-                    level: crate::model::Level::Clean,
-                    conf: Some(100),
-                    class: None,
-                    model_scores: Vec::new(),
-                    skipped_models: Vec::new(),
-                    version: "fixture".into(),
-                    eng: "fixture",
-                    analyzed_at: "2026-10-19T00:00:00Z".into(),
-                    files: Vec::new(),
-                    pids: None,
-                    deleted: None,
-                },
-                llm: None,
-                raw,
-            }),
-        };
-        let expected = serde_json::to_vec(&payload).expect("expected JSON");
-        // The stored report rides through the flattened envelope verbatim.
-        assert!(
-            String::from_utf8_lossy(&expected).ends_with(&format!(r#""raw":{raw_json}}}"#)),
-            "raw is embedded as stored"
-        );
-        let (body, encoding) = encode_result_body(payload, "test").expect("encode full report");
-        assert_eq!(encoding, Some("zstd"));
-        assert_eq!(
-            zstd::decode_all(body.as_slice()).expect("valid zstd"),
-            expected
-        );
-    }
-
-    #[test]
-    fn default_worker_name_is_valid_for_hopper() {
-        let name = default_worker_name();
-        assert!(!name.is_empty());
-        assert!(name.len() <= MAX_WORKER_NAME_LEN);
-        // Mirrors hopper's `validWorkerName`: printable ASCII, no spaces.
-        assert!(name.chars().all(|c| c.is_ascii_graphic()));
-    }
-
-    /// The `/api/known` probe walks the list like every other call.
-    ///
-    /// Its failure is safe — an unanswered probe makes the uploader treat
-    /// every artifact as missing, and hopper's upsert is idempotent — but it
-    /// is not free: that is the probe whose whole job is keeping bytes hopper
-    /// already holds off the wire. Stopping at a dead replica would spend the
-    /// outage re-uploading the corpus to a primary that was up the whole time.
-    #[test]
-    fn a_dead_replica_does_not_stop_the_known_probe() {
-        // Port 1 refuses immediately, so this measures the decision rather
-        // than a timeout.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("server address");
-        let server = serve_one(
-            listener,
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-              Content-Length: 16\r\nConnection: close\r\n\r\n{\"known\":[\"aa\"]}",
-        );
-        let hopper = hopper_at(&format!("http://127.0.0.1:1,http://{addr}"));
-        let known = hopper.known(&["aa", "bb"]);
-        server.join().expect("server thread");
-        assert!(known.contains("aa"), "the primary's answer was discarded");
-        assert!(!known.contains("bb"), "hopper did not claim to hold bb");
-    }
-
-    #[test]
-    fn upload_sends_configured_bearer_token() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("server address");
-        let server = serve_one(listener, NO_CONTENT);
-        let mut hopper = hopper_at(&format!("http://{addr}"));
-        hopper.token = Some("test-secret");
-        let art = artifact(&"a".repeat(64), 1, ArtifactBytes::File(PathBuf::new()));
-        assert!(hopper.upload(&art, None));
-        let request = String::from_utf8_lossy(&server.join().expect("server thread")).into_owned();
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer test-secret\r\n"),
-            "request headers: {request}"
-        );
-    }
-
-    /// A file-backed artifact streams from disk with its length declared up
-    /// front, behind the provenance part hopper's handler reads first.
-    #[test]
-    fn an_artifact_streams_from_disk_after_its_provenance() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("payload");
-        std::fs::write(&path, b"the artifact bytes").expect("write");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("server address");
-        let server = serve_one(listener, NO_CONTENT);
-        let hopper = hopper_at(&format!("http://{addr}"));
-        let art = artifact(&"b".repeat(64), 18, ArtifactBytes::File(path.clone()));
-        assert!(hopper.upload(&art, Some(&Body::File(path))));
-        let request = server.join().expect("server thread");
-        let text = String::from_utf8_lossy(&request);
-        assert!(
-            text.to_ascii_lowercase().contains("content-length:"),
-            "{text}"
-        );
-        let provenance = text.find(r#"name="provenance""#).expect("provenance part");
-        let file = text
-            .find(r#"name="file"; filename="x.bin""#)
-            .expect("file part");
-        assert!(provenance < file, "provenance must precede the file");
-        assert!(text.contains("the artifact bytes"), "{text}");
-    }
-
-    /// An artifact over `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` must never reach
-    /// `/api/upload` at all — hopper would reject it outright, and the
-    /// connection-drop that rejection produces looks identical to a real
-    /// network fault (see the constant's doc comment). `reconcile` is expected
-    /// to skip straight past it after the `/api/known` probe reports it
-    /// missing, rather than attempting and retrying a doomed upload.
-    #[test]
-    fn oversized_artifact_skips_the_byte_upload() {
-        let known_listener = TcpListener::bind("127.0.0.1:0").expect("bind known server");
-        let known_addr = known_listener.local_addr().expect("known address");
-        let known_server = serve_one(
-            known_listener,
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-              Content-Length: 12\r\nConnection: close\r\n\r\n{\"known\":[]}",
-        );
-
-        // Bound but never accepted: a wrongly-attempted byte upload would
-        // connect here, which the accept() below catches. Nonblocking so a
-        // bug that skips the size check fails the assertion instead of
-        // hanging the test for the full upload retry budget.
-        let upload_listener = TcpListener::bind("127.0.0.1:0").expect("bind upload server");
-        let upload_addr = upload_listener.local_addr().expect("upload address");
-        upload_listener
-            .set_nonblocking(true)
-            .expect("nonblocking upload listener");
-
-        let mut hopper = hopper_at(&format!("http://{known_addr}"));
-        hopper.upload = Route::new(&[format!("http://{upload_addr}")], "/api/upload");
-        let art = artifact(
-            &"d".repeat(64),
-            HOPPER_MAX_UPLOAD_ARTIFACT_BYTES + 1,
-            ArtifactBytes::File(PathBuf::from("/nonexistent/huge.bin")),
-        );
-        hopper.reconcile(None, &mut HashSet::new(), vec![art]);
-        known_server.join().expect("known server thread");
-
-        match upload_listener.accept() {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing connected — correct
-            Ok(_) => panic!("oversized artifact triggered a byte upload attempt"),
-            Err(e) => panic!("unexpected accept error: {e}"),
-        }
-    }
-
-    /// A job the queue refuses must leave no phantom behind in `pending`: the
-    /// counter is what tells "nothing to file" from "filing is stuck".
-    #[test]
-    fn a_refused_job_does_not_leak_the_pending_count() {
-        let (tx, jobs) = queue::channel::<Job>(UPLOAD_QUEUE_DEPTH);
-        drop(jobs);
-        let uploader = Uploader {
-            tx: Some(tx),
-            worker: None,
-            worker_name: "test".to_owned(),
-            pending: Arc::default(),
-            tally: Arc::default(),
-        };
-        let dep = crate::engine::DepResult {
-            sha256: "c".repeat(64),
-            locator: "pkg:npm/x@1".to_string(),
-            url: "https://example/x-1.tgz".to_string(),
-            size: 1,
-            provenance: None,
-            verdict: None,
-            members: crate::engine::MemberEvals::new(),
-            report: None,
-        };
-        uploader.submit_dependencies(vec![dep], "v", "t");
-        uploader.submit_artifacts(vec![artifact(
-            &"e".repeat(64),
-            1,
-            ArtifactBytes::File(PathBuf::new()),
-        )]);
-        assert_eq!(uploader.stats().pending, 0);
-    }
-
-    /// A re-fetch recovers bytes the blob cache evicted, but a locator is not
-    /// always a pin — a versionless PURL re-resolves to today's `latest`, and a
-    /// tag can move. Only bytes that still hash to the analyzed digest may be
-    /// uploaded under it; anything else would file one artifact's content under
-    /// another's identity, which is worse than the absence being repaired.
-    #[test]
-    fn only_bytes_matching_the_analyzed_digest_are_uploaded() {
-        let bytes = b"the exact bytes the verdict was computed over";
-        let sha = {
-            use sha2::{Digest as _, Sha256};
-            format!("{:x}", Sha256::digest(bytes))
-        };
-        assert!(
-            bytes_match_digest(bytes, &sha, "pkg:npm/x@1"),
-            "the analyzed bytes must be accepted"
-        );
-        assert!(
-            !bytes_match_digest(b"different bytes at the same locator", &sha, "pkg:npm/x@1"),
-            "a moved tag or re-resolved range must not be filed under the old digest"
-        );
-        assert!(
-            !bytes_match_digest(bytes, &"0".repeat(64), "pkg:npm/x@1"),
-            "an unrelated digest must not accept these bytes"
-        );
-        // Empty content hashes to a real, well-known digest rather than to
-        // nothing, so a truncated or zero-length re-fetch is a mismatch and not
-        // an accidental pass.
-        assert!(!bytes_match_digest(b"", &sha, "pkg:npm/x@1"));
-    }
-
-    /// A dependency's upload artifact loads its bytes lazily from the fetch cache
-    /// (never eagerly), derives its stored filename from the resolved URL, and is
-    /// marked backfillable so its captured registry provenance lands even when
-    /// hopper already holds the bytes. Built here from an *unevaluated*
-    /// dependency: the artifact is independent of the verdict, so bytes and
-    /// provenance reach hopper even when scan has no verdict to post for them.
-    /// The unsupported PURL proves artifact construction does not perform a
-    /// registry lookup.
-    #[test]
-    fn dep_artifact_loads_bytes_lazily_and_is_backfillable() {
-        let dep = crate::engine::DepResult {
-            sha256: "c".repeat(64),
-            locator: "pkg:bogus/x@1".to_string(),
-            url: "https://example/x-1.tgz".to_string(),
-            size: 99,
-            provenance: Some(crate::provenance::RegistryProvenance::from_record_sources(
-                crate::test_registry("bogus", "x", "1"),
-                &[fletch::fetch::RecordedSource {
-                    url: "https://registry.example/x".to_string(),
-                    status: 200,
-                    content_type: Some("application/json".to_string()),
-                    size: 20,
-                    bytes: Some(br#"{"provider_only":42}"#.to_vec()),
-                }],
-            )),
-            verdict: None,
-            members: crate::engine::MemberEvals::new(),
-            report: None,
-        };
-        let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z").expect("sidecar builds");
-        assert_eq!(art.sha256, "c".repeat(64));
-        assert_eq!(art.size, 99);
-        assert_eq!(
-            art.filename, "x-1.tgz",
-            "filename derived from the fetch URL"
-        );
-        assert!(art.backfill, "a dependency's provenance is backfillable");
-        let sidecar: serde_json::Value = serde_json::from_slice(&art.sidecar).unwrap();
-        assert_eq!(
-            sidecar["registry"]["raw"][0]["body"]["provider_only"], 42,
-            "upload uses the captured provider snapshot"
-        );
-        assert_eq!(sidecar["package"]["purl"], "pkg:bogus/x@1");
-        assert!(
-            matches!(&art.bytes, ArtifactBytes::Cached { locator } if locator == "pkg:bogus/x@1"),
-            "bytes load lazily from the cache by locator",
-        );
-    }
-}
+mod tests;

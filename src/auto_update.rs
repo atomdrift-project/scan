@@ -1,6 +1,6 @@
 //! Default-on, quiet refresh of detection rules and models when they go stale.
 //!
-//! On an interactive scan, if the local ruleset hasn't been checked in 24 hours
+//! On an interactive scan, if the local ruleset hasn't been checked in a day
 //! (and `--no-update` is not given), scan refreshes the cleave
 //! trait bundle, the ML model bundle, and the bloom filters before it starts.
 //! The check is gated by a tiny on-disk stamp, so the common case touches
@@ -22,10 +22,6 @@ use serde::{Deserialize, Serialize};
 use crate::Mode;
 use crate::cli::Refresh;
 
-/// Refresh rules + models once per day. Matches the network-check cadence of the
-/// version notice ([`crate::update_check`]).
-const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
-
 /// On-disk stamp of the last refresh attempt (success *or* failure), so an
 /// unreachable bucket doesn't trigger a network call on every run.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -34,17 +30,16 @@ struct Stamp {
     checked_unix: u64,
 }
 
-/// Path to the stamp (`<cache_dir>/atomdrift/scan/rules-update.toml`), one per
-/// rules channel: the uplink tree goes stale on its own clock, and a host
-/// that switches to `--uplink` must not inherit the open-source tree's
-/// "checked an hour ago".
+/// Path to the stamp in [`crate::cache_dir`], one per rules channel: the
+/// uplink tree goes stale on its own clock, and a host that switches to
+/// `--uplink` must not inherit the open-source tree's "checked an hour ago".
 fn stamp_path() -> Option<PathBuf> {
     let name = if cleave::enriched::enabled() {
         "rules-update-enriched.toml"
     } else {
         "rules-update.toml"
     };
-    Some(dirs::cache_dir()?.join("atomdrift").join("scan").join(name))
+    Some(crate::cache_dir()?.join(name))
 }
 
 /// Stamp the current time (best-effort; failures are non-fatal).
@@ -86,7 +81,8 @@ pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow:
         .and_then(|text| toml::from_str::<Stamp>(&text).ok())
         .map_or(0, |stamp| stamp.checked_unix);
     if refresh == Refresh::IfStale
-        && crate::civil::now_secs().saturating_sub(last_checked) < CHECK_INTERVAL_SECS
+        && crate::civil::now_secs().saturating_sub(last_checked)
+            < crate::update_check::CHECK_INTERVAL_SECS
     {
         return Ok(());
     }

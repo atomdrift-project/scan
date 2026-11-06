@@ -15,13 +15,13 @@ use crate::features::FeatureSpec;
 /// otherwise fire per file on a directory scan).
 static SHAP_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// `shap_importance.json` as collimator writes it.
+/// `shap_importance.json` as the training pipeline writes it.
 #[derive(Debug, serde::Deserialize)]
 struct ShapFile {
     #[serde(default)]
     top_features: Vec<ShapFeature>,
     /// Provenance: SHA-256 of the ordered feature-name list the SHAP was
-    /// computed against (collimator stamps it). Absent on legacy files.
+    /// computed against. A file without it is refused.
     feature_names_sha256: Option<String>,
 }
 
@@ -50,8 +50,8 @@ pub struct ShapImportance {
     n_features: usize,
 }
 
-/// SHA-256 over the ordered feature names, newline-joined — must match
-/// `collimator.explain.feature_names_digest` byte-for-byte.
+/// SHA-256 over the ordered feature names, newline-joined — byte-for-byte
+/// the digest the training pipeline stamps.
 fn feature_names_digest(feature_names: &[String]) -> String {
     let mut hasher = Sha256::new();
     for (i, name) in feature_names.iter().enumerate() {
@@ -81,12 +81,10 @@ impl ShapImportance {
     /// feature spec beside it.
     ///
     /// Reasons are computed in the general feature space (`Model::spec()`), so
-    /// the matching file in a routed bundle is the general route's
-    /// (`<dir>/general/shap_importance.json`). Falls back to a root-level file
-    /// for legacy single-model layouts. (Per-route SHAP for other routes is
-    /// kept under each route dir for offline analysis; attributing a specific
-    /// winning route in-scan would require explaining in that route's feature
-    /// space — a larger change tracked separately.)
+    /// the matching file is the general route's
+    /// (`<dir>/general/shap_importance.json`). Other routes' SHAP files are
+    /// for offline analysis: explaining a specialist's verdict would need its
+    /// own feature space.
     ///
     /// A bundle without a SHAP file is `Ok(None)`: most ship none.
     ///
@@ -98,13 +96,11 @@ impl ShapImportance {
     /// computed against that spec — a stale file (an older model) would
     /// otherwise yield misleading reasons.
     pub fn load(model_dir: &Path) -> Result<Option<Self>> {
-        let Some(dir) = [model_dir.join("general"), model_dir.to_path_buf()]
-            .into_iter()
-            .find(|d| d.join("shap_importance.json").is_file())
-        else {
-            return Ok(None);
-        };
+        let dir = model_dir.join("general");
         let path = dir.join("shap_importance.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
         let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let file: ShapFile =
             serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
@@ -132,7 +128,9 @@ impl ShapImportance {
         match &file.feature_names_sha256 {
             Some(stamp) if *stamp == feature_names_digest(feature_names) => {}
             Some(_) => anyhow::bail!("feature space does not match the loaded model (stale SHAP)"),
-            None => anyhow::bail!("no provenance stamp (regenerate with `make azoth-shap`)"),
+            None => anyhow::bail!(
+                "no feature_names_sha256 provenance stamp; regenerate the file with the training pipeline"
+            ),
         }
         let slots: HashMap<&str, usize> = feature_names
             .iter()
@@ -190,20 +188,6 @@ impl ShapImportance {
 
 /// Generate a human-readable description for a feature name.
 fn describe_feature(name: &str) -> String {
-    // v12 path×tier binary features: "path:objectives/evasion/process:hostile"
-    if let Some(rest) = name.strip_prefix("path:") {
-        if let Some((path, tier)) = rest.rsplit_once(':') {
-            let short = path
-                .strip_prefix("objectives/")
-                .or_else(|| path.strip_prefix("micro-behaviors/"))
-                .or_else(|| path.strip_prefix("well-known/"))
-                .or_else(|| path.strip_prefix("metadata/"))
-                .unwrap_or(path)
-                .replace('/', " > ");
-            return format!("{short} [{tier}]");
-        }
-        return format!("path: {}", rest.replace('/', " > "));
-    }
     if let Some(rest) = name.strip_prefix("agg:") {
         return format!("aggregate: {}", rest.replace('_', " "));
     }

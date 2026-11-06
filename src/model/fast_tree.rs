@@ -1,15 +1,13 @@
 //! A direct evaluator for ONNX tree-ensemble classifiers, accepted only for
 //! graphs it provably evaluates exactly as tract would.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 
 /// Class-score accumulator size kept on the stack. The route models are
 /// binary; anything wider falls back to a heap vector.
-pub(super) const FAST_TREE_STACK_CLASSES: usize = 8;
+const FAST_TREE_STACK_CLASSES: usize = 8;
 
 pub(super) struct FastTreeBackend {
     pub(super) n_features: usize,
@@ -100,7 +98,7 @@ const KNOWN_ATTRIBUTES: &[&str] = &[
 ];
 
 /// Whether `name` is an initializer holding the single value `1.0`.
-pub(super) fn is_constant_one(graph: &tract_onnx::pb::GraphProto, name: &str) -> bool {
+fn is_constant_one(graph: &tract_onnx::pb::GraphProto, name: &str) -> bool {
     graph
         .initializer
         .iter()
@@ -163,7 +161,7 @@ fn ensemble_node(graph: &tract_onnx::pb::GraphProto) -> Result<&tract_onnx::pb::
 /// Every tree must be one: each branch points inside its own tree, and no
 /// node is reached twice from the root. Together these make every walk in
 /// `predict` end at a leaf.
-pub(super) fn check_trees(roots: &[usize], nodes: &[FastTreeNode]) -> Result<()> {
+fn check_trees(roots: &[usize], nodes: &[FastTreeNode]) -> Result<()> {
     let mut seen = vec![false; nodes.len()];
     for (tree, &root) in roots.iter().enumerate() {
         let end = roots.get(tree + 1).copied().unwrap_or(nodes.len());
@@ -379,15 +377,8 @@ impl FastTreeBackend {
         })
     }
 
+    /// Score one vector of `n_features` (checked by `Backend::predict`).
     pub(super) fn predict(&self, features: &[f32]) -> Result<f32> {
-        if features.len() != self.n_features {
-            anyhow::bail!(
-                "feature vector length {} != ONNX expected {}",
-                features.len(),
-                self.n_features
-            );
-        }
-
         // Class counts are tiny (2 for the binary route models). Keeping the
         // accumulator on the stack for the common case avoids a heap
         // allocation per prediction on a path that runs once per route per
@@ -473,7 +464,7 @@ impl FastTreeBackend {
     }
 }
 
-pub(super) fn onnx_attr<'a>(
+fn onnx_attr<'a>(
     node: &'a tract_onnx::pb::NodeProto,
     name: &str,
 ) -> Result<&'a tract_onnx::pb::AttributeProto> {
@@ -483,14 +474,14 @@ pub(super) fn onnx_attr<'a>(
         .ok_or_else(|| anyhow::anyhow!("TreeEnsembleClassifier missing attribute {name}"))
 }
 
-pub(super) fn optional_onnx_attr<'a>(
+fn optional_onnx_attr<'a>(
     node: &'a tract_onnx::pb::NodeProto,
     name: &str,
 ) -> Option<&'a tract_onnx::pb::AttributeProto> {
     node.attribute.iter().find(|attr| attr.name == name)
 }
 
-pub(super) fn attr_usizes(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Vec<usize>> {
+fn attr_usizes(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Vec<usize>> {
     onnx_attr(node, name)?
         .ints
         .iter()
@@ -501,7 +492,7 @@ pub(super) fn attr_usizes(node: &tract_onnx::pb::NodeProto, name: &str) -> Resul
         .collect()
 }
 
-pub(super) fn attr_usizes_exact(
+fn attr_usizes_exact(
     node: &tract_onnx::pb::NodeProto,
     name: &str,
     expected: usize,
@@ -516,7 +507,7 @@ pub(super) fn attr_usizes_exact(
     Ok(values)
 }
 
-pub(super) fn attr_floats_exact(
+fn attr_floats_exact(
     node: &tract_onnx::pb::NodeProto,
     name: &str,
     expected: usize,
@@ -531,7 +522,7 @@ pub(super) fn attr_floats_exact(
     Ok(values)
 }
 
-pub(super) fn attr_strings_exact(
+fn attr_strings_exact(
     node: &tract_onnx::pb::NodeProto,
     name: &str,
     expected: usize,
@@ -554,10 +545,7 @@ pub(super) fn attr_strings_exact(
     Ok(values)
 }
 
-pub(super) fn optional_attr_string(
-    node: &tract_onnx::pb::NodeProto,
-    name: &str,
-) -> Result<Option<String>> {
+fn optional_attr_string(node: &tract_onnx::pb::NodeProto, name: &str) -> Result<Option<String>> {
     optional_onnx_attr(node, name)
         .map(|attr| {
             std::str::from_utf8(&attr.s)
@@ -567,7 +555,7 @@ pub(super) fn optional_attr_string(
         .transpose()
 }
 
-pub(super) fn optional_attr_bools(
+fn optional_attr_bools(
     node: &tract_onnx::pb::NodeProto,
     name: &str,
     expected: usize,
@@ -584,7 +572,7 @@ pub(super) fn optional_attr_bools(
     Ok(attr.ints.iter().map(|&value| value != 0).collect())
 }
 
-pub(super) fn onnx_class_count(node: &tract_onnx::pb::NodeProto) -> Result<usize> {
+fn onnx_class_count(node: &tract_onnx::pb::NodeProto) -> Result<usize> {
     let int_count = optional_onnx_attr(node, "classlabels_int64s").map(|attr| attr.ints.len());
     let string_count =
         optional_onnx_attr(node, "classlabels_strings").map(|attr| attr.strings.len());
@@ -597,7 +585,7 @@ pub(super) fn onnx_class_count(node: &tract_onnx::pb::NodeProto) -> Result<usize
     }
 }
 
-pub(super) fn onnx_input_feature_count(graph: &tract_onnx::pb::GraphProto) -> Result<usize> {
+fn onnx_input_feature_count(graph: &tract_onnx::pb::GraphProto) -> Result<usize> {
     let input = graph
         .input
         .first()
@@ -627,7 +615,7 @@ pub(super) fn onnx_input_feature_count(graph: &tract_onnx::pb::GraphProto) -> Re
     }
 }
 
-pub(super) fn parse_fast_cmp(mode: &str) -> Result<Option<FastCmp>> {
+fn parse_fast_cmp(mode: &str) -> Result<Option<FastCmp>> {
     match mode {
         "BRANCH_LEQ" => Ok(Some(FastCmp::LessEqual)),
         "BRANCH_LT" => Ok(Some(FastCmp::Less)),
@@ -640,7 +628,7 @@ pub(super) fn parse_fast_cmp(mode: &str) -> Result<Option<FastCmp>> {
     }
 }
 
-pub(super) fn fast_compare(cmp: FastCmp, feature: f32, threshold: f32, nan_is_true: bool) -> bool {
+fn fast_compare(cmp: FastCmp, feature: f32, threshold: f32, nan_is_true: bool) -> bool {
     if feature.is_nan() {
         return nan_is_true;
     }

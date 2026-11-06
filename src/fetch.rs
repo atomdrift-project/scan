@@ -31,85 +31,51 @@
 //! Off by default. Enabled, it is an online step performed after the offline
 //! analysis; failures degrade gracefully to "no fetches".
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
-use cleave::{AnalysisOptions, AnalysisReport, Finding};
-use fletch::fetch::{
-    BlobCache, CandidateSource, Coverage, Fetch, FetchBudget, FetchError, FetchRecord, Fetched,
-    HttpFetch, Method, Outcome, RecordedSource, Request, Served, UrlFetches, fetch_ref,
-    fetch_references,
-};
-use fletch::{RefKind, RefLocator, Reference, Registry, find};
-use reqwest::Url;
-
-use crate::analysis_cache::AnalysisCache;
-use crate::corpus_precheck::{Precheck, Standing, Verdict};
-use crate::deptree::{DepState, DepTree};
-use crate::hosts::{self, UrlHost};
-use crate::output::{Rgb, fg};
-use crate::provenance::RegistryProvenance;
+use cleave::AnalysisReport;
+use fletch::fetch::{BlobCache, Coverage, Fetch, FetchRecord, HttpFetch, Outcome};
+use fletch::{RefLocator, Reference, find};
 
 mod age_gate;
 mod budget;
 mod discover;
 mod imports;
 mod merge;
-mod pending;
 mod policy;
 mod registry;
 mod render;
 mod session;
 mod urls;
 
-pub use self::{age_gate::*, budget::*, merge::*, policy::*, registry::*, render::*};
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use self::{discover::*, imports::*, session::*, urls::*};
+pub use self::budget::payloads_analyzed_total;
+pub(crate) use self::budget::set_total_budget;
+pub use self::merge::fetched_url;
+pub use self::policy::{
+    DEFAULT_FETCH_DEPTH, DEFAULT_MAX_DEP_AGE_DAYS, DEFAULT_MAX_FILE_FETCHES,
+    DEFAULT_MAX_TOTAL_FETCHES, DEFAULT_MAX_TOTAL_SIZE, DEFAULT_MAX_URL_FETCHES, FetchPolicy,
+    WORKER_MAX_DEP_AGE_DAYS, default_service_follow_policy,
+};
+pub use self::registry::{
+    Unretrievable, fetch_one, graft_root_registry, registry_document, registry_summary,
+    registry_with_sources,
+};
+pub(crate) use self::render::dependency_attention;
+pub use self::render::{fetch_target, report_registry};
 
-/// Unfinished fetch work kept for a later run; see
-/// [`crate::settings::Settings::fetch_backlog`].
-pub(crate) use pending::Store as Backlog;
+use self::discover::{CiRefs, collect_references_from_input};
+use self::imports::attribute_undeclared_npm_imports;
+use self::session::FetchSession;
 
-/// What the process's fetch client and blob cache are built with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    /// Ceiling on one fetched response, in bytes; a larger one is abandoned.
-    pub max_fetch_bytes: u64,
-    /// Replaces both mutable registry-metadata TTLs. `None`
-    /// keeps fletch's tiered defaults; the immutable tier (a released version's
-    /// file list) is never re-checked regardless.
-    pub registry_ttl: Option<Duration>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            max_fetch_bytes: DEFAULT_MAX_FETCH_SIZE,
-            registry_ttl: None,
-        }
-    }
-}
-
-fn settings() -> Settings {
-    crate::settings::get().fetch
-}
-
-/// fletch's blob cache under the configured [`Settings`]. Everything that reads
-/// fetched bytes back opens it here, so it can read whatever a fetch admitted.
+/// fletch's blob cache. Everything that reads fetched bytes back opens it
+/// here, so it can read whatever a fetch admitted.
 ///
 /// # Errors
 /// When there is no OS cache directory.
 pub fn open_blob_cache() -> std::io::Result<BlobCache> {
-    let settings = settings();
-    Ok(BlobCache::open()?
-        .with_max_bytes(settings.max_fetch_bytes)
-        .with_registry_ttl(settings.registry_ttl))
+    BlobCache::open()
 }
 
 /// A PURL's coordinate, split once the way every reader in this module needs
@@ -145,6 +111,30 @@ impl<'a> Coordinate<'a> {
             version,
         })
     }
+
+    /// The package path with every percent escape decoded
+    /// (`%40scope/name` → `@scope/name`); `None` when an escape is malformed
+    /// or decodes to something other than UTF-8.
+    fn decoded_path(&self) -> Option<String> {
+        let mut decoded = Vec::with_capacity(self.path.len());
+        let mut bytes = self.path.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte != b'%' {
+                decoded.push(byte);
+                continue;
+            }
+            let digit = |b: Option<u8>| char::from(b?).to_digit(16);
+            let (hi, lo) = (digit(bytes.next())?, digit(bytes.next())?);
+            decoded.push(u8::try_from(hi << 4 | lo).ok()?);
+        }
+        String::from_utf8(decoded).ok()
+    }
+}
+
+/// How many hex digits `s` is, when it is nothing but hex digits: the one
+/// test behind every commit-hash and sha256 check here.
+fn hex_len(s: &str) -> Option<usize> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s.len())
 }
 
 /// Whether a PURL names one immutable release: a concrete version
@@ -158,7 +148,7 @@ fn pins_exact_version(purl: &str) -> bool {
         return false;
     };
     let numeric = version.strip_prefix('v').unwrap_or(version);
-    let commit = matches!(version.len(), 40 | 64) && version.bytes().all(|b| b.is_ascii_hexdigit());
+    let commit = matches!(hex_len(version), Some(40 | 64));
     (numeric.starts_with(|c: char| c.is_ascii_digit()) || commit)
         && !version.contains(['*', '^', '~', '<', '>', '=', '|', ',', ' '])
         && !version
@@ -166,10 +156,13 @@ fn pins_exact_version(purl: &str) -> bool {
             .any(|part| part.eq_ignore_ascii_case("x"))
 }
 
+/// Seconds in a day.
+const SECS_PER_DAY: u64 = 86_400;
+
 /// How long after its first file a PyPI release stops accepting new ones:
-/// PyPI's 14 days (July 2026), plus a day because PyPI does not say where it
-/// counts from and our clock is not theirs.
-const PYPI_RELEASE_CLOSED_SECS: u64 = 15 * 86_400;
+/// PyPI's 14-day window, plus a day because PyPI does not say where it counts
+/// from and our clock is not theirs.
+const PYPI_RELEASE_CLOSED_SECS: u64 = 15 * SECS_PER_DAY;
 
 /// Whether a PURL names bytes that can never change: a registry that refuses
 /// to replace a published version (npm, crates.io, the Go checksum database,
@@ -192,8 +185,7 @@ pub(crate) fn immutable_coordinate(purl: &str, age_secs: Option<u64>) -> bool {
     };
     let pinned = default_source(&parsed);
     let commit = matches!(parsed.typ(), "github" | "gitlab" | "bitbucket")
-        && matches!(version.len(), 40 | 64)
-        && version.bytes().all(|b| b.is_ascii_hexdigit());
+        && matches!(hex_len(version), Some(40 | 64));
     let fixed_registry = match parsed.typ() {
         "npm" | "cargo" | "golang" | "nuget" => true,
         "maven" => !version.ends_with("-SNAPSHOT"),
@@ -243,8 +235,7 @@ fn registry_digest(purl: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Str
         .inspect_err(|error| tracing::debug!(purl, %error, "registry lists no artifacts"))
         .ok()?;
     let sha = matrix.preferred()?.checksums.get("sha256")?;
-    (sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| sha.to_ascii_lowercase())
+    (hex_len(sha) == Some(64)).then(|| sha.to_ascii_lowercase())
 }
 
 /// The filefacts type a report's `file_type` label names; `unknown` for a
@@ -276,13 +267,6 @@ fn pin_verified(reference: &Reference, record: &FetchRecord) -> Option<bool> {
     }
 }
 
-/// The root sample's imperative hunt re-reads it from disk and re-parses it.
-/// Skip that for large roots — the win is scripts/manifests/Dockerfiles, which
-/// are small; a multi-megabyte binary root has no imperative install commands to
-/// find and would just pay a wasted parse. Declared references are read from the
-/// report regardless, so nothing is lost for large roots.
-const ROOT_HUNT_MAX_BYTES: u64 = 4 * 1024 * 1024;
-
 /// The transport and blob cache every fetch goes through. A test supplies its
 /// own transport; everything else shares [`shared_resources`].
 struct Resources {
@@ -300,14 +284,19 @@ fn shared_resources() -> Option<&'static Resources> {
         return Some(res);
     }
     let net = HttpFetch::new()
-        .map_err(|e| tracing::warn!("fetch disabled: http client unavailable: {e:#}"))
+        .map_err(|e| {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "fetch disabled: http client unavailable"
+            )
+        })
         .ok();
     let cache = open_blob_cache()
-        .map_err(|e| tracing::warn!("fetch disabled: blob cache unavailable: {e:#}"))
+        .map_err(|e| tracing::warn!(error = %e, "fetch disabled: blob cache unavailable"))
         .ok();
     let (net, cache) = net.zip(cache)?;
     Some(RESOURCES.get_or_init(|| Resources {
-        net: Box::new(net.with_max_bytes(settings().max_fetch_bytes)),
+        net: Box::new(net),
         cache,
     }))
 }
@@ -395,19 +384,6 @@ pub(crate) struct Follow<'a> {
     pub zip_passwords: &'a [String],
 }
 
-#[cfg(test)]
-impl Follow<'_> {
-    /// `policy`, with no progress, captures or passwords.
-    const fn quiet(policy: FetchPolicy) -> Self {
-        Self {
-            policy,
-            progress: false,
-            capture_deps: false,
-            zip_passwords: &[],
-        }
-    }
-}
-
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.
 /// Mutates `report.files` in place with one node per fetched payload (and any
 /// extracted members) and returns the fetch edge log plus the standalone report
@@ -436,14 +412,12 @@ pub(crate) fn orchestrate(
     };
     let worklist = collect_references_from_input(report, root_path, root_bytes, ci);
     attribute_undeclared_npm_imports(report, &worklist);
-    let mut session = FetchSession::new(report, &worklist, res, follow);
+    let precheck = crate::corpus_precheck::armed();
+    let mut session = FetchSession::new(report, &worklist, res, follow, precheck);
     session.record_unresolved_fetch_calls(report);
     session.run(report, worklist);
     session.finish(report)
 }
-
-#[cfg(test)]
-mod retrieval_failure_tests;
 
 /// Whether `fact` says a reference's analysis is missing or has gaps: what a
 /// later run retries, and what a summary counts as incomplete.
@@ -479,23 +453,3 @@ pub fn locator_str(locator: &RefLocator) -> &str {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod dependency_gap_tests;
-
-#[cfg(test)]
-mod retry_backlog_tests;
-
-#[cfg(test)]
-mod scope_inheritance_tests;
-
-/// A transport for tests that must not reach the network, and a cache no other
-/// test shares.
-#[cfg(test)]
-mod tests_offline;
-
-#[cfg(test)]
-mod registry_memo_tests;
-
-#[cfg(test)]
-mod qualifier_tests;

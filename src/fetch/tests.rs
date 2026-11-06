@@ -1,9 +1,73 @@
-use super::*;
-use fletch::RefKind;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
+use cleave::{AnalysisOptions, AnalysisReport, Finding};
+use fletch::fetch::{
+    BlobCache, CandidateSource, Coverage, FetchError, FetchRecord, Outcome, RecordedSource, Served,
+};
+use fletch::{RefKind, RefLocator, Reference, Registry, find};
+use reqwest::Url;
+
+use crate::corpus_precheck::{Standing, Verdict};
+use crate::deptree::DepState;
+use crate::provenance::RegistryProvenance;
+
+use super::*;
+use super::{
+    age_gate::*, budget::*, discover::*, imports::*, merge::*, policy::*, registry::*, render::*,
+    session::*, urls::*,
+};
+
+mod dependency_gap;
 mod gates;
 mod imports;
+/// A transport for tests that must not reach the network, and a cache no other
+/// test shares.
+mod offline;
+mod qualifier;
+mod registry_memo;
+mod retrieval_failure;
+mod scope_inheritance;
 mod urls;
+
+impl Follow<'_> {
+    /// `policy`, with no progress, captures or passwords.
+    const fn quiet(policy: FetchPolicy) -> Self {
+        Self {
+            policy,
+            progress: false,
+            capture_deps: false,
+            zip_passwords: &[],
+        }
+    }
+}
+
+/// References to fetch, grouped by the sha256 of the file that declared them.
+fn collect_references(report: &AnalysisReport, root_path: &Path, ci: CiRefs) -> Vec<Group> {
+    collect_references_from_input(report, root_path, None, ci)
+}
+
+#[test]
+fn recognizes_only_registry_hold_evidence() {
+    assert!(is_registry_security_hold_finding(
+        "metadata/registry::registry-security-hold"
+    ));
+    assert!(is_registry_security_hold_finding(
+        "metadata/registry::registry-security-hold-record"
+    ));
+    assert!(!is_registry_security_hold_finding(
+        "metadata/registry::registry-security-hold-record-impostor"
+    ));
+    assert!(!is_registry_security_hold_finding(
+        "other/registry::registry-security-hold-record"
+    ));
+    assert!(!is_registry_security_hold_finding(
+        "metadata/registry::deprecated"
+    ));
+}
 
 #[test]
 fn unresolved_shell_fetches_retain_root_and_member_coverage_gaps() {
@@ -442,7 +506,7 @@ fn unresolved_fetches_stay_out_of_the_terminal_view() {
 
 /// Neither `Skipped` reaches the human view: a reference that was never a
 /// fetch target says nothing about the scanned artifact, and a corpus hit is
-/// bytes the fleet already judged. Both stay in the record and the log.
+/// bytes the corpus already judged. Both stay in the record and the log.
 #[test]
 fn skipped_fetches_stay_out_of_the_terminal_view() {
     let mut rec = fetched_record();
@@ -513,9 +577,9 @@ fn only_immutable_coordinates_are_answered_by_name() {
     ] {
         assert!(!immutable_coordinate(purl, None), "{purl}");
     }
-    // PyPI closes a release to new files 14 days after it opens (July 2026);
+    // PyPI closes a release to new files 14 days after it opens;
     // a day of margin covers whose clock and which start PyPI means.
-    let day = 86_400;
+    let day = SECS_PER_DAY;
     assert!(!immutable_coordinate("pkg:pypi/foo@1.0", Some(14 * day)));
     assert!(!immutable_coordinate("pkg:pypi/foo@1.0", Some(15 * day)));
     assert!(immutable_coordinate("pkg:pypi/foo@1.0", Some(15 * day + 1)));
@@ -569,13 +633,13 @@ fn a_mutable_coordinate_resolves_to_its_registry_digest() {
     );
     let net = fletch::fetch::Fixtures::default()
         .with("https://pypi.org/pypi/widget/1.0/json", doc.as_bytes());
-    let cache = super::tests_offline::cache();
+    let cache = offline::cache();
     assert_eq!(
         registry_digest("pkg:pypi/widget@1.0", &net, &cache).as_deref(),
         Some(sha.as_str())
     );
     assert_eq!(
-        registry_digest("pkg:github/o/r@v1", &super::tests_offline::Offline, &cache),
+        registry_digest("pkg:github/o/r@v1", &offline::Offline, &cache),
         None
     );
 }
@@ -1647,6 +1711,22 @@ fn a_purl_coordinate_splits_once() {
     assert_eq!(npm_import_name(&purl_ref("pkg:pypi/requests")), None);
 }
 
+/// An npm name decodes every percent escape, not only `%40` and `%2F`, and a
+/// malformed escape names no package.
+#[test]
+fn npm_import_names_decode_every_escape() {
+    for (purl, name) in [
+        ("pkg:npm/%40scope%2ftool", Some("@scope/tool")),
+        ("pkg:npm/%40Scope/t%C3%BCl@1.0.0", Some("@Scope/tül")),
+        ("pkg:npm/lodash.get", Some("lodash.get")),
+        ("pkg:npm/bad%2", None),
+        ("pkg:npm/bad%zz", None),
+        ("pkg:npm/bad%ff", None),
+    ] {
+        assert_eq!(npm_import_name(&purl_ref(purl)).as_deref(), name, "{purl}");
+    }
+}
+
 /// The graft index is what a scan of the report would find: ids continue
 /// past the highest, and a parent is the first node with the declaring sha.
 #[test]
@@ -1683,4 +1763,56 @@ fn the_graft_index_matches_a_scan_of_the_report() {
         .collect();
     assert_eq!(grafted, [(6, Some(5), 2), (7, Some(6), 3)]);
     assert_eq!(graft.next_id, 8);
+}
+
+/// A `pyproject.toml`'s range is pinned by whichever Python lockfile sits
+/// beside it — poetry's, uv's or pdm's — and never by one in another
+/// directory.
+#[test]
+fn colocated_python_locks_pin_pyproject_ranges() {
+    let declared = serde_json::json!([{
+        "locator": {"purl": "pkg:pypi/requests?version_requirement=%3E%3D2"},
+        "kind": "dependency",
+        "source": "pyproject.toml:project.dependencies",
+        "evidence": "requests>=2"
+    }]);
+    let pin = |version: &str| {
+        serde_json::json!([{
+            "locator": {"purl": format!("pkg:pypi/requests@{version}")},
+            "kind": "dependency",
+            "source": "lock",
+            "evidence": "requests"
+        }])
+    };
+    let pinned = |lock_path: &str| {
+        let report = report_of(&serde_json::json!([
+            {"id":0,"path":"proj.zip","depth":0,"file_type":"zip","sha256":"root","size":1},
+            {"id":1,"parent_id":0,"path":"proj.zip!!app/pyproject.toml","depth":1,"file_type":"pyproject_toml",
+             "sha256":"manifest","size":1,"filefacts":{"references":declared}},
+            {"id":2,"parent_id":0,"path":lock_path,"depth":1,"file_type":"toml",
+             "sha256":"lock","size":1,"filefacts":{"references":pin("2.31.0")}}
+        ]));
+        let groups = collect_references(&report, Path::new("/nonexistent"), CiRefs::Skip);
+        groups
+            .iter()
+            .find(|(sha, _)| sha == "manifest")
+            .map(|(_, refs)| {
+                refs.iter()
+                    .map(|r| locator(r).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for lock in ["poetry.lock", "uv.lock", "pdm.lock"] {
+        assert_eq!(
+            pinned(&format!("proj.zip!!app/{lock}")),
+            ["pkg:pypi/requests@2.31.0"],
+            "{lock} beside the manifest pins it"
+        );
+    }
+    assert_eq!(
+        pinned("proj.zip!!other/uv.lock"),
+        ["pkg:pypi/requests?version_requirement=%3E%3D2"],
+        "a lock in another directory pins nothing"
+    );
 }

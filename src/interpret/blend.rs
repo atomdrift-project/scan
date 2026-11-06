@@ -1,11 +1,11 @@
 //! How an LLM grade moves the model's verdict: at most one step, and only
 //! as far as the evidence allows.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::cmp::Ordering;
+
+use serde::Serialize;
+
+use crate::model::{Classification, Level};
 
 /// The LLM's trinary verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,7 +51,8 @@ impl LlmGrade {
 }
 
 /// The result of an interpretation pass, serialized as the response `llm` object.
-/// Present whenever the pass was *attempted* (the sample was [`admit`]ted).
+/// Present whenever the pass was *attempted*: [`admit`](super::admit) let the
+/// sample through.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Interpretation {
@@ -154,14 +155,11 @@ pub struct MlVerdict {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's `serialize_with` passes the field by reference"
 )]
-pub(super) fn label<S: serde::Serializer>(
-    class: &Classification,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
+fn label<S: serde::Serializer>(class: &Classification, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_str(class)
 }
 
-pub(super) const fn is_false(value: &bool) -> bool {
+const fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -219,7 +217,7 @@ impl LevelContext {
     /// by a few hundredths.
     ///
     /// Manual-threshold mode has no calibrated axis to read, so ML abstains and
-    /// the caller's remaining admissions — an elevated cleave finding, a
+    /// the caller's remaining admissions — a hostile cleave finding, a
     /// non-benign class — carry the decision. Nothing is lost: with
     /// operator-set thresholds, a score above them already lands as non-benign.
     pub(super) fn ml_admits(self, min_level: Option<u16>) -> bool {
@@ -239,7 +237,7 @@ impl LevelContext {
     /// Abstains (returns `true`) in manual-threshold mode: with no level table
     /// there is no calibrated axis to measure against, so the gate has nothing to
     /// say and the remaining guards carry the decision.
-    pub(super) fn within_one_steer_of_hostile_boundary(self) -> bool {
+    fn within_one_steer_of_hostile_boundary(self) -> bool {
         let (Level::Clean | Level::At(_), Some(active)) = (self.fired, self.active) else {
             return true;
         };
@@ -254,7 +252,7 @@ impl LevelContext {
 /// A level's confidence as a `0.0..=1.0` fraction. `level_confidence` is the
 /// same pessimistic table that produces `ml.conf`, so proximity is measured on
 /// exactly the axis an operator reads.
-pub(super) fn band_confidence(level: Level) -> f32 {
+fn band_confidence(level: Level) -> f32 {
     f32::from(crate::engine::level_confidence(level).unwrap_or(0)) / 100.0
 }
 
@@ -264,7 +262,7 @@ pub(super) fn band_confidence(level: Level) -> f32 {
 pub(super) struct Evidence {
     /// Render is mostly readable source rather than escaped bytes.
     pub(super) readable: bool,
-    /// Render carries text addressed to the grader (see [`addresses_the_analyzer`]).
+    /// Render carries text addressed to the grader (see `addresses_the_analyzer`).
     pub(super) analyzer_directed: bool,
     /// cleave independently surfaced a hostile (`H`) finding.
     pub(super) hostile_finding: bool,
@@ -313,10 +311,9 @@ impl Evidence {
         // It is not gated on the same proximity test as an escalation: that
         // would make the LLM's ability to correct a false positive shrink as ML
         // grows more confidently wrong — backwards for the case `--llm`
-        // exists to catch. Benign tools such as yt-dlp, gallery-dl, androguard,
-        // crawl4ai and pyarmor can sit at L1 with a correct exoneration in the
+        // exists to catch. Legitimate downloaders, reverse-engineering kits
+        // and obfuscators can sit at L1 with a correct exoneration in the
         // same record.
-
         //
         // The step lands on *suspicious*, never benign, so a real threat the LLM
         // wrongly clears is routed for review rather than released, and how far
@@ -332,7 +329,6 @@ impl Evidence {
 /// verdict: benign and hostile are two steps apart, so neither can reach the
 /// other on the model's word alone.
 pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Classification {
-    use std::cmp::Ordering;
     match target.cmp(&ml) {
         Ordering::Greater => match ml {
             Classification::Benign => Classification::Suspicious,
@@ -373,7 +369,7 @@ pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Cla
 ///   third, a cleave hostile finding, is below):
 ///   an **opaque render** (packed/escaped bytes — a text model cannot clear what
 ///   it cannot read) or **analyzer-directed text** in the sample (see
-///   [`addresses_the_analyzer`]; a clear is precisely what an injected sample is
+///   `addresses_the_analyzer`; a clear is precisely what an injected sample is
 ///   fishing for).
 ///
 /// A third discards it too: a **cleave hostile finding**, which the LLM's prose
@@ -394,7 +390,6 @@ pub(super) fn blend(
     llm: LlmGrade,
     ev: Evidence,
 ) -> (Classification, f32) {
-    use std::cmp::Ordering;
     let p = ml_prob.clamp(0.0, 1.0);
     let target = llm.classification();
     // The LLM is trusted to make a sample look *worse* unconditionally, but to

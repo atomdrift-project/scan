@@ -1,4 +1,4 @@
-use super::import_tokens_from_parts;
+use super::report::import_tokens_from_parts;
 
 /// The tokens a `(library, name)` pair contributes. Both forms matter:
 /// LOGIC_GAPS matches bare names (`socket`, `CreateProcess`), while the

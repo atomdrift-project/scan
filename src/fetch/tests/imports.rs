@@ -347,11 +347,17 @@ fn npm_self_and_framework_imports_use_nearest_manifest() {
     let mut contexts = HashMap::new();
     contexts.insert(
         "bundle!!package".to_string(),
-        ("ember-velcro".to_string(), true),
+        PackageContext {
+            name: "ember-velcro".to_string(),
+            ember: true,
+        },
     );
     contexts.insert(
         "bundle!!package/nested".to_string(),
-        ("nested".to_string(), false),
+        PackageContext {
+            name: "nested".to_string(),
+            ember: false,
+        },
     );
     let path = "bundle!!package/dist/index.js";
     assert!(npm_import_is_package_or_framework_provided(

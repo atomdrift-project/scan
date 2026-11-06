@@ -2,7 +2,7 @@
 //! `/_/requests`, `/_/threads`.
 //!
 //! Each body is a typed struct. Field order is the wire order, and consumers —
-//! beamline's router, monitors, dashboards — index these by name, so
+//! routers, monitors, dashboards — index these by name, so
 //! `key_sets_are_pinned` holds the names in place.
 
 use std::sync::Arc;
@@ -14,13 +14,23 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 
+use super::AppState;
 use super::acl::Trusted;
-use super::{AppState, JobBucket, PURL_TYPE_NAMES, SIZE_BUCKET_NAMES};
+use super::jobs::{JobBucket, PURL_TYPE_NAMES, SIZE_BUCKET_NAMES};
 
 const MIB: u64 = 1024 * 1024;
 
 fn rss_mb() -> Option<u64> {
     cleave::memory_tracker::current_rss().map(|b| b / MIB)
+}
+
+/// Record the status `/_/health` is about to answer, returning the previous
+/// one when it differs. Probes arrive every few seconds, unauthenticated, so
+/// each logs a change of state rather than itself; the access log already
+/// records every request.
+fn health_changed(state: &AppState, status: &'static str) -> Option<&'static str> {
+    let previous = std::mem::replace(&mut *super::lock(&state.health), status);
+    (previous != status).then_some(previous)
 }
 
 /// `/_/health` while the server cannot serve: still loading, or startup failed.
@@ -106,7 +116,9 @@ pub(super) async fn health(
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     if let Some(message) = state.init_failure() {
-        tracing::error!("GET /_/health -> 503 (failed: {message})");
+        if let Some(previous) = health_changed(&state, "failed") {
+            tracing::error!(status = "failed", previous, error = %message, "health: startup failed");
+        }
         let body = HealthDown {
             status: "failed",
             reason: Some("initialization_failed"),
@@ -115,7 +127,9 @@ pub(super) async fn health(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
     if !state.is_ready() {
-        tracing::debug!("GET /_/health -> 503 (starting)");
+        if let Some(previous) = health_changed(&state, "starting") {
+            tracing::debug!(status = "starting", previous, "health: starting");
+        }
         let body = HealthDown {
             status: "starting",
             reason: None,
@@ -133,7 +147,15 @@ pub(super) async fn health(
     let overloaded = rss_bytes.zip(max_rss).is_some_and(|(rss, max)| rss > max);
 
     if overloaded {
-        tracing::warn!("GET /_/health -> 503 (degraded, rss={rss_mb:?}MB)");
+        if let Some(previous) = health_changed(&state, "degraded") {
+            tracing::warn!(
+                status = "degraded",
+                previous,
+                rss_mb,
+                max_rss_mb,
+                "health: degraded by memory pressure"
+            );
+        }
         let body = HealthDegraded {
             status: "degraded",
             reason: "memory_pressure",
@@ -149,7 +171,7 @@ pub(super) async fn health(
     let max_tasks = state.config.workers;
     let stuck_orphans = state.stuck_orphans.load(Ordering::Relaxed);
 
-    // Tasks running longer than 120s — visible in /_/requests with full phase
+    // Long-running tasks — visible in /_/requests with full phase
     // detail. The count is always computed (it is cheap: `in_flight` holds at
     // most one entry per analysis slot, and the count feeds the log line), but
     // each entry names the sample being analysed, so the detail is built only
@@ -159,7 +181,7 @@ pub(super) async fn health(
     let mut long_running = Vec::new();
     for entry in &state.in_flight {
         let elapsed_secs = now.duration_since(entry.started_at).as_secs();
-        if elapsed_secs < 120 {
+        if elapsed_secs < super::LONG_RUNNING_SECS {
             continue;
         }
         long_running_count += 1;
@@ -168,7 +190,7 @@ pub(super) async fn health(
                 request_id: *entry.key(),
                 name: entry.name.clone(),
                 elapsed_secs,
-                phase: entry.phase.get(),
+                phase: entry.phase.current(),
                 thread_id: entry.thread_id.load(Ordering::Relaxed),
             });
         }
@@ -195,23 +217,23 @@ pub(super) async fn health(
         })
         .flatten();
 
-    if saturated {
-        tracing::debug!(
+    let status = if saturated { "saturated" } else { "ok" };
+    if let Some(previous) = health_changed(&state, status) {
+        tracing::info!(
+            status,
+            previous,
+            rss_mb,
             active_tasks,
-            stuck_orphans,
-            long_running = long_running_count,
             max_concurrent_tasks = max_tasks,
+            long_running = long_running_count,
+            stuck_orphans,
             oldest_task = ?oldest,
-            "GET /_/health -> 200 (saturated)"
-        );
-    } else {
-        tracing::debug!(
-            "GET /_/health -> 200 (rss={rss_mb:?}MB, active={active_tasks}, long_running={long_running_count}, stuck_orphans={stuck_orphans}, load={load:.2})"
+            "health: status changed"
         );
     }
 
     Json(HealthOk {
-        status: if saturated { "saturated" } else { "ok" },
+        status,
         rss_mb,
         max_rss_mb,
         active_tasks,
@@ -278,10 +300,10 @@ pub(super) async fn info(State(state): State<Arc<AppState>>) -> Response {
 
 /// A class of work's windowed latency, in milliseconds.
 #[derive(Serialize)]
-pub(crate) struct Recent {
-    pub(crate) samples: u64,
-    pub(crate) p80_ms: Option<u64>,
-    pub(crate) mean_ms: Option<u64>,
+pub(super) struct Recent {
+    pub(super) samples: u64,
+    pub(super) p80_ms: Option<u64>,
+    pub(super) mean_ms: Option<u64>,
 }
 
 /// One class of work on `/_/stats`.
@@ -333,10 +355,10 @@ pub(super) struct Uploads {
 /// `/_/stats`. The comment on each field says what a router reads it for.
 #[derive(Serialize)]
 pub(super) struct Stats<'a> {
-    /// Where lookups this index could not answer actually went. A fleet
+    /// Where lookups this index could not answer actually went. Servers
     /// quietly reading from the primary because the replica stopped answering
-    /// is otherwise indistinguishable from one reading the replica, until the
-    /// primary's load says so.
+    /// are otherwise indistinguishable from ones reading the replica, until
+    /// the primary's load says so.
     corpus: Option<super::corpus::CorpusStats>,
     /// Saturation. The best routing signal available, because it is current
     /// rather than lagging: a latency average still reports health for the
@@ -375,7 +397,7 @@ pub(super) struct Stats<'a> {
     /// so it cannot flatter a server into looking fast at work it never did.
     avg_job_ms_cached: Option<u64>,
     cached_samples: u64,
-    /// Windowed p80, for the fleet-wide view, beside the lifetime means.
+    /// Windowed p80, for comparing servers, beside the lifetime means.
     recent: Recent,
     recent_lookup: Recent,
     latency_window_secs: u64,
@@ -500,10 +522,10 @@ impl<'a> Stats<'a> {
 /// reports what this build *is* and barely changes, while everything here moves
 /// every second and must not be cached.
 ///
-/// The vocabulary deliberately matches what postdoc's worker advertises
-/// to hopper on `/api/next` — slots, rss, load, max_bytes, traits, tools — so a
-/// caller reasoning about which scanner to use is reading the same facts hopper
-/// uses to ration work, rather than a second dialect of the same idea.
+/// The vocabulary deliberately matches what a hopper worker advertises on
+/// `/api/next` — slots, rss, load, max_bytes, traits, tools — so a caller
+/// reasoning about which scanner to use is reading the same facts hopper uses
+/// to ration work, rather than a second dialect of the same idea.
 pub(super) async fn stats(State(state): State<Arc<AppState>>) -> Response {
     // Serialized on the blocking thread too: `Stats` borrows the state.
     match tokio::task::spawn_blocking(move || serde_json::to_vec(&Stats::collect(&state))).await {
@@ -632,7 +654,7 @@ pub(super) async fn requests(State(state): State<Arc<AppState>>) -> Json<Request
                 size_bytes: e.size_bytes,
                 elapsed_ms,
                 long_running: elapsed_ms >= 120_000,
-                phase: e.phase.get(),
+                phase: e.phase.current(),
                 thread_id: (tid > 0).then_some(tid),
             }
         })

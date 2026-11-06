@@ -1,6 +1,11 @@
 //! UTC civil dates without a date crate: Howard Hinnant's `civil_from_days`
 //! and `days_from_civil`, exact for the proleptic Gregorian calendar.
 
+/// Seconds in a minute, an hour, and a UTC day (no leap seconds, as Unix time).
+pub(crate) const SECS_PER_MINUTE: i64 = 60;
+pub(crate) const SECS_PER_HOUR: i64 = 60 * SECS_PER_MINUTE;
+pub(crate) const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
+
 /// `(year, month, day)` for `days` since 1970-01-01.
 #[expect(
     clippy::cast_possible_truncation,
@@ -21,7 +26,7 @@ pub(crate) fn from_days(days: i64) -> (i64, u32, u32) {
 
 /// Days since 1970-01-01 for a civil date; `None` when the date does not
 /// exist (month 13, February 30th).
-pub(crate) fn to_days(year: i64, month: u32, day: u32) -> Option<i64> {
+fn to_days(year: i64, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -65,17 +70,49 @@ pub(crate) fn utc_epoch(
     }
     let days = to_days(i64::from(year), month, day)?;
     u64::try_from(
-        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second),
+        days * SECS_PER_DAY
+            + i64::from(hour) * SECS_PER_HOUR
+            + i64::from(minute) * SECS_PER_MINUTE
+            + i64::from(second),
     )
     .ok()
 }
 
 /// `secs` after the Unix epoch as RFC 3339 in UTC (`2026-10-01T13:02:22Z`).
 pub(crate) fn rfc3339(secs: u64) -> String {
-    let (y, mo, d) = from_days(i64::try_from(secs / 86_400).unwrap_or(i64::MAX));
-    let t = secs % 86_400;
-    let (h, m, s) = (t / 3_600, t % 3_600 / 60, t % 60);
+    let (day, hour, minute) = (
+        SECS_PER_DAY.unsigned_abs(),
+        SECS_PER_HOUR.unsigned_abs(),
+        SECS_PER_MINUTE.unsigned_abs(),
+    );
+    let (y, mo, d) = from_days(i64::try_from(secs / day).unwrap_or(i64::MAX));
+    let t = secs % day;
+    let (h, m, s) = (t / hour, t % hour / minute, t % minute);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Parse a `YYYY-MM-DD` date as a UTC-midnight Unix timestamp (seconds).
+/// Returns `None` for any malformed field.
+#[must_use]
+pub fn parse_ymd(s: &str) -> Option<i64> {
+    let mut parts = s.splitn(3, '-');
+    // A four-digit year: a manifest's date is not trusted to keep the day
+    // arithmetic below from overflowing.
+    let y = i64::from(parts.next()?.trim().parse::<u16>().ok()?);
+    let m: u32 = parts.next()?.trim().parse().ok()?;
+    let d: u32 = parts.next()?.trim().parse().ok()?;
+    Some(to_days(y, m, d)? * SECS_PER_DAY)
+}
+
+/// Most a recorded time may lie ahead of this clock (skew between hosts) and
+/// still count as when it happened.
+const MAX_CLOCK_SKEW_S: u64 = 300;
+
+/// Whether something recorded at `at` is within `max_age_s` of `now`. A time
+/// further ahead than clock skew explains is not a time at all: read as "now",
+/// it would stay fresh until that date.
+pub(crate) fn fresh_at(at: u64, max_age_s: u64, now: u64) -> bool {
+    at <= now.saturating_add(MAX_CLOCK_SKEW_S) && now.saturating_sub(at) <= max_age_s
 }
 
 #[cfg(test)]

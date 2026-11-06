@@ -1,4 +1,15 @@
+use super::names::METRIC_RENAMES;
+use super::report::{
+    BASE_TRAIT_PATH_DEPTH, FileSummary, FindingSummary, RawFinding, metric_fields, numeric_metrics,
+    ranked_ngram_paths, summarize_findings,
+};
+use super::spec::default_tiered_min_crit;
+use super::structure::{
+    file_symbols, finding_paths, kv_tokens, kv_tokens_with_options, relative_depths,
+};
+use super::write::{capped_triples, ranked_tiered_path_tokens, write_code_features};
 use super::*;
+use anyhow::{Context, Result};
 use std::io::Write;
 
 #[test]
@@ -64,7 +75,7 @@ fn ranked_base_paths_select_before_vocabulary_filtering() {
 }
 
 fn paths(id: &str) -> Vec<&str> {
-    finding_paths(id, default_trait_path_depth()).collect()
+    finding_paths(id, BASE_TRAIT_PATH_DEPTH).collect()
 }
 
 /// An ATT&CK ID whose first four bytes straddle a codepoint must not take
@@ -118,14 +129,6 @@ fn kv_tokens_cover_booleans_and_strings_only() {
     tokens.sort();
     assert_eq!(tokens, ["kv:pe.signed=true", "kv:pe.subsystem=windows gui"]);
     assert!(kv_tokens(None).is_empty());
-}
-
-#[test]
-fn trait_depth_spec_defaults_and_reads_explicit_value() {
-    let old: FeatureSpec = serde_json::from_str("{}").expect("legacy defaults");
-    assert_eq!(old.trait_path_depth, 3);
-    let new: FeatureSpec = serde_json::from_str(r#"{"trait_path_depth":5}"#).expect("depth field");
-    assert_eq!(new.trait_path_depth, 5);
 }
 
 #[test]
@@ -372,7 +375,7 @@ fn explicit_metric_transform_overrides_legacy_defaults() -> Result<()> {
     for (transform, expected) in [("identity", 9.0_f32), ("log1p_abs", 10.0_f32.ln())] {
         let mut file = tempfile::NamedTempFile::new()?;
         let value = serde_json::json!({
-            "version":21,"abi_version":21,"presence_vocab":["metadata"],
+            "version":21,"abi_version":21,"trait_path_depth":3,"presence_vocab":["metadata"],
             "feature_names":["metrics:text_max_inline_whitespace_run"],"total_features":1,
             "metric_transforms":{"text_max_inline_whitespace_run":transform},"standardized":false
         });
@@ -388,7 +391,7 @@ fn explicit_metric_transform_overrides_legacy_defaults() -> Result<()> {
 }
 
 #[test]
-fn new_metric_contract_is_required_and_legacy_abi_defaults_to_version() -> Result<()> {
+fn new_metric_contract_is_required() -> Result<()> {
     for (version, transforms, succeeds) in [
         (20, None, true),
         (21, None, false),
@@ -396,19 +399,52 @@ fn new_metric_contract_is_required_and_legacy_abi_defaults_to_version() -> Resul
         (21, Some("log10"), false),
     ] {
         let mut file = tempfile::NamedTempFile::new()?;
-        let mut value = serde_json::json!({"version":version,"presence_vocab":["metadata"],
+        let mut value = serde_json::json!({"version":version,"abi_version":version,
+                "trait_path_depth":3,"presence_vocab":["metadata"],
                 "feature_names":["metrics:text_max_inline_whitespace_run"],"total_features":1,"standardized":false});
         if let Some(t) = transforms {
             value["metric_transforms"] = serde_json::json!({"text_max_inline_whitespace_run":t});
         }
         serde_json::to_writer(&mut file, &value)?;
-        let result = FeatureSpec::load(file.path());
-        assert_eq!(result.is_ok(), succeeds, "{value}");
-        if let Ok(spec) = result {
-            assert_eq!(spec.abi_version, version);
-        }
+        assert_eq!(FeatureSpec::load(file.path()).is_ok(), succeeds, "{value}");
     }
     Ok(())
+}
+
+#[test]
+fn specs_older_than_the_deployed_abi_are_refused() -> Result<()> {
+    for version in [16, 19] {
+        let mut file = tempfile::NamedTempFile::new()?;
+        let value = serde_json::json!({"version":version,"abi_version":version,
+                "trait_path_depth":3,"presence_vocab":["metadata"],
+                "feature_names":["present:metadata"],"total_features":1,"standardized":false});
+        serde_json::to_writer(&mut file, &value)?;
+        assert!(FeatureSpec::load(file.path()).is_err(), "{value}");
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_keyword_sources_are_refused_at_parse() {
+    let spec = serde_json::from_value::<FeatureSpec>(serde_json::json!({
+        "version":23,"abi_version":23,"base_feature_abi":20,"trait_path_depth":3,
+        "presence_vocab":["metadata"],"keyword_vocabs":{"nameword":["x"]},
+        "feature_names":["present:metadata"],"total_features":1,"standardized":false
+    }));
+    assert!(spec.is_err());
+}
+
+#[test]
+fn capped_triples_counts_the_bounded_enumeration() {
+    for n in 0_usize..60 {
+        let mut enumerated = 0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                enumerated += (j + 20).min(n).saturating_sub(j + 1);
+            }
+        }
+        assert_eq!(capped_triples(n, 20), enumerated, "n = {n}");
+    }
 }
 
 #[test]
@@ -447,7 +483,7 @@ fn member_features_match_training_fixture() -> Result<()> {
         samples: Vec<Sample>,
     }
     let dir = crate::env::path(crate::env::SCAN_MODELS_DIR).context("SCAN_MODELS_DIR")?;
-    let spec = FeatureSpec::load(&dir.join("feature_spec.json"))?;
+    let spec = FeatureSpec::load(&dir.join("general/feature_spec.json"))?;
     let fixture: Fixture =
         serde_json::from_slice(&std::fs::read(dir.join("extraction_fixture.json"))?)?;
     assert!(!fixture.samples.is_empty());
@@ -586,8 +622,8 @@ fn file_symbols_picks_up_targets_and_members() {
 #[test]
 fn test_standardize() {
     let spec = FeatureSpec {
-        version: 16,
-        abi_version: 16,
+        version: 20,
+        abi_version: 20,
         base_feature_abi: None,
         keyword_vocabs: HashMap::new(),
         presence_vocab: vec![],
@@ -622,7 +658,7 @@ fn test_standardize() {
         feature_means: Some(vec![0.0, 1.0, 2.0]),
         feature_stds: Some(vec![1.0, 2.0, 0.5]),
         standardized: true,
-        trait_path_depth: default_trait_path_depth(),
+        trait_path_depth: BASE_TRAIT_PATH_DEPTH,
         tiered_min_crit: default_tiered_min_crit(),
         tiered_branch_min_crit: HashMap::new(),
     };
@@ -638,7 +674,7 @@ fn test_load_rejects_missing_feature_names() -> Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     writeln!(
         file,
-        "{{\"version\":16,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}"
+        "{{\"version\":20,\"abi_version\":20,\"trait_path_depth\":3,\"presence_vocab\":[\"objectives\"],\"filetype_vocab\":[\"sh\"],\"total_features\":51,\"standardized\":false}}"
     )?;
     let Err(err) = FeatureSpec::load(file.path()) else {
         anyhow::bail!("missing feature_names should be rejected");
@@ -655,8 +691,8 @@ fn anchor_spec(
     feature_names: Vec<String>,
 ) -> FeatureSpec {
     FeatureSpec {
-        version: 17,
-        abi_version: 17,
+        version: 20,
+        abi_version: 20,
         base_feature_abi: None,
         keyword_vocabs: HashMap::new(),
         presence_vocab,
@@ -691,7 +727,7 @@ fn anchor_spec(
         feature_means: None,
         feature_stds: None,
         standardized: false,
-        trait_path_depth: default_trait_path_depth(),
+        trait_path_depth: BASE_TRAIT_PATH_DEPTH,
         tiered_min_crit: default_tiered_min_crit(),
         tiered_branch_min_crit: HashMap::new(),
     }
@@ -832,7 +868,15 @@ fn ngram_writes_match_vocab_membership_on_both_probe_paths() {
             &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         ] {
             let summary = FileSummary {
-                unique_3level_paths: fired.iter().map(|&i| format!("p{i}")).collect(),
+                raw_findings: fired
+                    .iter()
+                    .map(|&i| RawFinding {
+                        id: format!("p{i}::rule"),
+                        conf: 1.0,
+                        crit: CRIT_NOTABLE,
+                        ..RawFinding::default()
+                    })
+                    .collect(),
                 ..FileSummary::default()
             };
             let mut got = vec![0.0f32; spec.total_features];
@@ -845,7 +889,7 @@ fn ngram_writes_match_vocab_membership_on_both_probe_paths() {
             let on = |ngram: &str| {
                 ngram
                     .split(" + ")
-                    .all(|part| summary.unique_3level_paths.iter().any(|p| p == part))
+                    .all(|part| fired.iter().any(|i| format!("p{i}") == part))
             };
             let expected: Vec<f32> = spec
                 .bigram_vocab

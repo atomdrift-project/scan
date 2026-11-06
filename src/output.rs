@@ -1,14 +1,31 @@
-//! Terminal and JSON output formatting with color-graded confidence indicators.
-//! Supports both dark and light terminal backgrounds via auto-detection.
+//! Terminal and JSON output formatting: the colour palette, the card and
+//! summary renderers, and the helpers every terminal writer shares. Supports
+//! dark and light terminal backgrounds.
 
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write as _};
-use std::sync::OnceLock;
-use unicode_width::UnicodeWidthStr;
+use std::sync::{LazyLock, OnceLock};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::OutputFormat;
+pub use crate::civil::parse_ymd;
+use crate::civil::{SECS_PER_DAY, SECS_PER_HOUR, SECS_PER_MINUTE};
 use crate::engine::{ScanResult, ScanSummary, level_confidence};
 use crate::model::{Classification, Level, RouteScore};
+
+impl OutputFormat {
+    /// Whether every scanned file is written, whatever `--show` says. JSON,
+    /// tiny and interpret are payloads for programs and LLMs, which need the
+    /// complete stream; `--show` filters only what a person reads.
+    #[must_use]
+    pub(crate) const fn emits_every_result(self) -> bool {
+        !matches!(self, Self::Terminal)
+    }
+}
+
+/// Return to column 0 and erase the line: how the progress bar, the spinner
+/// and the dependency tree clear what they drew.
+pub(crate) const ERASE_LINE: &str = "\r\x1b[2K";
 
 /// Whether `c` can rewrite or disguise what a terminal shows: a C0/C1
 /// control (ESC opens CSI/OSC sequences that move the cursor, erase lines,
@@ -37,7 +54,73 @@ pub(crate) fn tty_text(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-const BLOCK: &str = "\u{2588}";
+/// Which part of a too-wide text [`elide`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// The start: prose, where the opening words carry the meaning.
+    Head,
+    /// Both ends around a central cut: a URL or package path, whose host and
+    /// file name are both telling.
+    Ends,
+    /// The end: a member path, whose file name is the telling part.
+    Tail,
+}
+
+/// `text` fitted to `width` terminal columns, an ellipsis marking the cut.
+/// Measured in display columns, so wide characters count double and a fitted
+/// line never wraps. Returned whole when it already fits.
+pub(crate) fn elide(text: &str, width: usize, keep: Keep) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let Some(budget) = width.checked_sub(1) else {
+        return String::new();
+    };
+    let (head, tail) = match keep {
+        Keep::Head => (budget, 0),
+        Keep::Tail => (0, budget),
+        Keep::Ends => (budget / 2, budget - budget / 2),
+    };
+    /// The leading chars of `chars` that fit in `columns`.
+    fn fit(chars: impl Iterator<Item = char>, columns: usize) -> Vec<char> {
+        let mut used = 0;
+        chars
+            .take_while(|c| {
+                used += c.width().unwrap_or(0);
+                used <= columns
+            })
+            .collect()
+    }
+    let mut out: String = fit(text.chars(), head).into_iter().collect();
+    out.push('\u{2026}');
+    out.extend(fit(text.chars().rev(), tail).into_iter().rev());
+    out
+}
+
+/// Remove ANSI CSI escape sequences (`ESC [ … <final>`) and any other lone
+/// `ESC`. Only the sequence itself goes: text after a non-SGR sequence
+/// (`ESC [2J`) is kept, not eaten up to the next `m`.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Skip a CSI sequence: ESC '[' params... final byte in '@'..='~'.
+        if chars.clone().next() == Some('[') {
+            chars.next();
+            for n in chars.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 const TERMINAL_MARKER_WIDTH: usize = 3;
 
 /// Prefix a card row with one fixed-width marker rail and one-cell gutter.
@@ -68,52 +151,49 @@ pub enum Theme {
     Light,
 }
 
-/// Color palette tuned for a specific background theme.
+/// Color palette tuned for a specific background theme. Every coloured
+/// terminal line takes its colours from here, so a theme is one table.
 #[derive(Debug, Clone, Copy)]
-struct Palette {
+pub(crate) struct Palette {
     // Classification colors — high-vis on both backgrounds.
-    hostile: Rgb,
-    hostile_finding: Rgb,
-    suspicious: Rgb,
-    suspicious_finding: Rgb,
-    benign: Rgb,
+    pub(crate) hostile: Rgb,
+    pub(crate) suspicious: Rgb,
+    pub(crate) benign: Rgb,
 
-    // Semantic accent colors.
-    filetype: Rgb,
-    formula: Rgb,
+    // Live activity: the progress bar, spinners, in-flight fetches.
+    pub(crate) live: Rgb,
+    pub(crate) bar: Rgb,
 
     // UI chrome.
-    dot_sep: Rgb,
-    dim: Rgb,
-    very_dim: Rgb,
-    path_name: Rgb,
-    header_path: Rgb,
-    summary_line: Rgb,
-    warning: Rgb,
-    arrow: Rgb,
-    reason: Rgb,
+    pub(crate) dot_sep: Rgb,
+    pub(crate) label: Rgb,
+    pub(crate) dim: Rgb,
+    pub(crate) very_dim: Rgb,
+    pub(crate) path_name: Rgb,
+    pub(crate) header_path: Rgb,
+    pub(crate) summary_line: Rgb,
+    pub(crate) warning: Rgb,
+    pub(crate) reason: Rgb,
 }
 
 impl Palette {
     const fn dark() -> Self {
         Self {
             hostile: Rgb(255, 70, 70),
-            hostile_finding: Rgb(255, 100, 100),
             suspicious: Rgb(255, 175, 55),
-            suspicious_finding: Rgb(255, 190, 90),
             benign: Rgb(80, 200, 80),
 
-            filetype: Rgb(110, 110, 110),
-            formula: Rgb(110, 110, 110),
+            live: Rgb(100, 180, 255),
+            bar: Rgb(80, 160, 220),
 
             dot_sep: Rgb(50, 50, 50),
+            label: Rgb(160, 160, 160),
             dim: Rgb(100, 100, 100),
             very_dim: Rgb(80, 80, 80),
             path_name: Rgb(230, 230, 230),
             header_path: Rgb(180, 180, 180),
             summary_line: Rgb(50, 50, 50),
             warning: Rgb(180, 180, 60),
-            arrow: Rgb(70, 70, 70),
             reason: Rgb(100, 100, 100),
         }
     }
@@ -121,22 +201,20 @@ impl Palette {
     const fn light() -> Self {
         Self {
             hostile: Rgb(200, 30, 30),
-            hostile_finding: Rgb(180, 40, 40),
             suspicious: Rgb(180, 120, 0),
-            suspicious_finding: Rgb(160, 100, 0),
             benign: Rgb(30, 140, 30),
 
-            filetype: Rgb(130, 130, 130),
-            formula: Rgb(130, 130, 130),
+            live: Rgb(0, 110, 200),
+            bar: Rgb(30, 120, 190),
 
             dot_sep: Rgb(180, 180, 180),
+            label: Rgb(90, 90, 90),
             dim: Rgb(120, 120, 120),
             very_dim: Rgb(150, 150, 150),
             path_name: Rgb(30, 30, 30),
             header_path: Rgb(80, 80, 80),
             summary_line: Rgb(190, 190, 190),
             warning: Rgb(140, 140, 0),
-            arrow: Rgb(160, 160, 160),
             reason: Rgb(100, 100, 100),
         }
     }
@@ -161,118 +239,127 @@ pub fn detect_theme() -> Theme {
     })
 }
 
-/// The active theme; see [`crate::settings::Settings::theme`].
-fn current_theme() -> Theme {
-    crate::settings::get().theme.unwrap_or(Theme::Dark)
-}
-
-fn palette() -> &'static Palette {
+/// The active theme's palette; see [`crate::settings::Settings::theme`].
+pub(crate) fn palette() -> &'static Palette {
     static DARK: Palette = Palette::dark();
     static LIGHT: Palette = Palette::light();
 
-    match current_theme() {
+    match crate::settings::get().theme.unwrap_or(Theme::Dark) {
         Theme::Dark => &DARK,
         Theme::Light => &LIGHT,
     }
 }
 
-/// Whether output may carry ANSI color: stdout is a terminal and `NO_COLOR`
-/// is unset, as the `colored` crate decides it.
+#[cfg(test)]
+thread_local! {
+    /// Set by [`PlainOutput`]: this thread renders without colour.
+    static PLAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Renders on this thread without colour while held, whatever the
+/// environment says, so a test asserts on the plain text under test even on a
+/// host that sets `CLICOLOR_FORCE`. Per thread, so parallel tests are
+/// untouched; dropping it restores the environment's decision.
+#[cfg(test)]
+struct PlainOutput(());
+
+#[cfg(test)]
+impl PlainOutput {
+    pub(crate) fn new() -> Self {
+        PLAIN.set(true);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlainOutput {
+    fn drop(&mut self) {
+        PLAIN.set(false);
+    }
+}
+
+/// Whether stdout, where results go, may carry ANSI colour. Decided as the
+/// `colored` crate decides it, which is also how cleave paints the context it
+/// renders: `CLICOLOR_FORCE` forces colour on, `NO_COLOR` forces it off, and
+/// otherwise stdout must be a terminal and `CLICOLOR` not `0`.
 pub(crate) fn color_enabled() -> bool {
+    #[cfg(test)]
+    if PLAIN.get() {
+        return false;
+    }
     colored::control::SHOULD_COLORIZE.should_colorize()
 }
 
-/// `text` in truecolor foreground, or plain when color is off.
-pub(crate) fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
-    if color_enabled() {
-        format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
-    } else {
-        text.to_owned()
-    }
+/// Paints text for one output stream: truecolor when that stream takes
+/// colour, plain otherwise.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ink {
+    color: bool,
 }
 
-/// `text` in truecolor foreground + bold, or plain when color is off.
-pub(crate) fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
-    if color_enabled() {
-        format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
-    } else {
-        text.to_owned()
-    }
-}
-
-/// Linear interpolation between two RGB colors.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "clamped to 0..=255 before the cast"
-)]
-fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    let ch = |x: u8, y: u8| -> u8 {
-        (x as f32 + (y as f32 - x as f32) * t)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
-}
-
-/// Color gradient within each classification band.
-///
-/// `threshold` is the cutoff that defined `classification` (the value
-/// `probability` was compared against).
-fn indicator_colors(
-    probability: f32,
-    classification: Classification,
-    threshold: f32,
-) -> (Rgb, Rgb, Rgb) {
-    // Normalized progress within the band. The envelope does not carry both
-    // suspicious and hostile cutoffs, so the suspicious band uses the same
-    // "distance to 1.0" formula as the hostile band — an acceptable
-    // approximation for the band-internal color ramp.
-    let t = match classification {
-        Classification::Hostile | Classification::Suspicious => {
-            ((probability - threshold) / (1.0 - threshold).max(f32::EPSILON)).clamp(0.0, 1.0)
+impl Ink {
+    /// For stdout, where result cards go.
+    pub(crate) fn stdout() -> Self {
+        Self {
+            color: color_enabled(),
         }
-        Classification::Benign => (probability / threshold.max(f32::EPSILON)).clamp(0.0, 1.0),
-    };
-    let theme = current_theme();
-
-    match (theme, classification) {
-        // Benign shifts from strong green toward yellow-green near the suspicious boundary.
-        (Theme::Dark, Classification::Benign) => (
-            mix_rgb(Rgb(25, 170, 120), Rgb(120, 190, 40), t),
-            mix_rgb(Rgb(70, 215, 135), Rgb(195, 210, 60), t),
-            mix_rgb(Rgb(45, 195, 105), Rgb(160, 205, 50), t),
-        ),
-        (Theme::Light, Classification::Benign) => (
-            mix_rgb(Rgb(20, 130, 95), Rgb(120, 135, 20), t),
-            mix_rgb(Rgb(35, 155, 100), Rgb(150, 150, 25), t),
-            mix_rgb(Rgb(25, 145, 95), Rgb(135, 145, 20), t),
-        ),
-
-        // Suspicious starts at greenish-yellow, moves through yellow, and ends orange.
-        (Theme::Dark, Classification::Suspicious) => (
-            mix_rgb(Rgb(170, 190, 45), Rgb(255, 180, 40), t),
-            mix_rgb(Rgb(235, 220, 65), Rgb(255, 125, 20), t),
-            mix_rgb(Rgb(210, 205, 55), Rgb(255, 150, 30), t),
-        ),
-        (Theme::Light, Classification::Suspicious) => (
-            mix_rgb(Rgb(125, 145, 20), Rgb(205, 135, 0), t),
-            mix_rgb(Rgb(165, 150, 20), Rgb(175, 100, 0), t),
-            mix_rgb(Rgb(145, 145, 15), Rgb(185, 115, 0), t),
-        ),
-
-        // Hostile starts orange-red at the boundary and deepens to saturated red.
-        (Theme::Dark, Classification::Hostile) => (
-            mix_rgb(Rgb(255, 135, 40), Rgb(255, 50, 65), t),
-            mix_rgb(Rgb(255, 95, 35), Rgb(255, 35, 35), t),
-            mix_rgb(Rgb(255, 120, 40), Rgb(255, 45, 50), t),
-        ),
-        (Theme::Light, Classification::Hostile) => (
-            mix_rgb(Rgb(190, 85, 10), Rgb(200, 30, 30), t),
-            mix_rgb(Rgb(170, 65, 10), Rgb(175, 25, 25), t),
-            mix_rgb(Rgb(185, 75, 10), Rgb(190, 30, 30), t),
-        ),
     }
+
+    /// For stderr, where progress, banners, warnings and summaries go: colour
+    /// only when [`color_enabled`] allows it at all — `NO_COLOR` and
+    /// `CLICOLOR=0` hold for both streams — and stderr is itself a terminal,
+    /// so `atomscan … 2> log` writes no escapes into the log.
+    pub(crate) fn stderr() -> Self {
+        static TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stderr().is_terminal());
+        Self {
+            color: color_enabled() && *TERMINAL,
+        }
+    }
+
+    /// Never coloured: text for programs and LLMs.
+    pub(crate) const fn plain() -> Self {
+        Self { color: false }
+    }
+
+    /// Whether this stream takes colour.
+    pub(crate) const fn on(self) -> bool {
+        self.color
+    }
+
+    /// `text` in truecolor foreground, or plain.
+    pub(crate) fn fg(self, Rgb(r, g, b): Rgb, text: &str) -> String {
+        if self.color {
+            format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// `text` in bold truecolor foreground, or plain.
+    pub(crate) fn fg_bold(self, Rgb(r, g, b): Rgb, text: &str) -> String {
+        if self.color {
+            format!("\x1b[1;38;2;{r};{g};{b}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+}
+
+/// `text` in truecolor foreground for stdout, or plain when stdout takes no
+/// colour.
+pub(crate) fn fg(rgb: Rgb, text: &str) -> String {
+    Ink::stdout().fg(rgb, text)
+}
+
+/// `text` in bold truecolor foreground for stdout, or plain when stdout takes
+/// no colour.
+pub(crate) fn fg_bold(rgb: Rgb, text: &str) -> String {
+    Ink::stdout().fg_bold(rgb, text)
+}
+
+/// `text` as a stamp: bold white on a solid `background`. Colour mode only.
+fn stamp(Rgb(r, g, b): Rgb, text: &str) -> String {
+    format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m{text}\x1b[0m")
 }
 
 /// Rescale raw model probability for display.
@@ -297,12 +384,10 @@ fn display_probability(raw: f32, threshold: f32) -> f32 {
 /// prints ` BENIGN    0% `, which reads as *maximum* confidence in benign. The
 /// model never said that. It said the sample cleared no calibrated level,
 /// which is the same state as carrying no level marker: unknown, not certain.
-///
-/// The failure this fixes: an npm package with a raw probability of 0.998
-/// against a higher cutoff rendered as `BENIGN[0%]` directly above cleave's
-/// own hostile finding for the same file. Returning `None` routes those
-/// through the existing no-level path — the threshold-relative percentage —
-/// so the badge shows how near the cutoff the sample actually sat.
+/// A file just under a strict cutoff would otherwise read `BENIGN[0%]` above
+/// cleave's own hostile finding for it. Returning `None` routes it through the
+/// no-level path — the threshold-relative percentage — so the badge shows how
+/// near the cutoff the sample sat.
 ///
 /// Display-only by construction: the JSON `conf` field keeps calling
 /// [`level_confidence`], so the machine-readable shape is unchanged.
@@ -313,42 +398,10 @@ fn display_confidence(level: Level) -> Option<u8> {
     }
 }
 
-/// Color percentage text to match the classification band.
-fn colored_pct(probability: f32, classification: Classification, threshold: f32) -> String {
-    let pct = format!(
-        "{:>4}",
-        format!(
-            "{:.0}%",
-            display_probability(probability, threshold) * 100.0
-        )
-    );
-    let (_, _, accent) = indicator_colors(probability, classification, threshold);
-    fg(accent, &pct)
-}
-
-/// Header severity token: the level-derived confidence percent when the level
-/// marker exists, otherwise the rescaled threshold-relative percentage.
-fn colored_conf_or_pct(
-    probability: f32,
-    classification: Classification,
-    threshold: f32,
-    level: Level,
-) -> String {
-    match display_confidence(level) {
-        Some(conf) => {
-            let (_, _, accent) = indicator_colors(probability, classification, threshold);
-            fg(accent, &format!("{:>4}", format!("{conf}%")))
-        }
-        None => colored_pct(probability, classification, threshold),
-    }
-}
-
 /// Fixed per-class anchor color: red hostile, yellow suspicious, green benign.
 /// The verdict stamp and card rules use this — the word names the verdict, so
 /// the hue must match it exactly; confidence nuance lives in the percentage.
-/// (The band-interior gradient appears only in `ps`'s wordless two-block
-/// indicator, where hue is the sole carrier.)
-fn class_color(classification: Classification) -> Rgb {
+pub(crate) fn class_color(classification: Classification) -> Rgb {
     let p = palette();
     match classification {
         Classification::Hostile => p.hostile,
@@ -410,9 +463,11 @@ pub(crate) fn terminal_badge(
     // Bold white on the class anchor color (fixed red/yellow/green — the word
     // names the verdict, so the hue must agree with it; the percentage carries
     // the confidence), fixed-width so every stamp is the same size block.
-    let Rgb(r, g, b) = class_color(classification);
     (
-        format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {word:<7} {pct:>4} \x1b[0m"),
+        stamp(
+            class_color(classification),
+            &format!(" {word:<7} {pct:>4} "),
+        ),
         BADGE_WIDTH,
     )
 }
@@ -498,38 +553,6 @@ pub(crate) struct TerminalTrait {
     pub(crate) location: String,
 }
 
-fn truncate_terminal_text(text: &str, width: usize) -> String {
-    let len = text.chars().count();
-    if len <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    text.chars()
-        .take(width - 1)
-        .chain(std::iter::once('…'))
-        .collect()
-}
-
-fn truncate_terminal_location(text: &str, width: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
-        return text.to_string();
-    }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let head = (width - 1) / 2;
-    let tail = width - 1 - head;
-    chars[..head]
-        .iter()
-        .copied()
-        .chain(std::iter::once('…'))
-        .chain(chars[chars.len() - tail..].iter().copied())
-        .collect()
-}
-
 fn severity_dots(criticality: cleave::Criticality) -> (String, usize) {
     let dots = match criticality {
         cleave::Criticality::Hostile => "●●●",
@@ -559,20 +582,26 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
         return String::new();
     }
 
-    // Keep the reading measure composed on very wide terminals, but respect a
-    // narrow terminal so these rows never become an accidental second line.
-    let width = terminal_width.min(160);
-    let fixed = 5usize; // leading space + 3-cell marker rail + 1-cell gutter
-    let available = width.saturating_sub(fixed);
+    /// Widest a row grows: keeps the reading measure composed on very wide
+    /// terminals, while a narrow one still caps it so a row never wraps.
+    const MAX_ROW_WIDTH: usize = 160;
+    /// Leading space + 3-cell marker rail + 1-cell gutter.
+    const ROW_PREFIX_WIDTH: usize = 5;
+    /// Narrowest content area that still gets a location column.
+    const MIN_WIDTH_FOR_LOCATION: usize = 28;
+    /// Columns the description keeps when a location column is shown.
+    const MIN_DESCRIPTION_WIDTH: usize = 20;
+    let width = terminal_width.min(MAX_ROW_WIDTH);
+    let available = width.saturating_sub(ROW_PREFIX_WIDTH);
     let max_location = traits
         .iter()
         .map(|t| UnicodeWidthStr::width(t.location.as_str()))
         .max()
         .unwrap_or(0);
-    let location_width = if available >= 28 && max_location > 0 {
+    let location_width = if available >= MIN_WIDTH_FOR_LOCATION && max_location > 0 {
         max_location
             .min(available / 2)
-            .min(available.saturating_sub(20))
+            .min(available.saturating_sub(MIN_DESCRIPTION_WIDTH))
     } else {
         0
     };
@@ -584,13 +613,13 @@ pub(crate) fn terminal_trait_rows(traits: &[TerminalTrait], terminal_width: usiz
         .iter()
         .take(3)
         .map(|t| {
-            let description = truncate_terminal_text(&t.description, description_width);
+            let description = elide(&t.description, description_width, Keep::Head);
             let (dots, dots_width) = severity_dots(t.criticality);
             let prefix = terminal_marker_prefix_with_width(1, &dots, dots_width);
             if location_width == 0 {
                 return format!("{prefix}{description}");
             }
-            let location = truncate_terminal_location(&t.location, location_width);
+            let location = elide(&t.location, location_width, Keep::Ends);
             let padding = " ".repeat(
                 description_width.saturating_sub(UnicodeWidthStr::width(description.as_str())),
             );
@@ -791,7 +820,7 @@ pub(crate) fn terminal_card(
 ) -> String {
     // A card leads with the class *word*, not a percentage: every package in a
     // hostile archive shares the same confidence band, so eight identical `92%`
-    // stamps read as a stuck gauge. The one calibrated number lives on the
+    // stamps read as a stuck gauge. The one confidence number lives on the
     // archive banner; the cards rank by severity (worst first) and by class.
     let word = verdict_word(classification);
     let name = tty_text(name);
@@ -802,9 +831,8 @@ pub(crate) fn terminal_card(
     if color_enabled() {
         let p = palette();
         let accent = class_color(classification);
-        let Rgb(r, g, b) = accent;
         let bar = fg(accent, "\u{2502}"); // │
-        let stamp = format!("\x1b[1;38;2;255;255;255;48;2;{r};{g};{b}m {word} \x1b[0m");
+        let stamp = stamp(accent, &format!(" {word} "));
         let _ = writeln!(
             out,
             "{} {stamp} {} {}",
@@ -875,129 +903,40 @@ pub(crate) fn terminal_embedded_branch(
     out
 }
 
-/// Print a process scan result with PID annotations.
-pub fn print_ps_result(result: &ScanResult, has_progress: bool, extra: bool) {
-    let pids = result.pids.as_deref().unwrap_or_default();
-    let deleted = result.deleted == Some(true);
-    if has_progress {
-        eprint!("\r\x1b[2K");
-    }
-    let p = palette();
-    // Shift both blocks across the verdict band so threshold-adjacent results
-    // remain distinct from high-confidence results in the same class.
-    let (left, right, _) =
-        indicator_colors(result.probability, result.classification, result.threshold);
-    let blocks = format!("{}{}", fg(left, BLOCK), fg(right, BLOCK));
-    let pct = colored_conf_or_pct(
-        result.probability,
-        result.classification,
-        result.threshold,
-        result.level,
-    );
-
-    // Format PID list.
-    let pid_str = if pids.len() <= 5 {
+/// The line a process scan adds beneath a running binary's card: the PIDs
+/// running it, the first few when there are many, and whether the binary has
+/// since been deleted from disk.
+pub(crate) fn terminal_pids_line(pids: &[u32], deleted: bool) -> String {
+    /// More PIDs than this are summarised as a count.
+    const MAX_LISTED: usize = 5;
+    let listed = if pids.len() <= MAX_LISTED {
         pids.iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        let first: Vec<String> = pids[..4].iter().map(u32::to_string).collect();
-        format!("{} +{} more", first.join(", "), pids.len() - 4)
+        let shown = MAX_LISTED - 1;
+        let first: Vec<String> = pids[..shown].iter().map(u32::to_string).collect();
+        format!("{} +{} more", first.join(", "), pids.len() - shown)
     };
-    let pid_display = fg(p.dim, &format!("[pids: {pid_str}]"));
-    let label = fg(
-        class_color(result.classification),
-        &result.classification.to_string(),
-    );
-
-    let deleted_marker = if deleted {
-        format!(" {}", fg(p.hostile_finding, "(deleted)"))
+    let p = palette();
+    let deleted = if deleted {
+        format!("  {}", fg_bold(p.hostile, "(deleted)"))
     } else {
         String::new()
     };
-
-    eprintln!(
-        " {blocks} {pct} {label}  {}{deleted_marker}  {pid_display}",
-        fg_bold(p.path_name, &tty_text(&result.path)),
-    );
-
-    if let Some(llm) = &result.interpretation {
-        eprint!(
-            "   {}",
-            crate::engine::format_llm_line(llm, color_enabled())
-        );
-    }
-    print_detail_lines(result, p);
-    print_reasons(result, p);
-    if extra {
-        print_extra(result, p);
-    }
-    eprintln!();
+    format!(
+        "{}{}{deleted}",
+        rail(1, "\u{2699}\u{fe0f}", "   "), // ⚙️
+        fg(p.dim, &format!("pids: {listed}"))
+    )
 }
 
-/// Print metadata line (filetype + formula) and findings line.
-fn print_detail_lines(result: &ScanResult, p: &Palette) {
-    let dot = fg(p.dot_sep, "\u{00b7}");
-
-    // Line 2: filetype · formula. The headline carries the confidence; the raw
-    // level remains available in --extra output for debugging.
-    let mut meta: Vec<String> = Vec::new();
-    meta.push(fg(p.filetype, &result.file_type));
-    if !result.formula.is_empty() {
-        meta.push(fg(p.formula, &result.formula));
-    }
-    eprintln!("          {}", meta.join(&format!(" {dot} ")));
-
-    // Line 3: findings (classification-colored)
-    if !result.top_findings.is_empty() {
-        let findings: Vec<String> = result
-            .top_findings
-            .iter()
-            .take(4)
-            .map(|f| {
-                let base = crate::features::trait_path(&f.id);
-                let name = base
-                    .strip_prefix("objectives/")
-                    .or_else(|| base.strip_prefix("micro-behaviors/"))
-                    .or_else(|| base.strip_prefix("well-known/"))
-                    .or_else(|| base.strip_prefix("metadata/"))
-                    .unwrap_or(base);
-                match f.crit {
-                    cleave::Criticality::Hostile => fg(p.hostile_finding, name),
-                    cleave::Criticality::Suspicious => fg(p.suspicious_finding, name),
-                    _ => name.to_string(),
-                }
-            })
-            .collect();
-        eprintln!("          {}", findings.join(&format!(" {dot} ")));
-    }
-}
-
-/// Print SHAP reason line if present.
-fn print_reasons(result: &ScanResult, p: &Palette) {
-    if !result.reasons.is_empty() {
-        let reason_strs: Vec<&str> = result
-            .reasons
-            .iter()
-            .take(3)
-            .map(|r| r.description.as_str())
-            .collect();
-        eprintln!(
-            "          {} {}",
-            fg(p.arrow, "\u{2191}"),
-            fg(p.reason, &reason_strs.join(", ")),
-        );
-    }
-}
-
-/// Format a route-score list as `route=raw` tokens, using the *raw*
-/// (pre-isotonic) model score. The calibrated probability saturates the upper
-/// tail to 1.0, so it hides which route actually drove the grade and how
-/// confident the model really was — the raw score preserves that resolution.
-/// Per-route verdicts are intentionally omitted: blend-driven routes have no
+/// Format a route-score list as `route=raw` tokens, using each route's raw
+/// model output rather than the probability the verdict reports. Per-route
+/// verdicts are intentionally omitted: blend-driven routes have no
 /// individually-attributable classification (see `policy_route_class`).
-pub(crate) fn format_route_scores(scores: &[RouteScore]) -> String {
+fn format_route_scores(scores: &[RouteScore]) -> String {
     scores
         .iter()
         .map(|s| format!("{}={:.6}", s.model, s.raw))
@@ -1005,70 +944,70 @@ pub(crate) fn format_route_scores(scores: &[RouteScore]) -> String {
         .join(" ")
 }
 
-/// Print the matched level, raw route scores, and SHAP feature values
-/// (hidden --extra mode). Leads with the level — the operating point a file
-/// maps to is the actionable signal; the calibrated probability is not shown
-/// because isotonic saturation collapses it to 1.0 across the whole upper tail.
-fn print_extra(result: &ScanResult, p: &Palette) {
-    eprintln!(
-        "          {} {}",
-        fg(p.dim, "level:"),
-        fg(p.dim, &result.level.to_string()),
-    );
-    if !result.model_scores.is_empty() {
-        eprintln!(
-            "          {} {}",
-            fg(p.dim, "models:"),
-            fg(p.dim, &format_route_scores(&result.model_scores)),
-        );
+/// Write the ML diagnostics behind a grade (`--extra`) beneath its card: the
+/// level, each route's raw score and the routes skipped, the SHAP features
+/// behind the top-level featurization, and the routing of the worst archive
+/// members. Leads with the level: it is the only place the rung a benign
+/// file fired on is legible.
+///
+/// Members carry route scores but no SHAP reasons (reasons exist only for the
+/// top-level file); to attribute a member's hit, scan the extracted member
+/// directly so it becomes the top-level file.
+///
+/// # Errors
+/// Writing to `out` failed.
+pub(crate) fn write_extra(out: &mut dyn std::io::Write, r: &ScanResult) -> std::io::Result<()> {
+    /// SHAP features listed, by importance.
+    const MAX_REASONS: usize = 12;
+    /// Archive members listed, worst first.
+    const MAX_MEMBERS: usize = 10;
+    writeln!(out, "  level: {}", r.level)?;
+    if !r.model_scores.is_empty() {
+        writeln!(
+            out,
+            "  routes (raw): {}",
+            format_route_scores(&r.model_scores)
+        )?;
     }
-    // Surface the routing of archive members. A container often inherits a
-    // member's verdict (see `elevated archive classification`), so when the
-    // container's own models disagree with the final grade, the responsible
-    // route lives here — not above. A top-10 view of the evaluation table.
-    for ef in crate::engine::EmbeddedFile::top_offenders(&result.embedded_files, 10) {
-        if ef.model_scores.is_empty() {
-            continue;
-        }
-        eprintln!(
-            "          {} {} {} {} {}",
-            fg(p.dim, "embedded:"),
-            fg(p.dim, &tty_text(&ef.path)),
-            fg(p.dim, &format!("[{} {}]", ef.file_type, ef.level)),
-            fg(p.dim, &format_route_scores(&ef.model_scores)),
-            fg(p.very_dim, "(raw scores)"),
-        );
-    }
-    if !result.skipped_models.is_empty() {
-        let skipped: Vec<String> = result
+    if !r.skipped_models.is_empty() {
+        let skipped: Vec<String> = r
             .skipped_models
             .iter()
             .map(|s| format!("{}:{}", s.model, s.reason))
             .collect();
-        eprintln!(
-            "          {} {}",
-            fg(p.dim, "skipped:"),
-            fg(p.dim, &skipped.join(" "))
-        );
+        writeln!(out, "  skipped: {}", skipped.join(" "))?;
     }
-    if !result.reasons.is_empty() {
-        eprintln!("          {}", fg(p.dim, "shap:"));
-        for r in &result.reasons {
-            eprintln!(
-                "            {} {} {}",
-                fg(p.dim, &format!("{:>8.4}", r.importance)),
-                fg(p.dim, &format!("val={:<8.2}", r.value)),
-                fg(p.very_dim, &r.feature),
-            );
+    if !r.reasons.is_empty() {
+        writeln!(out, "  shap (top features by importance):")?;
+        for reason in r.reasons.iter().take(MAX_REASONS) {
+            writeln!(
+                out,
+                "    imp={:.4} val={:.4}  {}  [{}]",
+                reason.importance, reason.value, reason.feature, reason.description,
+            )?;
         }
     }
+    // A view of the evaluation table; the table itself is complete.
+    for ef in crate::engine::EmbeddedFile::top_offenders(&r.embedded_files, MAX_MEMBERS) {
+        if !ef.model_scores.is_empty() {
+            writeln!(
+                out,
+                "  embedded {} ({} {}): routes (raw) {}",
+                tty_text(&ef.path),
+                ef.file_type,
+                ef.level,
+                format_route_scores(&ef.model_scores),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// A bloom-filter verdict that stands instead of analysis. Known-bad and
 /// conflicted are flags, not short-circuits: they are scanned, and ride the
 /// result as a [`BloomMark`].
 #[derive(Debug, Clone, Copy)]
-pub enum BloomVerdict {
+pub(crate) enum BloomVerdict {
     /// Matched the known-good set — the scan was skipped.
     KnownGood,
     /// In neither set; left unscanned because the mode is `fast`.
@@ -1164,12 +1103,11 @@ impl BloomMark {
 
 /// Report a bloom decision as a real result, not a debug line: a JSON record on
 /// the output stream in `--format json`, a themed one-liner on stderr otherwise.
-pub fn print_bloom_verdict(
+pub(crate) fn print_bloom_verdict(
     label: &str,
     verdict: BloomVerdict,
     format: OutputFormat,
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
     if matches!(format, OutputFormat::Json) {
         return writeln!(
             std::io::stdout().lock(),
@@ -1187,23 +1125,24 @@ pub fn print_bloom_verdict(
     }
 
     let p = palette();
+    let ink = Ink::stderr();
     let (icon, name, reason) = match verdict {
         BloomVerdict::KnownGood => (
-            fg(p.benign, "\u{2713}"),
-            fg(p.benign, "known-good"),
+            ink.fg(p.benign, "\u{2713}"),
+            ink.fg(p.benign, "known-good"),
             "skipping scan",
         ),
         BloomVerdict::Unscanned => (
-            fg(p.warning, "!"),
-            fg(p.very_dim, "unscanned"),
+            ink.fg(p.warning, "!"),
+            ink.fg(p.very_dim, "unscanned"),
             "not in known sets (fast mode)",
         ),
     };
     writeln!(
         std::io::stderr().lock(),
         " {icon}  {name} {}  {}",
-        fg(p.very_dim, reason),
-        fg(p.header_path, &tty_text(label)),
+        ink.fg(p.very_dim, reason),
+        ink.fg(p.header_path, &tty_text(label)),
     )
 }
 
@@ -1212,8 +1151,8 @@ pub fn print_bloom_verdict(
 ///
 /// JSON gets a record shaped like the bloom one — `"source": "remote"` says
 /// whose verdict it is — carrying what the service said: the level, the digest
-/// it describes, when and by what it was analyzed, and its findings (at most
-/// three). Every other format gets one line.
+/// it describes, when and by what it was analyzed, and every finding it
+/// reported. Every other format gets one line, naming its first finding.
 ///
 /// # Errors
 /// Writing to `out` failed.
@@ -1263,7 +1202,7 @@ pub(crate) fn write_remote_verdict(
         .analyzed_at
         .as_deref()
         .and_then(|at| at.get(..10))
-        .map(|day| format!(" \u{b7} analyzed {day}"))
+        .map(|day| format!(" \u{b7} analyzed {}", tty_text(day)))
         .unwrap_or_default();
     let why = verdict
         .findings
@@ -1285,13 +1224,13 @@ pub(crate) fn write_remote_verdict(
 /// hits folded in). A clean scan keeps the quiet thin rule and ✓ line — the
 /// frame inherits the color of what it contains, and a clean run contains no
 /// color.
-pub fn print_summary(summary: &ScanSummary) {
+pub(crate) fn print_summary(summary: &ScanSummary) {
     let p = palette();
+    let ink = Ink::stderr();
     let flagged = summary.hostile > 0 || summary.suspicious > 0 || summary.static_flags > 0;
-    let color = color_enabled();
     let bloom = crate::bloom_repo::counts();
 
-    if flagged && color {
+    if flagged && ink.on() {
         // Cards end flush; the footer leads with its own separating blank.
         eprintln!();
         let accent = if summary.hostile > 0 {
@@ -1299,20 +1238,20 @@ pub fn print_summary(summary: &ScanSummary) {
         } else {
             p.suspicious
         };
-        let mut parts = summary_counts(summary, p);
+        let mut parts = summary_counts(summary, p, ink);
         if bloom.flagged > 0 {
             let s = format!("{} known-bad", bloom.flagged);
-            parts.push((fg(p.hostile, &s), s));
+            parts.push((ink.fg(p.hostile, &s), s));
         }
         if bloom.conflicted > 0 {
             let s = format!("{} conflicted", bloom.conflicted);
-            parts.push((fg(p.warning, &s), s));
+            parts.push((ink.fg(p.warning, &s), s));
         }
         {
             let s = format_elapsed(summary.duration_ms);
-            parts.push((fg(p.very_dim, &s), s));
+            parts.push((ink.fg(p.very_dim, &s), s));
         }
-        let sep_colored = format!(" {} ", fg(p.dot_sep, "\u{00b7}"));
+        let sep_colored = format!(" {} ", ink.fg(p.dot_sep, "\u{00b7}"));
         let colored_line: Vec<&str> = parts.iter().map(|(c, _)| c.as_str()).collect();
         let plain_len: usize =
             parts.iter().map(|(_, s)| s.chars().count()).sum::<usize>() + (parts.len() - 1) * 3;
@@ -1322,15 +1261,15 @@ pub fn print_summary(summary: &ScanSummary) {
             .max(2);
         eprintln!(
             " {} {} {}",
-            fg(accent, "\u{2501}\u{2501}"),
+            ink.fg(accent, "\u{2501}\u{2501}"),
             colored_line.join(&sep_colored),
-            fg(accent, &"\u{2501}".repeat(fill)),
+            ink.fg(accent, &"\u{2501}".repeat(fill)),
         );
         eprintln!();
         return;
     }
 
-    let line = fg(p.summary_line, &"\u{2500}".repeat(52));
+    let line = ink.fg(p.summary_line, &"\u{2500}".repeat(52));
     eprintln!(" {line}");
 
     eprintln!(" {}", summary_status_line(summary));
@@ -1342,26 +1281,30 @@ pub fn print_summary(summary: &ScanSummary) {
 /// [`print_summary`] adds. Shared by the full filesystem-scan summary and
 /// `ps`'s compact finish, which overwrites its progress bar with this line.
 #[must_use]
-pub fn summary_status_line(summary: &ScanSummary) -> String {
+pub(crate) fn summary_status_line(summary: &ScanSummary) -> String {
     let p = palette();
+    let ink = Ink::stderr();
 
     if summary.total_files == 0 {
         let (icon, msg) = if summary.errors > 0 {
             (
-                fg(p.warning, "!"),
+                ink.fg(p.warning, "!"),
                 format!(
                     "no files scanned, {}",
-                    fg(p.header_path, &format!("{} errors", summary.errors)),
+                    ink.fg(p.header_path, &format!("{} errors", summary.errors)),
                 ),
             )
         } else {
-            (fg(p.warning, "!"), "no scannable files found".to_string())
+            (
+                ink.fg(p.warning, "!"),
+                "no scannable files found".to_string(),
+            )
         };
         return format!(
             "{}  {}  {}",
             icon,
             msg,
-            fg(p.very_dim, &format_elapsed(summary.duration_ms)),
+            ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
     }
 
@@ -1374,25 +1317,25 @@ pub fn summary_status_line(summary: &ScanSummary) -> String {
     {
         return format!(
             "{}  {} files scanned, all graded benign  {}",
-            fg(p.benign, "\u{2713}"),
+            ink.fg(p.benign, "\u{2713}"),
             summary.total_files,
-            fg(p.very_dim, &format_elapsed(summary.duration_ms)),
+            ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
     }
 
-    let mut parts: Vec<String> = summary_counts(summary, p)
+    let mut parts: Vec<String> = summary_counts(summary, p, ink)
         .into_iter()
         .map(|(colored, _)| colored)
         .collect();
-    parts.push(fg(p.very_dim, &format_elapsed(summary.duration_ms)));
+    parts.push(ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)));
 
-    let sep = format!("  {}  ", fg(p.dot_sep, "\u{00b7}"));
+    let sep = format!("  {}  ", ink.fg(p.dot_sep, "\u{00b7}"));
     parts.join(&sep)
 }
 
 /// The count segments both summaries share, in order, each as (colored,
 /// plain) so the flagged rule can size its fill from visible width.
-fn summary_counts(summary: &ScanSummary, p: &Palette) -> Vec<(String, String)> {
+fn summary_counts(summary: &ScanSummary, p: &Palette, ink: Ink) -> Vec<(String, String)> {
     let plural = |n: u32| if n == 1 { "" } else { "s" };
     let ScanSummary {
         total_files,
@@ -1434,11 +1377,11 @@ fn summary_counts(summary: &ScanSummary, p: &Palette) -> Vec<(String, String)> {
         ),
     ] {
         if n > 0 {
-            parts.push((fg(color, &text), text));
+            parts.push((ink.fg(color, &text), text));
         }
     }
     let benign = format!("{benign} graded benign");
-    parts.push((fg(p.very_dim, &benign), benign));
+    parts.push((ink.fg(p.very_dim, &benign), benign));
     parts
 }
 
@@ -1455,10 +1398,11 @@ fn type_and_size(file_type: &str, size: u64) -> String {
 /// Warn that a process scan skipped `count` processes it may not inspect.
 pub(crate) fn print_permission_warning(count: u32) {
     let p = palette();
+    let ink = Ink::stderr();
     eprintln!(
         " {}  {}\n",
-        fg(p.suspicious, "\u{26A0}"),
-        fg(
+        ink.fg(p.suspicious, "\u{26A0}"),
+        ink.fg(
             p.header_path,
             &format!(
                 "Skipping {count} processes due to insufficient permissions — re-run as root for full coverage"
@@ -1473,14 +1417,15 @@ pub(crate) fn print_permission_warning(count: u32) {
 /// trait/composite/YARA rules instead of inflating a misleading "rules" total.
 pub(crate) fn print_banner(counts: crate::engine::DetectionCounts) {
     let p = palette();
+    let ink = Ink::stderr();
     eprintln!();
     eprintln!(
         " \u{269b}\u{fe0f} {} {}",
-        fg_bold(
+        ink.fg_bold(
             p.path_name,
             &format!("Atomdrift Scan v{}", env!("CARGO_PKG_VERSION"))
         ),
-        fg(
+        ink.fg(
             p.very_dim,
             &detection_inventory_text(counts.hashes_and_purls, counts.rules)
         ),
@@ -1594,21 +1539,21 @@ pub fn print_version(
 
 /// Format an upstream Unix timestamp as a UTC `YYYY-MM-DD` date.
 fn fmt_date(epoch: i64) -> String {
-    let (y, m, d) = crate::civil::from_days(epoch.div_euclid(86_400));
+    let (y, m, d) = crate::civil::from_days(epoch.div_euclid(SECS_PER_DAY));
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Render an age in seconds as a compact "just now / Nm / Nh / Nd ago" string.
 fn fmt_age(secs: i64) -> String {
     let s = secs.max(0);
-    if s < 60 {
+    if s < SECS_PER_MINUTE {
         "just now".to_string()
-    } else if s < 3600 {
-        format!("{}m ago", s / 60)
-    } else if s < 86_400 {
-        format!("{}h ago", s / 3600)
+    } else if s < SECS_PER_HOUR {
+        format!("{}m ago", s / SECS_PER_MINUTE)
+    } else if s < SECS_PER_DAY {
+        format!("{}h ago", s / SECS_PER_HOUR)
     } else {
-        format!("{}d ago", s / 86_400)
+        format!("{}d ago", s / SECS_PER_DAY)
     }
 }
 
@@ -1616,25 +1561,14 @@ fn fmt_age(secs: i64) -> String {
 /// red beyond. Reuses the classification palette so freshness reads the same way
 /// a verdict does.
 fn freshness_color(secs: i64) -> Rgb {
+    const FRESH: i64 = 2 * SECS_PER_DAY;
+    const CURRENT: i64 = 7 * SECS_PER_DAY;
     let p = palette();
     match secs.max(0) {
-        ..=172_800 => p.benign,
-        172_801..=604_800 => p.suspicious,
+        age if age <= FRESH => p.benign,
+        age if age <= CURRENT => p.suspicious,
         _ => p.hostile,
     }
-}
-
-/// Parse a `YYYY-MM-DD` date as a UTC-midnight Unix timestamp (seconds).
-/// Returns `None` for any malformed field.
-#[must_use]
-pub fn parse_ymd(s: &str) -> Option<i64> {
-    let mut parts = s.splitn(3, '-');
-    // A four-digit year: a manifest's date is not trusted to keep the day
-    // arithmetic below from overflowing.
-    let y = i64::from(parts.next()?.trim().parse::<u16>().ok()?);
-    let m: u32 = parts.next()?.trim().parse().ok()?;
-    let d: u32 = parts.next()?.trim().parse().ok()?;
-    Some(crate::civil::to_days(y, m, d)? * 86_400)
 }
 
 #[cfg(test)]

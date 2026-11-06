@@ -369,12 +369,15 @@ impl EmbeddedFile {
         }
     }
 
-    /// The `n` highest-probability evaluations, for diagnostics displays.
-    /// A view — the table itself is never sorted or truncated.
+    /// The `n` gravest evaluations, worst first by the order verdicts
+    /// outrank each other in (class, then level, then probability), for
+    /// diagnostics displays. Probability alone would rank across routes whose
+    /// scores are not on one scale. A view — the table itself is never sorted
+    /// or truncated.
     #[must_use]
-    pub fn top_offenders(evals: &MemberEvals, n: usize) -> Vec<&EmbeddedFile> {
+    pub(crate) fn top_offenders(evals: &MemberEvals, n: usize) -> Vec<&EmbeddedFile> {
         let mut v: Vec<&EmbeddedFile> = evals.values().collect();
-        v.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+        v.sort_by(|a, b| super::verdict::worst_first(&a.decision(), &b.decision()));
         v.truncate(n);
         v
     }
@@ -568,19 +571,6 @@ impl ScanResult {
             })
     }
 
-    /// The class to record beside `level` when the LLM placed it: a graded
-    /// interpretation whose blend moved the level off what the model measured.
-    /// The blend is the last thing to touch `level`, so a difference from
-    /// `llm.before.lvl` is exactly a placed one.
-    fn llm_class(&self) -> Option<Classification> {
-        match &self.interpretation {
-            Some(Interpretation::Graded(graded)) if graded.before.lvl != self.level => {
-                Some(self.classification)
-            }
-            _ => None,
-        }
-    }
-
     /// The `ml` section. Clones only the small fields; `files` is built here.
     fn ml_section(&self) -> MlSection {
         MlSection {
@@ -588,7 +578,15 @@ impl ScanResult {
             probability: self.probability,
             level: self.level,
             conf: level_confidence(self.level),
-            class: self.llm_class(),
+            // The class beside `level` when the LLM placed it: the blend is
+            // the last thing to touch `level`, so a difference from
+            // `llm.before.lvl` is exactly a placed one.
+            class: match &self.interpretation {
+                Some(Interpretation::Graded(graded)) if graded.before.lvl != self.level => {
+                    Some(self.classification)
+                }
+                _ => None,
+            },
             model_scores: self.model_scores.clone(),
             skipped_models: self.skipped_models.clone(),
             version: self.version.clone(),

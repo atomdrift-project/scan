@@ -1,11 +1,12 @@
 //! How much one root, and the whole run, may fetch: counts, bytes and
 //! wall-clock time.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use fletch::fetch::FetchRecord;
+
+use super::policy::FetchPolicy;
 
 /// A fetch allowance: live fetches and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +83,7 @@ pub(crate) fn set_total_budget(max_fetches: usize, max_bytes: u64) {
 
 /// What one scanned artifact may still fetch, across all of its hops and
 /// declaring files: live dependency/package fetches, live URL fetches, and
-/// bytes, each a [`FetchPolicy`](super::FetchPolicy) per-file ceiling. Cache
+/// bytes, each a [`FetchPolicy`] per-file ceiling. Cache
 /// hits are free and uncounted, so a warm re-run is never
 /// throttled; references past a cap become `BudgetExceeded`, never silently
 /// dropped.
@@ -132,11 +133,11 @@ impl RootBudget {
 }
 
 /// Dependency payloads whose analysis has finished, process-wide, whatever the
-/// outcome (analyzed, cache hit, corpus skip, nothing to analyze). Postdoc's
-/// worker reads this from its stall ticker as a liveness signal: a top-level
-/// analysis walking a large transitive closure completes nothing and changes no
-/// stage for a long time while making steady progress payload by payload, and
-/// without this counter that walk is indistinguishable from a wedged pool.
+/// outcome (analyzed, cache hit, corpus skip, nothing to analyze). A liveness
+/// signal for a stall detector: a top-level analysis walking a large
+/// transitive closure completes nothing and changes no stage for a long time
+/// while making steady progress payload by payload, and without this counter
+/// that walk is indistinguishable from a wedged pool.
 pub(super) static PAYLOADS_ANALYZED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// How many dependency payloads have finished analysis in this process.
@@ -179,7 +180,8 @@ pub(super) fn live_fetch_usage(records: &[FetchRecord]) -> Allowance {
         )
 }
 
-/// The wall-clock ceiling on one artifact's fetch phase (`--fetch-timeout`).
+/// The wall-clock ceiling on one artifact's fetch phase
+/// ([`FetchPolicy::max_duration`]).
 ///
 /// The count and byte budgets bound how much a scan pulls, not how long pulling
 /// takes: a wide tree of slow or rate-limited registries keeps every count
@@ -212,7 +214,7 @@ impl Deadline {
             self.passed = true;
             tracing::warn!(
                 timeout_secs = self.limit.as_secs(),
-                "fetch time cap reached (--fetch-timeout); remaining references not followed"
+                "fetch time cap reached; remaining references not followed"
             );
         }
         self.passed

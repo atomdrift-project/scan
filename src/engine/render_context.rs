@@ -76,7 +76,7 @@ fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32
 /// on those (hex rows and JSON), so 96 KiB is roughly 32–48k tokens, past the
 /// p95 of what the model is asked to read and under the point where one
 /// request holds the KV cache against everyone else.
-pub(crate) const INTERPRET_PRIMARY_BUDGET_BYTES: usize = 96 * 1024;
+const INTERPRET_PRIMARY_BUDGET_BYTES: usize = 96 * 1024;
 
 /// Render `primary` for the LLM, dropping its weakest members until the render
 /// fits in `budget` bytes. Returns the render and how many members went.
@@ -785,13 +785,10 @@ fn compact_fetch_record(fetch: &FetchRecord, source_path: Option<&str>) -> serde
 /// projected to identity and credibility signals ([`project_registry_record`]).
 ///
 /// The provider documents behind the record (`raw`) are not rendered. They are
-/// about 30% of every prompt token, every identity signal they carry is
-/// summarised by the record fletch derives from them, and the shipped prompt
-/// grades the same samples identically without them
-/// (`scripts/hacks/interpret-tune/tune.py --templates noraw`).
+/// about a third of every prompt's tokens, and every identity signal they
+/// carry is summarised by the record fletch derives from them.
 fn registry_provenance(provenance: &RegistryProvenance, now_secs: i64) -> serde_json::Value {
-    let record = serde_json::to_value(&provenance.record).unwrap_or(serde_json::Value::Null);
-    serde_json::json!({ "record": project_registry_record(&record, now_secs) })
+    serde_json::json!({ "record": project_registry_record(&provenance.record, now_secs) })
 }
 
 /// The package's registry identity, projected for the grader.
@@ -803,92 +800,90 @@ fn registry_provenance(provenance: &RegistryProvenance, now_secs: i64) -> serde_
 /// model recognise a typosquat, a dependency-confusion placeholder, or a
 /// hijacked publisher — the supply-chain cases our rules cannot enumerate —
 /// so the projection keeps all of them, in words rather than single letters,
-/// at a few dozen tokens. The provider documents behind them (`raw`) are not
-/// kept: they are about 30% of every prompt token and carry nothing the record
-/// does not summarise.
+/// at a few dozen tokens.
 ///
 /// Ages are measured at scan time from `first_published_at`/`published_at`,
 /// not read from the record's `age_days`: an offline `--registry-map` sidecar
 /// freezes that at *collection* time, and a corpus collected within days of
 /// publication would tell the grader every long-established package is new.
 ///
-/// Reads the record through its serialized keys rather than the `fletch::Registry`
-/// struct: these are the wire names every consumer of the envelope already sees,
-/// and ecosystems populate different subsets of them (a gem record carries
-/// downloads but no release count; a pypi record carries both). Absent and
-/// empty values are omitted; a zero download count is kept, because zero is
-/// the signal.
-fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_json::Value {
-    let get_str = |key: &str| {
-        record
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-    };
-    let get_i64 = |key: &str| record.get(key).and_then(serde_json::Value::as_i64);
-    let get_true = |key: &str| record.get(key).and_then(serde_json::Value::as_bool) == Some(true);
-    let truncate = |s: &str, max: usize| {
+/// Keys are the record's wire names, which every consumer of the envelope
+/// already sees. Ecosystems populate different subsets of the record (a gem
+/// carries downloads but no release count; a pypi record carries both); absent
+/// and empty values are omitted, and a zero download count is kept, because
+/// zero is the signal.
+fn project_registry_record(record: &fletch::Registry, now_secs: i64) -> serde_json::Value {
+    fn text(value: Option<&String>) -> Option<&str> {
+        value.map(String::as_str).filter(|s| !s.is_empty())
+    }
+    fn truncate(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             s.to_string()
         } else {
             let head: String = s.chars().take(max).collect();
             format!("{head}…")
         }
-    };
+    }
 
     let mut out = serde_json::Map::new();
     let mut put = |key: &str, value: serde_json::Value| {
         out.insert(key.to_string(), value);
     };
-    let version = get_str("version").unwrap_or("");
-    if let Some(name) = get_str("name") {
-        let eco = get_str("ecosystem").unwrap_or("");
+    let version = record.version.as_str();
+    if !record.name.is_empty() {
+        let eco = record.ecosystem.as_str();
         let mut id = String::new();
         if !eco.is_empty() {
             id.push_str(eco);
             id.push('/');
         }
-        id.push_str(name);
+        id.push_str(&record.name);
         if !version.is_empty() {
             id.push('@');
             id.push_str(version);
         }
         put("package", serde_json::json!(id));
     }
-    for (key, max) in [("title", 120), ("description", 300)] {
-        if let Some(text) = get_str(key) {
-            put(key, serde_json::json!(truncate(text, max)));
-        }
-    }
-    // Who. `publisher` is the account that pushed this version; `author` is
-    // whatever the manifest claims. Both matter when they disagree.
-    for (key, max) in [
-        ("publisher", 60),
-        ("author", 60),
-        ("publisher_email_domain", 80),
+    for (key, value, max) in [
+        ("title", &record.title, 120),
+        ("description", &record.description, 300),
+        // Who. `publisher` is the account that pushed this version; `author`
+        // is whatever the manifest claims. Both matter when they disagree.
+        ("publisher", &record.publisher, 60),
+        ("author", &record.author, 60),
+        ("publisher_email_domain", &record.publisher_email_domain, 80),
     ] {
-        if let Some(text) = get_str(key) {
+        if let Some(text) = text(value.as_ref()) {
             put(key, serde_json::json!(truncate(text, max)));
         }
     }
-    if let Some(n) = get_i64("maintainers") {
+    if let Some(n) = record.maintainers {
         put("maintainers", serde_json::json!(n));
     }
-    if get_true("publisher_in_maintainers") {
-        put("publisher_in_maintainers", serde_json::json!(true));
-    }
-    if get_true("publisher_verified") {
-        put("publisher_verified", serde_json::json!(true));
+    for (key, flag) in [
+        ("publisher_in_maintainers", record.publisher_in_maintainers),
+        ("publisher_verified", record.publisher_verified),
+    ] {
+        if flag == Some(true) {
+            put(key, serde_json::json!(true));
+        }
     }
     // Where it claims to come from.
-    for key in ["repository", "homepage", "license"] {
-        if let Some(text) = get_str(key) {
+    for (key, value) in [
+        ("repository", &record.repository),
+        ("homepage", &record.homepage),
+        ("license", &record.license),
+    ] {
+        if let Some(text) = text(value.as_ref()) {
             put(key, serde_json::json!(truncate(text, 200)));
         }
     }
     // Whether anyone uses it.
-    for key in ["downloads_total", "downloads_recent"] {
-        if let Some(n) = get_i64(key) {
+    for (key, value) in [
+        ("downloads_total", record.downloads_total),
+        ("downloads_recent", record.downloads_recent),
+    ] {
+        if let Some(n) = value {
             put(key, serde_json::json!(n));
         }
     }
@@ -897,22 +892,29 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
     // `version_age_days` is how long this *version* has, a freshness signal.
     // Folding them into one would report a decade-old gem as days old whenever
     // it had just cut a release — inverting exactly the signal that matters.
-    let days_since = |ts: i64| (now_secs > ts).then(|| (now_secs - ts) / 86_400);
-    if let Some(days) = get_i64("first_published_at").and_then(days_since) {
-        put("package_age_days", serde_json::json!(days));
+    let days_since = |ts: Option<u64>| {
+        let ts = i64::try_from(ts?).ok()?;
+        (now_secs > ts).then(|| (now_secs - ts) / crate::civil::SECS_PER_DAY)
+    };
+    for (key, at) in [
+        ("package_age_days", record.first_published_at),
+        ("version_age_days", record.published_at),
+        ("previous_release_age_days", record.previous_published_at),
+    ] {
+        if let Some(days) = days_since(at) {
+            put(key, serde_json::json!(days));
+        }
     }
-    if let Some(days) = get_i64("published_at").and_then(days_since) {
-        put("version_age_days", serde_json::json!(days));
-    }
-    if let Some(days) = get_i64("previous_published_at").and_then(days_since) {
-        put("previous_release_age_days", serde_json::json!(days));
-    }
-    for key in ["release_count", "releases_24h", "releases_48h"] {
-        if let Some(n) = get_i64(key) {
+    for (key, value) in [
+        ("release_count", record.release_count),
+        ("releases_24h", record.releases_24h),
+        ("releases_48h", record.releases_48h),
+    ] {
+        if let Some(n) = value {
             put(key, serde_json::json!(n));
         }
     }
-    if let Some(latest) = get_str("latest_version") {
+    if let Some(latest) = text(record.latest_version.as_ref()) {
         put("latest_version", serde_json::json!(latest));
         if !version.is_empty() && latest != version {
             put("is_latest", serde_json::json!(false));
@@ -920,25 +922,25 @@ fn project_registry_record(record: &serde_json::Value, now_secs: i64) -> serde_j
     }
     // What the registry itself has flagged. Only when true: a sea of `false`
     // is noise, and an absent flag reads the same as a false one.
-    for key in [
-        "has_install_script",
-        "security_hold",
-        "version_removed",
-        "deprecated",
+    for (key, flag) in [
+        ("has_install_script", record.has_install_script),
+        ("security_hold", record.security_hold),
+        ("version_removed", record.version_removed),
     ] {
-        if get_true(key) {
+        if flag == Some(true) {
             put(key, serde_json::json!(true));
         }
     }
-    if let Some(text) = get_str("deprecated") {
+    if let Some(text) = text(record.deprecated.as_ref()) {
         put("deprecated", serde_json::json!(truncate(text, 120)));
     }
-    for key in ["unpacked_size", "file_count"] {
-        if let Some(n) = get_i64(key).filter(|n| *n > 0) {
-            put(key, serde_json::json!(n));
-        }
+    if let Some(n) = record.unpacked_size.filter(|n| *n > 0) {
+        put("unpacked_size", serde_json::json!(n));
     }
-    if let Some(vulns) = get_i64("vulnerability_count").filter(|v| *v > 0) {
+    if let Some(n) = record.file_count.filter(|n| *n > 0) {
+        put("file_count", serde_json::json!(n));
+    }
+    if let Some(vulns) = record.vulnerability_count.filter(|v| *v > 0) {
         put("vulnerability_count", serde_json::json!(vulns));
     }
     serde_json::Value::Object(out)
@@ -1085,9 +1087,6 @@ fn ref_kind_phrase(kind: &fletch::RefKind) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 /// Replay an artifact-only interpretation input with the live prompt budget and
 /// annotation rewrite. Reports with fetched/registry subjects need the complete
 /// saved presentation envelope; failing is preferable to silently dropping them.
@@ -1128,6 +1127,9 @@ pub(super) fn render_saved_interpret(
         &crate::interpret::sanitize_context(&rendered),
     ))
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod saved_render_tests;

@@ -104,12 +104,23 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
     // itself (when `derived_purl` is `None`), and `locator` moves into
     // `fetch_one` below before this is used again in the fetch-failure arm.
     let fallback_locator = crate::fetch::locator_str(registry_locator).to_owned();
-    // Scan the registry's record in place of a release that has no bytes.
-    let metadata_only = |name: &str, bytes| {
-        crate::engine::run_bytes(
+    // Scan the registry's record in place of a release that has no bytes,
+    // saying why; `None` when there is no record to scan.
+    let metadata_only = |why: &str| {
+        let (name, bytes) = crate::fetch::registry_document(registry.as_ref()?)?;
+        tracing::warn!(locator = %fallback_locator, reason = why, "scanning registry metadata only");
+        if progress {
+            let (ink, p) = (crate::output::Ink::stderr(), crate::output::palette());
+            eprintln!(
+                "\n  {}  {}",
+                ink.fg(p.suspicious, "\u{26a0}"),
+                ink.fg(p.label, &format!("{why} — scanning registry metadata only"))
+            );
+        }
+        Some(crate::engine::run_bytes(
             Fetched {
-                label: name,
-                name,
+                label: &name,
+                name: &name,
                 bytes,
                 registry: registry_provenance.as_ref(),
                 kind: FetchedKind::RegistryRecord {
@@ -117,7 +128,7 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
                 },
             },
             config,
-        )
+        ))
     };
     if let Some(reg) = &registry {
         crate::fetch::report_registry(reg, progress);
@@ -127,12 +138,9 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         // record directly. No extra lookup, no wasted 404 round-trip.
         if reg.version_removed == Some(true)
             && matches!(locator, RefLocator::Purl(_))
-            && let Some((name, bytes)) = crate::fetch::registry_document(reg)
+            && let Some(scanned) = metadata_only("version unpublished")
         {
-            if progress {
-                warn_metadata_only("version unpublished");
-            }
-            return metadata_only(&name, bytes);
+            return scanned;
         }
     }
     // No known-good short-circuit here, by design. This function only ever runs
@@ -167,39 +175,15 @@ fn run(locator: RefLocator, config: &ScanConfig) -> Result<ScanSummary> {
         // other failure (a size cap, a refused address, the network) is not an
         // answer about the package, so the scan fails rather than judge it on
         // less than the operator asked for.
-        Err(e) => match registry
-            .as_ref()
-            .filter(|_| {
-                e.downcast_ref::<crate::fetch::Unretrievable>()
-                    .is_some_and(crate::fetch::Unretrievable::gone)
-            })
-            .and_then(crate::fetch::registry_document)
-        {
-            Some((name, bytes)) => {
-                tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), "artifact gone; scanning registry metadata only");
-                if progress {
-                    warn_metadata_only("artifact unavailable");
-                }
-                metadata_only(&name, bytes)
+        Err(e) => {
+            let gone = e
+                .downcast_ref::<crate::fetch::Unretrievable>()
+                .is_some_and(crate::fetch::Unretrievable::gone);
+            tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), gone, "artifact could not be fetched");
+            if gone && let Some(scanned) = metadata_only("artifact unavailable") {
+                return scanned;
             }
-            None => {
-                tracing::warn!(locator = %fallback_locator, error = %format!("{e:#}"), "artifact could not be fetched");
-                Err(e)
-            }
-        },
+            Err(e)
+        }
     }
-}
-
-/// Tell the operator the scan fell back to the registry's record because there
-/// are no bytes to scan, and why.
-fn warn_metadata_only(why: &str) {
-    use crate::output::{Rgb, fg};
-    eprintln!(
-        "\n  {}  {}",
-        fg(Rgb(230, 180, 80), "\u{26a0}"),
-        fg(
-            Rgb(160, 160, 160),
-            &format!("{why} — scanning registry metadata only")
-        )
-    );
 }

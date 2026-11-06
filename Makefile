@@ -80,15 +80,15 @@ SCAN_THREADS ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-# Cargo's output directory: CARGO_TARGET_DIR when set (cleave-tuna sets it to
-# share the cargo cache across worktrees), else cargo's default `target`.
+# Cargo's output directory: CARGO_TARGET_DIR when set, else cargo's default
+# `target`.
 CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
 # `make lint LOCKED=--locked` (CI) refuses a Cargo.lock that would change.
 # Empty by default so a local `[patch]` experiment still lints and tests.
 LOCKED ?=
 
-.PHONY: all pgo-corpus pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: all pgo-corpus pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark lint fix test test-unit install-precommit clean cut-release
 
 all: build
 
@@ -126,10 +126,8 @@ check-cargo:
 # not by default: training scans a malware corpus, which a plain
 # `make release` or `make install` must never fetch or run on its own. With
 # PGO=1 the first optimized build trains a profile (`pgo-train`) and every
-# later one reuses it until `make pgo-train` runs again. Measured 2026-11-01
-# on a 16c/32t host, cold cache, identical findings: a 672-file benign corpus
-# CPU -7% / wall -6%, a 2,454-file hostile corpus CPU -10% / wall -8%
-# (2026-08-31, poppy worker benchmark: wall -8% / CPU -11%). The profile must
+# later one reuses it until `make pgo-train` runs again; it cuts CPU and wall
+# time by roughly 6-10% with identical findings. The profile must
 # come from an instrumented build of the SAME cargo profile it is applied to
 # -- a thin-LTO profile applied to the fat-LTO build measured slower than no
 # profile at all -- so each cargo profile keeps its own file,
@@ -264,13 +262,13 @@ benchmark: release
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
 	@# Exit 1/2 mean hostile/suspicious found — expected on a malware corpus;
 	@# only scan errors (3+) fail the benchmark.
-	CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) -f json "$(BENCHMARK_PATH)" > /tmp/litmus-benchmark-$(DATASET).json; \
+	CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" ./out/$(BINARY) -f json "$(BENCHMARK_PATH)" > out/benchmark-$(DATASET).json; \
 	status=$$?; [ $$status -le 2 ] || exit $$status
 
 profile-slow:
 	$(CARGO) build --profile profiling --bin $(BINARY)
 	@[ -e "$(BENCHMARK_PATH)" ] || { echo "error: benchmark path not found: $(BENCHMARK_PATH)"; exit 1; }
-	samply record --save-only --duration 20 -o /tmp/litmus-$(DATASET)-profile.json.gz -- \
+	samply record --save-only --duration 20 -o out/$(DATASET)-profile.json.gz -- \
 		env CLEAVE_SCAN_THREADS="$(SCAN_THREADS)" CLEAVE_SKIP_YARA_CACHE=0 ./target/profiling/$(BINARY) -f json "$(BENCHMARK_PATH)"
 
 # ----- archive-mode benchmark ---------------------------------------------
@@ -294,9 +292,8 @@ ARCHIVE_RESULTS ?= $(OUT_DIR)/bench-archive.tsv
 # src edits) — the whole point of the history is before/after across cleave
 # changes, and an unlabeled row can't be attributed to anything.
 ARCHIVE_LABEL   ?= $(shell git -C ../cleave rev-parse --short HEAD 2>/dev/null || echo local)$(shell git -C ../cleave diff --quiet -- src crates 2>/dev/null || echo -dirty)
-# Best-of-N. This box runs hopper/cyclotron/forager alongside, and wall time
-# under that load varies 4x run to run; contention only ever ADDS time, so the
-# minimum is the closest thing to an uncontended measurement available here.
+# Best-of-N. Contention only ever ADDS time, so on a shared host the minimum
+# is the closest thing to an uncontended measurement.
 ARCHIVE_RUNS    ?= 3
 # CLEAVE_SKIP_CACHE=1 forces the full per-file analysis every run — without it a
 # warm analysis cache turns a 400 s scan into 14 s and the benchmark silently
@@ -385,14 +382,11 @@ profile-archive: ## perf-record an archive-mode scan and print the top symbols
 		| grep -E '^ +[0-9]+\.[0-9]+%' | head -30
 	@echo "✓ profile: $(OUT_DIR)/archive.perf.data"
 
-# ----- cleave-tuna integration --------------------------------------------
-# Standardized targets that cleave-tuna drives. The naming mirrors cleave's
-# Makefile so one tuna binary can tune both repos. See ../cleave-tuna/README.md.
-#
+# ----- profiling -----------------------------------------------------------
 # Builds land in $(CARGO_TARGET), which honors CARGO_TARGET_DIR (see the top).
 
-TUNA_DATASET     ?= 200MB
-TUNA_BENCH_PATH  ?= $(BENCHMARK_ROOT)/$(TUNA_DATASET)
+PROFILE_DATASET ?= 200MB
+PROFILE_PATH    ?= $(BENCHMARK_ROOT)/$(PROFILE_DATASET)
 
 bench-build: $(OUT_DIR) ## Build benchmark binary (profiling profile, release + debug syms)
 	$(CARGO) build --profile profiling --bin $(BINARY)
@@ -400,42 +394,23 @@ bench-build: $(OUT_DIR) ## Build benchmark binary (profiling profile, release + 
 	@if [ "$$(uname)" = "Darwin" ]; then codesign -s - -f $(OUT_DIR)/$(BINARY).bench; fi
 	@echo "✓ Benchmark binary: $(OUT_DIR)/$(BINARY).bench"
 
-# Model loading only, independent of traits, bloom filters, and sample scans.
-# EAGER=1 includes every specialist; default measures normal lazy startup.
-MODEL_LOAD_DIR ?= ../azoth
-MODEL_LOAD_RUNS ?= 20
-MODEL_LOAD_MAX_MS ?= 300
-.PHONY: bench-model-load profile-model-load
-bench-model-load: ## Time model startup (MODEL_LOAD_DIR=../azoth EAGER=1 for all specialists)
-	$(CARGO) build --release --example model-load
-	$(CARGO_TARGET)/release/examples/model-load "$(MODEL_LOAD_DIR)" "$(MODEL_LOAD_RUNS)" --max-ms "$(MODEL_LOAD_MAX_MS)" $(if $(filter 1,$(EAGER)),--eager,)
-
-profile-model-load: $(OUT_DIR) ## CPU-profile model loading independently of file analysis
-	$(CARGO) build --profile profiling --example model-load
-	perf record -F 999 -o $(OUT_DIR)/model-load.perf.data -- \
-		$(CARGO_TARGET)/profiling/examples/model-load "$(MODEL_LOAD_DIR)" "$(MODEL_LOAD_RUNS)" $(if $(filter 1,$(EAGER)),--eager,)
-	perf report -i $(OUT_DIR)/model-load.perf.data --stdio --no-children -F overhead,sym
-
 # Full local analysis, including all archive members. Keep compiled rules,
 # but disable analysis-result caches at every layer (not just cleave).
 # Reference downloads are outside this benchmark's measured corpus.
 BENCHMARK_RUNS ?= 1
 BENCHMARK_BINARY ?= $(OUT_DIR)/$(BINARY).bench
-BENCHMARK_RIZIN ?=
-BENCHMARK_NATIVE_CPUS ?=
 .PHONY: balanced-benchmark balanced-benchmark-existing
 balanced-benchmark: bench-build
 balanced-benchmark balanced-benchmark-existing: ## Cache-disabled balanced analysis; -existing uses BENCHMARK_BINARY without rebuilding
 	CLEAVE_RAYON_THREADS="$(SCAN_THREADS)" python3 scripts/bench-balanced.py --binary "$(BENCHMARK_BINARY)" \
 		--output $(OUT_DIR)/balanced-benchmark --runs $(BENCHMARK_RUNS) $(if $(BENCHMARK_LIMIT),--limit $(BENCHMARK_LIMIT),) \
-		$(if $(BENCHMARK_RIZIN),--rizin "$(BENCHMARK_RIZIN)",) $(if $(BENCHMARK_NATIVE_CPUS),--native-cpus "$(BENCHMARK_NATIVE_CPUS)",) \
 		"$(BENCHMARK_PATH)"
 
 sampled-benchmark: bench-build ## Benchmark with samply CPU profiling
 	@command -v samply >/dev/null 2>&1 || { echo "Error: samply not installed. Run: cargo install samply"; exit 1; }
-	@[ -e "$(TUNA_BENCH_PATH)" ] || { echo "error: benchmark path not found: $(TUNA_BENCH_PATH)"; exit 1; }
+	@[ -e "$(PROFILE_PATH)" ] || { echo "error: benchmark path not found: $(PROFILE_PATH)"; exit 1; }
 	$(ARCHIVE_ENV) SCAN_NO_UPDATE_CHECK=1 samply record --save-only -o $(OUT_DIR)/bench.profile.json.gz -- \
-		$(OUT_DIR)/$(BINARY).bench --mode balanced -f json $(TUNA_BENCH_PATH) \
+		$(OUT_DIR)/$(BINARY).bench --mode balanced -f json $(PROFILE_PATH) \
 		>$(OUT_DIR)/bench.out 2>$(OUT_DIR)/bench.err
 	@echo "✓ Profile: $(OUT_DIR)/bench.profile.json.gz  Logs: $(OUT_DIR)/bench.err"
 
@@ -446,61 +421,14 @@ heap-build: $(OUT_DIR) ## Build with jemalloc heap profiling support
 	@echo "✓ Heap-profiling binary: $(OUT_DIR)/$(BINARY).heap"
 
 heap-benchmark: heap-build ## Benchmark with jemalloc heap profiling
-	@[ -e "$(TUNA_BENCH_PATH)" ] || { echo "error: benchmark path not found: $(TUNA_BENCH_PATH)"; exit 1; }
+	@[ -e "$(PROFILE_PATH)" ] || { echo "error: benchmark path not found: $(PROFILE_PATH)"; exit 1; }
 	@rm -rf $(OUT_DIR)/heap && mkdir -p $(OUT_DIR)/heap
 	CLEAVE_SKIP_CACHE=1 _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_interval:28,prof_prefix:$(OUT_DIR)/heap/jeprof" \
-		$(OUT_DIR)/$(BINARY).heap -f json $(TUNA_BENCH_PATH) \
+		$(OUT_DIR)/$(BINARY).heap -f json $(PROFILE_PATH) \
 		>$(OUT_DIR)/bench.out 2>$(OUT_DIR)/bench.err
 	@echo "✓ Heap profiles: $(OUT_DIR)/heap/jeprof.*.heap"
 	@echo "  Analyze with: jeprof --text $(OUT_DIR)/$(BINARY).heap $(OUT_DIR)/heap/jeprof.*.heap"
 
-# cleave-tuna: LLM-driven CPU+memory autoresearch loop. See ../cleave-tuna/README.md.
-TUNA_REPO            ?= ../cleave-tuna
-TUNA_BIN             ?= $(TUNA_REPO)/out/cleave-tuna
-TUNA_EXPERIMENTS     ?= 6
-TUNA_SCREEN_SAMPLES  ?= 1
-TUNA_CONFIRM_SAMPLES ?= 3
-TUNA_PROVIDER        ?= gemini,codex,claude
-TUNA_MODE            ?=
-TUNA_INTERVAL        ?= 30
-
-tuna: ## Run cleave-tuna in a loop, alternating memory/cpu; cherry-picks wins (Ctrl-C to stop)
-	@test -x $(TUNA_BIN) || { echo "build cleave-tuna first: (cd $(TUNA_REPO) && make build)"; exit 1; }
-	@test -z "$$(git status --porcelain)" || { echo "working tree must be clean before starting tuna"; exit 1; }
-	@echo "tuna: looping forever, alternating memory/cpu (Ctrl-C to stop). settings: dataset=$(TUNA_DATASET) experiments=$(TUNA_EXPERIMENTS) screen-samples=$(TUNA_SCREEN_SAMPLES) confirm-samples=$(TUNA_CONFIRM_SAMPLES) provider=$(TUNA_PROVIDER)"
-	@mode=memory; \
-	while true; do \
-		echo "tuna: starting cycle in $$mode mode"; \
-		$(MAKE) tuna-once TUNA_MODE=$$mode || exit $$?; \
-		if [ "$$mode" = "memory" ]; then mode=cpu; else mode=memory; fi; \
-		echo "tuna: sleeping $(TUNA_INTERVAL)s before next cycle ($$mode) — Ctrl-C to stop"; \
-		sleep $(TUNA_INTERVAL); \
-	done
-
-tuna-once: ## One cleave-tuna cycle, then cherry-pick accepted experiments
-	@test -x $(TUNA_BIN) || { echo "build cleave-tuna first: (cd $(TUNA_REPO) && make build)"; exit 1; }
-	@test -z "$$(git status --porcelain)" || { echo "working tree must be clean before tuna-once"; exit 1; }
-	@before=$$(git rev-parse HEAD); \
-	$(TUNA_BIN) --source $(CURDIR) --root $(TUNA_REPO) --dataset $(TUNA_DATASET) \
-		--name scan \
-		--bench-arg -f --bench-arg json \
-		--bench-env CLEAVE_SKIP_CACHE=1 \
-		--deny vendor/ --deny packaging/ --deny scripts/ --deny testdata/ \
-		--experiments $(TUNA_EXPERIMENTS) \
-		--screen-samples $(TUNA_SCREEN_SAMPLES) --confirm-samples $(TUNA_CONFIRM_SAMPLES) \
-		--provider $(TUNA_PROVIDER) $(if $(TUNA_MODE),--$(TUNA_MODE),) \
-		|| { echo "tuna: cleave-tuna exited non-zero; not cherry-picking"; exit 1; }; \
-	branch=$$(git for-each-ref --sort=-committerdate --format='%(refname:short)' 'refs/heads/tuna/*' | head -1); \
-	if [ -z "$$branch" ]; then echo "tuna: no tuna/* branch found"; exit 0; fi; \
-	ahead=$$(git rev-list --count $$before..$$branch); \
-	if [ "$$ahead" = "0" ]; then \
-		echo "tuna: no accepted experiments on $$branch — nothing to cherry-pick"; \
-		exit 0; \
-	fi; \
-	echo "tuna: cherry-picking $$ahead commit(s) from $$branch"; \
-	git cherry-pick $$branch~$$ahead..$$branch
-
-# --------------------------------------------------------------------------
 
 lint:
 	$(CARGO) fmt --all --check
@@ -527,13 +455,10 @@ test-cli:
 	$(CARGO) test --locked --test cli_smoke
 
 test-unit:
-	@set -e; \
-	if command -v cargo-nextest >/dev/null 2>&1; then \
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		$(CARGO) nextest run --lib; \
 	else \
-		$(CARGO) test --lib worker::tests::prefetcher_fills_to_target_backpressures_and_refills --quiet; \
-		$(CARGO) test --lib -- \
-			--skip worker::tests::prefetcher_fills_to_target_backpressures_and_refills; \
+		$(CARGO) test --lib; \
 	fi
 
 # Install the pre-commit gate (no local Cargo.toml path overrides + make lint +
@@ -586,61 +511,3 @@ clean:
 
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
-
-# ----- Wolfi packaging ----------------------------------------------------
-# Build a Wolfi-based OCI image for scan via melange + apko. Mirrors
-# the cleave/packaging/wolfi flow; depends on a sibling cleave checkout
-# at ../cleave (the local build stages cleave + filefacts + the scan
-# source repo and overrides the cleave git dep via a Cargo [patch] block).
-# On macOS the build runs inside a dedicated Lima VM (`scan-wolfi`). See
-# packaging/wolfi/README.md.
-WOLFI_DIR = packaging/wolfi
-WOLFI_OUT = $(OUT_DIR)/wolfi
-WOLFI_ARCH ?=
-
-wolfi: wolfi-bootstrap wolfi-build wolfi-test
-
-wolfi-bootstrap:
-	@$(WOLFI_DIR)/scripts/bootstrap-lima.sh
-
-wolfi-build:
-	@WOLFI_ARCH="$(WOLFI_ARCH)" $(WOLFI_DIR)/scripts/build.sh
-	@echo "✓ Wolfi image: $(WOLFI_OUT)/scan.tar"
-
-wolfi-test:
-	@$(WOLFI_DIR)/scripts/smoke-test.sh
-
-wolfi-shell:
-	@[ -f $(WOLFI_OUT)/scan.tar ] || { echo "error: run 'make wolfi-build' first"; exit 1; }
-	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / scan-wolfi nerdctl run --rm -it --entrypoint /bin/sh scan:smoke ;; \
-		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r run --rm -it --entrypoint /bin/sh scan:smoke; }; done; echo "no container runtime"; exit 1 ;; \
-	esac
-
-wolfi-clean:
-	rm -rf $(WOLFI_OUT)
-	@echo "✓ Wolfi output cleaned"
-
-wolfi-nuke: wolfi-clean
-	@case "$$(uname -s)" in \
-		Darwin) limactl delete --force scan-wolfi 2>/dev/null || true ;; \
-	esac
-	rm -rf $$HOME/.cache/scan-wolfi
-	@echo "✓ Wolfi VM and cache removed"
-
-# ----- Publish -----------------------------------------------------------
-# Push the multi-arch scan image to a registry and sign it keyless with
-# cosign via Google OIDC. Override REGISTRY / ORG / ARCHS via env. See
-# packaging/wolfi/README.md for prerequisites.
-REGISTRY ?= docker.io
-ORG      ?= atomdrift
-
-docker-login: wolfi-bootstrap ## Log the lima VM's runtime into REGISTRY (interactive)
-	@case "$$(uname -s)" in \
-		Darwin) limactl shell --workdir / scan-wolfi nerdctl login $(REGISTRY) ;; \
-		Linux)  for r in nerdctl docker podman; do command -v $$r >/dev/null 2>&1 && { exec $$r login $(REGISTRY); }; done; echo "no container runtime"; exit 1 ;; \
-	esac
-
-docker-publish: wolfi-bootstrap ## Build multi-arch + push + cosign sign (set DRY_RUN=1 to skip the push)
-	@REGISTRY="$(REGISTRY)" ORG="$(ORG)" \
-		$(WOLFI_DIR)/scripts/publish.sh

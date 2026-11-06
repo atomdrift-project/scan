@@ -1,11 +1,7 @@
 //! What a model says about a sample: its classification, the level it fires
 //! at, and the thresholds that turn scores into both.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::fmt;
 
 /// The suspicious ceiling never sits below this level, whatever the deploy.
 ///
@@ -18,12 +14,8 @@ pub(super) const SUSPICIOUS_CEILING_FLOOR: u16 = 500;
 /// The suspicious ceiling as a multiple of the active hostile level.
 ///
 /// Suspicious means "up to 100× the false-positive budget you chose for
-/// blocking": the shipped `-l 25` reviews through L2500, and a deploy loose
-/// enough to block at L250 reviews the whole grid. Replaces the flat L3000 of
-/// the 2026-07 experiment, which a fired-level analysis (gauntlet, 2026-10-27..
-/// 11-06) showed bought nothing over L2500 at the default: model-only verdicts
-/// past L2500 were a handful, and interpreted ones are placed inside the band
-/// whatever its width.
+/// blocking": the default `-l 25` reviews through L2500, and a deploy loose
+/// enough to block at L250 reviews the whole grid.
 pub(super) const SUSPICIOUS_CEILING_MULTIPLE: u16 = 100;
 
 /// The suspicious ceiling for a deploy at `active`:
@@ -79,16 +71,16 @@ pub struct RouteScore {
     /// Compact model route name, e.g. `az`, `az/native`, `az/elf`.
     #[serde(rename = "rte")]
     pub model: String,
-    /// Probability emitted by this route's model. This is the calibrated value
-    /// (the space thresholds live in) and drives the verdict.
+    /// Probability emitted by this route's model, in the space thresholds
+    /// live in; it drives the verdict.
     #[serde(rename = "prob")]
     pub probability: f32,
-    /// Raw (pre-isotonic) model probability. The calibrated `probability`
-    /// saturates the upper tail to 1.0, so the raw score is what's surfaced to
-    /// humans for triage — it preserves resolution the calibrated number loses.
+    /// The model's own score. Scan applies no transform to it, so this
+    /// equals `probability`; the field stays on the wire for the consumers
+    /// that read it.
     #[serde(rename = "raw")]
     pub raw: f32,
-    /// Classification after applying this route's calibrated thresholds.
+    /// Classification after applying this route's thresholds.
     #[serde(rename = "cls")]
     pub classification: Classification,
 }
@@ -134,51 +126,14 @@ pub struct Thresholds {
     pub hostile: f32,
 }
 
-impl Default for Thresholds {
-    fn default() -> Self {
-        Self {
-            suspicious: Self::FALLBACK_SUSPICIOUS,
-            hostile: Self::FALLBACK_HOSTILE,
-        }
-    }
-}
-
 impl Thresholds {
-    /// Fallback thresholds used when `evaluation.json` is absent or unreadable.
-    /// These are intentionally conservative (high hostile threshold, moderate
-    /// suspicious threshold) to minimize false positives when operating without
-    /// model-specific calibration data.
-    pub const FALLBACK_SUSPICIOUS: f32 = 0.65;
-    /// Fallback hostile threshold.
-    pub const FALLBACK_HOSTILE: f32 = 0.90;
-
-    /// Maximum acceptable relative divergence between custom thresholds and
-    /// recommended thresholds before a warning is emitted. 0.3 = 30%.
-    const DIVERGENCE_WARN_RATIO: f32 = 0.3;
-
-    /// Warn if custom thresholds diverge significantly from recommended values.
-    pub fn warn_if_divergent(&self, recommended: &Thresholds) {
-        let check = |name: &str, custom: f32, rec: f32| {
-            if rec > 0.0 {
-                let ratio = ((custom - rec) / rec).abs();
-                if ratio > Self::DIVERGENCE_WARN_RATIO {
-                    tracing::warn!(
-                        custom = custom,
-                        recommended = rec,
-                        divergence_pct = format!("{:.0}%", ratio * 100.0),
-                        "custom {name} threshold diverges significantly from model recommendation"
-                    );
-                }
-            }
-        };
-        check("suspicious", self.suspicious, recommended.suspicious);
-        check("hostile", self.hostile, recommended.hostile);
-    }
-
     /// Validate the threshold invariants.
     ///
     /// Callers constructing thresholds dynamically should validate once at the
     /// boundary, then pass the value through the rest of the system unchanged.
+    ///
+    /// # Errors
+    /// When a threshold is outside `[0, 1]` or suspicious exceeds hostile.
     pub fn validate(&self) -> std::result::Result<(), ThresholdValidationError> {
         if !(0.0..=1.0).contains(&self.suspicious) {
             return Err(ThresholdValidationError::OutOfRange {
@@ -225,7 +180,7 @@ impl Thresholds {
     #[must_use]
     pub fn decide(&self, probability: f32) -> Decision {
         // The raw threshold path carries no level table (manual `--threshold-*`
-        // mode, single-bundle, or the no-grid fallback), so `level` is `Manual`.
+        // mode, or the no-grid fallback), so `level` is `Manual`.
         let class = self.classify(probability);
         Decision {
             class,
@@ -373,7 +328,7 @@ impl std::error::Error for ThresholdValidationError {}
 /// Stable metadata about the loaded model, computed once at startup.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ModelInfo {
-    /// Feature spec version (e.g. 13).
+    /// Feature spec version (e.g. 20).
     pub version: u32,
     /// Stable preprocessing/inference ABI version.
     pub abi_version: u32,

@@ -3,17 +3,17 @@
 use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use cleave::{AnalysisOptions, AnalysisReport};
 
 use super::hopper::{Origin, renew};
-use super::pipeline::{ClassifyRequest, OutputNeeds, classify_report};
+use super::pipeline::{ClassifyRequest, classify_report};
 use super::progress::{Progress, Spinner};
-use super::render_cards::{write_extra_diagnostics, write_tiny};
+use super::render_cards::write_tiny;
 use super::{
     DisplayFilter, ENGINE_VERSION, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources,
@@ -46,7 +46,7 @@ pub fn run(path: &Path, config: &ScanConfig) -> Result<ScanSummary> {
 ///
 /// # Errors
 /// As [`run`].
-pub fn run_with(
+pub(crate) fn run_with(
     model: &Model,
     shap: Option<&ShapImportance>,
     path: &Path,
@@ -93,7 +93,7 @@ pub fn run_paths(
 ///
 /// # Errors
 /// As [`run_paths`].
-pub fn run_paths_with(
+fn run_paths_with(
     model: &Model,
     shap: Option<&ShapImportance>,
     paths: &[PathBuf],
@@ -116,7 +116,7 @@ pub fn run_paths_with(
         } else if path.is_dir() {
             dir_files.extend(discover_files(path, &session.tally.errors));
         } else {
-            tracing::error!("path does not exist: {}", path.display());
+            tracing::error!(path = %path.display(), "path does not exist");
             session.tally.errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -160,7 +160,7 @@ fn scan_partitioned(
         };
         let target = Target {
             sidecar: !named && session.config.sidecars() && is_attached_sidecar(path),
-            ..Target::new(origin, named)
+            ..Target::new(origin)
         };
         session.record(&target, analyzed, None);
     };
@@ -177,7 +177,7 @@ fn scan_partitioned(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        let spinner = Spinner::start(label);
+        let spinner = Spinner::start(&label);
         let analyzed = cleave::analyze_file(path, &named_target_opts(&session.opts))
             .with_context(|| format!("cleave analysis of {}", path.display()));
         drop(spinner);
@@ -208,7 +208,7 @@ fn scan_partitioned(
 
 /// Bytes fetched for `scan url` or `scan purl`, and where they came from.
 #[derive(Debug)]
-pub struct Fetched<'a> {
+pub(crate) struct Fetched<'a> {
     /// The display path: the URL, or the PURL.
     pub label: &'a str,
     /// The file name, which drives cleave's extension-based type detection.
@@ -223,7 +223,7 @@ pub struct Fetched<'a> {
 
 /// What a [`Fetched`]'s bytes are.
 #[derive(Debug, Clone, Copy)]
-pub enum FetchedKind<'a> {
+pub(crate) enum FetchedKind<'a> {
     /// The artifact itself, as fetched.
     Artifact(&'a fletch::fetch::FetchRecord),
     /// The registry's record of the package at `purl`, standing in for a
@@ -242,7 +242,7 @@ pub enum FetchedKind<'a> {
 ///
 /// # Errors
 /// As [`run_paths`].
-pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummary> {
+pub(crate) fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummary> {
     let Fetched {
         label,
         name,
@@ -299,7 +299,7 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
     // dependency of it.
     let target = Target {
         fallback_purl,
-        ..Target::new(origin, true)
+        ..Target::new(origin)
     };
     session.record(&target, analyzed, Some(bytes));
     session.finish()
@@ -310,7 +310,7 @@ pub fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<ScanSummar
 ///
 /// # Errors
 /// As [`run_paths`].
-pub fn report_remote(
+pub(crate) fn report_remote(
     config: &ScanConfig,
     label: &str,
     sha: &str,
@@ -337,17 +337,19 @@ pub fn report_remote(
 /// Unlike [`run`], no `ScanSummary` aggregation happens here; one call =
 /// one [`ScanResult`]. Callers that need bulk counters should aggregate.
 ///
+/// The caller has run [`super::prefetch_cleave_resources`] once, as
+/// [`crate::Analyzer::new`] does, so a call pays nothing for it.
+///
 /// # Errors
 /// Propagates cleave analysis failures, model inference errors, and feature
 /// spec mismatches.
-pub fn scan_bytes(
+pub(crate) fn scan_bytes(
     data: Vec<u8>,
     filename: &str,
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources();
     let data = bytes::Bytes::from(data);
     let report = cleave::analyze_bytes_shared(data.clone(), filename, &analysis_options(config))
         .with_context(|| format!("cleave analysis of {filename}"))?;
@@ -375,18 +377,18 @@ pub fn scan_bytes(
 /// (e.g. the originating URL) echoed into the report and used for the label,
 /// exactly as in [`scan_bytes`]. `read_path`'s extension still drives cleave's
 /// type detection, so callers should give the temporary file a name that carries
-/// the payload's real extension.
+/// the payload's real extension. Prefetching is the caller's, as for
+/// [`scan_bytes`].
 ///
 /// # Errors
 /// Propagates cleave analysis failures and model inference errors.
-pub fn scan_file(
+pub(crate) fn scan_file(
     read_path: &Path,
     filename: &str,
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
 ) -> Result<ScanResult> {
-    prefetch_cleave_resources();
     let report = cleave::analyze_file(read_path, &analysis_options(config))
         .with_context(|| format!("cleave analysis of {filename}"))?;
     let classifier = Classifier {
@@ -426,6 +428,8 @@ struct Session<'a> {
     /// What every file is analyzed with, the bloom skip predicate and the
     /// Ctrl-C flag included.
     opts: AnalysisOptions,
+    /// Files the skip predicate left unanalyzed; see [`SkippedByBloom`].
+    skipped: SkippedByBloom,
     cancel: Arc<AtomicBool>,
     tally: Tally,
     progress: Option<Progress>,
@@ -444,7 +448,8 @@ impl<'a> Session<'a> {
         let cancel = crate::interrupt::arm("Interrupted — finishing current file…");
         let mut opts = analysis_options(config);
         opts.cancellation = Some(Arc::clone(&cancel));
-        opts.skip_predicate = bloom_skip_predicate(config);
+        let skipped = SkippedByBloom::default();
+        opts.skip_predicate = bloom_skip_predicate(config, &skipped);
         if config.upload_hopper().is_none()
             && let Some(url) = config.hopper()
         {
@@ -458,6 +463,7 @@ impl<'a> Session<'a> {
             model,
             shap,
             opts,
+            skipped,
             cancel,
             tally: Tally::default(),
             progress: None,
@@ -479,47 +485,30 @@ impl<'a> Session<'a> {
         analyzed: Result<AnalysisReport>,
         root_bytes: Option<bytes::Bytes>,
     ) {
-        // The bloom verdict, re-derived from the sha cleave computed. A file
-        // cleave skipped at our request (a stale known-good, or a fast-mode
-        // unknown) arrives as a minimal report and is counted here without an
-        // ML pass. A known-bad or conflicted file — or a known-good scanned on
-        // its own merits — was analyzed, and carries a mark on its SHA-256 line.
+        // A file cleave skipped at the predicate's word arrives as a target-only
+        // report: it is counted on the decision that skipped it, never graded.
+        if let Some(decision) = self.skipped.take(target.origin.path) {
+            let label = target.origin.path.display().to_string();
+            let benign = bloom_gate(self.config, &label, decision, |label, verdict| {
+                self.write_result(|| {
+                    crate::output::print_bloom_verdict(label, verdict, self.config.format())
+                });
+            });
+            if benign.is_some_and(|n| n > 0) {
+                self.tally.count(Classification::Benign);
+            }
+            self.advance();
+            return;
+        }
+        // Everything else was analyzed — a named file, an adverse match, a
+        // fresh known-good — and carries its bloom verdict as a mark on its
+        // SHA-256 line.
         let mut bloom_mark = None;
         if let (Some(lookup), Ok(report)) = (self.config.bloom(), &analyzed)
             && let Some(digest) = burton::parse_sha256_hex(&report.target.sha256)
         {
             let decision = lookup.decide_sha256(&digest);
-            // A file the operator named on the command line is scanned on its
-            // own merits: cleave got no skip predicate (see
-            // `named_target_opts`), so it has produced a full report — past a
-            // bless, and past fast mode's unknown-skip. That is a policy, not
-            // an optimization: a bless is a bulk shortcut for dependencies and
-            // directory walks, and returning one where a scan was asked for
-            // answers a different question. A known-good touched within
-            // KNOWN_GOOD_RESCAN is scanned too (see `bloom_gate_fresh`). The
-            // mark is still emitted, so a named known-bad still says so.
-            let named_analyzed = target.named
-                && (decision == BloomDecision::Skip
-                    || (decision == BloomDecision::Unknown && self.config.mode() == Mode::Fast));
-            if !named_analyzed
-                && let Some(benign) = bloom_gate_fresh(
-                    self.config,
-                    target.origin.path,
-                    decision,
-                    |label, verdict| {
-                        self.write_result(|| {
-                            crate::output::print_bloom_verdict(label, verdict, self.config.format())
-                        });
-                    },
-                )
-            {
-                if benign > 0 {
-                    self.tally.count(Classification::Benign);
-                }
-                self.advance();
-                return;
-            }
-            // Non-fast unknown maps to `None` (unremarkable, matched neither set).
+            tally_bloom(decision, false, &report.target.path);
             bloom_mark = BloomMark::from_decision(decision);
         }
 
@@ -596,10 +585,7 @@ impl<'a> Session<'a> {
             return;
         };
         self.tally.count(class);
-        let shown = matches!(
-            self.config.format(),
-            OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-        ) || self.config.filter().shows(class);
+        let shown = self.config.format().emits_every_result() || self.config.filter().shows(class);
         if shown {
             self.write_result(|| {
                 let mut out = io::stdout().lock();
@@ -656,26 +642,27 @@ impl<'a> Session<'a> {
         // interpret are machine/LLM payload formats: they emit every scanned
         // file. Severe static findings also admit a terminal result, even when
         // the model's verdict is benign; `--show` selects their severity.
-        let (sidecar_shown, sidecar_filed) = if target.sidecar {
-            let policy = sidecar_policy(result.classification, result.has_severe_findings());
+        let sidecar = if target.sidecar {
+            let policy = SidecarPolicy::new(result.classification, result.has_severe_findings());
             tracing::debug!(
                 path = %target.origin.path.display(),
                 classification = ?result.classification,
-                shown = policy.0,
-                filed = policy.1,
+                shown = policy.shown,
+                filed = policy.filed,
                 "capture record analyzed as a sidecar",
             );
             policy
         } else {
-            (true, true)
+            SidecarPolicy {
+                shown: true,
+                filed: true,
+            }
         };
-        let shown = sidecar_shown
-            && (matches!(
-                self.config.format(),
-                OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
-            ) || result
-                .bloom_mark
-                .is_some_and(BloomMark::forces_terminal_display)
+        let shown = sidecar.shown
+            && (self.config.format().emits_every_result()
+                || result
+                    .bloom_mark
+                    .is_some_and(BloomMark::forces_terminal_display)
                 || self.config.filter().shows(result.classification)
                 || findings_match_filter(
                     self.config.filter(),
@@ -689,7 +676,7 @@ impl<'a> Session<'a> {
         // the handoff; the upload itself runs on the uploader's thread. Only
         // successful results are sent — an error envelope has an empty file
         // type, which hopper treats as a delete.
-        if sidecar_filed
+        if sidecar.filed
             && let (Some(uploader), Some(hopper_url)) = (&self.uploader, self.config.hopper())
         {
             renew(
@@ -710,7 +697,7 @@ impl<'a> Session<'a> {
             return;
         }
         let msg = crate::tools::enrich_error(error).unwrap_or_else(|| format!("{error:#}"));
-        tracing::error!("error analyzing {}: {}", path.display(), msg);
+        tracing::error!(path = %path.display(), error = %msg, "analysis failed");
         // A failed file still gets a line on stdout under `--format json`, so a
         // consumer reading the NDJSON sees *that* it failed and why, instead of
         // inferring it from a record that never arrives. This does not make the
@@ -758,6 +745,9 @@ impl<'a> Session<'a> {
             progress.finish();
         }
         drop(self.uploader);
+        // Engine-internal attribution (per-phase thread time, regex store
+        // churn) for slow-scan diagnosis: cumulative, so logged once a scan.
+        cleave::log_scan_stats();
         let summary = self.tally.summary(self.started);
         if self.broken_pipe.load(Ordering::Relaxed) {
             // The reader went away (`atomscan … | head`), so nothing more is
@@ -807,27 +797,34 @@ fn findings_match_filter(
         })
 }
 
-/// What an attached capture record's result does under `--enable-sidecar`:
-/// `(shown, filed on hopper)`. The record is bookkeeping, not a sample, so a
-/// clean one is neither; it is shown when it raises anything — a suspicious or
-/// hostile verdict, or a severe static finding — and filed only when hostile.
-const fn sidecar_policy(class: Classification, severe_findings: bool) -> (bool, bool) {
-    let hostile = matches!(class, Classification::Hostile);
-    (
-        hostile || matches!(class, Classification::Suspicious) || severe_findings,
-        hostile,
-    )
+/// What an attached capture record's result does under `--enable-sidecar`.
+/// The record is bookkeeping, not a sample, so a clean one is neither shown
+/// nor filed; it is shown when it raises anything — a suspicious or hostile
+/// verdict, or a severe static finding — and filed only when hostile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidecarPolicy {
+    /// Written to the output.
+    shown: bool,
+    /// Renewed on hopper as a sample.
+    filed: bool,
+}
+
+impl SidecarPolicy {
+    const fn new(class: Classification, severe_findings: bool) -> Self {
+        let hostile = matches!(class, Classification::Hostile);
+        Self {
+            shown: hostile || matches!(class, Classification::Suspicious) || severe_findings,
+            filed: hostile,
+        }
+    }
 }
 
 /// One file of a CLI scan, and what the scan knows about it besides its report.
 #[derive(Clone, Copy)]
 struct Target<'a> {
     origin: Origin<'a>,
-    /// The operator named it on the command line, so it is analyzed on its own
-    /// merits and never answered from a bloom bless (see `named_target_opts`).
-    named: bool,
     /// A capture record found by a walk under `--enable-sidecar`; see
-    /// [`sidecar_policy`].
+    /// [`SidecarPolicy`].
     sidecar: bool,
     /// Set when the bytes are a registry-metadata document standing in for a
     /// package that could not be fetched; see [`super::HopperRoute`].
@@ -835,10 +832,9 @@ struct Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    const fn new(origin: Origin<'a>, named: bool) -> Self {
+    const fn new(origin: Origin<'a>) -> Self {
         Self {
             origin,
-            named,
             sidecar: false,
             fallback_purl: None,
         }
@@ -870,7 +866,6 @@ impl Classifier<'_> {
     ) -> Result<ScanResult> {
         let config = self.config;
         let label = origin.path.display().to_string();
-        let json = config.format() == OutputFormat::Json;
         let classified = classify_report(
             report,
             ClassifyRequest {
@@ -881,18 +876,7 @@ impl Classifier<'_> {
                 interpret: config.interpret(),
                 fetch: config.fetch_policy(),
                 zip_passwords: config.zip_passwords(),
-                needs: OutputNeeds {
-                    llm_view: config.format() == OutputFormat::Interpret,
-                    // The live fetch log renders only on the interactive
-                    // terminal path; JSON and tiny stay machine-clean (the edges
-                    // ride along in the JSON `fetched` array regardless).
-                    fetch_progress: config.format() == OutputFormat::Terminal,
-                    render_context: !json,
-                    // `--show=all` with JSON output: list every archive member,
-                    // even the no-finding ones cleave skipped analyzing.
-                    list_all_members: json && config.filter().is_all(),
-                    deps_for_upload: config.upload_hopper().is_some(),
-                },
+                needs: config.output_needs(),
                 root_registry: origin.registry,
                 root_fetch: origin.fetch,
                 bloom_mark,
@@ -916,22 +900,16 @@ impl Classifier<'_> {
             total_ms = crate::duration_ms(phase.total),
             "scan phases complete",
         );
-        // Engine-internal attribution (per-phase thread-time, regex store churn)
-        // for slow-scan diagnosis; one line per stat at info.
-        cleave::log_scan_stats();
-
-        // JSON output and hopper renewals carry the report (so hopper stores it
-        // and explodes archive members); the terminal never reads it.
-        let keep_report = json || config.upload_hopper().is_some();
-        Ok(classified.into_scan_result(label, self.model, keep_report))
+        Ok(classified.into_scan_result(label, self.model, config.keeps_report()))
     }
 }
 
-/// Write one result to stdout in the configured format.
+/// Write one result to stdout in the configured format: the one writer for
+/// path, package and process scans alike.
 ///
 /// # Errors
 /// The write failed; `BrokenPipe` means nobody is reading any more.
-fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
+pub(crate) fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
     match config.format() {
         OutputFormat::Json => {
             // Archive reports can contain thousands of members. Serialize on
@@ -956,10 +934,15 @@ fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
             if !r.rendered_context.ends_with('\n') {
                 out.write_all(b"\n")?;
             }
+            // A process scan names the processes running the binary.
+            if let Some(pids) = &r.pids {
+                let line = crate::output::terminal_pids_line(pids, r.deleted == Some(true));
+                writeln!(out, "{line}")?;
+            }
             // `--extra`: append the full ML diagnostics that explain the grade —
             // which route drove it and the top SHAP features behind it.
             if config.extra() {
-                write_extra_diagnostics(&mut out, r)?;
+                crate::output::write_extra(&mut out, r)?;
             }
             // The closing summary is written to stderr. Commit this whole card
             // first so stdio buffering cannot strand its final trait beneath the
@@ -1036,8 +1019,7 @@ fn bloom_gate(
     // aggregate tally always reports them in the summary regardless.
     let show_quiet =
         config.format() == OutputFormat::Json || config.filter().shows(Classification::Benign);
-    // Tally for end-of-scan observability. `unscanned` only matters for Unknown.
-    crate::bloom_repo::record(decision, fast && decision == BloomDecision::Unknown);
+    tally_bloom(decision, fast && decision == BloomDecision::Unknown, label);
     match decision {
         BloomDecision::Skip => {
             if show_quiet {
@@ -1057,17 +1039,8 @@ fn bloom_gate(
         BloomDecision::KnownBad
         | BloomDecision::SightedHostile
         | BloomDecision::SightedSuspicious
-        | BloomDecision::Unavailable => None,
-        BloomDecision::Conflicted => {
-            // Build-time subtraction removes bad keys from good, so a conflict can
-            // only mean filter version skew or a producer bug — it should never
-            // happen. Always scan, but make the noise loud (in the logs).
-            tracing::warn!(
-                label,
-                "bloom conflict: key is in BOTH the good and bad filters (should never happen) — scanning"
-            );
-            None
-        }
+        | BloomDecision::Unavailable
+        | BloomDecision::Conflicted => None,
         // Unknown is left unscanned only in bloom-only fast mode; otherwise scanned.
         BloomDecision::Unknown => fast.then(|| {
             if show_quiet {
@@ -1075,6 +1048,45 @@ fn bloom_gate(
             }
             0
         }),
+    }
+}
+
+/// Count one bloom decision in the end-of-scan tally (`unscanned`: a
+/// fast-mode unknown left unanalyzed), and say so loudly on a conflict.
+fn tally_bloom(decision: BloomDecision, unscanned: bool, label: &str) {
+    crate::bloom_repo::record(decision, unscanned);
+    if decision == BloomDecision::Conflicted {
+        // Build-time subtraction removes bad keys from good, so a conflict can
+        // only mean filter version skew or a producer bug. The file is
+        // scanned regardless; the log says the filters need attention.
+        tracing::warn!(
+            label,
+            "bloom conflict: key is in both the good and the bad filter; scanning"
+        );
+    }
+}
+
+/// The bloom decisions cleave's skip predicate left unanalyzed, by path.
+///
+/// [`Session::record`] counts a skipped file on the decision that skipped it
+/// rather than deciding again: a file touched between the two would otherwise
+/// be graded from the target-only report cleave returns for a skip.
+#[derive(Clone, Default)]
+struct SkippedByBloom(Arc<Mutex<HashMap<PathBuf, BloomDecision>>>);
+
+impl SkippedByBloom {
+    fn insert(&self, path: &Path, decision: BloomDecision) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), decision);
+    }
+
+    fn take(&self, path: &Path) -> Option<BloomDecision> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path)
     }
 }
 
@@ -1100,11 +1112,11 @@ pub(crate) fn bloom_gate_fresh(
 /// The analysis options for a target the operator named by path, which is the
 /// shared options with the bloom skip predicate removed.
 ///
-/// A named target is always analyzed on its own merits, so cleave must not
-/// short-circuit it into a minimal report. The gate in [`Session::record`]
-/// makes the same call for the same reason; both are needed, because they act at
-/// different points — the predicate decides whether analysis runs at all, the
-/// gate decides whether the result is counted without an ML pass.
+/// A named target is always analyzed on its own merits — a bless is a bulk
+/// shortcut for dependencies and directory walks, and answering one where a
+/// scan was asked for answers a different question — so cleave must not
+/// short-circuit it into a minimal report. With no predicate, nothing lands
+/// in [`SkippedByBloom`], and [`Session::record`] grades it.
 fn named_target_opts(opts: &AnalysisOptions) -> AnalysisOptions {
     AnalysisOptions {
         skip_predicate: None,
@@ -1114,12 +1126,16 @@ fn named_target_opts(opts: &AnalysisOptions) -> AnalysisOptions {
 
 /// Build the cleave skip predicate from the active bloom filters: a file whose
 /// sha256 is known-good (or, in fast mode, simply unknown) is skipped before
-/// analysis. Known-bad and conflicted return `false` so they are still analyzed;
-/// every file's verdict line is emitted later in [`Session::record`], which
-/// re-derives the decision from the report's sha. `None` when bloom is disabled.
-fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
+/// analysis, and its decision noted in `skipped` for [`Session::record`].
+/// Known-bad and conflicted return `false` so they are still analyzed. `None`
+/// when bloom is disabled.
+fn bloom_skip_predicate(
+    config: &ScanConfig,
+    skipped: &SkippedByBloom,
+) -> Option<cleave::SkipPredicate> {
     let lookup = config.bloom.clone()?;
     let fast = config.mode() == Mode::Fast;
+    let skipped = skipped.clone();
     Some(cleave::SkipPredicate(Arc::new(
         move |sha_hex: &str, path: &Path| {
             let Some(digest) = burton::parse_sha256_hex(sha_hex) else {
@@ -1135,11 +1151,15 @@ fn bloom_skip_predicate(config: &ScanConfig) -> Option<cleave::SkipPredicate> {
             //
             // Every other decision is analyzed, adverse or not: in fast mode an
             // unknown is skipped as well, which is what fast mode means.
-            if decision.may_skip() {
+            let skip = if decision.may_skip() {
                 !file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now())
             } else {
                 fast && decision == BloomDecision::Unknown
+            };
+            if skip {
+                skipped.insert(path, decision);
             }
+            skip
         },
     )))
 }
@@ -1183,7 +1203,7 @@ fn discover_files(dir: &Path, errors: &AtomicU32) -> Vec<PathBuf> {
 /// sitting beside the artifact it describes.
 ///
 /// Under `--enable-sidecar` a directory walk treats those as bookkeeping
-/// (see [`sidecar_policy`]). They are never skipped: whoever wrote the
+/// (see [`SidecarPolicy`]). They are never skipped: whoever wrote the
 /// artifact may have written the record too, and a payload inside it is still
 /// analyzed. The name alone proves nothing — a script can hide behind it — so
 /// only a small JSON object that states a digest qualifies. Naming one
@@ -1577,16 +1597,23 @@ mod tests {
     /// hopper as a sample.
     #[test]
     fn a_sidecar_is_shown_when_it_raises_something_and_filed_only_when_hostile() {
-        use super::sidecar_policy;
+        use super::SidecarPolicy;
+        let policy = |shown, filed| SidecarPolicy { shown, filed };
         assert_eq!(
-            sidecar_policy(Classification::Benign, false),
-            (false, false)
+            SidecarPolicy::new(Classification::Benign, false),
+            policy(false, false)
         );
-        assert_eq!(sidecar_policy(Classification::Benign, true), (true, false));
         assert_eq!(
-            sidecar_policy(Classification::Suspicious, false),
-            (true, false)
+            SidecarPolicy::new(Classification::Benign, true),
+            policy(true, false)
         );
-        assert_eq!(sidecar_policy(Classification::Hostile, false), (true, true));
+        assert_eq!(
+            SidecarPolicy::new(Classification::Suspicious, false),
+            policy(true, false)
+        );
+        assert_eq!(
+            SidecarPolicy::new(Classification::Hostile, false),
+            policy(true, true)
+        );
     }
 }

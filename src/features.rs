@@ -1,26 +1,16 @@
 //! Feature extraction from cleave's compact report.
 //!
-//! Mirrors the feature extraction in collimator/src/collimator/features.py (v16)
-//! exactly, using the same feature_spec.json vocabulary to produce identical
-//! feature vectors.
+//! Produces the same feature vectors as the training pipeline's extractor,
+//! driven by the vocabularies of the model's `feature_spec.json`.
 //!
 //! Feature assignment uses `FeatureWriter`, which maps feature names to the
 //! slots of the spec's `feature_names` list. A name the spec does not carry
 //! (a disabled group, or a vocabulary token the model never saw) writes
 //! nothing — that is how pruned and partial specs "just work".
 
-use anyhow::{Context, Result};
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::fmt::Write as _;
-use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
 
-// An ensemble can load many specs of the same version, including specialists
-// initialized concurrently during validation. Report the compatibility note
-// once per version for the process, not once per route.
-static WARNED_OLD_SPEC_VERSIONS: LazyLock<Mutex<HashSet<u32>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+use self::names::FIXED_FEATURE_NAMES;
 
 /// Name-based feature assignment: one route's feature vector plus the spec's
 /// name → slot lookup.
@@ -72,25 +62,27 @@ impl FeatureWriter<'_> {
 
 /// Newest feature spec version this build reads.
 ///
-/// v23 adds full-ID, pooled ID/description and decoded context words.
-/// v22 adds keywords over an explicit base feature ABI. v21 requires
-/// `metric_transforms`. v20 retains the strongest tiered tokens
-/// (older models keep overflow-drop semantics). v19 reads per-model
-/// `trait_path_depth`, defaulting to depth 3. v18 adds `ast_depth_capped` to
-/// the extended metrics, which are read by name from the spec vocab.
+/// Each version adds to its predecessor: v21 requires `metric_transforms` and
+/// measures archive structure relative to the sample; v22 adds the rule and
+/// description keyword families over an explicit `base_feature_abi`; v23 adds
+/// full-ID, pooled ID/description and decoded context keywords.
 pub const EXPECTED_SPEC_VERSION: u32 = 23;
 
-/// Earliest spec format this build parses. The real floor is the model ABI:
-/// an unset `abi_version` defaults to the spec version, so a v16/v17 spec
-/// loads only if it declares an ABI of at least [`MIN_MODEL_ABI_VERSION`].
-pub const MIN_LOADABLE_SPEC_VERSION: u32 = 16;
-/// Stable model ABI version shared with collimator.
-/// Keep this in sync with EXPECTED_SPEC_VERSION for a single compatibility number.
+/// Earliest spec format this build parses: the deployed model's.
+const MIN_LOADABLE_SPEC_VERSION: u32 = 20;
+/// Stable model ABI version, one number with [`EXPECTED_SPEC_VERSION`].
 pub const EXPECTED_MODEL_ABI_VERSION: u32 = EXPECTED_SPEC_VERSION;
 /// Oldest model ABI this build loads.
-pub const MIN_MODEL_ABI_VERSION: u32 = 18;
+const MIN_MODEL_ABI_VERSION: u32 = 20;
+/// First ABI with explicit metric transforms and relative archive depths.
+const METRIC_TRANSFORM_ABI: u32 = 21;
+/// First ABI with keyword families: rule-ID and description words.
+const KEYWORD_ABI: u32 = 22;
+/// First ABI with the extended keyword families, which also reads a
+/// finding with no description as empty text rather than refusing it.
+const EXTENDED_KEYWORD_ABI: u32 = 23;
 
-/// Minimum finding confidence for inclusion (matches collimator MIN_CONFIDENCE).
+/// Minimum finding confidence for inclusion, as in training.
 const MIN_CONFIDENCE: f64 = 0.65;
 
 /// Criticality ordinals as a compact report carries them: the values of
@@ -117,13 +109,9 @@ mod spec;
 mod structure;
 mod write;
 
-pub(crate) use self::report::*;
-pub use self::{context::*, spec::*};
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use self::{names::*, structure::*, write::*};
+pub use self::context::ExtractContext;
+pub(crate) use self::report::{ParsedReport, RawNeeds};
+pub use self::spec::FeatureSpec;
 
 #[cfg(test)]
 mod reader_equivalence_tests;

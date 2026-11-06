@@ -1,30 +1,23 @@
-//! Locates the model bundle and installs/updates it from the R2 bundle.
+//! Locates the model bundle and installs/updates it from the published bundle.
 //!
 //! Models are distributed as `.tar.zst` bundles from the update bucket,
 //! verified by sha256 against the bucket's own (unsigned) manifest — see
 //! [`crate::model_update`], which `scan update-rules` drives. This module
 //! handles *resolution* (where the bundle lives) and the first-run bootstrap
-//! install. The bundle root *is* what [`crate::model::Model::load`] reads:
-//! `feature_spec.json` + `model.onnx` (or `models/seed_*.onnx`) at the top, or a
-//! `general/` ensemble subdirectory. No git.
+//! install. The bundle root *is* what [`crate::model::Model::load`] reads: a
+//! routed ensemble whose `general/` route holds `feature_spec.json` and
+//! `model.onnx` (or `models/seed_*.onnx`). No git.
 //!
-//! On-disk layout: `dirs::data_dir()/atomdrift/scan/models/azoth`.
+//! On-disk layout: `<data_dir>/atomdrift/scan/models/azoth`.
 //!
 //! Resolution order:
 //! 1. `SCAN_MODELS_DIR` env var (a ready-to-load bundle directory)
 //! 2. The default bundle directory (bootstrapped if missing)
 //!
-//! For development, symlink the bundle path to a local working tree:
-//!   ln -sfn ~/dev/atomdrift/azoth ~/.local/share/atomdrift/scan/models/azoth
+//! For development, symlink the bundle path to a local working tree.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-
-/// Files that must be present in a complete bundle. The model file is checked
-/// separately because it may live at the top level or under `models/`.
-const REQUIRED_ARTIFACTS: &[&str] = &["feature_spec.json"];
-/// Scan loads ONNX models only; there is no native LightGBM/XGBoost loader.
-const MODEL_FILES: &[&str] = &["model.onnx"];
 
 /// Resolve the models bundle directory, bootstrap-installing (a download) if
 /// nothing is installed yet.
@@ -37,7 +30,7 @@ const MODEL_FILES: &[&str] = &["model.onnx"];
 pub fn ensure_model_dir() -> Result<PathBuf> {
     if let Some(explicit) = crate::env::path(crate::env::SCAN_MODELS_DIR) {
         if explicit.is_dir() {
-            tracing::debug!("Using models from SCAN_MODELS_DIR={}", explicit.display());
+            tracing::debug!(dir = %explicit.display(), "using models from SCAN_MODELS_DIR");
             return Ok(explicit);
         }
         anyhow::bail!("SCAN_MODELS_DIR={} does not exist", explicit.display());
@@ -46,7 +39,7 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
     let data_dir = default_models_dir()?;
     // `settle`: an update between its swap's two renames is not a first run.
     if has_models(&data_dir) || (crate::bundle::settle(&data_dir) && has_models(&data_dir)) {
-        tracing::debug!("Using models from {}", data_dir.display());
+        tracing::debug!(dir = %data_dir.display(), "using installed models");
         return Ok(data_dir);
     }
 
@@ -56,7 +49,7 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
     Ok(data_dir)
 }
 
-/// Get the installed model commit (short), from the bundle's sidecar.
+/// The installed model commit (short), from the bundle's sidecar.
 #[must_use]
 pub fn version() -> Option<String> {
     crate::model_update::installed(&install_target().ok()?)
@@ -83,13 +76,10 @@ pub fn feature_dimension() -> Option<usize> {
     struct Dim {
         total_features: usize,
     }
-    let base = install_target().ok()?;
-    let spec = [
-        base.join("general").join("feature_spec.json"),
-        base.join("feature_spec.json"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())?;
+    let spec = install_target()
+        .ok()?
+        .join("general")
+        .join("feature_spec.json");
     let text = std::fs::read_to_string(spec).ok()?;
     serde_json::from_str::<Dim>(&text)
         .ok()
@@ -114,41 +104,35 @@ pub fn model_count() -> Option<usize> {
     (n > 0).then_some(n)
 }
 
-/// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/azoth`.
+/// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/azoth`
+/// (the directory name is the bundle's, kept so existing installs are found).
 fn default_models_dir() -> Result<PathBuf> {
     Ok(crate::data_dir()?.join("models").join("azoth"))
 }
 
-/// True if the directory looks like a complete bundle scan can load.
-///
-/// Two layouts are accepted: an ensemble bundle (`general/` subdirectory
-/// containing the required artifacts) or a legacy single-bundle (artifacts
-/// at the root). See `model.rs` for the loader-side details.
+/// True if `path` looks like a complete bundle scan can load: a routed
+/// ensemble whose `general/` route has its feature spec and an ONNX model,
+/// either `model.onnx` or `models/seed_*.onnx`. Scan loads ONNX only; there is
+/// no native LightGBM/XGBoost loader.
 fn has_models(path: &Path) -> bool {
-    has_single_bundle_layout(&path.join("general")) || has_single_bundle_layout(path)
-}
-
-fn has_single_bundle_layout(path: &Path) -> bool {
-    REQUIRED_ARTIFACTS.iter().all(|f| path.join(f).exists()) && has_model_artifact(path)
-}
-
-fn has_model_artifact(path: &Path) -> bool {
-    if MODEL_FILES.iter().any(|f| path.join(f).exists()) {
+    let general = path.join("general");
+    if !general.join("feature_spec.json").exists() {
+        return false;
+    }
+    if general.join("model.onnx").exists() {
         return true;
     }
-    let models = path.join("models");
-    let Ok(entries) = std::fs::read_dir(models) else {
+    let Ok(entries) = std::fs::read_dir(general.join("models")) else {
         return false;
     };
     entries.filter_map(Result::ok).any(|entry| {
         let path = entry.path();
-        if !path.is_file() {
-            return false;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return false;
-        };
-        name.starts_with("seed_") && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
+        path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with("seed_"))
+            && path.extension().and_then(|ext| ext.to_str()) == Some("onnx")
     })
 }
 
@@ -163,11 +147,11 @@ mod tests {
     }
 
     #[test]
-    fn has_models_accepts_onnx_single_layout() {
+    fn has_models_rejects_the_retired_single_bundle_layout() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("model.onnx"), b"").unwrap();
         std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
-        assert!(has_models(tmp.path()));
+        assert!(!has_models(tmp.path()));
     }
 
     #[test]
@@ -201,8 +185,10 @@ mod tests {
     fn has_models_rejects_native_model_files() {
         for native in ["model.txt", "model.json"] {
             let tmp = tempfile::tempdir().unwrap();
-            std::fs::write(tmp.path().join(native), b"").unwrap();
-            std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
+            let general = tmp.path().join("general");
+            std::fs::create_dir_all(&general).unwrap();
+            std::fs::write(general.join(native), b"").unwrap();
+            std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
             assert!(!has_models(tmp.path()), "{native} should be rejected");
         }
     }
@@ -210,7 +196,9 @@ mod tests {
     #[test]
     fn has_models_rejects_missing_model_file() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("feature_spec.json"), b"{}").unwrap();
+        let general = tmp.path().join("general");
+        std::fs::create_dir_all(&general).unwrap();
+        std::fs::write(general.join("feature_spec.json"), b"{}").unwrap();
         assert!(!has_models(tmp.path()));
     }
 }

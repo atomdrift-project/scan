@@ -84,29 +84,31 @@ pub fn endpoints(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a credential sent to `url` crosses the network in cleartext: plain
+/// `http://` to anything but loopback. A WireGuard or Tailscale address, which
+/// encrypts on its own, cannot be told apart and so still counts.
+pub(crate) fn is_cleartext(url: &reqwest::Url) -> bool {
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    url.scheme() == "http" && !loopback
+}
+
 /// Warn, once per address, when the hopper token would cross the network in
-/// cleartext: a plain `http://` hopper that is not on loopback. The token is
-/// fleet-wide write access to the corpus, so it should only travel over TLS or
-/// a network that encrypts on its own (a WireGuard/Tailscale address, which
-/// this cannot tell apart and so still names).
+/// cleartext (see `is_cleartext`). The token is write access to the corpus,
+/// so it should only travel over TLS or a network that encrypts on its own.
 pub fn warn_if_cleartext(raw: &str) {
     if token().is_none() {
         return;
     }
     for endpoint in endpoints(raw) {
-        let Ok(url) = reqwest::Url::parse(&endpoint) else {
-            continue;
-        };
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        if url.scheme() == "http" && !loopback {
+        if reqwest::Url::parse(&endpoint).is_ok_and(|url| is_cleartext(&url)) {
             tracing::warn!(
                 hopper = %endpoint,
                 "the hopper token is sent to this address in cleartext; use https unless the network itself is encrypted"
@@ -115,12 +117,12 @@ pub fn warn_if_cleartext(raw: &str) {
     }
 }
 
-/// The one address a queue worker (postdoc's, for one) may poll: the primary,
-/// which [`endpoints`] puts last.
+/// The one address a queue worker may poll: the primary, which [`endpoints`]
+/// puts last.
 ///
 /// Worker routes are the exception to the rule above. A replica answers
 /// lookups and relays renewals, but it refuses `/api/next` and the plain
-/// `/api/result` with a 403 even when its relay is enabled — the fleet's queue
+/// `/api/result` with a 403 even when its relay is enabled — the work queue
 /// is the primary's to hand out, and passing the worker firehose through a
 /// replica helps no one. So there is nothing to fail over to here: the second
 /// address is not another way to reach the same answer, it is the only one.
@@ -236,9 +238,7 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 /// ask to be retried. Resending a permanent refusal can never succeed.
 #[must_use]
 pub fn is_permanent(status: StatusCode) -> bool {
-    status.is_client_error()
-        && status != StatusCode::REQUEST_TIMEOUT
-        && status != StatusCode::TOO_MANY_REQUESTS
+    status.is_client_error() && !crate::retry::is_transient(status)
 }
 
 /// How long a hopper lookup with a safe fallback retries one address before
@@ -251,7 +251,7 @@ pub(crate) const LOOKUP_RETRY_BUDGET: Duration = Duration::from_secs(15);
 /// `None` on any failure or absence, so a caller posts nothing rather than
 /// guess.
 #[must_use]
-pub fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
+pub(crate) fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
     let client = http()?;
     #[derive(serde::Deserialize)]
     struct LookupResponse {

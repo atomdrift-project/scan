@@ -1,10 +1,12 @@
 //! Preparing a rendered report for the prompt: sanitized, readable, and
 //! free of text addressed to the analyzer.
 
+use crate::output::strip_ansi;
+
 /// Prepare a cleave tiny render for the LLM by stripping any ANSI escapes (tiny
 /// must never carry color) and normalizing the archive delimiter. Path hygiene —
-/// basenaming the root and showing archive members archive-relative, so a corpus
-/// directory can't leak a ground-truth label — is done by cleave's `tiny()` view
+/// basenaming the root and showing archive members archive-relative, so the
+/// directory a sample sits in cannot sway the grade — is done by cleave's `tiny()` view
 /// (`basename_root`), so we must not re-strip here: that would mangle a
 /// `a.zip/member` header into a bare `member` when the container section is
 /// omitted.
@@ -27,7 +29,7 @@ pub fn sanitize_context(rendered: &str) -> String {
 /// Heuristic for a rendered context line that is escaped binary rather than
 /// readable source: cleave renders non-printable bytes as `\xNN`/`\0`, so two or
 /// more such escapes is decisive; otherwise fall back to a low printable ratio.
-pub(super) fn is_binary_render(line: &str) -> bool {
+fn is_binary_render(line: &str) -> bool {
     let s = line.trim();
     if s.len() < 16 {
         return false;
@@ -52,13 +54,13 @@ pub(super) fn render_mostly_readable(rendered: &str) -> bool {
     // Counting lines across the render lets one member outvote every other: a
     // wheel of readable Python that also ships a DLL renders as thousands of hex
     // rows beside a few hundred source lines, so the whole archive reads as
-    // opaque and the LLM's clear is discarded. `PyAutoIt`, a legitimate AutoIt
-    // wrapper the model correctly clears, is that case: a whole-render count
-    // would refuse it. A package is opaque when *most of its members* are,
-    // which is the question this gate was always asking.
+    // opaque and the LLM's clear is discarded: a legitimate scripting-language
+    // wrapper that ships its runtime's DLLs would be refused. A package is
+    // opaque when *most of its members* are, which is the question this gate
+    // asks.
     //
     // Note what it does not claim: that the LLM read the flagged bytes. A clear
-    // can rest on recognizing the package — an AutoIt wrapper shipping AutoIt
+    // can rest on recognizing the package — a wrapper shipping its runtime's
     // DLLs — and that is a judgment about a mostly-readable archive, not about
     // hex it cannot see. A sample that really is one packed binary still has a
     // single opaque member and is still refused.
@@ -135,8 +137,8 @@ pub(super) fn is_member_header(line: &str) -> bool {
 ///
 /// Kept short and specific rather than broad: each entry is either a stock
 /// instruction-override opener, a chat-template control token, a verbatim
-/// fragment of our own prompt or reply schema (a sample echoing those is
-/// mirroring the harness, not doing its job), or a direct assertion of
+/// fragment of this module's prompt or reply schema (a sample echoing those is
+/// mirroring the grader, not doing its job), or a direct assertion of
 /// innocence. Deliberately *not* included are soft phrases like "not malicious"
 /// or "safe to run", which appear in ordinary documentation and comments.
 ///
@@ -171,9 +173,9 @@ pub(super) const ANALYZER_DIRECTED: &[&str] = &[
 ];
 
 /// Whether the render carries text aimed at the grader rather than at a human
-/// reading the program — the prompt-injection tell. Benign software does not
+/// reading the program: the tell of a sample trying to instruct its grader. Benign software does not
 /// instruct its analyzer, so a hit is a reason to distrust an LLM verdict that
-/// happens to favor the author (see [`blend`]).
+/// happens to favor the author (see `blend`).
 ///
 /// Deliberately a plain substring scan over the sanitized render: deterministic,
 /// dependency-free, and independent of the model's cooperation, which is exactly
@@ -184,5 +186,3 @@ pub(super) fn addresses_the_analyzer(rendered: &str) -> bool {
     let haystack = rendered.to_ascii_lowercase();
     ANALYZER_DIRECTED.iter().any(|p| haystack.contains(p))
 }
-
-pub(super) use crate::deptree::strip_ansi;

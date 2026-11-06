@@ -1,5 +1,6 @@
 //! Command smoke tests: `cargo test --locked --test cli_smoke`.
-//! The update test downloads published models and traits from R2 into a tempdir.
+//! The update test (ignored by default; `--include-ignored` runs it) downloads
+//! published models and traits into a tempdir.
 //! Other tests use a tiny local model and never need production artifacts.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -24,11 +25,6 @@ impl Fixture {
         let traits = root.path().join("traits");
         bundle::write(&models).unwrap();
         fs::create_dir_all(traits.join("metadata")).unwrap();
-        fs::write(
-            models.join("config.json"),
-            br#"{"suspicious":0.9,"hostile":0.99}"#,
-        )
-        .unwrap();
         Self {
             root,
             models,
@@ -178,7 +174,8 @@ fn read_bytes(mut file: File) -> Vec<u8> {
 }
 
 #[test]
-fn update_rules_installs_models_and_traits_from_r2() {
+#[ignore = "downloads the published rules over the network; CI's release builds run it"]
+fn update_rules_installs_models_and_traits() {
     let fixture = Fixture::new();
     // `SCAN_MODELS_DIR` pins a bundle the updater never touches, so unpinned
     // the models install into the platform data directory. Elsewhere that
@@ -201,16 +198,16 @@ fn update_rules_installs_models_and_traits_from_r2() {
         .map(walkdir::DirEntry::into_path)
         .find(|path| {
             path.file_name()
-                .is_some_and(|name| name == ".litmus-models.toml")
+                .is_some_and(|name| name == ".scan-models.toml")
         })
-        .expect("R2 model installation sidecar");
+        .expect("model installation sidecar");
     let models = model_meta
         .parent()
         .expect("sidecar has a parent")
         .to_path_buf();
     let trait_meta = fixture.traits.join(".cleave-rules.toml");
-    let model_before = fs::read(&model_meta).expect("R2 model installation sidecar");
-    let traits_before = fs::read(&trait_meta).expect("R2 traits installation sidecar");
+    let model_before = fs::read(&model_meta).expect("model installation sidecar");
+    let traits_before = fs::read(&trait_meta).expect("traits installation sidecar");
     assert!(
         models.join("feature_spec.json").is_file()
             || models.join("general/feature_spec.json").is_file()
@@ -295,8 +292,12 @@ fn ps_reports_a_missing_model_bundle() {
     let mut cmd = fixture.command(&["ps", "--mode", "slow"]);
     cmd.env("SCAN_MODELS_DIR", &empty);
     let output = fixture.run(&mut cmd, 1, Duration::from_secs(60));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("feature_spec.json"));
+    // A bundle is a routed ensemble: an empty directory lacks its `general/`
+    // route, and the error says so and how to fix it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("incomplete"), "{stderr}");
+    assert!(stderr.contains("general/"), "{stderr}");
+    assert!(stderr.contains("update-rules"), "{stderr}");
 }
 
 #[test]

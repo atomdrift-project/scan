@@ -5,11 +5,23 @@
     reason = "feature values are narrowed to the model's f32 input dtype"
 )]
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+
+use super::report::{FileSummary, FindingSummary, ParsedReport};
+use super::{
+    CRIT_BASELINE, CRIT_HOSTILE, CRIT_NOTABLE, CRIT_SUSPICIOUS, FeatureWriter, MIN_CONFIDENCE,
+};
+
+/// The span training bounds its triple enumerations to: the third member
+/// sits fewer than this many places past the second.
+pub(super) const TRIPLE_SPAN: usize = 20;
+
+/// The triples `i < j < k < n` with `k < j + cap`, which is how training
+/// counts co-occurring triples without enumerating all O(n³) of them.
+pub(super) fn capped_triples(n: usize, cap: usize) -> usize {
+    (1..n).map(|j| j * (n - 1 - j).min(cap - 1)).sum()
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct FileRiskStats {
@@ -116,7 +128,7 @@ pub(super) fn write_optional_finding_features(parsed: &ParsedReport, w: &mut Fea
     }
 }
 
-pub(super) fn lexical_distance(a: &str, b: &str) -> usize {
+fn lexical_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {
@@ -146,7 +158,7 @@ pub(super) fn write_aggregate_features(parsed: &ParsedReport, w: &mut FeatureWri
 
 /// How widely the sample's findings spread over the trait taxonomy, counted
 /// over distinct sample paths at each criticality tier.
-pub(super) struct PathBreadth {
+struct PathBreadth {
     pub(super) max_crit: u32,
     /// Top-level categories reached at baseline or above.
     pub(super) categories: usize,
@@ -201,7 +213,7 @@ impl PathBreadth {
 
 /// Breadth over the taxonomy: categories, active paths, and how far their
 /// criticality escalates.
-pub(super) fn write_breadth_features(
+fn write_breadth_features(
     summary: &FindingSummary,
     breadth: &PathBreadth,
     w: &mut FeatureWriter<'_>,
@@ -273,7 +285,7 @@ pub(super) fn write_breadth_features(
 
 /// Finding counts at each tier: as logs, per KB, as shares of each other,
 /// and how often the same id or category repeats.
-pub(super) fn write_finding_volume_features(
+fn write_finding_volume_features(
     summary: &FindingSummary,
     summaries: &[FileSummary],
     w: &mut FeatureWriter<'_>,
@@ -317,9 +329,8 @@ pub(super) fn write_finding_volume_features(
         (summary.unique_hostile_ids as f32).ln_1p() / log_kb_p1,
     );
 
-    // Size-invariant crit-tier severity fractions — mirror of collimator's
-    // include_severity_fractions block (count of crit>=N findings as a share of
-    // ALL findings, not per-KB).
+    // Size-invariant crit-tier severity fractions: the count of crit>=N
+    // findings as a share of ALL findings, not per-KB.
     let total_findings = summary.filtered_finding_count.max(1) as f32;
     let mundane = summary
         .filtered_finding_count
@@ -413,7 +424,7 @@ pub(super) fn write_finding_volume_features(
 }
 
 /// The `top1` block: the single riskiest file by each ordering.
-pub(super) fn write_top_file_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+fn write_top_file_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
     let topk = topk_file_risk_features_from_summaries(summaries);
     w.set("agg:top1_file_suspicious_ratio_sum", topk[0]);
     w.set("agg:top1_file_hostile_ratio_sum", topk[1]);
@@ -442,7 +453,7 @@ pub(super) fn write_top_file_features(summaries: &[FileSummary], w: &mut Feature
 }
 
 /// How many files sit in each criticality tier.
-pub(super) fn write_file_tier_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
+fn write_file_tier_features(summaries: &[FileSummary], w: &mut FeatureWriter<'_>) {
     let n_files = summaries.len().max(1) as f32;
     let hostile_files = summaries
         .iter()
@@ -462,8 +473,8 @@ pub(super) fn write_file_tier_features(summaries: &[FileSummary], w: &mut Featur
     w.set("agg:file_hostile_count_log", hostile_files.ln_1p());
     w.set("agg:file_suspicious_count_log", suspicious_files.ln_1p());
     w.set("agg:file_notable_count_log", notable_files.ln_1p());
-    // Legacy training uses the report's explicit nesting depths. ABI 21+
-    // overwrites this with relative depths in write_structural_extensions.
+    // The report's explicit nesting depths; from ABI 21 the structural
+    // extensions overwrite this with depths relative to the sample.
     w.set(
         "agg:hostile_depth_weight",
         summaries
@@ -496,12 +507,9 @@ pub(super) fn write_code_features(
     w.set("agg:mbc_behavior_count", mbc_behaviors.len() as f32);
 
     // ATT&CK / MBC co-occurrence aggregates: log1p of the count of unordered
-    // pairs / triples among the distinct technique and behavior codes seen.
-    // Mirrors `agg:attack_bigram_count` and friends in the collimator extractor
-    // (features.py around line 2197).  Combinations are computed analytically
-    // (n choose k) — equivalent to enumerating but cheaper for large finding
-    // counts.  saturating_sub guards the n=0 / n=1 cases where the product
-    // would otherwise underflow on usize.
+    // pairs / triples among the distinct technique and behavior codes seen,
+    // as n choose k. saturating_sub guards the n=0 / n=1 cases where the
+    // product would otherwise underflow on usize.
     let n_atk = attack_techniques.len();
     let atk_bi = (n_atk * n_atk.saturating_sub(1)) / 2;
     let atk_tri = (n_atk * n_atk.saturating_sub(1) * n_atk.saturating_sub(2)) / 6;
@@ -519,30 +527,21 @@ pub(super) fn write_code_features(
         f32::from(!attack_techniques.is_empty() && has_objectives),
     );
 
-    // Objective-path co-occurrence aggregates.  Mirrors collimator's
-    // `agg:objective_bigram_count` / `agg:objective_trigram_count` (features.py
-    // around line 2155).  Counts unordered pairs and triples among the distinct
-    // `objectives/*` and `well-known/*` sample paths.  The trigram inner loop
-    // is capped at 20 per (i, j) pair to bound work on samples with many
-    // objective paths — the same cap collimator uses, so the values match.
+    // Objective-path co-occurrence aggregates: unordered pairs and capped
+    // triples among the distinct `objectives/*` and `well-known/*` sample
+    // paths.
     let n_obj = summary
         .sample_paths
         .keys()
         .filter(|p| p.starts_with("objectives/") || p.starts_with("well-known/"))
         .count();
     let n_obj_bi = (n_obj * n_obj.saturating_sub(1)) / 2;
-    let mut n_obj_tri: usize = 0;
-    for i in 0..n_obj {
-        for j in (i + 1)..n_obj {
-            let k_end = (j + 20).min(n_obj);
-            n_obj_tri += k_end.saturating_sub(j + 1);
-        }
-    }
+    let n_obj_tri = capped_triples(n_obj, TRIPLE_SPAN);
     w.set("agg:objective_bigram_count", (n_obj_bi as f32).ln_1p());
     w.set("agg:objective_trigram_count", (n_obj_tri as f32).ln_1p());
 }
 
-pub(super) fn tier_prefix(crit: u32) -> &'static str {
+fn tier_prefix(crit: u32) -> &'static str {
     match crit {
         CRIT_HOSTILE => "h",
         CRIT_SUSPICIOUS => "s",
@@ -551,7 +550,7 @@ pub(super) fn tier_prefix(crit: u32) -> &'static str {
 }
 
 /// Categories whose notable-or-above paths feed the `crit:` n-grams.
-pub(super) const CRIT_CATEGORIES: &[&str] = &[
+const CRIT_CATEGORIES: &[&str] = &[
     "objectives",
     "well-known",
     "supply-chain",
@@ -591,7 +590,7 @@ pub(super) fn crit_category_tokens(summary: &FindingSummary) -> Vec<String> {
     tokens
 }
 
-pub(super) fn tiered_path_tokens_with_options(
+fn tiered_path_tokens_with_options(
     summary: &FindingSummary,
     minimum: u32,
     branches: &HashMap<String, u32>,
@@ -611,7 +610,7 @@ pub(super) fn tiered_path_tokens_with_options(
 
 /// Keep real finding evidence, with deterministic lexical ties. The score for
 /// each path was accumulated as max(severity * confidence), never a product
-/// of unrelated maxima. Match collimator's v20 token budgets exactly.
+/// of unrelated maxima. The token budgets per order are training's.
 pub(super) fn ranked_tiered_path_tokens(
     summary: &FindingSummary,
     minimum: u32,
@@ -662,9 +661,10 @@ pub(super) fn write_ngrams(
     what: &str,
 ) {
     if tokens.len() > 512 {
-        tracing::warn!(
+        tracing::debug!(
+            family = what,
             tokens = tokens.len(),
-            "too many unique {what} tokens; skipping n-gram generation"
+            "too many unique tokens; skipping n-gram features",
         );
         return;
     }

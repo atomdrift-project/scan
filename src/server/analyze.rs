@@ -81,8 +81,8 @@ impl Job {
 ///
 /// Refusing past full, rather than queueing. A queue here would hide the one
 /// fact the router most needs: a rejection is information, delivered in
-/// milliseconds, and beamline answers it by promoting the next arm onto a
-/// backend that has room. A queued request looks identical to a slow one from
+/// milliseconds, and a router answers it by sending the request to a backend
+/// that has room. A queued request looks identical to a slow one from
 /// outside, so the router keeps choosing a saturated backend while an idle one
 /// waits — and the queued analysis still runs after somebody else has already
 /// answered, which is the duplicate work single-flight exists to prevent.
@@ -118,7 +118,11 @@ fn acquire(state: &AppState) -> Result<AnalysisPermit, ApiError> {
     let cpu = Arc::clone(&state.cpu)
         .try_acquire_owned()
         .map_err(|_no_permit| {
-            ApiError::at_capacity("At capacity (every core busy)", None, Some(30))
+            ApiError::at_capacity(
+                "At capacity (every core busy)",
+                None,
+                Some(super::error::BUSY_RETRY_AFTER_SECS),
+            )
         })?;
     Ok(AnalysisPermit {
         _slot: slot,
@@ -462,7 +466,7 @@ fn classify_upload(
 }
 
 /// Fetch the PURL's artifact (and its registry record), then classify. Scan
-/// looks up provenance itself — beamline does not supply it.
+/// looks up provenance itself; a caller does not supply it.
 ///
 /// `corpus` comes with the runtime it is read on: the registry fallback asks
 /// hopper what it holds, and this runs on a blocking thread.
@@ -557,12 +561,11 @@ fn classify_purl(
     )?;
 
     // Offer the artifact — bytes, registry record, and fetch provenance —
-    // before its verdict, exactly as the CLI (`scan purl --hopper`) and
-    // postdoc's worker do. Deliberately after analysis, not on fetch: hopper's
-    // upload-tier claim query drains bytes-with-no-verdict rows first and
-    // ahead of everything else, so offering them before this process has its
-    // own verdict in hand would race the sample onto the fleet's claim
-    // queue for a redundant analysis. Hopper drops a result for a SHA it
+    // before its verdict, exactly as the CLI (`scan purl --hopper`) does.
+    // Deliberately after analysis, not on fetch: hopper hands
+    // bytes-with-no-verdict rows to its workers ahead of everything else, so
+    // offering them before this process has its own verdict in hand would
+    // race the sample onto hopper's work queue for a redundant analysis. Hopper drops a result for a SHA it
     // never ingested, so the verdict alone lands nowhere either — queuing
     // artifacts then result keeps the row unclaimable for only the width of
     // the queue, not the width of an analysis.
@@ -580,7 +583,7 @@ fn classify_purl(
 }
 
 /// Fetch an exact URL verbatim and classify it. The result carries the SHA-256
-/// beamline uses to alias the URL to the canonical artifact.
+/// a caller uses to alias the URL to the canonical artifact.
 fn classify_url(
     url: &str,
     template: Analysis<'_>,
@@ -815,7 +818,7 @@ mod tests {
     ///
     /// It also pins a dependency on the caller: the PURL slot hopper projects
     /// into its queryable `purl_base` column is filled only when the locator
-    /// carries the `pkg:` prefix. Beamline forwards the canonical form, so this
+    /// carries the `pkg:` prefix. Callers send the canonical form, so this
     /// holds today; if that ever changes, the artifact still uploads but
     /// `/api/sample?purl=` stops finding it, which is exactly the silent gap
     /// this whole path exists to close.

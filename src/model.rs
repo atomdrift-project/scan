@@ -2,51 +2,34 @@
 //!
 //! ## Model file format
 //!
-//! Only **`.onnx`** is supported — a portable inference graph emitted by
-//! collimator's training pipeline (LightGBM via `onnxmltools.convert_lightgbm`)
-//! or any other framework that exports to ONNX. Loaded via `tract` (pure-Rust,
-//! no FFI). The native LightGBM (`.txt`) and XGBoost (`.json`) loaders were
-//! retired now that collimator deploys ONNX-only bundles; any non-ONNX model
-//! artifact is rejected at load time.
+//! Only **`.onnx`** is supported: the portable inference graph the training
+//! pipeline exports (LightGBM through `onnxmltools.convert_lightgbm`). It is
+//! loaded with `tract` (pure Rust, no FFI), or walked directly when it is a
+//! plain tree ensemble. Any other model artifact is rejected at load.
 //!
-//! ## Bundle layouts
+//! ## Bundle layout
 //!
-//! Two on-disk shapes are supported:
-//!
-//! ### Single-bundle (legacy / dev)
+//! A bundle is a routed ensemble:
 //!
 //! ```text
 //! <model_dir>/
-//!   model.onnx
-//!   feature_spec.json
-//!   config.json
-//!   evaluation.json
-//! ```
-//!
-//! ### Ensemble (azoth) — see `~/azoth/DESIGN.md`
-//!
-//! ```text
-//! <model_dir>/
-//!   config.json                   ensemble-level config: route map + thresholds
+//!   config.json                   route map + per-level threshold grid
 //!   route_policies.json           optional per-filetype decision policies
 //!   general/                      always required
 //!     model.onnx | models/seed_*.onnx
 //!     feature_spec.json
 //!   filegroups/<group>/           optional, a filefacts group: native, scripts, archives, …
 //!     model.onnx | models/seed_*.onnx
-//!     feature_spec.json           may be absent → uses general's spec
+//!     feature_spec.json
 //!   filetypes/<type>/             optional, e.g. elf, pe
 //!     model.onnx | models/seed_*.onnx
-//!     feature_spec.json           may be absent → uses general's spec
+//!     feature_spec.json
 //! ```
 //!
-//! Detection is by presence of `general/` immediately under `<model_dir>`.
+//! ## `config.json` schema (`azoth.routed_ensemble.v1`)
 //!
-//! ## Ensemble `config.json` schema (`azoth.routed_ensemble.v1`)
-//!
-//! Emitted by collimator's calibration pipeline. The top-level config is the
-//! coarse compatibility source of thresholds for every route; specialist
-//! subdirectories do not carry their own `config.json`. When
+//! The top-level config is the source of thresholds for every route;
+//! specialist subdirectories carry no `config.json` of their own. When
 //! `route_policies.json` is present, it is the primary runtime decision
 //! artifact.
 //!
@@ -55,6 +38,7 @@
 //!   "schema": "azoth.routed_ensemble.v1",
 //!   "filetype_to_group": { "elf": "native", "pe": "native", "py": "scripts", … },
 //!   "required_routes": ["general"],                    // optional
+//!   "default_severity_level": 25,                      // optional
 //!   "models": [
 //!     {"route": "general",        "kind": "general",   "rows": …},
 //!     {"route": "filegroups/native", "kind": "filegroup", "rows": …},
@@ -80,12 +64,15 @@
 //! ```
 //!
 //! Route names use slash-separated paths matching the on-disk layout:
-//! `"general"`, `"filegroups/<name>"`, `"filetypes/<name>"`.
+//! `"general"`, `"filegroups/<name>"`, `"filetypes/<name>"`. The general
+//! route must have a threshold at the bundle's default level, or explicit
+//! thresholds must be given: a bundle with neither cannot classify and does
+//! not load.
 //!
-//! ## Ensemble `route_policies.json` schema (`azoth.route_policy_search.v1`)
+//! ## `route_policies.json` schema (`azoth.route_policy_search.v1`)
 //!
-//! This optional artifact records the calibrated decision policy per filetype
-//! and level. Each severity has a `best.thresholds` map:
+//! This optional artifact records the decision policy per filetype and
+//! level. Each severity has a `best.thresholds` map or a learned `best.blend`:
 //!
 //! ```text
 //! {
@@ -115,78 +102,79 @@
 //! `route_policies.json` is absent or has no policy for a filetype, scan
 //! falls back to an OR over `config.json` route thresholds.
 //!
-//! ## Specialist feature-spec rule
+//! ## Specialist feature specs
 //!
-//! Specialists may carry their own `feature_spec.json`. It may differ from
-//! `general/feature_spec.json`, but it must have the ABI version this scan
-//! binary understands and it must match the specialist model's feature count.
-//! At runtime each route extracts its own feature vector from the same cleave
-//! report before scoring.
+//! Each route carries its own `feature_spec.json`, which may differ from
+//! general's but must have an ABI this build reads and match its model's
+//! feature count. Every route extracts its own feature vector from the same
+//! parsed cleave report.
 //!
-//! ## ABI mismatch
+//! A general route this build cannot load stops the load; a specialist that
+//! fails is dropped with a warning and its files fall back to the other
+//! routes.
 //!
-//! - `general/` ABI mismatch: fatal. Refuse to start.
-//! - Specialist ABI mismatch: warn, drop that specialist, continue.
+//! ## The suspicious band
 //!
-//! ## Optional `suspicious` in collimator JSON
-//!
-//! Collimator does not emit a `suspicious` field in any of the JSONs it
-//! writes (`config.json`, `evaluation.json`, `route_policies.json`). Scan
-//! derives it consumer-side as a **level-table lookup**: the suspicious
-//! threshold is the hostile threshold at level
-//! `suspicious_ceiling(level, max_grid_level)` — `min(max_grid_level,
-//! max(500, 100 × level))` — or the loosest row below it when that is not a
-//! row of its own (the looser-budget row in the same `levels[]` table). A manual hostile threshold (no level)
-//! skips the derivation: the `Thresholds` struct carries
-//! `suspicious == hostile`, so `classify` only ever returns Benign or Hostile.
+//! The JSON artifacts carry hostile thresholds only. The suspicious
+//! threshold is the hostile threshold at level `suspicious_ceiling(level,
+//! max_grid_level)` — `min(max_grid_level, max(500, 100 × level))` — or at
+//! the loosest row below it when that is not a row of its own. Explicit
+//! thresholds skip the derivation and are used as given.
 //!
 //! ## Malformed metadata
 //!
-//! A bundle file that is absent is simply not used. One that is present but
-//! unreadable, unparseable, or internally inconsistent stops the load with an
-//! error: a silently-ignored threshold table degrades every verdict.
+//! An optional bundle file that is absent is simply not used. One that is
+//! present but unreadable, unparseable, or internally inconsistent stops the
+//! load with an error: a silently ignored threshold table degrades every
+//! verdict.
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
 
-use crate::features::{
-    EXPECTED_MODEL_ABI_VERSION, ExtractContext, FeatureSpec, ParsedReport, RawNeeds,
+use crate::features::{ExtractContext, FeatureSpec, ParsedReport, RawNeeds};
+
+use self::backend::Backend;
+use self::load::{BundleConfig, BundlePin, LoadedBundle, Route, RouteSet, load_bundle};
+use self::policy::{
+    EnsembleConfig, RouteId, RouteNames, RoutePolicy, RouteProbability, compact_route_name,
+    load_route_policies, policy_decide, policy_route_class, sweep_general_grid, sweep_policy_grid,
 };
 
-/// FALLBACK default severity level (per-100M-benigns scale; 50 = 50 FP/100M ≡
-/// 0.5 FP/M). The operating point is resolved as: explicit CLI level → the
-/// model-prescribed default from the bundle's config.json
-/// (`model_default_level`, baked by collimator from its `DEFAULT_SEVERITY_LEVEL`)
-/// → THIS const. So the tuning goal normally travels embedded in the model and
-/// this is only used for older bundles whose config.json lacks
-/// `default_severity_level`. Keep it equal to collimator's current default so
-/// the fallback is sane; `make deploy` (collimator's azoth-deploy-final) fails
-/// if the staged bundle's level, collimator's const, and this const disagree.
+/// Default severity level (per-100M-benigns scale; 25 = 25 FP/100M).
+///
+/// The operating point is resolved as: an explicit level → the bundle's own
+/// `default_severity_level` (see [`model_default_level`]) → this constant.
+/// Keep it equal to the level the deployed model is calibrated for, so a
+/// bundle that omits the field still operates where it was tuned.
 pub const DEFAULT_SEVERITY_LEVEL: u16 = 25;
 
-/// The deploy tuning goal prescribed by THIS model's `config.json`
-/// (`default_severity_level`), or `None` if the bundle predates the field.
+/// The default level prescribed by the bundle's `config.json`
+/// (`default_severity_level`), or `None` when the bundle names none.
 ///
-/// Resolution order for the operating point is: explicit CLI level → this
-/// model-prescribed default → the `DEFAULT_SEVERITY_LEVEL` const fallback. So a
-/// bundle calibrated at L50 operates at L50 without any scan rebuild, and a
-/// caller can still pin a different level explicitly. A malformed config.json
-/// reads as `None` here; `Model::load` reports it.
+/// A bundle calibrated at L50 thus operates at L50 without a scan rebuild,
+/// and a caller can still pin another level explicitly. An unreadable
+/// config.json is logged and reads as `None` here; `Model::load` refuses it.
 #[must_use]
 pub fn model_default_level(model_dir: &Path) -> Option<u16> {
-    BundleConfig::load(model_dir).ok()??.default_severity_level
+    match BundleConfig::load(model_dir) {
+        Ok(config) => config?.default_severity_level,
+        Err(error) => {
+            tracing::warn!(
+                path = %model_dir.display(),
+                error = %format!("{error:#}"),
+                "cannot read the model's default severity level",
+            );
+            None
+        }
+    }
 }
 
-/// Loaded model plus the feature spec and thresholds used for inference.
-///
-/// For an ensemble bundle, `inner`/`spec`/`thresholds` are the *general*
-/// route, and `routes` carries the optional specialists. For a single-bundle
-/// deployment, `routes` is empty and the model behaves exactly like before.
+/// A loaded model bundle: the general route, its feature spec and
+/// thresholds, and the specialist routes.
 #[derive(Debug)]
 pub struct Model {
     inner: Backend,
@@ -196,17 +184,13 @@ pub struct Model {
     thresholds: Thresholds,
     info: ModelInfo,
     routes: RouteSet,
-    /// Optional isotonic calibrator for the general model. Applied after
-    /// `inner.predict` everywhere we score with the general route. Mirrors
-    /// the per-route calibrator on Route; backward compat = None.
-    general_calibrator: Option<IsotonicCalibrator>,
     /// Active deploy level (pool-adjusted FP scale) that drives the verdict and
-    /// the envelope level marker. `None` in manual-threshold mode (`--threshold-*`)
-    /// and on single-bundle deployments with no level grid; the sweep is then
-    /// bypassed and the level serializes as `null`.
+    /// the envelope level marker. `None` in manual-threshold mode
+    /// (`--threshold-*`): the sweep is then bypassed and the level serializes
+    /// as `null`.
     active_level: Option<u16>,
     /// General route's hostile threshold per level (ascending), for the
-    /// no-policy verdict sweep. Empty on single-bundle / pre-grid deployments.
+    /// no-policy verdict sweep.
     general_grid: Vec<(u16, f32)>,
     /// Largest grid level; caps `suspicious_ceiling(active, grid_max)`.
     grid_max: u16,
@@ -216,44 +200,33 @@ pub struct Model {
 /// and the wire record.
 struct Scored {
     route: RouteId,
-    raw: f32,
     probability: f32,
     class: Classification,
 }
 
 impl Model {
-    /// Load model artifacts from a directory containing `feature_spec.json`
-    /// and `model.onnx` (or `models/seed_*.onnx`).
+    /// Load a routed model bundle (see the module docs for its layout).
     ///
-    /// The same directory may also contain optional metadata such as
-    /// `shap_importance.json` and git history, but those are not required here.
+    /// `thresholds` overrides the general route's thresholds from
+    /// `config.json`; `active_level` is the deploy level, `None` for manual
+    /// thresholds.
     ///
     /// # Errors
-    /// Returns an error if thresholds are invalid, required model artifacts are
-    /// missing, any present metadata file is malformed, or the loaded feature
-    /// spec does not match this build.
-    ///
-    /// Threshold resolution order:
-    /// 1. Explicit `thresholds` argument (from CLI flags)
-    /// 2. `config.json` in the model directory
-    /// 3. Recommended thresholds from `evaluation.json`
-    /// 4. Conservative fallback constants
-    ///
-    /// If explicit thresholds are provided *and* `evaluation.json` contains
-    /// recommendations, a warning is emitted when they diverge significantly.
+    /// Returns an error if thresholds are invalid or absent, required model
+    /// artifacts are missing, any present metadata file is malformed, or a
+    /// feature spec does not match this build.
     pub fn load(
         model_dir: &Path,
         thresholds: Option<Thresholds>,
         active_level: Option<u16>,
     ) -> Result<Self> {
-        let started = std::time::Instant::now();
-        // Detect ensemble layout by the presence of `general/` immediately
-        // under model_dir. Otherwise treat model_dir itself as a single bundle.
-        let model = if model_dir.join("general").is_dir() {
-            Self::load_ensemble(model_dir, thresholds, active_level)
-        } else {
-            Self::load_single_bundle(model_dir, thresholds, active_level)
-        }?;
+        let started = Instant::now();
+        anyhow::ensure!(
+            model_dir.join("general").is_dir(),
+            "model bundle is incomplete: no general/ route in {}. Run 'atomscan update-rules' to refresh the installed models.",
+            model_dir.display(),
+        );
+        let model = Self::load_ensemble(model_dir, thresholds, active_level)?;
         tracing::info!(
             path = %model_dir.display(),
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -262,196 +235,96 @@ impl Model {
         Ok(model)
     }
 
-    /// Load a single-bundle layout (legacy / dev). The model artifacts
-    /// (`model.onnx`, `feature_spec.json`, `config.json`,
-    /// `evaluation.json`) sit directly in `model_dir`. No specialists.
-    fn load_single_bundle(
-        model_dir: &Path,
-        thresholds: Option<Thresholds>,
-        active_level: Option<u16>,
-    ) -> Result<Self> {
-        let bundle = load_bundle(model_dir, thresholds, /* is_general = */ true)?;
-        tracing::info!(
-            n_members = bundle.backend.n_members(),
-            features = bundle.spec.total_features(),
-            model_abi_version = bundle.spec.abi_version(),
-            threshold_suspicious = bundle.thresholds.suspicious,
-            threshold_hostile = bundle.thresholds.hostile,
-            threshold_source = bundle.threshold_source,
-            spec_version = bundle.spec.version(),
-            layout = "single-bundle",
-            "model loaded",
-        );
-        // Single-bundle deployments carry no level grid, so the verdict sweep
-        // has nothing to sweep: `decide` falls back to the threshold path and
-        // the level serializes as `null`.
-        Ok(Self::new(
-            bundle,
-            RouteSet::default(),
-            active_level,
-            Vec::new(),
-            0,
-        ))
-    }
-
-    /// Load an ensemble layout (`general/` + `filegroups/*` + `filetypes/*`).
-    /// See module-level docs for the on-disk shape and config schema.
     fn load_ensemble(
         model_dir: &Path,
-        thresholds: Option<Thresholds>,
+        explicit: Option<Thresholds>,
         active_level: Option<u16>,
     ) -> Result<Self> {
-        // Ensemble-level config.json carries the routing map and the per-route
-        // thresholds for every level. We resolve thresholds from it before
-        // loading any individual route bundle so each bundle gets the right
-        // pre-resolved thresholds and skips its own (nonexistent) config.json.
-        //
-        // The diagnostic `by_filetype` policy and per-route thresholds are
-        // pinned to DEFAULT_SEVERITY_LEVEL (not the active level) so the
-        // `models[]` array and emitted `prob` are identical regardless of the
-        // caller's `-l` — the JSON envelope stays cacheable across levels. The
-        // active level enters only the final verdict derivation, via the
-        // level-independent sweep over `policies.grid` / `general_grid`.
         // Pinned before anything is read: a bundle swapped in mid-load then
         // fails the pin, rather than its specialists being scored against
         // the thresholds read from the bundle it replaced.
         let pin = Arc::new(BundlePin::new(model_dir));
-        let cfg = EnsembleConfig::new(
-            BundleConfig::load(model_dir)?.unwrap_or_default(),
-            DEFAULT_SEVERITY_LEVEL,
-        );
+        let config = BundleConfig::load(model_dir)?.unwrap_or_default();
+        // The diagnostic `by_filetype` policy and per-route thresholds are
+        // resolved at the bundle's own default level, never the caller's
+        // `-l`, so the `models[]` array and emitted `prob` are identical
+        // across levels and the JSON envelope stays cacheable. The active
+        // level enters only the final verdict, via the level-independent
+        // sweep over the policy grid or `general_grid`.
+        let diagnostic_level = config
+            .default_severity_level
+            .unwrap_or(DEFAULT_SEVERITY_LEVEL);
+        let cfg = EnsembleConfig::new(config, diagnostic_level);
         let mut names = RouteNames::default();
         for route in cfg.route_thresholds.keys() {
             names.intern(route);
         }
+
+        // The policy JSON carries large diagnostic tables. Parse it while
+        // decoding the general model: neither depends on the other.
         let general_dir = model_dir.join("general");
-        let general_thresholds =
-            thresholds.or_else(|| cfg.route_thresholds.get("general").copied());
-
-        // The policy search JSON includes large diagnostic tables. Parse it
-        // while decoding the general model: neither operation depends on the
-        // other. Specialist registration needs the policy route names, so it
-        // follows both loads; it only reads small calibrator files.
-        let specialist_start = std::time::Instant::now();
         let (policies, general) = rayon::join(
-            || load_route_policies(model_dir, DEFAULT_SEVERITY_LEVEL, &mut names),
+            || load_route_policies(model_dir, diagnostic_level, &mut names),
             || {
-                load_bundle(
-                    &general_dir,
-                    general_thresholds,
-                    /* is_general = */ true,
-                )
-                .with_context(|| format!("loading general route from {}", general_dir.display()))
+                load_bundle(&general_dir).with_context(|| {
+                    format!("loading general route from {}", general_dir.display())
+                })
             },
         );
-        let mut policies = policies?;
+        let policies = policies?;
         let general = general?;
-        let (filegroups, filetypes) = rayon::join(
-            || {
-                load_specialists(
-                    &model_dir.join("filegroups"),
-                    &pin,
-                    &cfg.route_thresholds,
-                    &policies,
-                    &names,
-                    "filegroups",
-                )
-            },
-            || {
-                load_specialists(
-                    &model_dir.join("filetypes"),
-                    &pin,
-                    &cfg.route_thresholds,
-                    &policies,
-                    &names,
-                    "filetypes",
-                )
-            },
-        );
-        tracing::info!(
-            filegroups = filegroups.len(),
-            filetypes = filetypes.len(),
-            elapsed_ms = specialist_start.elapsed().as_millis(),
-            "prepared specialist routes",
-        );
-
-        let routes = RouteSet {
-            filegroups,
-            filetypes,
-            filetype_to_filegroup: cfg.filetype_to_filegroup,
-            policies: RoutePolicies::default(),
-            names,
+        let (thresholds, threshold_source) = match explicit {
+            Some(t) => {
+                t.validate().context("invalid thresholds")?;
+                (t, "explicit")
+            }
+            None => {
+                let t = cfg.route_thresholds.get("general").copied().with_context(|| {
+                    format!(
+                        "{} has no general-route thresholds at level {diagnostic_level}, so the model cannot classify; reinstall the bundle with 'atomscan update-rules'",
+                        model_dir.join("config.json").display(),
+                    )
+                })?;
+                (t, "config.json")
+            }
         };
 
-        // Required routes from config: any listed name that didn't load is
-        // fatal. "general" is implicitly required and was already loaded above.
-        for required in &cfg.required_routes {
-            match RouteKind::parse(required) {
-                Some(RouteKind::General) => {}
-                Some(RouteKind::Group(name)) => {
-                    routes.filegroups.validate_route(name).with_context(|| {
-                        format!(
-                            "ensemble config marks filegroup {name:?} as required but it failed to load"
-                        )
-                    })?;
-                }
-                Some(RouteKind::Type(name)) => {
-                    routes.filetypes.validate_route(name).with_context(|| {
-                        format!(
-                            "ensemble config marks filetype {name:?} as required but it failed to load"
-                        )
-                    })?;
-                }
-                None => anyhow::bail!(
-                    "unknown required-route name {required:?} in ensemble config; \
-                     expected `general`, `filegroups/<name>`, or `filetypes/<name>`"
-                ),
-            }
-        }
-
-        // The route_policies.json thresholds for the OR-of-routes decision
-        // path were loaded in raw-score space, but the route scorers emit
-        // calibrated probabilities (see `load_bundle`). Push each per-route
-        // threshold through that route's calibrator so the policy compares
-        // like with like. Isotonic monotonicity preserves the decision.
-        calibrate_policy_thresholds(&mut policies, |route| {
-            routes.calibrator(general.calibrator.as_ref(), route)
-        });
-        let routes = RouteSet { policies, ..routes };
-        // The general grid comes from the same raw `levels[]` table, and the
-        // fallback sweep compares it with calibrated probabilities too.
-        let mut general_grid = cfg.general_grid;
-        if let Some(cal) = general.calibrator.as_ref() {
-            for (_, threshold) in &mut general_grid {
-                *threshold = cal.apply(*threshold);
-            }
-        }
+        let routes = RouteSet::load(
+            model_dir,
+            &pin,
+            &cfg.route_thresholds,
+            cfg.filetype_to_filegroup,
+            policies,
+            names,
+        );
+        routes.check_required(&cfg.required_routes)?;
 
         tracing::info!(
             n_members = general.backend.n_members(),
             features = general.spec.total_features(),
             model_abi_version = general.spec.abi_version(),
-            threshold_suspicious = general.thresholds.suspicious,
-            threshold_hostile = general.thresholds.hostile,
-            threshold_source = general.threshold_source,
+            threshold_suspicious = thresholds.suspicious,
+            threshold_hostile = thresholds.hostile,
+            threshold_source,
+            diagnostic_level,
             spec_version = general.spec.version(),
             filegroups = routes.filegroups.len(),
             filetypes = routes.filetypes.len(),
-            layout = "ensemble",
             "model loaded",
         );
-
         Ok(Self::new(
             general,
+            thresholds,
             routes,
             active_level,
-            general_grid,
+            cfg.general_grid,
             cfg.grid_max,
         ))
     }
 
     fn new(
         general: LoadedBundle,
+        thresholds: Thresholds,
         routes: RouteSet,
         active_level: Option<u16>,
         general_grid: Vec<(u16, f32)>,
@@ -466,17 +339,16 @@ impl Model {
             inner: general.backend,
             spec: general.spec,
             ctx,
-            thresholds: general.thresholds,
+            thresholds,
             info,
             routes,
-            general_calibrator: general.calibrator,
             active_level,
             general_grid,
             grid_max,
         }
     }
 
-    /// Force every calibrated specialist route to load and validate.
+    /// Force every registered specialist route to load and validate.
     ///
     /// Normal scanning initializes specialist ONNX graphs on demand from the
     /// observed file type. Validation and install gates call this explicitly so
@@ -489,7 +361,7 @@ impl Model {
         if self.routes.is_empty() {
             return Ok(());
         }
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         self.routes.validate_all()?;
         tracing::info!(
             filegroups = self.routes.filegroups.len(),
@@ -500,9 +372,12 @@ impl Model {
         Ok(())
     }
 
-    /// Classify a cleave report the way a scan does: featurize every file,
-    /// standardize, score each route the report's primary file type reaches,
-    /// and decide.
+    /// Classify a whole cleave report: featurize every file, standardize,
+    /// score each route the report's primary file type reaches, and decide.
+    ///
+    /// A scan reaches the same decision through
+    /// `Self::predict_for_report_detailed`, sharing one parse between the
+    /// verdict, archive members and explanations.
     ///
     /// # Errors
     /// Returns an error if a consulted route's backend fails.
@@ -559,24 +434,20 @@ impl Model {
         let group = group_key.and_then(|name| self.routes.filegroups.get(name));
         let filetype = self.routes.filetypes.get(&type_key);
 
-        let classify = |route: RouteId, probability: f32, own: &Thresholds| {
-            policy.map_or_else(
-                || own.classify(probability),
-                |policy| policy_route_class(policy, route, probability),
-            )
+        // A route's own class comes from the filetype's policy, else its
+        // thresholds at the diagnostic level; a route with neither is benign
+        // on its own and still feeds the decision.
+        let classify = |route: RouteId, probability: f32, own: Option<&Thresholds>| match policy {
+            Some(policy) => policy_route_class(policy, route, probability),
+            None => own.map_or(Classification::Benign, |t| t.classify(probability)),
         };
         let score_general = || -> Result<Scored> {
             self.ctx.validate_keyword_inputs(parsed)?;
-            let raw = self.inner.predict(general_features)?;
-            let probability = self
-                .general_calibrator
-                .as_ref()
-                .map_or(raw, |cal| cal.apply(raw));
+            let probability = self.inner.predict(general_features)?;
             Ok(Scored {
                 route: RouteId::GENERAL,
-                raw,
                 probability,
-                class: classify(RouteId::GENERAL, probability, &self.thresholds),
+                class: classify(RouteId::GENERAL, probability, Some(&self.thresholds)),
             })
         };
         let score_specialist = |entry: Option<&(RouteId, Arc<Route>)>| -> Result<Option<Scored>> {
@@ -586,13 +457,11 @@ impl Model {
             route.ctx.validate_keyword_inputs(parsed)?;
             let mut features = route.ctx.extract_from_parsed(parsed);
             route.spec.standardize(&mut features);
-            let raw = route.backend.predict(&features)?;
-            let probability = route.calibrator.as_ref().map_or(raw, |cal| cal.apply(raw));
+            let probability = route.backend.predict(&features)?;
             Ok(Some(Scored {
                 route: *id,
-                raw,
                 probability,
-                class: classify(*id, probability, &route.thresholds),
+                class: classify(*id, probability, route.thresholds.as_ref()),
             }))
         };
         // Files (including embedded members) already score in parallel. These
@@ -622,7 +491,7 @@ impl Model {
             scores.push(RouteScore {
                 model: compact_route_name(self.routes.names.name(scored.route)),
                 probability: scored.probability,
-                raw: scored.raw,
+                raw: scored.probability,
                 classification: scored.class,
             });
         }
@@ -756,8 +625,9 @@ impl Model {
         let swept = if let Some(grid) = self.routes.policies.grid_for(file_type) {
             sweep_policy_grid(grid, route_probs)
         } else if self.general_grid.is_empty() {
-            // No grid to sweep (general-only bundle without a levels[] table):
-            // fall back to the threshold path; the level stays null.
+            // No grid to sweep (explicit thresholds on a bundle without a
+            // levels[] table): fall back to the threshold path; the level
+            // stays null.
             return self.decide_from_scores(route_probs);
         } else {
             sweep_general_grid(&self.general_grid, route_probs)
@@ -818,7 +688,7 @@ impl Model {
 
     /// Active deploy level (`-l`, pool-adjusted FP scale): the single hostile
     /// threshold — a file is hostile iff its firing level is `<=` this. `None`
-    /// in manual-threshold mode and on single-bundle deployments with no grid.
+    /// in manual-threshold mode.
     #[must_use]
     pub(crate) const fn active_level(&self) -> Option<u16> {
         self.active_level
@@ -844,12 +714,11 @@ mod policy;
 mod verdict;
 
 pub(crate) use self::policy::verdict_for_level;
-pub use self::verdict::*;
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use self::{backend::*, fast_tree::*, load::*, policy::*};
+pub(crate) use self::verdict::suspicious_ceiling;
+pub use self::verdict::{
+    Classification, Decision, Level, ModelInfo, RouteScore, SkippedRoute, ThresholdValidationError,
+    Thresholds,
+};
 
 #[cfg(test)]
 mod tests;

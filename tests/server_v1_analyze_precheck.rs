@@ -1,7 +1,7 @@
 //! `POST /v1/analyze` asks before it works.
 //!
 //! Analyzing unconditionally would spend minutes per request re-deriving a
-//! verdict the fleet already holds, while `GET /v1/lookup` answers the same
+//! verdict the corpus already holds, while `GET /v1/lookup` answers the same
 //! question from the corpus in one hop.
 //!
 //! These run against an empty model directory, which is what makes the assertions
@@ -145,8 +145,8 @@ async fn a_held_verdict_answers_without_analyzing() -> Result<()> {
 /// A request narrower than the server's policy is answered from a verdict
 /// already held, whatever policy filed it.
 ///
-/// Deliberate: callers routinely ask for less than a server follows (beamline
-/// asks `references` of servers that follow everything), and refusing to share
+/// Deliberate: callers routinely ask for less than a server follows (a router
+/// may ask `references` of servers that follow everything), and refusing to share
 /// across policies would leave every such request unanswerable from the corpus
 /// and every analysis unfiled. `follow=none` is narrower than any policy, so a
 /// 200 here can only have come from the precheck; an analysis would answer
@@ -210,7 +210,7 @@ async fn a_policy_wider_than_the_server_allows_is_refused() -> Result<()> {
 }
 
 /// An upload is asked about by the digest of the bytes in hand — the identity —
-/// so re-sending an artifact the fleet has already seen costs nothing either.
+/// so re-sending an artifact the corpus has already seen costs nothing either.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;

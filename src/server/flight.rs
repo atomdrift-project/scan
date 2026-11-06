@@ -1,10 +1,10 @@
 //! Single-flight de-duplication of concurrent identical analyses.
 //!
 //! Two clients asking about the same artifact should cost one analysis, not
-//! two. Beamline already collapses duplicate lookups, but only within one
-//! Worker isolate: it runs many, and a client that retries a cut-short stream
-//! usually lands on a different one, so the same sha can arrive here several
-//! times while the first analysis is still running. Each duplicate would take a
+//! two. A router in front may collapse duplicates, but only within one of its
+//! own instances, and a client that retries a cut-short stream usually lands
+//! on a different one, so the same sha can arrive here several times while
+//! the first analysis is still running. Each duplicate would take a
 //! slot of its own and push the server toward `429 At capacity` for work it is
 //! already doing.
 //!
@@ -157,7 +157,7 @@ impl Flight {
 
     /// The phase the analysis is in, once it has started.
     pub(super) fn phase(&self) -> Option<String> {
-        self.phase.get().map(RequestPhase::get)
+        self.phase.get().map(RequestPhase::current)
     }
 
     /// The key this analysis is shared under.

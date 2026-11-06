@@ -2,11 +2,16 @@
 //! nothing declares is a phantom dependency, and one the package itself
 //! provides is not a dependency at all.
 
-#[allow(
-    clippy::wildcard_imports,
-    reason = "one module split across files: each part shares the parent's namespace"
-)]
-use super::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use cleave::{AnalysisOptions, AnalysisReport};
+use filefacts::FileType;
+use fletch::fetch::{CandidateSource, Coverage, FetchRecord};
+use fletch::{RefKind, RefLocator, Reference, find};
+
+use super::discover::{PYPROJECT_LOCKS, npm_import_name, virtual_parent};
+use super::render::delivered_bytes;
+use super::{Group, report_file_type};
 
 /// Turn parser-observed static ES module edges into the same package
 /// references as literal dynamic imports. Type-only edges were excluded by
@@ -74,7 +79,13 @@ impl PythonNamespaces {
             } else {
                 first.split('.').next().unwrap_or_default()
             };
-            if python_module_root(module) {
+            // A Python identifier: what an `import` could name.
+            let mut chars = module.chars();
+            let identifier = chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if identifier {
                 roots
                     .entry(archive.to_owned())
                     .or_default()
@@ -94,15 +105,7 @@ impl PythonNamespaces {
     }
 }
 
-pub(super) fn python_module_root(module: &str) -> bool {
-    let mut chars = module.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-pub(super) fn python_runtime_module_file(path: &str) -> bool {
+fn python_runtime_module_file(path: &str) -> bool {
     path.ends_with(".py") || path.ends_with(".so") || path.ends_with(".pyd")
 }
 
@@ -119,7 +122,7 @@ pub(super) fn python_candidate_provides_namespace(
     let Some(root) = report.files.first() else {
         return false;
     };
-    if root.file_type != "whl" {
+    if report_file_type(&root.file_type) != FileType::Whl {
         return false;
     }
     let module = reference.evidence.split('.').next().unwrap_or_default();
@@ -199,9 +202,20 @@ pub(super) fn annotate_python_import_candidate(
     verified
 }
 
+/// The package a `package.json` directory belongs to, for the imports it
+/// satisfies without a registry: its own name, and an Ember app's
+/// framework-provided modules.
+#[derive(Debug, Clone)]
+pub(super) struct PackageContext {
+    pub(super) name: String,
+    /// Depends on `ember-source`, whose `@ember/*` and `@glimmer/tracking`
+    /// modules have no independent registry package.
+    pub(super) ember: bool,
+}
+
 /// A package can import itself, or framework-provided modules that have no
 /// independent registry package. Use only the nearest manifest's context.
-pub(super) fn npm_package_contexts(report: &AnalysisReport) -> HashMap<String, (String, bool)> {
+pub(super) fn npm_package_contexts(report: &AnalysisReport) -> HashMap<String, PackageContext> {
     let mut result = HashMap::new();
     for file in &report.files {
         // Keyed as `virtual_parent` spells directories: an archive's root is
@@ -227,7 +241,7 @@ pub(super) fn npm_package_contexts(report: &AnalysisReport) -> HashMap<String, (
                     && npm_import_name(r).as_deref() == Some("ember-source")
             })
         });
-        result.insert(dir.to_owned(), (name, ember));
+        result.insert(dir.to_owned(), PackageContext { name, ember });
     }
     result
 }
@@ -235,15 +249,16 @@ pub(super) fn npm_package_contexts(report: &AnalysisReport) -> HashMap<String, (
 pub(super) fn npm_import_is_package_or_framework_provided(
     path: &str,
     package: &str,
-    contexts: &HashMap<String, (String, bool)>,
+    contexts: &HashMap<String, PackageContext>,
 ) -> bool {
     let Some(mut dir) = virtual_parent(path) else {
         return false;
     };
     loop {
-        if let Some((name, ember)) = contexts.get(&dir) {
-            return package == name
-                || (*ember && (package.starts_with("@ember/") || package == "@glimmer/tracking"));
+        if let Some(context) = contexts.get(&dir) {
+            return package == context.name
+                || (context.ember
+                    && (package.starts_with("@ember/") || package == "@glimmer/tracking"));
         }
         let Some(parent) = virtual_parent(&dir) else {
             return false;
@@ -284,7 +299,10 @@ pub(super) fn declared_npm_imports_in_hop(
     }
     let mut result: HashMap<String, HashMap<String, Reference>> = HashMap::new();
     for file in &report.files {
-        if !matches!(file.file_type.as_str(), "javascript" | "typescript") {
+        if !matches!(
+            report_file_type(&file.file_type),
+            FileType::JavaScript | FileType::TypeScript
+        ) {
             continue;
         }
         let mut dir = virtual_parent(&file.path);
@@ -311,7 +329,7 @@ pub(super) fn declared_npm_imports_in_hop(
     result
 }
 
-pub(super) fn python_distribution_name(reference: &Reference) -> Option<String> {
+fn python_distribution_name(reference: &Reference) -> Option<String> {
     let RefLocator::Purl(raw) = &reference.locator else {
         return None;
     };
@@ -333,6 +351,28 @@ pub(super) fn python_distribution_name(reference: &Reference) -> Option<String> 
     Some(name)
 }
 
+/// Python declarations, by owning package directory and then by normalized
+/// distribution name, each list reconciled with the lock pins beside it.
+type PythonOwners = HashMap<String, HashMap<String, Vec<Reference>>>;
+
+/// The package contexts one Python source occurs in.
+#[derive(Default)]
+struct PythonContext {
+    /// How many times the source occurs.
+    occurrences: usize,
+    /// What those occurrences declare, by distribution name.
+    names: HashMap<String, NameDeclarations>,
+}
+
+/// One distribution name's declarations across a source's occurrences.
+#[derive(Default)]
+struct NameDeclarations {
+    /// How many occurrences declare the name: all of them, or the binding is
+    /// incomplete.
+    occurrences: usize,
+    declarations: Vec<Reference>,
+}
+
 /// Python declarations constrain matching distribution-name candidates. This
 /// is not a general module-to-distribution mapping. Stop at the nearest package
 /// boundary; identical source bytes must agree across all supplied contexts.
@@ -349,11 +389,60 @@ pub(super) fn reconcile_python_imports(
     if candidate_sources.is_empty() {
         return Vec::new();
     }
+    let owners = python_owners(report, worklist);
+    let contexts = python_contexts(report, &candidate_sources, &owners);
+    let mut covered = Vec::new();
+    for (source, refs) in worklist {
+        let mut updated = Vec::new();
+        for reference in std::mem::take(refs) {
+            let binding = is_python_import_candidate(&reference)
+                .then(|| python_distribution_name(&reference))
+                .flatten()
+                .and_then(|name| {
+                    let context = contexts.get(source)?;
+                    let named = context.names.get(&name)?;
+                    Some((
+                        named.occurrences == context.occurrences,
+                        &named.declarations,
+                    ))
+                });
+            let Some((complete, declarations)) = binding.filter(|(_, decls)| !decls.is_empty())
+            else {
+                updated.push(reference);
+                continue;
+            };
+            if dependencies && complete {
+                covered.push((source.clone(), reference));
+                continue;
+            }
+            if !dependencies {
+                for declaration in declarations {
+                    let mut bound = reference.clone();
+                    bound.locator = declaration.locator.clone();
+                    bound.pinned_hash = declaration.pinned_hash.clone();
+                    bound.context = declaration.context.clone();
+                    if !updated.contains(&bound) {
+                        updated.push(bound);
+                    }
+                }
+            }
+            if !complete {
+                updated.push(reference);
+            }
+        }
+        *refs = updated;
+    }
+    covered
+}
+
+/// Every Python package boundary in the report — a manifest's directory, a
+/// wheel, an installed `.dist-info` — and the distributions it declares.
+fn python_owners(report: &AnalysisReport, worklist: &[Group]) -> PythonOwners {
     let mut source_refs: HashMap<&str, Vec<&Reference>> = HashMap::new();
-    for (sha, refs) in worklist.iter() {
+    for (sha, refs) in worklist {
         source_refs.entry(sha).or_default().extend(refs);
     }
-    let mut owners: HashMap<String, HashMap<String, Vec<Reference>>> = HashMap::new();
+    let mut owners = PythonOwners::new();
     for file in &report.files {
         let basename = file.path.rsplit(['/', '!']).next().unwrap_or_default();
         let mut owner = virtual_parent(&file.path).unwrap_or_else(|| ".".into());
@@ -363,13 +452,10 @@ pub(super) fn reconcile_python_imports(
                 | "requirements.txt"
                 | "setup.py"
                 | "setup.cfg"
-                | "poetry.lock"
-                | "uv.lock"
-                | "pdm.lock"
                 | "Pipfile"
                 | "Pipfile.lock"
-        );
-        if file.file_type == "whl" {
+        ) || PYPROJECT_LOCKS.contains(&basename);
+        if report_file_type(&file.file_type) == FileType::Whl {
             owner = format!("{}!!", file.path);
         } else if basename == "METADATA" && owner.ends_with(".dist-info") {
             owner = virtual_parent(&owner).unwrap_or_else(|| ".".into());
@@ -395,12 +481,21 @@ pub(super) fn reconcile_python_imports(
             *refs = reconciled;
         }
     }
-    // A content hash can occur in multiple packages. Preserve every applicable
-    // constraint, and remember any context with no declaration for that name.
-    type NameRefs = HashMap<String, (usize, Vec<Reference>)>;
-    let mut contexts: HashMap<String, (usize, NameRefs)> = HashMap::new();
+    owners
+}
+
+/// For each candidate source sha, the declarations of the nearest package
+/// boundary above each of its occurrences. A content hash can occur in
+/// several packages: every applicable constraint is kept, and an occurrence
+/// with no declaration for a name leaves that name incomplete.
+fn python_contexts(
+    report: &AnalysisReport,
+    candidate_sources: &HashSet<&str>,
+    owners: &PythonOwners,
+) -> HashMap<String, PythonContext> {
+    let mut contexts: HashMap<String, PythonContext> = HashMap::new();
     for file in &report.files {
-        if file.file_type != "python"
+        if report_file_type(&file.file_type) != FileType::Python
             || file.path.ends_with(".pyi")
             || !candidate_sources.contains(file.sha256.as_str())
         {
@@ -415,52 +510,15 @@ pub(super) fn reconcile_python_imports(
             }
             dir = virtual_parent(&current);
         }
-        let (count, bindings) = contexts.entry(file.sha256.clone()).or_default();
-        *count += 1;
+        let context = contexts.entry(file.sha256.clone()).or_default();
+        context.occurrences += 1;
         for (name, declarations) in names {
-            let (seen, existing) = bindings.entry(name).or_default();
-            *seen += 1;
-            existing.extend(declarations);
+            let named = context.names.entry(name).or_default();
+            named.occurrences += 1;
+            named.declarations.extend(declarations);
         }
     }
-    let mut covered = Vec::new();
-    for (source, refs) in worklist {
-        let mut updated = Vec::new();
-        for reference in std::mem::take(refs) {
-            let binding = is_python_import_candidate(&reference)
-                .then(|| python_distribution_name(&reference))
-                .flatten()
-                .and_then(|name| {
-                    let (total, names) = contexts.get(source)?;
-                    let (seen, refs) = names.get(&name)?;
-                    Some((*seen == *total, refs))
-                });
-            if let Some((complete, declarations)) = binding.filter(|(_, decls)| !decls.is_empty()) {
-                if dependencies && complete {
-                    covered.push((source.clone(), reference));
-                    continue;
-                }
-                if !dependencies {
-                    for declaration in declarations {
-                        let mut bound = reference.clone();
-                        bound.locator = declaration.locator.clone();
-                        bound.pinned_hash = declaration.pinned_hash.clone();
-                        bound.context = declaration.context.clone();
-                        if !updated.contains(&bound) {
-                            updated.push(bound);
-                        }
-                    }
-                }
-                if !complete {
-                    updated.push(reference);
-                }
-            } else {
-                updated.push(reference);
-            }
-        }
-        *refs = updated;
-    }
-    covered
+    contexts
 }
 
 /// Report literal imports from a published npm package's own code that do
@@ -470,7 +528,11 @@ pub(super) fn undeclared_npm_imports(
     report: &AnalysisReport,
     worklist: &[Group],
 ) -> BTreeMap<String, Vec<Reference>> {
-    let Some(root) = report.files.first().filter(|f| f.file_type == "npm") else {
+    let Some(root) = report
+        .files
+        .first()
+        .filter(|f| report_file_type(&f.file_type) == FileType::Npm)
+    else {
         return BTreeMap::new();
     };
     let prefix = format!("{}!!package/", root.path);
@@ -495,8 +557,10 @@ pub(super) fn undeclared_npm_imports(
         let Some(member) = file.path.strip_prefix(&prefix) else {
             continue;
         };
-        if !matches!(file.file_type.as_str(), "javascript" | "typescript")
-            || member.ends_with(".d.ts")
+        if !matches!(
+            report_file_type(&file.file_type),
+            FileType::JavaScript | FileType::TypeScript
+        ) || member.ends_with(".d.ts")
             || member.ends_with(".d.cts")
             || member.ends_with(".d.mts")
             || member.split('/').any(|p| {
@@ -559,6 +623,9 @@ pub(super) fn attribute_undeclared_npm_imports(report: &mut AnalysisReport, work
     if let Err(e) =
         cleave::graft_reference_outcomes_batch(report, &sources, &AnalysisOptions::default())
     {
-        tracing::warn!("undeclared import trait pass failed: {e:#}");
+        tracing::warn!(
+            error = format!("{e:#}"),
+            "undeclared import trait pass failed"
+        );
     }
 }

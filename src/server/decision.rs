@@ -28,7 +28,7 @@ use crate::model::Level;
 /// `None` is manual-threshold mode, where no level table applies at all; the
 /// fallback const stands in so the parameter still has a meaning, though
 /// [`decide`] answers `Unanalyzed` for such verdicts regardless.
-pub(crate) fn default_budget(server_level: Option<u16>) -> u16 {
+pub(super) fn default_budget(server_level: Option<u16>) -> u16 {
     server_level.unwrap_or(crate::model::DEFAULT_SEVERITY_LEVEL)
 }
 
@@ -43,7 +43,7 @@ const GRID_MAX: u16 = 25_000;
 /// What a caller should do about this package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Decision {
+pub(super) enum Decision {
     /// Analyzed, and not hostile at the caller's threshold.
     Allow,
     /// Analyzed, and hostile at the caller's threshold.
@@ -62,7 +62,7 @@ pub(crate) enum Decision {
 /// How bad the artifact is, independent of anyone's threshold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Severity {
+pub(super) enum Severity {
     /// Fires at no level, or only above the suspicious ceiling.
     Benign,
     /// Fires, but only under a budget looser than the ceiling.
@@ -88,7 +88,7 @@ pub(crate) enum Severity {
 /// [`Level::Manual`] answers [`Decision::Unanalyzed`] rather than guessing: no
 /// level table applies to such a verdict, so no budget can be evaluated against
 /// it, and saying so is honest where allowing it would not.
-pub(crate) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
+pub(super) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
     match fires_at {
         Level::Manual => (Decision::Unanalyzed, Severity::Benign),
         Level::At(lvl) if lvl <= budget => (Decision::Block, Severity::Hostile),
@@ -96,135 +96,6 @@ pub(crate) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
             (Decision::Allow, Severity::Suspicious)
         }
         Level::Clean | Level::At(_) => (Decision::Allow, Severity::Benign),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The whole point of the layer, and the one line that must never invert.
-    #[test]
-    fn lower_levels_are_worse() {
-        assert_eq!(
-            decide(Level::At(2), 25).0,
-            Decision::Block,
-            "a tight firing level is hostile"
-        );
-        assert_eq!(
-            decide(Level::At(25), 25).0,
-            Decision::Block,
-            "the budget is inclusive"
-        );
-        assert_eq!(
-            decide(Level::At(26), 25).0,
-            Decision::Allow,
-            "one past the budget is not"
-        );
-        assert_eq!(decide(Level::At(20000), 25).0, Decision::Allow);
-    }
-
-    /// Clean means "fires at no level". Its wire form, `-1`, compared
-    /// numerically is lower than every budget, so a naive `lvl <= budget`
-    /// blocks every clean package in the corpus.
-    #[test]
-    fn the_clean_sentinel_is_not_the_tightest_level() {
-        for budget in [0, 1, 25, 25_000] {
-            assert_eq!(
-                decide(Level::Clean, budget),
-                (Decision::Allow, Severity::Benign),
-                "the clean sentinel was read as a firing level at budget={budget}",
-            );
-        }
-    }
-
-    /// A verdict with no level table cannot be judged against a budget. Unanalyzed
-    /// hands the choice to the caller's policy; allow would make it for them.
-    #[test]
-    fn manual_threshold_mode_is_unanalyzed_not_allowed() {
-        assert_eq!(decide(Level::Manual, 25).0, Decision::Unanalyzed);
-        assert_eq!(decide(Level::Manual, 25_000).0, Decision::Unanalyzed);
-    }
-
-    #[test]
-    fn severity_is_independent_of_the_budget() {
-        // Same artifact, two callers: the decision moves, the severity does not.
-        assert_eq!(
-            decide(Level::At(500), 25),
-            (Decision::Allow, Severity::Suspicious)
-        );
-        assert_eq!(
-            decide(Level::At(500), 1000),
-            (Decision::Block, Severity::Hostile)
-        );
-        // The suspicious ceiling is 100× the budget (floor L500), so the
-        // default reviews through L2500 and a looser caller reviews further.
-        assert_eq!(
-            decide(Level::At(2501), 25),
-            (Decision::Allow, Severity::Benign)
-        );
-        assert_eq!(
-            decide(Level::At(2500), 25),
-            (Decision::Allow, Severity::Suspicious)
-        );
-        assert_eq!(
-            decide(Level::At(2501), 100),
-            (Decision::Allow, Severity::Suspicious)
-        );
-    }
-
-    /// The default follows the deploy rather than restating it. If someone
-    /// retunes this server to a looser level, a caller who sends no threshold
-    /// must move with it — otherwise the API quietly enforces a policy the
-    /// operator stopped running.
-    #[test]
-    fn the_default_budget_follows_the_server() {
-        assert_eq!(default_budget(Some(500)), 500);
-        assert_eq!(default_budget(Some(0)), 0);
-        assert_eq!(
-            default_budget(None),
-            crate::model::DEFAULT_SEVERITY_LEVEL,
-            "manual-threshold mode falls back to the shipped default",
-        );
-        // The shipped default is strict on purpose: this number decides whether
-        // a build breaks, and a firewall that cries wolf gets switched off.
-        assert_eq!(crate::model::DEFAULT_SEVERITY_LEVEL, 25);
-        assert_eq!(
-            decide(Level::At(50), default_budget(None)).0,
-            Decision::Allow
-        );
-        assert_eq!(
-            decide(Level::At(25), default_budget(None)).0,
-            Decision::Block
-        );
-    }
-
-    /// This layer restates a rule that already exists in the model, so it can
-    /// drift from it. Pin them together across the grid rather than trusting
-    /// two copies of one sentence to stay equal.
-    #[test]
-    fn agrees_with_the_model_grid() {
-        use crate::model::{Classification, verdict_for_level};
-        for level in [
-            0_u16, 1, 2, 25, 26, 500, 501, 2500, 2501, 3000, 20_000, 25_000,
-        ] {
-            for budget in [0_u16, 5, 25, 70, 250, 500, 3000] {
-                let (decision, severity) = decide(Level::At(level), budget);
-                let expected = verdict_for_level(level, budget, GRID_MAX);
-                let blocked = decision == Decision::Block;
-                assert_eq!(
-                    blocked,
-                    expected == Classification::Hostile,
-                    "level={level} budget={budget}: decision and model disagree",
-                );
-                let expected_severity = match expected {
-                    Classification::Hostile => Severity::Hostile,
-                    Classification::Suspicious => Severity::Suspicious,
-                    Classification::Benign => Severity::Benign,
-                };
-                assert_eq!(severity, expected_severity, "level={level} budget={budget}");
-            }
-        }
     }
 }
 
@@ -274,7 +145,8 @@ impl V1Decision {
     ///
     /// `engine_version` and `analyzed_at` stay `None`, which is the whole
     /// contract: an engine is what separates a measurement from a citation, so
-    /// a caller (and beamline's cache) can tell this from a scan we ran, and
+    /// a caller (and any cache in front of us) can tell this from a scan we
+    /// ran, and
     /// `/v1/analyze` is free to replace it with a real one.
     ///
     /// Levels come from [`crate::lookup::bloom_claim`] — the loosest each tier
@@ -565,3 +437,132 @@ const REPORT_MIN_CRIT: u8 = 4;
 
 /// Enough to show why, few enough to read. Matches the corpus's `LIMIT 3`.
 const REPORT_LIMIT: usize = 3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the layer, and the one line that must never invert.
+    #[test]
+    fn lower_levels_are_worse() {
+        assert_eq!(
+            decide(Level::At(2), 25).0,
+            Decision::Block,
+            "a tight firing level is hostile"
+        );
+        assert_eq!(
+            decide(Level::At(25), 25).0,
+            Decision::Block,
+            "the budget is inclusive"
+        );
+        assert_eq!(
+            decide(Level::At(26), 25).0,
+            Decision::Allow,
+            "one past the budget is not"
+        );
+        assert_eq!(decide(Level::At(20000), 25).0, Decision::Allow);
+    }
+
+    /// Clean means "fires at no level". Its wire form, `-1`, compared
+    /// numerically is lower than every budget, so a naive `lvl <= budget`
+    /// blocks every clean package in the corpus.
+    #[test]
+    fn the_clean_sentinel_is_not_the_tightest_level() {
+        for budget in [0, 1, 25, 25_000] {
+            assert_eq!(
+                decide(Level::Clean, budget),
+                (Decision::Allow, Severity::Benign),
+                "the clean sentinel was read as a firing level at budget={budget}",
+            );
+        }
+    }
+
+    /// A verdict with no level table cannot be judged against a budget. Unanalyzed
+    /// hands the choice to the caller's policy; allow would make it for them.
+    #[test]
+    fn manual_threshold_mode_is_unanalyzed_not_allowed() {
+        assert_eq!(decide(Level::Manual, 25).0, Decision::Unanalyzed);
+        assert_eq!(decide(Level::Manual, 25_000).0, Decision::Unanalyzed);
+    }
+
+    #[test]
+    fn severity_is_independent_of_the_budget() {
+        // Same artifact, two callers: the decision moves, the severity does not.
+        assert_eq!(
+            decide(Level::At(500), 25),
+            (Decision::Allow, Severity::Suspicious)
+        );
+        assert_eq!(
+            decide(Level::At(500), 1000),
+            (Decision::Block, Severity::Hostile)
+        );
+        // The suspicious ceiling is 100× the budget (floor L500), so the
+        // default reviews through L2500 and a looser caller reviews further.
+        assert_eq!(
+            decide(Level::At(2501), 25),
+            (Decision::Allow, Severity::Benign)
+        );
+        assert_eq!(
+            decide(Level::At(2500), 25),
+            (Decision::Allow, Severity::Suspicious)
+        );
+        assert_eq!(
+            decide(Level::At(2501), 100),
+            (Decision::Allow, Severity::Suspicious)
+        );
+    }
+
+    /// The default follows the deploy rather than restating it. If someone
+    /// retunes this server to a looser level, a caller who sends no threshold
+    /// must move with it — otherwise the API quietly enforces a policy the
+    /// operator stopped running.
+    #[test]
+    fn the_default_budget_follows_the_server() {
+        assert_eq!(default_budget(Some(500)), 500);
+        assert_eq!(default_budget(Some(0)), 0);
+        assert_eq!(
+            default_budget(None),
+            crate::model::DEFAULT_SEVERITY_LEVEL,
+            "manual-threshold mode falls back to the shipped default",
+        );
+        // The shipped default is strict on purpose: this number decides whether
+        // a build breaks, and a firewall that cries wolf gets switched off.
+        assert_eq!(crate::model::DEFAULT_SEVERITY_LEVEL, 25);
+        assert_eq!(
+            decide(Level::At(50), default_budget(None)).0,
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(Level::At(25), default_budget(None)).0,
+            Decision::Block
+        );
+    }
+
+    /// This layer restates a rule that already exists in the model, so it can
+    /// drift from it. Pin them together across the grid rather than trusting
+    /// two copies of one sentence to stay equal.
+    #[test]
+    fn agrees_with_the_model_grid() {
+        use crate::model::{Classification, verdict_for_level};
+        for level in [
+            0_u16, 1, 2, 25, 26, 500, 501, 2500, 2501, 3000, 20_000, 25_000,
+        ] {
+            for budget in [0_u16, 5, 25, 70, 250, 500, 3000] {
+                let (decision, severity) = decide(Level::At(level), budget);
+                let expected = verdict_for_level(level, budget, GRID_MAX);
+                let blocked = decision == Decision::Block;
+                assert_eq!(
+                    blocked,
+                    expected == Classification::Hostile,
+                    "level={level} budget={budget}: decision and model disagree",
+                );
+                let expected_severity = match expected {
+                    Classification::Hostile => Severity::Hostile,
+                    Classification::Suspicious => Severity::Suspicious,
+                    Classification::Benign => Severity::Benign,
+                };
+                assert_eq!(severity, expected_severity, "level={level} budget={budget}");
+            }
+        }
+    }
+}

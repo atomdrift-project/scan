@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle::{self, Bundle};
 
-/// Sidecar recording what the R2 backend installed (no `.git` in the tree).
-const SIDECAR: &str = ".litmus-models.toml";
+/// Sidecar recording what the updater installed (no `.git` in the tree).
+const SIDECAR: &str = ".scan-models.toml";
 
 /// This build's version, matched against the manifest's release keys (e.g. `2.0.0-rc.4`).
 const OUR_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -41,7 +41,7 @@ struct Artifact {
     date: String,
 }
 
-/// Sidecar contents — what the R2 backend last installed.
+/// Sidecar contents — what the updater last installed.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Installed {
     /// Content id of the installed model bundle (manifest artifact key).
@@ -54,7 +54,7 @@ pub struct Installed {
     pub version: String,
 }
 
-/// Read the install sidecar, if the models dir was populated by the R2 backend.
+/// Read the install sidecar, if the updater populated the models dir.
 #[must_use]
 pub fn installed(dir: &Path) -> Option<Installed> {
     let text = fs::read_to_string(dir.join(SIDECAR)).ok()?;
@@ -71,15 +71,6 @@ pub fn update(dir: &Path, force: bool, quiet: bool) -> Result<bool> {
     bundle::update::<Models>(dir, force, quiet)
 }
 
-/// Report what would be installed without changing anything.
-///
-/// # Errors
-/// Returns an error if the manifest cannot be fetched or resolved.
-pub fn check(dir: &Path) -> Result<()> {
-    bundle::check::<Models>(dir)
-}
-
-/// The model bundle, as [`bundle::update`] installs it.
 /// Most bytes a model bundle may unpack to. The download is capped, but zstd
 /// is not: a small tarball can claim terabytes.
 const MAX_UNPACKED_BYTES: u64 = 16 << 30;
@@ -142,6 +133,7 @@ fn unpack(reader: impl Read, staging: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The model bundle, as [`bundle::update`] installs it.
 struct Models;
 
 /// The bundle this build should run, resolved from the manifest.
@@ -171,7 +163,7 @@ impl Bundle for Models {
             toml::from_str(&text).with_context(|| format!("parsing manifest {url}"))?;
         // This build's own `[stable]` pointer, else `latest`.
         let (key, source) = match manifest.stable.remove(OUR_VERSION) {
-            Some(key) => (key, format!("stable:{}", OUR_VERSION)),
+            Some(key) => (key, format!("stable:{OUR_VERSION}")),
             None if !manifest.latest.is_empty() => (manifest.latest, "latest".to_owned()),
             None => bail!("manifest has no pointer for this version and no `latest`"),
         };
@@ -253,18 +245,12 @@ impl Bundle for Models {
         )
     }
 
-    fn describe_installed(have: &Installed) -> String {
-        let commit: String = have.commit.chars().take(12).collect();
-        format!("{commit} ({})", have.date)
-    }
-
     /// A newer *release* runs models this build can't. The manifest's
     /// `[upgrade]` table already leaves out dev and unlisted builds.
     fn note(remote: &Release) -> Option<String> {
         remote.upgrade.as_ref().map(|target| {
             format!(
-                "Note: Atomdrift Scan {} cannot use the newest models. Upgrade to Atomdrift Scan {target} for the latest detections.",
-                OUR_VERSION
+                "Note: Atomdrift Scan {OUR_VERSION} cannot use the newest models. Upgrade to Atomdrift Scan {target} for the latest detections."
             )
         })
     }

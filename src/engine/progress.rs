@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::output::{Rgb, fg};
+use crate::output::{ERASE_LINE, Ink, Keep, elide, palette, tty_text};
 
 pub(crate) const SPINNER: &[char] = &[
     '\u{2800}', '\u{2801}', '\u{2809}', '\u{2819}', '\u{281B}', '\u{281E}', '\u{2816}', '\u{2812}',
@@ -24,27 +24,29 @@ pub(crate) const PROGRESS_TICK: Duration = Duration::from_millis(125);
 /// Files-remaining threshold below which a stall counts as the "long tail".
 const TAIL_FILES: u32 = 4;
 
-/// How long the tail must sit without advancing before we reassure the user
-/// that the scan is grinding, not hung.
+/// How long the tail must sit without a file completing before the bar says
+/// the scan is grinding, not hung.
 const TAIL_STALL: Duration = Duration::from_millis(150);
 
 /// The long-tail reassurance text (plain; colorized at render time).
 const TAIL_MESSAGE: &str =
     "\u{2014} on the final long tail of difficult reverse engineering; please be patient\u{2026}";
 
-/// Return to column 0 and erase the line: how the bar and the spinner clear
-/// themselves.
-const ERASE_LINE: &str = "\r\x1b[2K";
 /// Erase to the end of the line — clears a wider previous frame (a longer ETA,
 /// or the notice once it's gone) without padding.
 const ERASE_TO_EOL: &str = "\x1b[K";
 
-const ACCENT: Rgb = Rgb(100, 180, 255);
-const BAR: Rgb = Rgb(80, 160, 220);
-const TRACK: Rgb = Rgb(50, 50, 50);
-const STATS: Rgb = Rgb(160, 160, 160);
-const NOTE: Rgb = Rgb(120, 120, 120);
-const FAINT: Rgb = Rgb(80, 80, 80);
+/// Columns of the bar itself.
+const BAR_WIDTH: usize = 20;
+
+/// Columns the bar line spends before its stats: margin, spinner, bar, gaps.
+const BAR_LINE_PREFIX: usize = BAR_WIDTH + 5;
+
+/// Narrowest notice worth showing; below it the bar renders alone.
+const MIN_NOTICE_WIDTH: usize = 12;
+
+/// Columns of a member path the spinner shows, its file name end kept.
+const SPINNER_MEMBER_WIDTH: usize = 48;
 
 /// Write a redraw to stderr. Progress is cosmetic: a failed redraw must not
 /// stop the scan, so its write errors are ignored — here, and nowhere else.
@@ -65,41 +67,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// columns, truncating with an ellipsis. Empty when there isn't room for a
 /// meaningful slice (a very narrow terminal) — the bar alone still renders.
 fn fit_notice(msg: &str, budget: usize) -> String {
-    const MIN: usize = 12;
-    if budget < MIN {
+    if budget < MIN_NOTICE_WIDTH {
         return String::new();
     }
-    let text = if msg.chars().count() <= budget {
-        msg.to_string()
-    } else {
-        let mut t: String = msg.chars().take(budget - 1).collect();
-        t.push('\u{2026}');
-        t
-    };
-    format!(" {}", fg(NOTE, &text))
-}
-
-/// Terminal size as `(cols, rows)`, for capping the progress line and bounding
-/// the live dependency tree. Falls back to `(80, 24)` when the size can't be
-/// queried (not a tty, or the ioctl fails).
-pub(crate) fn term_dims() -> (usize, usize) {
-    #[cfg(unix)]
-    {
-        // SAFETY: TIOCGWINSZ fills a zero-initialised `winsize`; we trust the
-        // result only when the ioctl reports success and a non-zero width.
-        unsafe {
-            let mut ws: libc::winsize = std::mem::zeroed();
-            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                let rows = if ws.ws_row > 0 {
-                    ws.ws_row as usize
-                } else {
-                    24
-                };
-                return (ws.ws_col as usize, rows);
-            }
-        }
-    }
-    (80, 24)
+    format!(
+        " {}",
+        Ink::stderr().fg(palette().dim, &elide(msg, budget, Keep::Head))
+    )
 }
 
 /// Shared progress state. Lives behind an `Arc` so the heartbeat thread can hold
@@ -214,12 +188,11 @@ impl Inner {
         let elapsed = self.start.elapsed();
 
         let frame = SPINNER[self.tick.fetch_add(1, Ordering::Relaxed) as usize % SPINNER.len()];
-        let bar_w = 20;
-        let filled = (done as usize * bar_w / self.total.max(1) as usize).min(bar_w);
+        let filled = (done as usize * BAR_WIDTH / self.total.max(1) as usize).min(BAR_WIDTH);
         // ━━━╸ then ─── for the remainder; a full bar has no tip.
-        let tip = if filled < bar_w { "\u{2578}" } else { "" };
+        let tip = if filled < BAR_WIDTH { "\u{2578}" } else { "" };
         let filled_str = format!("{}{tip}", "\u{2501}".repeat(filled));
-        let dim_str = "\u{2500}".repeat(bar_w.saturating_sub(filled + 1));
+        let dim_str = "\u{2500}".repeat(BAR_WIDTH.saturating_sub(filled + 1));
 
         let stats = progress_stats(done, self.total, elapsed);
 
@@ -237,17 +210,18 @@ impl Inner {
             ((1..=TAIL_FILES).contains(&left) && stalled >= TAIL_STALL)
                 .then(|| TAIL_MESSAGE.to_string())
         });
-        let used = 25 + stats.chars().count();
+        let used = BAR_LINE_PREFIX + stats.chars().count();
         let note = note_text.map_or_else(String::new, |text| {
             fit_notice(&text, self.term_cols.saturating_sub(used + 1))
         });
 
+        let (ink, p) = (Ink::stderr(), palette());
         draw_stderr(&format!(
             "\r {} {}{}  {}{note}{ERASE_TO_EOL}",
-            fg(ACCENT, frame.encode_utf8(&mut [0; 4])),
-            fg(BAR, &filled_str),
-            fg(TRACK, &dim_str),
-            fg(STATS, &stats),
+            ink.fg(p.live, frame.encode_utf8(&mut [0; 4])),
+            ink.fg(p.bar, &filled_str),
+            ink.fg(p.dot_sep, &dim_str),
+            ink.fg(p.label, &stats),
         ));
     }
 }
@@ -301,15 +275,11 @@ pub(crate) struct Spinner {
 impl Spinner {
     /// Start spinning next to `label`, or `None` when stderr isn't a terminal
     /// (piped/redirected output draws nothing, matching the progress bar).
-    pub(crate) fn start(label: String) -> Option<Self> {
+    pub(crate) fn start(label: &str) -> Option<Self> {
         if !std::io::stderr().is_terminal() {
             return None;
         }
-        let label = if label.chars().any(crate::output::tty_hostile) {
-            crate::output::tty_text(&label).into_owned()
-        } else {
-            label
-        };
+        let label = tty_text(label).into_owned();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let started = Instant::now();
@@ -345,20 +315,22 @@ impl Spinner {
                     if let Some(oldest) = members.iter().find(|c| c.analyzer == "member") {
                         current.clone_from(&oldest.target);
                     }
+                    let (ink, p) = (Ink::stderr(), palette());
                     let detail = if seen.is_empty() {
                         String::new()
                     } else {
+                        let member = elide(&tty_text(&current), SPINNER_MEMBER_WIDTH, Keep::Tail);
                         format!(
                             "  {}  {}",
-                            fg(NOTE, &format!("~{} members", seen.len())),
-                            fg(FAINT, &spinner_tail(&current, 48)),
+                            ink.fg(p.dim, &format!("~{} members", seen.len())),
+                            ink.fg(p.very_dim, &member),
                         )
                     };
                     draw_stderr(&format!(
                         "{ERASE_LINE} {}  {}{detail}  {}",
-                        fg(ACCENT, frame.encode_utf8(&mut [0; 4])),
-                        fg(STATS, &format!("scanning {label}")),
-                        fg(FAINT, &format!("{secs}s")),
+                        ink.fg(p.live, frame.encode_utf8(&mut [0; 4])),
+                        ink.fg(p.label, &format!("scanning {label}")),
+                        ink.fg(p.very_dim, &format!("{secs}s")),
                     ));
                     tick += 1;
                     // `drop` unparks this thread, so stopping costs no tick.
@@ -371,19 +343,6 @@ impl Spinner {
             thread: Some(thread),
         })
     }
-}
-
-/// Keep the last `width` characters of a member path — its filename and nearest
-/// directories, the telling part — eliding the head with a leading `…`. A short
-/// path is returned unchanged.
-fn spinner_tail(path: &str, width: usize) -> String {
-    let path = crate::output::tty_text(path);
-    let count = path.chars().count();
-    if count <= width {
-        return path.to_string();
-    }
-    let tail: String = path.chars().skip(count - width + 1).collect();
-    format!("\u{2026}{tail}")
 }
 
 impl Drop for Spinner {
@@ -417,7 +376,7 @@ impl Progress {
             start: Instant::now(),
             last_advance_ms: AtomicU64::new(0),
             tick: AtomicU32::new(0),
-            term_cols: term_dims().0,
+            term_cols: cleave::output::terminal_width(),
             stopped: AtomicBool::new(false),
             draw_lock: Mutex::new(()),
         });
@@ -555,16 +514,6 @@ mod tests {
         assert!(bar_active(), "the newer bar is still the live one");
         drop(second);
         assert!(!bar_active());
-    }
-
-    #[test]
-    fn spinner_tail_keeps_the_filename_end() {
-        assert_eq!(spinner_tail("short.py", 48), "short.py");
-        let long = "animica/stratum_pool/_data/aicf_rag/chunks/deeply/nested/file.json";
-        let tail = spinner_tail(long, 20);
-        assert!(tail.starts_with('\u{2026}'));
-        assert!(tail.ends_with("file.json"));
-        assert_eq!(tail.chars().count(), 20);
     }
 
     #[test]

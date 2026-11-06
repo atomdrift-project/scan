@@ -1,9 +1,9 @@
 //! Reading the registry-metadata provenance hopper stores per sample.
 //!
-//! A collector (forager) runs `fletch registry <purl>` at fetch time and stores
-//! its `{record, sources}` envelope in the sample's sidecar under `registry`.
-//! Both postdoc's worker (over HTTP, from `/api/provenance/{sha256}`) and the
-//! CLI (`--registry-map <file>`) read that sidecar to recover the normalized
+//! A collector runs `fletch registry <purl>` at fetch time and stores its
+//! `{record, sources}` envelope in the sample's sidecar under `registry`. Both
+//! a hosted worker (over HTTP, from `/api/provenance/{sha256}`) and the CLI
+//! (`--registry-map <file>`) read that sidecar to recover the normalized
 //! [`fletch::Registry`] a scan reasons over, so a hopper-sourced scan sees the
 //! same registry facts a live `pkg`/`url` scan fetches — without a refetch.
 
@@ -52,7 +52,7 @@ impl Upload<'_> {
     /// A new sidecar. `registry` is the normalized record scan derived for a
     /// fetched dependency (`None` for the root file); `sources` are the raw
     /// provider documents its lookup read, archived under `registry.raw` as the
-    /// re-parsing backup — the shape forager stores: a JSON body inline,
+    /// re-parsing backup — the shape collectors store: a JSON body inline,
     /// anything else base64 in `body_b64`.
     ///
     /// # Errors
@@ -89,7 +89,7 @@ impl Upload<'_> {
         })
     }
 
-    /// A sidecar that preserves provenance supplied by postdoc's worker, a
+    /// A sidecar that preserves provenance supplied by a hosted worker, a
     /// `--registry-map`, or a live lookup.
     ///
     /// A complete hopper sidecar is reused as-is, rebound to these bytes. Bare
@@ -99,7 +99,7 @@ impl Upload<'_> {
     ///
     /// # Errors
     /// Returns serde's error if the document cannot be parsed or serialized.
-    pub fn sidecar_from_provenance(
+    pub(crate) fn sidecar_from_provenance(
         &self,
         provenance: &RegistryProvenance,
     ) -> Result<Vec<u8>, serde_json::Error> {
@@ -396,8 +396,8 @@ impl RegistryProvenance {
     /// Preserve a provenance byte buffer and recover its normalized record
     /// without materializing ignored raw provider fields. Accepts any of three
     /// shapes:
-    /// - a hopper sidecar (record nested under `registry`, as postdoc's worker
-    ///   receives from `/api/provenance/{sha256}`),
+    /// - a hopper sidecar (record nested under `registry`, as a hosted worker
+    ///   receives it from `/api/provenance/{sha256}`),
     /// - a bare `fletch registry` envelope (`{record, sources}`, straight from
     ///   fletch's stdout), or
     /// - a bare normalized [`Registry`] record for legacy `--registry-map` callers.
@@ -414,18 +414,12 @@ impl RegistryProvenance {
         })
     }
 
-    /// Preserve borrowed JSON. Prefer [`Self::from_bytes`] when the caller
-    /// already owns a [`bytes::Bytes`] response to avoid a copy.
+    /// Preserve borrowed JSON, for tests; production callers own their
+    /// buffer and use [`Self::from_bytes`].
+    #[cfg(test)]
     #[must_use]
-    pub fn from_json(document: &[u8]) -> Option<Self> {
+    pub(crate) fn from_json(document: &[u8]) -> Option<Self> {
         Self::from_bytes(bytes::Bytes::copy_from_slice(document))
-    }
-
-    /// Adopt an owned raw JSON value without copying its backing allocation.
-    #[must_use]
-    pub fn from_raw_value(document: Box<serde_json::value::RawValue>) -> Option<Self> {
-        let document: Box<str> = document.into();
-        Self::from_bytes(bytes::Bytes::from(String::from(document)))
     }
 
     /// Build the same lossless envelope for a live lookup.
@@ -491,7 +485,7 @@ impl RegistryProvenance {
     /// Provider URLs carried by the preserved document, deduplicated in input
     /// order. Terminal rendering uses this instead of re-querying a registry.
     #[must_use]
-    pub fn source_urls(&self) -> Vec<String> {
+    pub(crate) fn source_urls(&self) -> Vec<String> {
         self.document.with_bytes(|bytes| {
             let Ok(document) = serde_json::from_slice::<UrlDocument<'_>>(bytes) else {
                 return Vec::new();
@@ -647,23 +641,41 @@ fn parse_registry_record(json: &[u8]) -> Option<Registry> {
     serde_json::from_slice::<Registry>(json).ok()
 }
 
-/// Parse a `--registry-map` without constructing a second full JSON value tree.
+/// Parse a `--registry-map`: a JSON object from artifact SHA-256 to that
+/// artifact's provenance, without constructing a second full JSON value tree.
+///
+/// Keys are normalized to the lowercase hex a scan looks artifacts up by, so
+/// a map written in uppercase still matches. An entry whose key is not a
+/// SHA-256, or whose value carries no registry record, can never match and is
+/// dropped with a warning naming it, rather than silently.
 ///
 /// Each value is initially borrowed as [`serde_json::value::RawValue`], then
 /// copied once into its long-lived compact buffer. Peak memory is therefore the
 /// input file plus compact per-entry documents, rather than the input plus a
-/// 3–6× parsed representation of every provider response.
+/// parsed tree several times its size.
 ///
 /// # Errors
 /// Returns serde's parse error when the top-level map is malformed.
 pub fn registry_map(json: &[u8]) -> Result<HashMap<String, RegistryProvenance>, serde_json::Error> {
     let raw: HashMap<String, Box<serde_json::value::RawValue>> = serde_json::from_slice(json)?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|(sha, value)| {
-            RegistryProvenance::from_raw_value(value).map(|provenance| (sha, provenance))
-        })
-        .collect())
+    let mut map = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        let sha = key.trim().to_ascii_lowercase();
+        if burton::parse_sha256_hex(&sha).is_none() {
+            tracing::warn!(key = %crate::output::tty_text(&key), "registry map key is not a SHA-256; entry ignored");
+            continue;
+        }
+        // The raw value's own allocation becomes the entry's buffer, uncopied.
+        let document = String::from(Box::<str>::from(value));
+        let Some(provenance) = RegistryProvenance::from_bytes(bytes::Bytes::from(document)) else {
+            tracing::warn!(sha256 = %sha, "registry map entry has no registry record; entry ignored");
+            continue;
+        };
+        if map.insert(sha.clone(), provenance).is_some() {
+            tracing::warn!(sha256 = %sha, "registry map lists one SHA-256 twice; the last entry wins");
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -890,6 +902,20 @@ mod tests {
         );
     }
 
+    /// Keys are matched as scans look them up — lowercase hex — and an entry
+    /// that can never match is dropped rather than kept under a dead key.
+    #[test]
+    fn registry_map_normalizes_keys_and_drops_unmatchable_entries() {
+        let upper = "AB".repeat(32);
+        let json = format!(
+            r#"{{" {upper} ":{{"record":{RECORD}}},"not-a-sha":{{"record":{RECORD}}},"{}":{{"feed":{{}}}}}}"#,
+            "c".repeat(64)
+        );
+        let map = registry_map(json.as_bytes()).expect("map parses");
+        assert_eq!(map.len(), 1, "{:?}", map.keys().collect::<Vec<_>>());
+        assert!(map.contains_key(&"ab".repeat(32)));
+    }
+
     #[test]
     fn owned_worker_buffer_is_adopted_and_clones_share_it() {
         let bytes = bytes::Bytes::from_static(
@@ -966,7 +992,7 @@ mod tests {
         .sidecar(Some(&reg), &sources)
         .unwrap();
 
-        // What scan writes, scan (and postdoc's worker) reads back as the same record.
+        // What scan writes, scan (and a hosted worker) reads back as the same record.
         let rec = registry_record(&json).expect("registry record present");
         assert_eq!(rec.ecosystem, filefacts::Ecosystem::Npm);
         assert_eq!(rec.name, "left-pad");

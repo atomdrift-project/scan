@@ -10,14 +10,13 @@
 //!
 //! **It reports a percentile, not a mean.** Analysis time is strongly bimodal —
 //! seconds for a small package, minutes for a large archive — and a mean sits
-//! in the empty space between the two humps, describing almost no real job;
-//! against observed medians it is off by roughly an order of magnitude.
+//! in the empty space between the two humps, describing almost no real job.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How much recent history an estimate is drawn from.
-pub(crate) const WINDOW: Duration = Duration::from_secs(60 * 60);
+pub(super) const WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// Slots the window is divided into. Expiry is per slot, so this sets how
 /// abruptly the oldest traffic falls out: twelve slots retire five minutes at a
@@ -39,7 +38,7 @@ const BUCKETS: usize = 24;
 /// pathological archives that a stall detector should not be calibrated to. p80
 /// answers "how long does this usually take, including a bad day" — which is
 /// the question a dispatch decision is actually asking.
-pub(crate) const PERCENTILE: f64 = 0.80;
+pub(super) const PERCENTILE: f64 = 0.80;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Slot {
@@ -72,7 +71,7 @@ struct Window {
 /// invariant that matters: a reader sees one coherent window instead of a
 /// histogram from one instant and a total from another.
 #[derive(Debug)]
-pub(crate) struct Latency {
+pub(super) struct Latency {
     window: Mutex<Window>,
 }
 
@@ -91,10 +90,10 @@ impl Default for Latency {
 /// What a router reads. `None` fields mean the window holds nothing to answer
 /// with, which is a different statement from zero and must stay distinguishable.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Summary {
-    pub(crate) samples: u64,
-    pub(crate) mean_micros: Option<u64>,
-    pub(crate) p80_micros: Option<u64>,
+pub(super) struct Summary {
+    pub(super) samples: u64,
+    pub(super) mean_micros: Option<u64>,
+    pub(super) p80_micros: Option<u64>,
 }
 
 /// The histogram bucket for a duration. Sub-millisecond work lands in bucket 0
@@ -120,13 +119,13 @@ fn bucket_bounds(i: usize) -> (f64, f64) {
 
 impl Latency {
     /// Record one completion.
-    pub(crate) fn record(&self, micros: u64) {
+    pub(super) fn record(&self, micros: u64) {
         self.record_at(micros, Instant::now());
     }
 
     /// `record` with the clock supplied, so a test can age a window without
     /// sleeping through it.
-    pub(crate) fn record_at(&self, micros: u64, now: Instant) {
+    pub(super) fn record_at(&self, micros: u64, now: Instant) {
         let mut w = super::lock(&self.window);
         Self::advance(&mut w, now);
         let cur = w.cur;
@@ -138,11 +137,11 @@ impl Latency {
     }
 
     /// Summarise the window as of now.
-    pub(crate) fn summary(&self) -> Summary {
+    pub(super) fn summary(&self) -> Summary {
         self.summary_at(Instant::now())
     }
 
-    pub(crate) fn summary_at(&self, now: Instant) -> Summary {
+    pub(super) fn summary_at(&self, now: Instant) -> Summary {
         let mut w = super::lock(&self.window);
         // Advance on read too, or a server that stopped receiving work would
         // keep reporting whatever it was doing when the traffic stopped.
@@ -242,7 +241,7 @@ fn percentile_micros(hist: &[u64; BUCKETS], count: u64, p: f64) -> u64 {
 /// u64::MAX — but stating that in code beats asserting it in a comment.
 fn micros_from_ms(ms: f64) -> u64 {
     // A nonsense duration must never read as a fast one. Returning 0 for NaN or
-    // infinity would make a broken server the most attractive in the fleet,
+    // infinity would make a broken server the most attractive of all,
     // just as an unpollable server must never outrank a measured one. Zero is
     // reserved for the legitimate case: bucket 0's lower bound.
     if ms.is_nan() || (ms.is_infinite() && ms.is_sign_positive()) {
@@ -606,8 +605,8 @@ mod tests {
         assert_eq!(s.mean_micros, Some(4_000 * MS));
     }
 
-    // The wire format is a cross-repo contract: beamline reads these exact key
-    // names, and a rename here would silently drop the router back to means.
+    // The wire format is a contract: routers read these exact key names, and
+    // a rename here would silently drop them back to means.
     #[test]
     fn the_published_shape_is_the_one_consumers_read() {
         let base = Instant::now();

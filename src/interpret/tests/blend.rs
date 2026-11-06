@@ -2,6 +2,9 @@
 
 use super::*;
 
+use crate::interpret::blend::{MAX_STEER, blend, one_step_toward, steer};
+use crate::interpret::prompt::is_member_header;
+
 /// A deploy level of `-l 25` over a full grid, so the two band boundaries sit
 /// at L25 (suspicious|hostile, conf 92) and L3000 (benign|suspicious, conf 54).
 fn levels(fired: Level) -> LevelContext {
@@ -587,7 +590,6 @@ fn only_structured_findings_admit() {
         grid_max: 0,
     };
     let hostile = FindingSeverity {
-        elevated: true,
         hostile: true,
         ..FindingSeverity::default()
     };

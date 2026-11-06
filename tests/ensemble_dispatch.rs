@@ -17,7 +17,7 @@ use scan::model::Model;
 
 mod bundle;
 
-/// A loadable single-model bundle to copy routes and seeds from.
+/// A loadable bundle whose `general/` route the staged routes copy.
 fn onnx_bundle() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     bundle::write(dir.path()).expect("write bundle");
@@ -52,7 +52,7 @@ fn real_azoth_bundle_loads_grid_at_every_level() {
 }
 
 /// Stage `general/` plus optionally `filegroups/<group>` and
-/// `filetypes/<type>` from a single source bundle. All routes get the same
+/// `filetypes/<type>` from a source bundle's general route. All routes get the same
 /// model, which is sufficient to exercise the routing decision (each route's
 /// score is identical, so OR semantics are easy to verify).
 fn stage_ensemble(
@@ -66,7 +66,7 @@ fn stage_ensemble(
     let copy_bundle_to = |dest: &Path| {
         std::fs::create_dir_all(dest).unwrap();
         for f in &["model.onnx", "feature_spec.json"] {
-            std::fs::copy(src.join(f), dest.join(f)).unwrap();
+            std::fs::copy(src.join("general").join(f), dest.join(f)).unwrap();
         }
     };
 
@@ -114,6 +114,27 @@ const CALIBRATED: &str = r#"{
   }]
 }"#;
 
+/// An ensemble config with thresholds for the general route alone.
+const GENERAL_ONLY: &str =
+    r#"{"levels": [{"level": 25, "hostile": {"thresholds": {"general": 0.99}}}]}"#;
+
+#[test]
+fn ensemble_without_general_thresholds_is_refused() {
+    let src = onnx_bundle();
+    let dir = stage_ensemble(src.path(), &[], &[], "{}");
+    let err = Model::load(dir.path(), None, None).expect_err("no thresholds must fail");
+    assert!(
+        format!("{err:#}").contains("no general-route thresholds"),
+        "{err:#}"
+    );
+    // Explicit thresholds stand in for the config's.
+    let explicit = scan::Thresholds {
+        suspicious: 0.9,
+        hostile: 0.99,
+    };
+    Model::load(dir.path(), Some(explicit), None).expect("explicit thresholds load");
+}
+
 #[test]
 fn ensemble_routes_to_filetype_specialist_when_present() {
     let src = onnx_bundle();
@@ -154,7 +175,7 @@ fn ensemble_routes_to_filegroup_when_filetype_absent() {
 fn ensemble_with_only_general_falls_back_to_general() {
     let src = onnx_bundle();
     let src = src.path();
-    let dir = stage_ensemble(src, &[], &[], "{}");
+    let dir = stage_ensemble(src, &[], &[], GENERAL_ONLY);
     let model = Model::load(dir.path(), None, None).expect("load ensemble");
 
     // No specialists, so every file type scores on general alone.
@@ -170,7 +191,8 @@ fn ensemble_required_route_missing_is_fatal() {
     let src = onnx_bundle();
     let src = src.path();
     let cfg = r#"{
-      "required_routes": ["filetype:nonexistent"]
+      "required_routes": ["filetype:nonexistent"],
+      "levels": [{"level": 25, "hostile": {"thresholds": {"general": 0.99}}}]
     }"#;
     let dir = stage_ensemble(src, &[], &[], cfg);
     let err = Model::load(dir.path(), None, None).expect_err("missing required must fail");
