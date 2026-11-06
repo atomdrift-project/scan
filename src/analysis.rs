@@ -93,12 +93,15 @@ impl<'a> Analysis<'a> {
 pub(crate) const ANALYSIS_CONTEXT: &str = "cleave analysis of ";
 
 /// Analyze the file at `path`. Runs on a blocking thread.
+///
+/// An upload is staged to disk and analyzed from there, so it takes the same
+/// whale lane its size would take in memory.
 pub fn classify_file(path: &Path, analysis: Analysis<'_>) -> Result<ScanResult> {
     analysis.mark("cleave:init");
-    let opts = analysis.options();
-    analysis.mark("cleave:analyze");
-    let report = cleave::analyze_file(path, &opts)
-        .with_context(|| format!("{ANALYSIS_CONTEXT}{}", analysis.label))?;
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("{ANALYSIS_CONTEXT}{}", analysis.label))?
+        .len();
+    let report = on_lane(len, &analysis, |opts| cleave::analyze_file(path, opts))?;
     finish(report, analysis, Some(path), None)
 }
 
@@ -106,26 +109,38 @@ pub fn classify_file(path: &Path, analysis: Analysis<'_>) -> Result<ScanResult> 
 /// downloaded sample is never copied.
 pub fn classify_bytes(data: bytes::Bytes, analysis: Analysis<'_>) -> Result<ScanResult> {
     analysis.mark("cleave:init");
-    let mut opts = analysis.options();
-    // A whale analyzes on its own bounded pool so its members never fill the
-    // global pool's deques and starve the small analyses that arrive while it
-    // runs (see `whale_lane_for`). `install` blocks this thread until the
-    // analysis returns, exactly as an inline call would.
-    analysis.mark("whale:lane");
-    let lane = whale_lane_for(data.len() as u64)?;
-    // On its own pool the analysis is exempt from cleave's shared-pool
-    // throttles; see `AnalysisOptions::dedicated_pool`.
-    opts.dedicated_pool = lane.is_some();
-    analysis.mark("cleave:analyze");
     let label = analysis.label;
     let retained = data.clone();
-    let analyze = move || cleave::analyze_bytes_shared(data, label, &opts);
-    let report = match lane {
-        Some(lane) => lane.pool.install(analyze),
-        None => analyze(),
-    }
-    .with_context(|| format!("{ANALYSIS_CONTEXT}{label}"))?;
+    let report = on_lane(data.len() as u64, &analysis, move |opts| {
+        cleave::analyze_bytes_shared(data, label, opts)
+    })?;
     finish(report, analysis, None, Some(retained))
+}
+
+/// Run one cleave analysis of an artifact `len` bytes long on the lane its size
+/// calls for.
+///
+/// A whale analyzes on its own bounded pool so its members never fill the
+/// global pool's deques and starve the small analyses that arrive while it
+/// runs (see [`whale_lane_for`]); on that pool it is exempt from cleave's
+/// shared-pool throttles (`AnalysisOptions::dedicated_pool`). `install` blocks
+/// this thread until the analysis returns, exactly as an inline call would.
+fn on_lane(
+    len: u64,
+    analysis: &Analysis<'_>,
+    analyze: impl FnOnce(&cleave::AnalysisOptions) -> Result<cleave::AnalysisReport> + Send,
+) -> Result<cleave::AnalysisReport> {
+    let mut opts = analysis.options();
+    analysis.mark("whale:lane");
+    let lane = whale_lane_for(len)?;
+    opts.dedicated_pool = lane.is_some();
+    analysis.mark("cleave:analyze");
+    let run = move || analyze(&opts);
+    match lane {
+        Some(lane) => lane.pool.install(run),
+        None => run(),
+    }
+    .with_context(|| format!("{ANALYSIS_CONTEXT}{}", analysis.label))
 }
 
 /// Shared tail: honor a late cancellation, then classify and build the result.

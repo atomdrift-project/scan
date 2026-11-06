@@ -789,3 +789,76 @@ fn fully_absent_family_is_skipped_not_rejected() {
     let ctx = ExtractContext::new(&spec);
     assert_eq!(ctx.bigram_slots, vec![None]);
 }
+
+#[test]
+fn ngram_writes_match_vocab_membership_on_both_probe_paths() {
+    // The writers probe either the file's own id tuples or the vocab,
+    // whichever is smaller. Both must set exactly the vocab entries whose
+    // every part fired, including self-pairs and parts listed out of order.
+    let paths: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+    let mut all_bigrams = Vec::new();
+    for (i, a) in paths.iter().enumerate() {
+        for b in &paths[i..] {
+            all_bigrams.push(format!("{b} + {a}"));
+        }
+    }
+    let mut all_trigrams = Vec::new();
+    for (i, a) in paths.iter().enumerate() {
+        for (j, b) in paths.iter().enumerate().skip(i) {
+            for c in &paths[j..] {
+                all_trigrams.push(format!("{c} + {a} + {b}"));
+            }
+        }
+    }
+    // Full vocabs favor walking the file's tuples; sparse ones, the vocab.
+    let sparse = |v: &[String]| v.iter().step_by(7).cloned().collect::<Vec<_>>();
+    for (bigrams, trigrams) in [
+        (sparse(&all_bigrams), sparse(&all_trigrams)),
+        (all_bigrams, all_trigrams),
+    ] {
+        let names = bigrams
+            .iter()
+            .map(|b| format!("bigrams:{b}"))
+            .chain(trigrams.iter().map(|t| format!("trigram:{t}")))
+            .collect();
+        let spec = anchor_spec(vec![], bigrams, trigrams, names);
+        let ctx = ExtractContext::new(&spec);
+        for fired in [
+            &[][..],
+            &[3],
+            &[0, 9],
+            &[1, 4, 7],
+            &[0, 2, 3, 5, 8, 9],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        ] {
+            let summary = FileSummary {
+                unique_3level_paths: fired.iter().map(|&i| format!("p{i}")).collect(),
+                ..FileSummary::default()
+            };
+            let mut got = vec![0.0f32; spec.total_features];
+            let w = &mut FeatureWriter {
+                vec: &mut got,
+                lookup: &ctx.absolute_lookup,
+            };
+            ctx.write_bigram_features(std::slice::from_ref(&summary), w, &ctx.bigram_slots);
+            ctx.write_trigram_features(std::slice::from_ref(&summary), w);
+            let on = |ngram: &str| {
+                ngram
+                    .split(" + ")
+                    .all(|part| summary.unique_3level_paths.iter().any(|p| p == part))
+            };
+            let expected: Vec<f32> = spec
+                .bigram_vocab
+                .iter()
+                .chain(&spec.trigram_vocab)
+                .map(|ngram| if on(ngram) { 1.0 } else { 0.0 })
+                .collect();
+            assert_eq!(
+                got,
+                expected,
+                "fired {fired:?}, vocab {}",
+                spec.bigram_vocab.len()
+            );
+        }
+    }
+}

@@ -236,7 +236,8 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if entry.file_name().to_string_lossy().starts_with(".git") {
+            // Only the object store: `.github/` holds real fixtures.
+            if entry.file_name() == ".git" {
                 continue;
             }
             walk_files(&path, out)?;

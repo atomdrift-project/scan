@@ -119,9 +119,8 @@ pub struct ScanResult {
     /// reports one verdict, and this is for a caller that reports the model
     /// and the floor as separate opinions rather than as one number.
     ///
-    /// Recovering it is cheap because the floor fires only on a model-Benign
-    /// decision — so on a file it raised, the model's own reading was benign,
-    /// and everywhere else the stored decision is already the model's.
+    /// On a file the floor raised, [`FloorDecision::model`] holds the model's
+    /// own reading; everywhere else the stored decision is already the model's.
     pub model: Decision,
     /// The gravest trait-floor firing anywhere in this artifact, if any.
     ///

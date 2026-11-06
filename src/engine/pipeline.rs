@@ -671,9 +671,8 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
         }));
     }
 
-    // The same fold, over the model's own readings: members the floor raised
-    // are excluded because on those the model said benign, and the root's
-    // pre-floor decision stands in for the root. Adopted corpus verdicts count
+    // The same fold, over the model's own readings: a member the floor raised
+    // contributes its pre-floor decision, as the root's does for the root. Adopted corpus verdicts count
     // as model evidence — they are another scan's verdict, not this artifact's
     // traits. Purely observational; the verdict below does not read it.
     let model_decision = worst_member_model(&members)

@@ -673,8 +673,9 @@ fn conflicting_pins_have_distinct_fetch_work_keys() {
     assert_ne!(fetch_work_key(&first), fetch_work_key(&second));
 }
 
-#[test]
-fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
+/// A captured Yarn workspace (`app` depends on the local `server`), its
+/// report, and the `app` manifest's reference to `pkg:npm/server@0.0.0`.
+fn yarn_workspace_fixture() -> (tempfile::TempDir, AnalysisReport, String, Reference) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workspace.tar");
     let members: [(&str, &[u8]); 5] = [
@@ -723,18 +724,27 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
         .filter(|(sha, _)| sha == &app.sha256)
         .flat_map(|(_, refs)| refs)
         .find(|r| locator(r) == "pkg:npm/server@0.0.0")
-        .unwrap();
+        .unwrap()
+        .clone();
+    let app = app.sha256.clone();
+    (dir, report, app, reference)
+}
+
+#[test]
+fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
+    let (_dir, report, app_sha, reference) = yarn_workspace_fixture();
+    let reference = &reference;
     let local = LocalNpmPackages::from_report(&report);
     assert!(
         local
-            .workspace_coverage(&report, &app.sha256, reference)
+            .workspace_coverage(&report, &app_sha, reference)
             .is_some()
     );
     let mut different = reference.clone();
     different.locator = RefLocator::Purl("pkg:npm/server@1.0.0".into());
     assert!(
         local
-            .workspace_coverage(&report, &app.sha256, &different)
+            .workspace_coverage(&report, &app_sha, &different)
             .is_none()
     );
     let mut incomplete_report = report.clone();
@@ -747,7 +757,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
         .analysis_gaps
         .record(cleave::types::AnalysisGap::FlowGraphLimited);
     let coverage = LocalNpmPackages::from_report(&incomplete_report)
-        .workspace_coverage(&incomplete_report, &app.sha256, reference)
+        .workspace_coverage(&incomplete_report, &app_sha, reference)
         .unwrap();
     assert!(
         coverage.1,
@@ -760,7 +770,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     );
     pass.run(
         &mut incomplete_report,
-        vec![(app.sha256.clone(), vec![reference.clone()])],
+        vec![(app_sha.clone(), vec![reference.clone()])],
     );
     assert!(pass.out.records.iter().any(|record| {
         record
@@ -772,20 +782,26 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
                 .iter()
                 .any(|c| matches!(c, Coverage::Incomplete))
     }));
+}
+
+#[test]
+fn ambiguous_yarn_workspaces_stay_unresolved() {
+    let (_dir, report, app_sha, reference) = yarn_workspace_fixture();
+    let reference = &reference;
     let mut no_code = report.clone();
     no_code
         .files
         .retain(|f| !f.path.ends_with("!!server/index.js"));
     assert!(
         LocalNpmPackages::from_report(&no_code)
-            .workspace_coverage(&no_code, &app.sha256, reference)
+            .workspace_coverage(&no_code, &app_sha, reference)
             .is_none()
     );
     let mut no_lock = report.clone();
     no_lock.files.retain(|f| !f.path.ends_with("!!yarn.lock"));
     assert!(
         LocalNpmPackages::from_report(&no_lock)
-            .workspace_coverage(&no_lock, &app.sha256, reference)
+            .workspace_coverage(&no_lock, &app_sha, reference)
             .is_none()
     );
     let mut other_manager = report.clone();
@@ -797,7 +813,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     root.filefacts.as_mut().unwrap().values["packageManager"] = serde_json::json!("npm@10");
     assert!(
         LocalNpmPackages::from_report(&other_manager)
-            .workspace_coverage(&other_manager, &app.sha256, reference)
+            .workspace_coverage(&other_manager, &app_sha, reference)
             .is_none()
     );
     let mut configured = report.clone();
@@ -811,7 +827,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     configured.files.push(config);
     assert!(
         LocalNpmPackages::from_report(&configured)
-            .workspace_coverage(&configured, &app.sha256, reference)
+            .workspace_coverage(&configured, &app_sha, reference)
             .is_none()
     );
     let mut excluded = report.clone();
@@ -824,7 +840,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
         serde_json::json!(["app", "server", "!server"]);
     assert!(
         LocalNpmPackages::from_report(&excluded)
-            .workspace_coverage(&excluded, &app.sha256, reference)
+            .workspace_coverage(&excluded, &app_sha, reference)
             .is_none()
     );
     let mut shadowed = report.clone();
@@ -841,7 +857,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     shadowed.files.push(installed);
     assert!(
         LocalNpmPackages::from_report(&shadowed)
-            .workspace_coverage(&shadowed, &app.sha256, reference)
+            .workspace_coverage(&shadowed, &app_sha, reference)
             .is_none()
     );
     let mut duplicate = report.clone();
@@ -855,7 +871,7 @@ fn exact_local_yarn_workspace_does_not_resolve_to_registry() {
     );
     assert!(
         LocalNpmPackages::from_report(&duplicate)
-            .workspace_coverage(&duplicate, &app.sha256, reference)
+            .workspace_coverage(&duplicate, &app_sha, reference)
             .is_none()
     );
 }

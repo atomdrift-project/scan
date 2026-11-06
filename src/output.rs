@@ -1275,7 +1275,7 @@ pub(crate) fn write_remote_verdict(
         " {}  {} {}  {}",
         fg(color, icon),
         fg(color, &name),
-        fg(p.very_dim, &format!("isotope13{when}{why}")),
+        fg(p.very_dim, &format!("Uplink{when}{why}")),
         fg(p.header_path, &tty_text(label)),
     )
 }

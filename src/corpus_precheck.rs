@@ -38,10 +38,10 @@
 //!
 //! # Atomdrift Uplink
 //!
-//! `--uplink` scans arm the same precheck against isotope13's API instead
-//! ([`configure_isotope13`]), with the subscription token. The wire is the
+//! `--uplink` scans arm the same precheck against Uplink's API instead
+//! ([`configure_uplink`]), with the subscription token. The wire is the
 //! same `/v1/lookup`; what changes is whose judgment it is. Hopper is a corpus
-//! of other runs, so only the same analyzer's verdict is ours. isotope13 is the
+//! of other runs, so only the same analyzer's verdict is ours. Uplink is the
 //! service the subscriber asked to judge for them, so an analyzed verdict
 //! stands whatever produced it — with one bound kept from rule 2: a clean
 //! verdict older than the max age is analyzed again rather than trusted. A
@@ -165,31 +165,31 @@ pub struct Precheck {
 enum Backend {
     /// The hopper this process submits to. Only a same-analyzer verdict is ours.
     Hopper,
-    /// isotope13's API under `--uplink`. Its analyzed verdicts are the answer.
-    Isotope13(cleave::enriched::Token),
+    /// Uplink's API under `--uplink`. Its analyzed verdicts are the answer.
+    Uplink(cleave::enriched::Token),
 }
 
 /// The armed precheck. Every [`configure`] replaces it, so the last hopper a
 /// process was pointed at is the one it asks.
 static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 
-/// Arm the precheck against isotope13's API, for an `--uplink` scan in
+/// Arm the precheck against Uplink's API, for an `--uplink` scan in
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
-pub fn configure_isotope13(token: cleave::enriched::Token) {
+pub fn configure_uplink(token: cleave::enriched::Token) {
     let max_age_days = DEFAULT_MAX_AGE_DAYS;
     let precheck = Precheck {
         lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
         max_age: Duration::from_secs(max_age_days.saturating_mul(86_400)),
         breaker: Breaker::default(),
-        backend: Backend::Isotope13(token),
+        backend: Backend::Uplink(token),
     };
     tracing::info!(
         event = "remote.armed",
         url = %precheck.lookup_url,
         tid = %precheck.tid(),
         max_age_days,
-        "isotope13 lookups enabled: known artifacts are answered without local analysis"
+        "Uplink lookups enabled: known artifacts are answered without local analysis"
     );
     *ARMED.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(precheck));
 }
@@ -321,9 +321,9 @@ impl Precheck {
         })
     }
 
-    /// Whether this precheck asks isotope13 (`--uplink`) rather than hopper.
-    pub fn is_isotope13(&self) -> bool {
-        matches!(self.backend, Backend::Isotope13(_))
+    /// Whether this precheck asks Uplink (`--uplink`) rather than hopper.
+    pub fn is_uplink(&self) -> bool {
+        matches!(self.backend, Backend::Uplink(_))
     }
 
     /// Per-request ceiling: tight for a hopper replica on the fleet's network,
@@ -331,7 +331,7 @@ impl Precheck {
     fn timeout(&self) -> Duration {
         match self.backend {
             Backend::Hopper => LOOKUP_TIMEOUT,
-            Backend::Isotope13(_) => crate::remote::LOOKUP_TIMEOUT,
+            Backend::Uplink(_) => crate::remote::LOOKUP_TIMEOUT,
         }
     }
 
@@ -340,14 +340,14 @@ impl Precheck {
     fn tid(&self) -> String {
         match &self.backend {
             Backend::Hopper => String::new(),
-            Backend::Isotope13(token) => token.fingerprint(),
+            Backend::Uplink(token) => token.fingerprint(),
         }
     }
 
     fn http(&self) -> Option<&'static reqwest::blocking::Client> {
         match self.backend {
             Backend::Hopper => crate::hopper::http(),
-            Backend::Isotope13(_) => crate::remote::http(),
+            Backend::Uplink(_) => crate::remote::http(),
         }
     }
 
@@ -375,20 +375,19 @@ impl Precheck {
     ) -> reqwest::blocking::RequestBuilder {
         match &self.backend {
             Backend::Hopper => crate::hopper::bearer(request, crate::hopper::token()),
-            Backend::Isotope13(token) => request.bearer_auth(token.secret()),
+            Backend::Uplink(token) => request.bearer_auth(token.secret()),
         }
     }
 
     /// Whether to read this answer at all. Every non-200 means "analyze it";
-    /// from isotope13, a refused token or an exhausted quota also means "stop
+    /// from Uplink, a refused token or an exhausted quota also means "stop
     /// asking", because every later lookup in the run would get the same
     /// answer.
     fn answered(&self, status: reqwest::StatusCode, what: &str) -> bool {
         if status == reqwest::StatusCode::OK {
             return true;
         }
-        if matches!(self.backend, Backend::Isotope13(_))
-            && matches!(status.as_u16(), 401 | 403 | 429)
+        if matches!(self.backend, Backend::Uplink(_)) && matches!(status.as_u16(), 401 | 403 | 429)
         {
             let reason = if status.as_u16() == 429 {
                 "quota"
@@ -401,7 +400,7 @@ impl Precheck {
                     reason,
                     status = status.as_u16(),
                     tid = %self.tid(),
-                    "{what}: isotope13 lookups paused; analyzing locally"
+                    "{what}: Uplink lookups paused; analyzing locally"
                 );
             }
         }
@@ -418,7 +417,7 @@ impl Precheck {
                 crate::civil::now_secs(),
                 lookup,
             ),
-            Backend::Isotope13(_) => {
+            Backend::Uplink(_) => {
                 service_standing(rec, self.max_age.as_secs(), crate::civil::now_secs())
             }
         }
@@ -427,7 +426,8 @@ impl Precheck {
     /// What hopper's corpus already holds for these downloaded bytes: a verdict
     /// this build may adopt (same analyzer), or [`Standing::Analyze`]. A clean
     /// verdict from another analyzer does not cover the current rules. Any
-    /// failure — unreachable, non-200, unparseable — also means analyze.
+    /// failure — unreachable, non-200, unparseable, or an answer about bytes
+    /// other than `content_sha` — also means analyze.
     pub fn standing(&self, content_sha: &str) -> Standing {
         if content_sha.len() != 64 || !self.breaker.allows(crate::civil::now_secs()) {
             return Standing::Analyze;
@@ -453,6 +453,19 @@ impl Precheck {
                 return Standing::Analyze;
             }
         };
+        if rec
+            .sha256
+            .as_deref()
+            .is_none_or(|sha| !sha.eq_ignore_ascii_case(content_sha))
+        {
+            tracing::warn!(
+                event = "remote.lookup",
+                asked = content_sha,
+                answered = rec.sha256.as_deref().unwrap_or(""),
+                "answer does not name the digest asked; analyzing"
+            );
+            return Standing::Analyze;
+        }
         let standing = self.judge(rec, Lookup::DownloadedBytes);
         if standing.skips_analysis() {
             SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -472,10 +485,10 @@ impl Precheck {
         let Some(http) = self.http() else {
             return out;
         };
-        // isotope13 answers a repeated `sha256` as a batch; hopper's lookup
+        // Uplink answers a repeated `sha256` as a batch; hopper's lookup
         // reads only the first, so every further digest in a chunk would go
         // unanswered and be fetched and analyzed for nothing.
-        let batch = if self.is_isotope13() { PURL_BATCH } else { 1 };
+        let batch = if self.is_uplink() { PURL_BATCH } else { 1 };
         for chunk in shas.chunks(batch) {
             if !self.breaker.allows(crate::civil::now_secs()) {
                 break;
@@ -629,7 +642,7 @@ impl Precheck {
 }
 
 /// The verdict in one `/v1/analyze` answer line, and the digest it names:
-/// isotope13's judgment of an artifact it was asked to analyze, so it stands
+/// Uplink's judgment of an artifact it was asked to analyze, so it stands
 /// as long as it is an analyzed verdict with a level.
 ///
 /// # Errors
@@ -646,12 +659,15 @@ pub fn analyzed_verdict(line: &str) -> Result<(String, Verdict), String> {
     let mut rec = answer.record;
     if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
         return Err(format!(
-            "isotope13 could not analyze it ({}{})",
+            "Uplink could not analyze it ({}{})",
             rec.status.map_or("", Status::as_str),
             answer.cause.map(|c| format!(": {c}")).unwrap_or_default()
         ));
     }
     let sha = rec.sha256.take().unwrap_or_default().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("analysis answer names no SHA-256 digest ({sha:?})"));
+    }
     Ok((sha, rec.into()))
 }
 
@@ -676,7 +692,7 @@ fn fresh_at(at: u64, max_age_s: u64, now: u64) -> bool {
     at <= now.saturating_add(MAX_CLOCK_SKEW_S) && now.saturating_sub(at) <= max_age_s
 }
 
-/// isotope13's policy, pure for the same reason as [`standing_of`]: an
+/// Uplink's policy, pure for the same reason as [`standing_of`]: an
 /// analyzed verdict is adopted — the service's judgment is what an enriched
 /// scan asked for — except a clean one older than `max_age_s`, which is
 /// analyzed again rather than trusted past its freshness. Anything not
@@ -698,6 +714,23 @@ fn service_standing(rec: Record, max_age_s: u64, now: u64) -> Standing {
     Standing::Adopt(rec.into())
 }
 
+/// Rule 1: whether this analyzer — traits version `mine` — already judged the
+/// bytes `rec` describes, so its verdict may stand in for an analysis.
+///
+/// A verdict is only a dedupe key when it EXISTS: `fires_at` is null for a
+/// record that was never classified, and traits equality on an unclassified
+/// record would skip an analysis that never happened. An unknown local
+/// version matches nothing.
+///
+/// The model bundle is deliberately not part of the key: traits change every
+/// few hours and models about weekly, so a model fix reaches reused verdicts
+/// with the next traits change.
+#[must_use]
+pub fn same_analyzer(rec: &Record, mine: Option<&str>) -> bool {
+    rec.fires_at != Level::Manual
+        && mine.is_some_and(|mine| !mine.is_empty() && rec.traits_version.as_deref() == Some(mine))
+}
+
 /// The policy, pure so the tests can hold it still: rule 1 (same analyzer,
 /// verdict adopted) or, for package coordinates only, rule 2 (benign and fresh).
 fn standing_of(
@@ -707,15 +740,7 @@ fn standing_of(
     now: u64,
     lookup: Lookup,
 ) -> Standing {
-    // Rule 1: same analyzer already judged these bytes. A verdict is only a
-    // dedupe key when it EXISTS — fires_at is null for a record that was
-    // never classified, and traits equality on an unclassified record would
-    // skip an analysis that never happened.
-    if rec.fires_at != Level::Manual
-        && let (Some(mine), Some(theirs)) = (my_traits, rec.traits_version.as_deref())
-        && !mine.is_empty()
-        && mine == theirs
-    {
+    if same_analyzer(&rec, my_traits) {
         return Standing::Adopt(rec.into());
     }
     // Downloaded bytes need current-analyzer coverage. Returning SkipBenign
@@ -1071,22 +1096,22 @@ mod tests {
         ));
     }
 
-    fn isotope13() -> Precheck {
+    fn uplink() -> Precheck {
         Precheck {
             lookup_url: "https://unused.invalid/v1/lookup".into(),
             max_age: Duration::from_secs(30 * 86_400),
             breaker: Breaker::default(),
-            backend: Backend::Isotope13(
+            backend: Backend::Uplink(
                 cleave::enriched::Token::parse("i13_test_token").expect("a token"),
             ),
         }
     }
 
-    /// isotope13 is the judge an enriched scan asked for: an analyzed verdict
+    /// Uplink is the judge an enriched scan asked for: an analyzed verdict
     /// stands whatever produced it, but a stale clean one, an unanalyzed one,
     /// or one with no level is analyzed here.
     #[test]
-    fn isotope13_adopts_analyzed_verdicts_but_not_stale_clean_ones() {
+    fn uplink_adopts_analyzed_verdicts_but_not_stale_clean_ones() {
         let now = parse_rfc3339_epoch("2026-10-22T00:00:00Z").unwrap();
         let month = 30 * 86_400;
         let rec = |status: &str, fires: Level, at: &str| Record {
@@ -1126,7 +1151,7 @@ mod tests {
     /// a verdict about other bytes can never stand in for a file.
     #[test]
     fn a_digest_answer_must_name_a_digest_that_was_asked() {
-        let precheck = isotope13();
+        let precheck = uplink();
         let fresh = crate::engine::now_rfc3339();
         let (a, b, other) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
         let body = format!(
@@ -1144,9 +1169,9 @@ mod tests {
     /// A refused token or an exhausted quota stops the asking at once; any
     /// other failure is one batch analyzed here.
     #[test]
-    fn a_refusal_from_isotope13_stops_the_asking() {
+    fn a_refusal_from_uplink_stops_the_asking() {
         for status in [401, 403, 429] {
-            let precheck = isotope13();
+            let precheck = uplink();
             let code = reqwest::StatusCode::from_u16(status).unwrap();
             assert!(!precheck.answered(code, "test"));
             assert!(
@@ -1154,7 +1179,7 @@ mod tests {
                 "{status} opens the breaker"
             );
         }
-        let precheck = isotope13();
+        let precheck = uplink();
         assert!(!precheck.answered(reqwest::StatusCode::BAD_GATEWAY, "test"));
         assert!(
             precheck.breaker.allows(crate::civil::now_secs()),
@@ -1186,6 +1211,10 @@ mod tests {
             "no level"
         );
         assert!(analyzed_verdict("not json").is_err());
+        assert!(
+            analyzed_verdict(r#"{"status":"analyzed","fires_at":-1}"#).is_err(),
+            "a verdict about no named bytes is no verdict"
+        );
     }
 
     #[test]

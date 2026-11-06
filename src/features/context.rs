@@ -526,31 +526,54 @@ impl ExtractContext {
         slots: &[Option<usize>],
     ) {
         for s in summaries {
-            let ranked;
-            let paths = if self.ranked_ngrams {
-                ranked = ranked_ngram_paths(&s.raw_findings, 512);
-                &ranked
-            } else {
-                &s.unique_3level_paths
-            };
-            let ids: Vec<u32> = paths
-                .iter()
-                .filter_map(|p| self.path_to_id.get(p).copied())
-                .collect();
-            if ids.len() > 512 {
-                tracing::warn!(path = %s.path, tokens = ids.len(), "too many unique paths; skipping bigram generation for file");
+            let ids = self.sorted_path_ids(s, 512);
+            let n = ids.len();
+            if n > 512 {
+                tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping bigram generation for file");
                 continue;
             }
-            let present: HashSet<_> = ids.into_iter().collect();
-            for (&(a, b), &idx) in &self.bigram_id_lookup {
-                if present.contains(&a)
-                    && present.contains(&b)
-                    && let Some(&Some(slot)) = slots.get(idx)
-                {
+            let mut mark = |idx: usize| {
+                if let Some(&Some(slot)) = slots.get(idx) {
                     w.set_slot(slot, 1.0);
+                }
+            };
+            // Probe whichever side is smaller: a file usually fires a handful
+            // of paths, while the vocab holds thousands of pairs, and this
+            // runs once per archive member.
+            if n * (n + 1) / 2 <= self.bigram_id_lookup.len() {
+                for (i, &a) in ids.iter().enumerate() {
+                    for &b in &ids[i..] {
+                        if let Some(&idx) = self.bigram_id_lookup.get(&(a, b)) {
+                            mark(idx);
+                        }
+                    }
+                }
+            } else {
+                for (&(a, b), &idx) in &self.bigram_id_lookup {
+                    if [a, b].iter().all(|id| ids.binary_search(id).is_ok()) {
+                        mark(idx);
+                    }
                 }
             }
         }
+    }
+
+    /// The vocab ids of the file's n-gram base paths, ascending — the order
+    /// the bigram and trigram lookup keys are built in.
+    fn sorted_path_ids(&self, s: &FileSummary, rank_limit: usize) -> Vec<u32> {
+        let ranked;
+        let paths = if self.ranked_ngrams {
+            ranked = ranked_ngram_paths(&s.raw_findings, rank_limit);
+            &ranked
+        } else {
+            &s.unique_3level_paths
+        };
+        let mut ids: Vec<u32> = paths
+            .iter()
+            .filter_map(|p| self.path_to_id.get(p).copied())
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Path-triple features, as [`Self::write_bigram_features`].
@@ -560,30 +583,33 @@ impl ExtractContext {
         w: &mut FeatureWriter<'_>,
     ) {
         for s in summaries {
-            let ranked;
-            let paths = if self.ranked_ngrams {
-                ranked = ranked_ngram_paths(&s.raw_findings, 128);
-                &ranked
-            } else {
-                &s.unique_3level_paths
-            };
-            let ids: Vec<u32> = paths
-                .iter()
-                .filter_map(|p| self.path_to_id.get(p).copied())
-                .collect();
+            let ids = self.sorted_path_ids(s, 128);
             let n = ids.len();
             if n > 256 {
                 tracing::warn!(path = %s.path, tokens = n, "too many unique paths; skipping trigram generation for file");
                 continue;
             }
-            let present: HashSet<_> = ids.into_iter().collect();
-            for (&(a, b, c), &idx) in &self.trigram_id_lookup {
-                if present.contains(&a)
-                    && present.contains(&b)
-                    && present.contains(&c)
-                    && let Some(&Some(slot)) = self.trigram_slots.get(idx)
-                {
+            let mut mark = |idx: usize| {
+                if let Some(&Some(slot)) = self.trigram_slots.get(idx) {
                     w.set_slot(slot, 1.0);
+                }
+            };
+            // The smaller side again, as for bigrams.
+            if n * (n + 1) * (n + 2) / 6 <= self.trigram_id_lookup.len() {
+                for (i, &a) in ids.iter().enumerate() {
+                    for (j, &b) in ids.iter().enumerate().skip(i) {
+                        for &c in &ids[j..] {
+                            if let Some(&idx) = self.trigram_id_lookup.get(&(a, b, c)) {
+                                mark(idx);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (&(a, b, c), &idx) in &self.trigram_id_lookup {
+                    if [a, b, c].iter().all(|id| ids.binary_search(id).is_ok()) {
+                        mark(idx);
+                    }
                 }
             }
         }

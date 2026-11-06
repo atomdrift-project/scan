@@ -43,11 +43,11 @@ on:
           Profile-guided optimization for the targets built on their own
           architecture (Linux, macOS arm64, Windows): an instrumented build
           scans the public rules testdata and the real build uses the
-          profile, as `make release` does. Measured 2026-11-01: CPU -7% to
-          -10% on scan corpora. Costs those jobs a second build plus the
-          training scan; cross-built and VM-built targets are never
-          profiled. A training failure is reported and the build proceeds
-          unprofiled.
+          profile, as `make release PGO=1` does. Measured 2026-11-01: CPU
+          -7% to -10% on scan corpora. Training runs in its own job (see
+          `pgo-train`) and costs a second build plus the training scan;
+          cross-built and VM-built targets are never profiled. A training
+          failure is reported and the build proceeds unprofiled.
         type: boolean
         default: true
       sign:
@@ -100,9 +100,92 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Profile-guided optimization training, in a job of its own. Training builds
+  # an instrumented atomscan and scans the testdata of atomdrift-project/traits
+  # -- real malware, fetched at the commit pinned in scripts/pgo-traits.rev by
+  # scripts/pgo-corpus.sh -- so it runs on a fresh runner that never sees a
+  # signing or notarization secret: it references none, and its token can only
+  # read. The building jobs receive nothing from it but the merged .profdata.
+  # The cargo cache is restored, never saved, so this job cannot poison what
+  # the signing jobs restore. A failure here only costs the profile.
+  pgo-train:
+    name: PGO profile ${{ matrix.target }}
+    if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
+    # Same runner image as the job that applies the profile.
+    runs-on: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-24.04-arm' || matrix.target == 'aarch64-apple-darwin' && 'macos-26' || matrix.target == 'x86_64-pc-windows-msvc' && 'windows-2025' || matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 120
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows ARM64 trains only when dispatched by name, like its build.
+        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-pc-windows-msvc"]') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Reclaim runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "$TARGET"
+          rustup component add llvm-tools
+          rustc --version --verbose
+
+      - name: Restore cargo home
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
+
+      # scripts/pgo-train.sh is what `make pgo-train` runs. The optimized build
+      # must use the same cargo profile the instrumented one did, so the
+      # profile is named by $PROFILE. Rules and models install themselves on
+      # the instrumented binary's first run.
+      - name: Train PGO profile
+        id: train
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          prof="$RUNNER_TEMP/pgo/atomscan-$PROFILE.profdata"
+          if sh scripts/pgo-corpus.sh "$RUNNER_TEMP/traits" &&
+            sh scripts/pgo-train.sh -p "$PROFILE" -t "$TARGET" -o "$prof" "$RUNNER_TEMP/traits/testdata" tests; then
+            echo "trained=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::PGO training failed for $TARGET; it will build without a profile"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.train.outputs.trained == 'true'
+        with:
+          name: pgo-profile-${{ matrix.target }}
+          path: ${{ runner.temp }}/pgo/atomscan-${{ inputs.profile }}.profdata
+          if-no-files-found: error
+          retention-days: 1
+
   native:
     name: ${{ matrix.target }}
-    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin ', format(' {0} ', inputs.target))) }}
+    # `!cancelled()`: build whether training succeeded, failed or was skipped.
+    needs: pgo-train
+    if: ${{ !cancelled() && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin ', format(' {0} ', inputs.target))) }}
     runs-on: ${{ matrix.os }}
     # A publishing release may spend up to four hours waiting for Apple's
     # asynchronous notary service after the build. Keep the ordinary CI/dry-run
@@ -170,34 +253,41 @@ jobs:
           key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-${{ matrix.target }}-
 
-      # scripts/pgo-train.sh is what `make pgo-train` runs. The optimized build
-      # must use the same cargo profile the instrumented one did, so the
-      # profile is named by $PROFILE. Rules and models install themselves on
-      # the instrumented binary's first run. PGO_RUSTFLAGS reaches only the
-      # two steps that build with $PROFILE: the dev-profile unit tests would
-      # get hash-mismatch noise from it and nothing else.
-      - name: Train PGO profile
+      # The profile comes from the pgo-train job. A missing artifact means
+      # training failed or was skipped: build unprofiled. RUSTFLAGS is set
+      # only when a profile exists -- even an empty RUSTFLAGS makes cargo
+      # ignore .cargo/config.toml's target rustflags -- and only in the two
+      # steps that build with $PROFILE: the dev-profile unit tests would get
+      # hash-mismatch noise from it and nothing else.
+      - name: Download PGO profile
+        id: pgo
+        if: inputs.pgo && matrix.native
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pgo-profile-${{ matrix.target }}
+          path: ${{ runner.temp }}/pgo
+
+      - name: Use PGO profile
         if: inputs.pgo && matrix.native
         env:
-          TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
-          rustup component add llvm-tools
-          git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$RUNNER_TEMP/traits"
           prof="$RUNNER_TEMP/pgo/atomscan-$PROFILE.profdata"
-          if sh scripts/pgo-train.sh -p "$PROFILE" -t "$TARGET" -o "$prof" "$RUNNER_TEMP/traits/testdata" tests testdata; then
+          if [ -f "$prof" ]; then
             if command -v cygpath >/dev/null 2>&1; then prof=$(cygpath -m "$prof"); fi
-            echo "PGO_RUSTFLAGS=-C profile-use=$prof" >> "$GITHUB_ENV"
+            echo "PGO_PROFDATA=$prof" >> "$GITHUB_ENV"
           else
-            echo "::warning::PGO training failed; building without a profile"
+            echo "::warning::no PGO profile for this target; building without one"
           fi
 
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
-        run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
+        run: |
+          if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
+          cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       # Keep the full integration suite separate: most cases require models.
       - name: Test
@@ -209,8 +299,9 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
-        run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
+        run: |
+          if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
+          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       # --- macOS signing ------------------------------------------------------
       # Unsigned path: an ad-hoc signature, matching what `make release` does on
@@ -490,11 +581,11 @@ jobs:
           # shipped macOS binaries that were SIGKILLed ("Code Signature
           # Invalid") the moment they scanned anything. Scan a real file, after
           # signing, so a bad entitlement set fails the build instead of the
-          # user. --fetch=none keeps it offline; the rules update it does need
+          # user. --follow=none keeps it offline; the rules update it does need
           # takes seconds. The same reasoning is why the openbsd job below runs
           # tests rather than trusting --version.
           printf '#!/bin/sh\necho hello\n' > "$RUNNER_TEMP/smoke.sh"
-          "./target/$TARGET/$PROFILE/atomscan" --fetch=none "$RUNNER_TEMP/smoke.sh"
+          "./target/$TARGET/$PROFILE/atomscan" --follow=none "$RUNNER_TEMP/smoke.sh"
 
       - name: Package
         env:
@@ -506,6 +597,47 @@ jobs:
         with:
           name: atomscan-${{ matrix.target }}
           path: atomscan-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # The notices every release archive carries: the project's LICENSE and
+  # THIRD_PARTY_LICENSES, the license texts of everything linked into the
+  # binary (see about.toml). One file covers every target. publish-assets adds
+  # both to each archive, so the build jobs package the binary alone. Runs in
+  # CI too, so a dependency under an unaccepted license fails before a release.
+  notices:
+    name: license notices
+    if: ${{ inputs.wave == '' || inputs.wave == 'fast' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_ABOUT_VERSION: "0.9.3"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Install toolchain and cargo-about
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          cargo install --locked "cargo-about@$CARGO_ABOUT_VERSION"
+
+      - name: Generate THIRD_PARTY_LICENSES
+        run: |
+          set -eu
+          mkdir notices
+          cargo about generate about.hbs -o notices/THIRD_PARTY_LICENSES
+          cp LICENSE notices/LICENSE
+          grep -q 'UnRAR source code may be used' notices/THIRD_PARTY_LICENSES
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notices
+          path: notices
           if-no-files-found: error
           retention-days: 14
 
@@ -646,7 +778,7 @@ jobs:
             # compiles the ruleset through the wasmtime/cranelift aarch64 JIT,
             # which `--version` never touches (the v2.5.0 macOS lesson).
             printf '#!/bin/sh\necho hello\n' > /tmp/smoke.sh
-            "/tmp/target/$BUILD_PROFILE/atomscan" --fetch=none /tmp/smoke.sh
+            "/tmp/target/$BUILD_PROFILE/atomscan" --follow=none /tmp/smoke.sh
             cp "/tmp/target/$BUILD_PROFILE/atomscan" ./atomscan
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
@@ -966,87 +1098,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Solaris 11.4 — the only thing that actually exercises the Solaris half of
-  # the tree-sitter __sun branch we added; the illumos jobs only prove the
-  # illumos half. Uses the -gcc image variant, which ships the toolchain.
-  #
-  # Expected to be rocky: Oracle's IPS repo may carry no rust at all, in which
-  # case this fails in `prepare` and the enumeration below is what tells us.
-  # Same research shape the OmniOS job used to resolve its package names.
-  solaris:
-    name: x86_64-pc-solaris
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-pc-solaris') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    permissions:
-      contents: read
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Build in Solaris VM
-        uses: vmactions/solaris-vm@1c166978f5a2c1f87f1c9d4d8dd85ae3d1eff6f7 # v1.4.2
-        with:
-          release: "11.4-gcc"
-          cpu: "4"
-          mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
-          prepare: |
-            set -eux
-            # Confirmed by the enumeration in run 30598384692: Oracle's IPS
-            # ships no rust at all. rust-lang does publish an official
-            # x86_64-pc-solaris standalone build, which is what we use.
-            # cmake is for aws-lc-sys; git because five deps are git deps.
-            pkg install --accept developer/build/cmake developer/versioning/git || true
-            RUST_VERSION=1.97.1
-            TARBALL="rust-${RUST_VERSION}-x86_64-pc-solaris.tar.gz"
-            # Solaris tar cannot decompress; pipe through gzip explicitly.
-            curl -fsSLO "https://static.rust-lang.org/dist/${TARBALL}"
-            gzip -dc "${TARBALL}" | tar xf -
-            "./rust-${RUST_VERSION}-x86_64-pc-solaris/install.sh" --prefix=/usr/local --disable-ldconfig
-            rm -rf "rust-${RUST_VERSION}-x86_64-pc-solaris" "${TARBALL}"
-            # Solaris, like illumos, reserves backing store for the full
-            # address space of both processes during fork(). The final fat-LTO
-            # rustc process is large enough that spawning gcc otherwise fails
-            # with ENOMEM. The VM image has a 199G rpool, so give the fork a
-            # dedicated ZFS-backed swap volume.
-            /usr/sbin/zpool list rpool
-            /usr/sbin/zfs create -V 32G rpool/ci-swap
-            /usr/sbin/swap -a /dev/zvol/dsk/rpool/ci-swap
-            /usr/sbin/swap -l
-          run: |
-            set -eux
-            PATH="/usr/local/bin:$PATH"
-            export PATH
-            command -v cargo || { echo "::error::rust install did not put cargo on PATH"; exit 1; }
-            rustc --version
-            # /tmp is swap-backed tmpfs on Solaris, same as illumos.
-            export CARGO_TARGET_DIR=/var/tmp/target
-            # unrar_sys builds C++, but cc-rs cannot infer Solaris's C++
-            # standard library from the target name. Tell it to link libstdc++.
-            export CXXSTDLIB=stdc++
-            # cc-rs's hint does not reach Cargo's final Rust link, so make that
-            # gcc invocation link the GCC C++ runtime as well.
-            export RUSTFLAGS="-C link-arg=-lstdc++"
-            cargo build --locked --profile "$BUILD_PROFILE" --bin atomscan
-            "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" --version
-            cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/atomscan" ./atomscan
-        env:
-          BUILD_PROFILE: ${{ inputs.profile }}
-
-      - name: Package
-        run: tar -czf atomscan-x86_64-pc-solaris.tar.gz atomscan
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: atomscan-x86_64-pc-solaris
-          path: atomscan-x86_64-pc-solaris.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
   # Artifact deliberately NOT named atomscan-x86_64-unknown-illumos: the cross
   # job builds that same target and owns the release-bound name, and
   # upload-artifact rejects a duplicate name within a run. This one is a
@@ -1149,7 +1200,9 @@ jobs:
   # without relying on a cross-link that cannot execute its result.
   windows:
     name: ${{ matrix.target }}
-    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
+    # `!cancelled()`: build whether training succeeded, failed or was skipped.
+    needs: pgo-train
+    if: ${{ !cancelled() && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
     runs-on: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'windows-2025' }}
     timeout-minutes: 150
     permissions:
@@ -1198,34 +1251,41 @@ jobs:
           key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-${{ matrix.target }}-
 
-      # scripts/pgo-train.sh is what `make pgo-train` runs. The optimized build
-      # must use the same cargo profile the instrumented one did, so the
-      # profile is named by $PROFILE. Rules and models install themselves on
-      # the instrumented binary's first run. PGO_RUSTFLAGS reaches only the
-      # two steps that build with $PROFILE: the dev-profile unit tests would
-      # get hash-mismatch noise from it and nothing else.
-      - name: Train PGO profile
+      # The profile comes from the pgo-train job. A missing artifact means
+      # training failed or was skipped: build unprofiled. RUSTFLAGS is set
+      # only when a profile exists -- even an empty RUSTFLAGS makes cargo
+      # ignore .cargo/config.toml's target rustflags -- and only in the two
+      # steps that build with $PROFILE: the dev-profile unit tests would get
+      # hash-mismatch noise from it and nothing else.
+      - name: Download PGO profile
+        id: pgo
+        if: inputs.pgo
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pgo-profile-${{ matrix.target }}
+          path: ${{ runner.temp }}/pgo
+
+      - name: Use PGO profile
         if: inputs.pgo
         env:
-          TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
         run: |
-          rustup component add llvm-tools
-          git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$RUNNER_TEMP/traits"
           prof="$RUNNER_TEMP/pgo/atomscan-$PROFILE.profdata"
-          if sh scripts/pgo-train.sh -p "$PROFILE" -t "$TARGET" -o "$prof" "$RUNNER_TEMP/traits/testdata" tests testdata; then
+          if [ -f "$prof" ]; then
             if command -v cygpath >/dev/null 2>&1; then prof=$(cygpath -m "$prof"); fi
-            echo "PGO_RUSTFLAGS=-C profile-use=$prof" >> "$GITHUB_ENV"
+            echo "PGO_PROFDATA=$prof" >> "$GITHUB_ENV"
           else
-            echo "::warning::PGO training failed; building without a profile"
+            echo "::warning::no PGO profile for this target; building without one"
           fi
 
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
-        run: cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
+        run: |
+          if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
+          cargo build --locked --profile "$PROFILE" --target "$TARGET" --bin atomscan
 
       - name: Inspect
         env:
@@ -1237,8 +1297,9 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PROFILE: ${{ inputs.profile }}
-          RUSTFLAGS: ${{ env.PGO_RUSTFLAGS }}
-        run: cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
+        run: |
+          if [ -n "${PGO_PROFDATA:-}" ]; then export RUSTFLAGS="-C profile-use=$PGO_PROFDATA"; fi
+          cargo test --locked --profile "$PROFILE" --target "$TARGET" --test cli_smoke
 
       - name: Smoke test
         env:
@@ -1279,7 +1340,7 @@ jobs:
   # where cmake already exists.
   cross:
     name: ${{ matrix.target }}
-    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl arm-unknown-linux-musleabihf armv7-unknown-linux-musleabihf loongarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target))) }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-musl aarch64-unknown-linux-musl loongarch64-unknown-linux-musl x86_64-unknown-illumos s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu ', format(' {0} ', inputs.target))) }}
     # Container builds, so the host's glibc never reaches the artifact — same
     # reasoning as the freebsd job, and unlike `native`.
     runs-on: ubuntu-24.04
@@ -1300,19 +1361,6 @@ jobs:
           # Same artifact for arm64. No smoke test: the runner is x86_64, so
           # there is nothing here that can execute it.
           - target: aarch64-unknown-linux-musl
-
-          # Static ARMv6 hard-float covers Raspberry Pi 1/Zero-class Linux
-          # systems without inheriting the build container's libc. Wasmtime
-          # uses its portable Pulley backend because Cranelift has no ARM32
-          # backend. QEMU verifies that the resulting CLI starts correctly.
-          - target: arm-unknown-linux-musleabihf
-            emulated_smoke: true
-
-          # ARMv7-A is still common in routers, cameras, NAS appliances and
-          # industrial gateways. The static artifact works on glibc, musl and
-          # uClibc userlands that use the standard hard-float ABI.
-          - target: armv7-unknown-linux-musleabihf
-            emulated_smoke: true
 
           # LoongArch64 is an edge/server target rather than a constrained MCU
           # target. Its Rust and Cross support are Tier 2 and QEMU-capable; use

@@ -80,11 +80,15 @@ SCAN_THREADS ?=
 # malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
+# Cargo's output directory: CARGO_TARGET_DIR when set (cleave-tuna sets it to
+# share the cargo cache across worktrees), else cargo's default `target`.
+CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+
 # `make lint LOCKED=--locked` (CI) refuses a Cargo.lock that would change.
 # Empty by default so a local `[patch]` experiment still lints and tests.
 LOCKED ?=
 
-.PHONY: pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
+.PHONY: all pgo-corpus pgo-train bench-archive bench-archive-scaling profile-archive bench-typed bench-typed-extract bench-typed-goal baseline-typed-detection check-typed-detection build release release-lto install uninstall check-cargo tarball benchmark profile-slow bench-build sampled-benchmark heap-build heap-benchmark tuna tuna-once lint fix test test-unit install-precommit clean wolfi wolfi-bootstrap wolfi-build wolfi-test wolfi-shell wolfi-clean wolfi-nuke docker-login docker-publish cut-release
 
 all: build
 
@@ -118,64 +122,69 @@ check-cargo:
 	}
 
 # --- Profile-guided optimization ---------------------------------------------
-# Optimized builds (`release`, `release-lto`) are profile-guided: the first one
-# trains a profile (`pgo-train`) and every later one reuses it until
-# `make pgo-train` runs again. Measured 2026-11-01 on a 16c/32t host, cold
-# cache, identical findings: a 672-file benign corpus CPU -7% / wall -6%, a
-# 2,454-file hostile corpus CPU -10% / wall -8% (2026-08-31, poppy worker
-# benchmark: wall -8% / CPU -11%). The profile must come from an instrumented
-# build of the SAME cargo profile it is applied to -- a thin-LTO profile
-# applied to the fat-LTO build measured slower than no profile at all -- so
-# each cargo profile keeps its own file, $(PGO_DIR)/atomscan-<profile>.profdata
-# (untracked: ~100 MB, host-generated).
+# Optimized builds (`release`, `release-lto`) can be profile-guided, and are
+# not by default: training scans a malware corpus, which a plain
+# `make release` or `make install` must never fetch or run on its own. With
+# PGO=1 the first optimized build trains a profile (`pgo-train`) and every
+# later one reuses it until `make pgo-train` runs again. Measured 2026-11-01
+# on a 16c/32t host, cold cache, identical findings: a 672-file benign corpus
+# CPU -7% / wall -6%, a 2,454-file hostile corpus CPU -10% / wall -8%
+# (2026-08-31, poppy worker benchmark: wall -8% / CPU -11%). The profile must
+# come from an instrumented build of the SAME cargo profile it is applied to
+# -- a thin-LTO profile applied to the fat-LTO build measured slower than no
+# profile at all -- so each cargo profile keeps its own file,
+# $(PGO_DIR)/atomscan-<profile>.profdata (untracked: ~100 MB, host-generated).
 #
-# Training scans the rules repo's testdata beside this checkout (../traits-dev
-# or ../traits), or a shallow clone of https://github.com/atomdrift-project/traits
-# made into $(PGO_DIR)/traits when neither exists, plus scan's own tests/ and
-# testdata/. PGO_TRAIN_PATHS overrides the list. Needs rustup's llvm-tools
-# (`rustup component add llvm-tools`), found in the toolchain or named by
+# Training scans the rules repo's testdata, TRAITS_TESTDATA: by default the one
+# beside this checkout (../traits-dev or ../traits), else $(PGO_DIR)/traits,
+# which only `make pgo-corpus` creates -- a checkout of atomdrift-project/traits
+# at the commit pinned in scripts/pgo-traits.rev, the corpus CI trains on.
+# Nothing is ever cloned implicitly. scan's own tests/ are scanned too;
+# PGO_TRAIN_PATHS overrides the whole list. Needs rustup's llvm-tools
+# (`rustup component add llvm-tools`) for the active toolchain, or
 # LLVM_PROFDATA. The training itself is scripts/pgo-train.sh, which the CI
 # build workflow runs too, so the two cannot drift.
 #
-# PGO=0 builds without a profile and without training. When training cannot
-# run (no corpus and no network to clone one, no llvm-profdata), optimized
-# builds say so and proceed unprofiled. rustc prints "no profile data
-# available" for functions the training never reached; those warnings are
-# expected and harmless.
-PGO ?= 1
+# When training cannot run (no corpus, no llvm-profdata), PGO=1 builds say so
+# and proceed unprofiled. rustc prints "no profile data available" for
+# functions the training never reached; those warnings are expected and
+# harmless.
+PGO ?= 0
 PGO_DIR ?= build/pgo
-TRAITS_TESTDATA ?= $(firstword $(wildcard ../traits-dev/testdata ../traits/testdata))
-PGO_TRAIN_CORPUS = $(if $(TRAITS_TESTDATA),$(TRAITS_TESTDATA),$(PGO_DIR)/traits/testdata)
-PGO_TRAIN_PATHS ?= $(PGO_TRAIN_CORPUS) tests testdata
+TRAITS_TESTDATA ?= $(firstword $(wildcard ../traits-dev/testdata ../traits/testdata $(PGO_DIR)/traits/testdata))
+PGO_TRAIN_PATHS ?= $(TRAITS_TESTDATA) tests
 # The cargo profile `pgo-train` instruments (`release` or `release-lto`);
 # the optimized targets pass their own.
 PGO_PROFILE ?= release
 PGO_PROFDATA = $(PGO_DIR)/$(BINARY)-$(PGO_PROFILE).profdata
 
-# $(call pgo_build,<cargo profile>): train when the profile is missing, then
-# build with it and install the binary in $(OUT_DIR). The checks run in the
-# shell, not in make's $(wildcard): a profile written by the training
-# sub-make during this same run would be invisible to make's directory cache.
-# The sub-make stays on a recipe line of its own: make runs a line that
-# mentions $(MAKE) even under `-n`, so sharing that line with the cargo build
-# would turn a dry run into a real one. rustc and the instrumented binary
-# take native paths, so on Windows the MSYS form from `pwd` goes through
-# `cygpath -m`.
+# $(call pgo_build,<cargo profile>): with PGO=1, train when the profile is
+# missing; then build (with the profile when there is one) and install the
+# binary in $(OUT_DIR). The checks run in the shell, not in make's
+# $(wildcard): a profile written by the training sub-make during this same run
+# would be invisible to make's directory cache. The sub-make stays on a recipe
+# line of its own: make runs a line that mentions $(MAKE) even under `-n`, so
+# sharing that line with the cargo build would turn a dry run into a real one.
+# RUSTFLAGS is only set when a profile is applied: even an empty RUSTFLAGS
+# makes cargo ignore the target rustflags in .cargo/config.toml. rustc and the
+# instrumented binary take native paths, so on Windows the MSYS form from
+# `pwd` goes through `cygpath -m`.
 define pgo_build
 	@if [ "$(PGO)" != 0 ] && [ ! -f "$(PGO_DIR)/$(BINARY)-$(1).profdata" ]; then \
 	  $(MAKE) --no-print-directory pgo-train PGO_PROFILE=$(1) \
 	    || echo "$(1): PGO training failed (see above); building without PGO" >&2; \
 	fi
-	@set -e; prof="$(PGO_DIR)/$(BINARY)-$(1).profdata"; flags=""; \
+	@set -e; prof="$(PGO_DIR)/$(BINARY)-$(1).profdata"; \
 	if [ "$(PGO)" != 0 ] && [ -f "$$prof" ]; then \
-	  abs="$$(pwd)/$$prof"; \
+	  case "$$prof" in /*) abs="$$prof" ;; *) abs="$$(pwd)/$$prof" ;; esac; \
 	  if command -v cygpath >/dev/null 2>&1; then abs=$$(cygpath -m "$$abs"); fi; \
-	  flags="-C profile-use=$$abs"; echo "$(1): PGO enabled ($$prof)"; \
+	  RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }-C profile-use=$$abs"; export RUSTFLAGS; \
+	  echo "$(1): PGO enabled ($$prof)"; \
 	else \
 	  echo "$(1): building without PGO"; \
 	fi; \
-	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS RUSTFLAGS="$${RUSTFLAGS:-} $$flags" cargo build --locked --profile $(1)
-	cp target/$(1)/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
+	$(CARGO) build --locked --profile $(1)
+	cp $(CARGO_TARGET)/$(1)/$(BINARY) $(OUT_DIR)/$(BINARY).new && mv -f $(OUT_DIR)/$(BINARY).new $(OUT_DIR)/$(BINARY)
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
 		codesign --force --sign - $(OUT_DIR)/$(BINARY); \
 	fi
@@ -189,12 +198,22 @@ release: check-cargo $(OUT_DIR)
 release-lto: check-cargo $(OUT_DIR)
 	$(call pgo_build,release-lto)
 
+# Fetch the pinned PGO training corpus (real malware, only ever scanned) into
+# $(PGO_DIR)/traits. Replaces whatever is there, including a partial fetch.
+pgo-corpus:
+	sh scripts/pgo-corpus.sh "$(PGO_DIR)/traits"
+
 # Regenerate the PGO profile for $(PGO_PROFILE): build it instrumented, scan
 # every training path with it (analysis only, fetch off, ~2x slower than an
 # optimized scan), merge the counters. Any representative corpus works --
-# PGO only needs the hot paths exercised.
+# PGO only needs the hot paths exercised -- but tests/ alone is not one, so
+# the default list refuses to run without TRAITS_TESTDATA.
 pgo-train: check-cargo
-	@if [ ! -d "$(PGO_TRAIN_CORPUS)" ] && [ "$(PGO_TRAIN_CORPUS)" = "$(PGO_DIR)/traits/testdata" ]; then 	  echo "pgo-train: no rules testdata beside this checkout; cloning atomdrift-project/traits into $(PGO_DIR)/traits"; 	  mkdir -p "$(PGO_DIR)" && git clone --quiet --depth 1 https://github.com/atomdrift-project/traits "$(PGO_DIR)/traits"; 	fi
+	@if [ -z "$(TRAITS_TESTDATA)" ] && [ "$(origin PGO_TRAIN_PATHS)" = file ]; then \
+	  echo "pgo-train: no training corpus. Set TRAITS_TESTDATA to a traits checkout's testdata/," >&2; \
+	  echo "  or run 'make pgo-corpus' to fetch the pinned one into $(PGO_DIR)/traits." >&2; \
+	  exit 1; \
+	fi
 	env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS BINARY=$(BINARY) sh scripts/pgo-train.sh -p $(PGO_PROFILE) -o $(PGO_PROFDATA) $(PGO_TRAIN_PATHS)
 	@echo "✓ PGO profile: $(PGO_PROFDATA) — '$(PGO_PROFILE)' builds use it until the next pgo-train"
 
@@ -370,9 +389,7 @@ profile-archive: ## perf-record an archive-mode scan and print the top symbols
 # Standardized targets that cleave-tuna drives. The naming mirrors cleave's
 # Makefile so one tuna binary can tune both repos. See ../cleave-tuna/README.md.
 #
-# Honor CARGO_TARGET_DIR if set (cleave-tuna sets it to share the cargo
-# cache across worktrees). Falls back to the cargo default `target` otherwise.
-CARGO_TARGET ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+# Builds land in $(CARGO_TARGET), which honors CARGO_TARGET_DIR (see the top).
 
 TUNA_DATASET     ?= 200MB
 TUNA_BENCH_PATH  ?= $(BENCHMARK_ROOT)/$(TUNA_DATASET)
