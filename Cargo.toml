@@ -227,6 +227,9 @@ fletch = { git = "https://github.com/atomdrift-project/fletch.git", features = [
 #     ./out/scan.heap -f json <sample>
 # Analyze with: jeprof --text ./out/scan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
+# Exposes `bloom_repo::test_support` so embedders' tests can load a fixture
+# bloom bundle from a directory of their choosing.
+test-support = []
 
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a
 # third of the link time — the right default for everyday `cargo build

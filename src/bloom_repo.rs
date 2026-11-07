@@ -339,6 +339,20 @@ pub fn install_dir() -> anyhow::Result<PathBuf> {
     Ok(crate::data_dir()?.join("bloom"))
 }
 
+/// Hooks for embedders' tests, behind the `test-support` feature.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::Lookup;
+    use std::path::Path;
+
+    /// Open a bundle from `dir` rather than [`super::install_dir`], so a test
+    /// can query a fixture bundle without touching the installed one.
+    #[must_use]
+    pub fn load_from(dir: &Path) -> Lookup {
+        Lookup::load_from(dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
