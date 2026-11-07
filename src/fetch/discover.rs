@@ -7,6 +7,7 @@ use std::path::Path;
 
 use cleave::{AnalysisReport, Finding};
 use filefacts::FileType;
+use filefacts::package_context::{ContextLimits, ReferenceMember, go_dependency_context};
 use fletch::fetch::{Coverage, FetchRecord, Outcome};
 use fletch::{RefKind, RefLocator, Reference, find};
 
@@ -337,21 +338,21 @@ fn reconcile_go_contexts(report: &AnalysisReport, groups: &mut [Group]) {
     // filefacts reads member paths as `/`-separated paths inside one
     // artifact, so each archive's members go in a call of their own, named by
     // the path after the archive's `!!`; results are keyed back by report path.
-    let mut by_archive: BTreeMap<&str, Vec<filefacts::ReferenceMember<'_>>> = BTreeMap::new();
+    let mut by_archive: BTreeMap<&str, Vec<ReferenceMember<'_>>> = BTreeMap::new();
     for file in &report.files {
         let (archive, path) = file.path.rsplit_once("!!").unwrap_or(("", &file.path));
         by_archive
             .entry(archive)
             .or_default()
-            .push(filefacts::ReferenceMember {
+            .push(ReferenceMember {
                 path,
                 references: group_refs.get(file.sha256.as_str()).copied().unwrap_or(&[]),
             });
     }
-    let limits = filefacts::package_context::ContextLimits::default();
+    let limits = ContextLimits::default();
     let mut go_context: HashMap<String, Vec<Reference>> = HashMap::new();
     for (archive, members) in &by_archive {
-        for (path, resolved) in filefacts::go_dependency_context(members, &limits) {
+        for (path, resolved) in go_dependency_context(members, &limits) {
             let path = if archive.is_empty() {
                 path
             } else {
