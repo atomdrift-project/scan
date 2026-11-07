@@ -645,3 +645,102 @@ pub(super) static METRIC_EQUIVALENTS: LazyLock<Vec<Vec<MetricAliasKey>>> = LazyL
     }
     groups
 });
+
+/// Signature findings cleave renamed (2026-11, `metadata/signed/` to
+/// `metadata/signature/<trust state>/`), spelled as the deployed model was
+/// trained to read them. Keep in sync with collimator's
+/// `legacy_finding_id`; drop both at the next retrain on new reports.
+const LEGACY_SIGNATURE_IDS: &[(&str, &str)] = &[
+    (
+        "metadata/signature/invalid/tampered::macho-code-directory",
+        "metadata/signed/integrity::macho-code-directory-invalid",
+    ),
+    (
+        "metadata/signature/code-directory::hardened-runtime-dup",
+        "metadata/signed/trust-level::hardened-runtime-dup",
+    ),
+    (
+        "metadata/signature/code-directory::developer-team-identifier",
+        "metadata/signed/trust-level::developer-team-identifier",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-nt-kernel-image",
+        "metadata/signed/platform::microsoft-nt-kernel-image",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-signed-edge-runtime-context",
+        "metadata/signed/certificate/signature::microsoft-signed-edge-runtime-context",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-signed-kernel32-context",
+        "metadata/signed/trust-level::microsoft-signed-kernel32-context",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-signed-kernelbase-context",
+        "metadata/signed/trust-level::microsoft-signed-kernelbase-context",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-signed-kernel-api-dll-context",
+        "metadata/signed/trust-level::microsoft-signed-kernel-api-dll-context",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-signed-system-component-context",
+        "metadata/signed/trust-level::microsoft-signed-system-component-context",
+    ),
+];
+
+/// Directory renames under `metadata/signature/`, most specific first.
+const LEGACY_SIGNATURE_DIRS: &[(&str, &str)] = &[
+    ("certificate/integrity", "certificate/signature"),
+    ("certificate/format", "trust-level"),
+    ("absent", "trust-level"),
+    ("ad-hoc", "trust-level"),
+    ("certificate", "certificate"),
+    ("entitlements", "entitlements"),
+    ("code-directory", "code-directory"),
+    ("resource", "resource"),
+    ("script", "script"),
+];
+
+/// Trust states the engine files signer findings under.
+const SIGNATURE_STATES: &[&str] = &[
+    "verified",
+    "unverified",
+    "self-signed",
+    "invalid/tampered",
+    "invalid/bad-signature",
+];
+
+/// `id` as the deployed model knows it: renamed signature findings map back
+/// to their `metadata/signed/` spelling; every other id is returned as is.
+pub(super) fn legacy_finding_id(id: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if let Some(&(_, old)) = LEGACY_SIGNATURE_IDS.iter().find(|(new, _)| *new == id) {
+        return Cow::Borrowed(old);
+    }
+    let Some(rest) = id.strip_prefix("metadata/signature/") else {
+        return Cow::Borrowed(id);
+    };
+    let (path, leaf) = rest.split_once("::").unwrap_or((rest, ""));
+    for &(new, old) in LEGACY_SIGNATURE_DIRS {
+        if let Some(tail) = path.strip_prefix(new)
+            && (tail.is_empty() || tail.starts_with('/'))
+        {
+            let sep = if leaf.is_empty() { "" } else { "::" };
+            return Cow::Owned(format!("metadata/signed/{old}{tail}{sep}{leaf}"));
+        }
+    }
+    for state in SIGNATURE_STATES {
+        let Some(kind) = path.strip_prefix(state).and_then(|t| t.strip_prefix('/')) else {
+            continue;
+        };
+        let old = match kind {
+            "platform" | "developer" | "id" => kind,
+            "signer" => "leaf",
+            "subject" => "unknown",
+            _ => break,
+        };
+        return Cow::Owned(format!("metadata/signed/{old}::{leaf}"));
+    }
+    Cow::Borrowed(id)
+}

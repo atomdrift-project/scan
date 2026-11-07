@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use super::keywords::{self, FileKeywords};
-use super::names::METRIC_EQUIVALENTS;
+use super::names::{METRIC_EQUIVALENTS, legacy_finding_id};
 use super::structure::{
     MetricMap, file_symbols, finding_paths, kv_tokens_with_options, merge_metric_summaries,
 };
@@ -322,7 +322,7 @@ impl FileSummary {
             .findings
             .iter()
             .map(|f| RawFinding {
-                id: f.id.clone(),
+                id: legacy_finding_id(&f.id).into_owned(),
                 conf: *confidences
                     .entry(f.confidence.to_bits())
                     .or_insert_with(|| {
