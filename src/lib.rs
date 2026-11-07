@@ -23,6 +23,9 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+/// This scan build, for a caller recording which engine produced a result.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // The supported API: what the crate docs above describe.
 pub mod engine;
 pub mod model;
