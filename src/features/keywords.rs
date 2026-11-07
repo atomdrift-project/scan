@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 
 use super::context::ExtractContext;
+use super::names::legacy_finding_id;
 use super::report::{ParsedReport, RawNeeds};
 use super::spec::KeywordSource;
 use super::{FeatureWriter, MIN_CONFIDENCE};
@@ -70,15 +71,16 @@ pub(super) fn file_keywords(file: &cleave::types::CompactFile, needs: RawNeeds) 
         {
             continue;
         }
+        let id = legacy_finding_id(&finding.id);
         if needs.rule_keywords {
-            let relative = finding.id.split_once("::").map_or_else(
-                || finding.id.rsplit('/').next().unwrap_or(""),
+            let relative = id.split_once("::").map_or_else(
+                || id.rsplit('/').next().unwrap_or(""),
                 |(_, relative)| relative,
             );
             add_words(relative, &mut result.ids);
         }
         if needs.full_rule_keywords {
-            add_words(&finding.id, &mut result.full_ids);
+            add_words(&id, &mut result.full_ids);
         }
         if needs.description_keywords {
             // Blank as Python's `str.isspace` has it, which training used:

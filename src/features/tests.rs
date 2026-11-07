@@ -906,3 +906,97 @@ fn ngram_writes_match_vocab_membership_on_both_probe_paths() {
         }
     }
 }
+
+/// Same cases as collimator's `test_legacy_finding_id`: the two extractors
+/// must agree, or the deployed model sees different features in training
+/// and in service.
+const LEGACY_FINDING_ID_CASES: &[(&str, &str)] = &[
+    (
+        "metadata/signature/verified/platform::apple",
+        "metadata/signed/platform::apple",
+    ),
+    (
+        "metadata/signature/verified/developer::abcde12345",
+        "metadata/signed/developer::abcde12345",
+    ),
+    (
+        "metadata/signature/unverified/id::com.apple.ls",
+        "metadata/signed/id::com.apple.ls",
+    ),
+    (
+        "metadata/signature/self-signed/signer::adobe-inc.",
+        "metadata/signed/leaf::adobe-inc.",
+    ),
+    (
+        "metadata/signature/invalid/tampered/subject::microsoft-windows",
+        "metadata/signed/unknown::microsoft-windows",
+    ),
+    (
+        "metadata/signature/invalid/bad-signature/signer::valve-corp.",
+        "metadata/signed/leaf::valve-corp.",
+    ),
+    (
+        "metadata/signature/invalid/tampered::macho-code-directory",
+        "metadata/signed/integrity::macho-code-directory-invalid",
+    ),
+    (
+        "metadata/signature/certificate/integrity::pe-signature-verified",
+        "metadata/signed/certificate/signature::pe-signature-verified",
+    ),
+    (
+        "metadata/signature/certificate/issuer/microsoft::microsoft-code-signing-pca-2011",
+        "metadata/signed/certificate/issuer/microsoft::microsoft-code-signing-pca-2011",
+    ),
+    (
+        "metadata/signature/certificate/format::phar-signed",
+        "metadata/signed/trust-level::phar-signed",
+    ),
+    (
+        "metadata/signature/absent::unsigned",
+        "metadata/signed/trust-level::unsigned",
+    ),
+    (
+        "metadata/signature/ad-hoc::adhoc",
+        "metadata/signed/trust-level::adhoc",
+    ),
+    (
+        "metadata/signature/code-directory::apple-identifier-prefix",
+        "metadata/signed/code-directory::apple-identifier-prefix",
+    ),
+    (
+        "metadata/signature/code-directory::hardened-runtime-dup",
+        "metadata/signed/trust-level::hardened-runtime-dup",
+    ),
+    (
+        "metadata/signature/entitlements::get-task-allow",
+        "metadata/signed/entitlements::get-task-allow",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::microsoft-nt-kernel-image",
+        "metadata/signed/platform::microsoft-nt-kernel-image",
+    ),
+    // Not renamed: new concepts and unrelated ids pass through.
+    (
+        "metadata/signature/claim/signer::microsoft-corporation",
+        "metadata/signature/claim/signer::microsoft-corporation",
+    ),
+    (
+        "metadata/signature/certificates::x",
+        "metadata/signature/certificates::x",
+    ),
+    (
+        "well-known/app/system/microsoft/platform::windows-os-product-name",
+        "well-known/app/system/microsoft/platform::windows-os-product-name",
+    ),
+    (
+        "micro-behaviors/fs/file/open::x",
+        "micro-behaviors/fs/file/open::x",
+    ),
+];
+
+#[test]
+fn renamed_signature_findings_keep_their_trained_names() {
+    for &(new, old) in LEGACY_FINDING_ID_CASES {
+        assert_eq!(super::names::legacy_finding_id(new), old, "{new}");
+    }
+}
