@@ -263,7 +263,7 @@ jobs:
         id: pgo
         if: inputs.pgo && matrix.native
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pgo-profile-${{ matrix.target }}
           path: ${{ runner.temp }}/pgo
@@ -894,7 +894,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in NetBSD VM
-        uses: vmactions/netbsd-vm@c8a0d7ddb84619a7a8cc4e652efa7950b3fd9f92 # v1.5.2
+        uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
         with:
           usesh: true
           # Latest stable image published by vmactions.
@@ -1118,7 +1118,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build in OmniOS VM
-        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
+        uses: vmactions/omnios-vm@aeee92416495d9685b2997d954f6b063ae5b832d # v1.3.8
         with:
           usesh: true
           # Newest image the builder publishes. Unlike the FreeBSD pin, newer
@@ -1261,7 +1261,7 @@ jobs:
         id: pgo
         if: inputs.pgo
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pgo-profile-${{ matrix.target }}
           path: ${{ runner.temp }}/pgo
