@@ -851,7 +851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
  "crypto-common 0.2.2",
- "inout 0.2.5",
+ "inout 0.2.6",
 ]
 
 [[package]]
@@ -897,7 +897,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.3"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm",
@@ -944,6 +944,7 @@ dependencies = [
  "regex-syntax",
  "reqwest 0.13.1",
  "roxmltree",
+ "rsa 0.10.0-rc.22",
  "rusqlite",
  "rust-fs-core",
  "rust-fs-squashfs",
@@ -986,7 +987,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1680,8 +1681,8 @@ dependencies = [
 
 [[package]]
 name = "dmgwiz"
-version = "1.1.0"
-source = "git+https://github.com/atomdrift-project/dmgwiz.git#47c6e34877efa7447fc99f7c11a42422aff01a43"
+version = "1.1.1"
+source = "git+https://github.com/atomdrift-project/dmgwiz.git#0c7133ac635f4ace7137ebd8f4940f64e99800a4"
 dependencies = [
  "adc",
  "bincode 1.3.3",
@@ -1694,7 +1695,7 @@ dependencies = [
  "num-derive 0.4.2",
  "num-traits",
  "plist",
- "quick-xml 0.37.5",
+ "quick-xml",
  "serde",
 ]
 
@@ -1930,7 +1931,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#cb99976904958c80c3da8a608b6c4fe032594b6d"
+source = "git+https://github.com/atomdrift-project/filefacts.git#dfac967ccd18a0d2930903c6e5e4c7616d8c04bc"
 dependencies = [
  "aes 0.9.4",
  "aho-corasick",
@@ -2048,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/fletch.git#8e3724880036146c57e7b7bdb01d649df207a821"
+source = "git+https://github.com/atomdrift-project/fletch.git#868671ab614fc6df1be392cd1dfef9b703d9b688"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2767,9 +2768,9 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
+checksum = "3a580c13f0ffc335ef42dd3f6b1a41b726051c5e1656d9a3aa6fddb3c5dfbbf9"
 dependencies = [
  "block-padding 0.4.2",
  "hybrid-array",
@@ -3224,7 +3225,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 
 [[package]]
 name = "lzxd"
@@ -3938,7 +3939,7 @@ checksum = "327a4cb2ad49dc48adfdc9da89e22c64d488b508c67a044d71ba729e4521a285"
 dependencies = [
  "base64 0.23.1",
  "indexmap",
- "quick-xml 0.42.0",
+ "quick-xml",
  "serde",
  "time",
 ]
@@ -4234,21 +4235,12 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 dependencies = [
  "flate2",
  "memchr",
  "thiserror 2.0.21",
  "tracing",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.37.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -4670,9 +4662,9 @@ dependencies = [
 
 [[package]]
 name = "rsa"
-version = "0.10.0-rc.21"
+version = "0.10.0-rc.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47cf9537fc2210e5db7a35a1cdda9d8d451b9df6fba234ec1cf0cd746c120c35"
+checksum = "d4fb656eb8fa4b5fb89c86cbb9099dd28604edc8987d59401fde20c4ebc8466e"
 dependencies = [
  "const-oid 0.10.2",
  "crypto-bigint 0.7.10",
@@ -4959,7 +4951,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -5428,7 +5420,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/stng.git#eed8096ecb2daec9c7cb281e841e5248d205c698"
+source = "git+https://github.com/atomdrift-project/stng.git#24dc3ff34099e72dfc1067a32f0f9bc222e730c9"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -5565,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 
 [[package]]
 name = "tap"
@@ -6154,7 +6146,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
+source = "git+https://github.com/tstromberg/tree-sitter#1eccaf16a89d6d5d9b82bc4bb09813aac3db2632"
 dependencies = [
  "cc",
  "regex",
@@ -6204,7 +6196,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#cb99976904958c80c3da8a608b6c4fe032594b6d"
+source = "git+https://github.com/atomdrift-project/filefacts.git#dfac967ccd18a0d2930903c6e5e4c7616d8c04bc"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6283,7 +6275,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter#10d5d1372be200e04480a6b1d6780229c5b1ee79"
+source = "git+https://github.com/tstromberg/tree-sitter#1eccaf16a89d6d5d9b82bc4bb09813aac3db2632"
 
 [[package]]
 name = "tree-sitter-lua"
@@ -7381,7 +7373,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#1ebaf307402dade02489260ca5db775d33f92a53"
+source = "git+https://github.com/atomdrift-project/cleave.git#2b29f0347a259d9c88eca5d8b2608c180f90bbcb"
 
 [[package]]
 name = "yara-x"
@@ -7430,7 +7422,7 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "roxmltree",
- "rsa 0.10.0-rc.21",
+ "rsa 0.10.0-rc.22",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
