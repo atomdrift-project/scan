@@ -2,7 +2,7 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 3.0.0-beta.0 (unreleased)
+## 3.0.0-beta.1 (2026-11-09)
 
 ### Security
 

@@ -52,7 +52,7 @@ too_many_lines = "warn"
 
 [package]
 name = "atomdrift-scan"
-version = "3.0.0-beta.0"
+version = "3.0.0-beta.1"
 default-run = "atomscan"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable. Drives the
