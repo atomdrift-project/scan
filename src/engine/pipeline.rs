@@ -6,6 +6,7 @@
 //! LLM's second opinion), and `render`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -48,7 +49,7 @@ pub(crate) struct ClassifyRequest<'a> {
     pub root_bytes: Option<bytes::Bytes>,
     pub model: &'a Model,
     pub shap: Option<&'a ShapImportance>,
-    pub cancellation: Option<&'a AtomicBool>,
+    pub cancellation: Option<&'a Arc<AtomicBool>>,
     pub tiny_opts: cleave::output::TinyOpts,
     pub interpret: Option<&'a crate::interpret::InterpretConfig>,
     pub fetch: crate::fetch::FetchPolicy,
@@ -173,6 +174,9 @@ pub(crate) fn classify_report(
     let needs = req.needs;
 
     let mut prepared = prepare(report, &req);
+    if req.cancellation.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        bail!("analysis cancelled during reference fetching");
+    }
     // Fetch discovery is finished; release the retained input before inference
     // and the potentially slow LLM round trip.
     drop(req.root_bytes.take());
@@ -392,6 +396,7 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
             progress: needs.fetch_progress,
             capture_deps,
             zip_passwords: req.zip_passwords,
+            cancellation: req.cancellation,
         },
     );
     let fetch_time = fetch_started.elapsed();
@@ -590,7 +595,14 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
     // and permit a hostile tail member to evade elevation.
     let entries: Vec<&CompactFile> = embedded_entries(compact).collect();
     let mut members = MemberEvals::new();
-    for ef in score_embedded_files(&entries, label, needs, ctx, model, req.cancellation)? {
+    for ef in score_embedded_files(
+        &entries,
+        label,
+        needs,
+        ctx,
+        model,
+        req.cancellation.map(Arc::as_ref),
+    )? {
         tracing::debug!(
             parent = %label,
             embedded_path = %ef.path,
@@ -862,11 +874,17 @@ fn classify_dependency(
 
     // Every member elevates the dependency as it would in a first-hand scan.
     let entries: Vec<&CompactFile> = embedded_entries(report).collect();
-    let members: MemberEvals =
-        score_embedded_files(&entries, label, needs, ctx, model, req.cancellation)?
-            .into_iter()
-            .map(|ef| (ef.id, ef))
-            .collect();
+    let members: MemberEvals = score_embedded_files(
+        &entries,
+        label,
+        needs,
+        ctx,
+        model,
+        req.cancellation.map(Arc::as_ref),
+    )?
+    .into_iter()
+    .map(|ef| (ef.id, ef))
+    .collect();
     let decision = members
         .values()
         .map(EmbeddedFile::decision)

@@ -41,6 +41,7 @@ impl Follow<'_> {
             progress: false,
             capture_deps: false,
             zip_passwords: &[],
+            cancellation: None,
         }
     }
 }

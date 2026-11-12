@@ -208,12 +208,15 @@ fn report(prefix: &str, entry: &str, code: bool) -> AnalysisReport {
     serde_json::from_value(serde_json::json!({"version":"3","files":files})).unwrap()
 }
 fn session(report: &AnalysisReport, policy: FetchPolicy) -> FetchSession {
+    session_follow(report, Follow::quiet(policy))
+}
+fn session_follow(report: &AnalysisReport, follow: Follow<'_>) -> FetchSession {
     static RESOURCES: OnceLock<Resources> = OnceLock::new();
     let resources = RESOURCES.get_or_init(|| Resources {
         net: Box::new(super::offline::Offline),
         cache: super::offline::cache(),
     });
-    FetchSession::new(report, &[], resources, Follow::quiet(policy), None)
+    FetchSession::new(report, &[], resources, follow, None)
 }
 #[test]
 fn unresolved_downloader_records_survive_an_empty_worklist_and_deduplicate() {
@@ -737,5 +740,36 @@ fn ambiguous_yarn_workspaces_stay_unresolved() {
         LocalNpmPackages::from_report(&duplicate)
             .workspace_coverage(&duplicate, &app_sha, reference)
             .is_none()
+    );
+}
+
+#[test]
+fn parent_cancellation_stops_reference_work_and_reaches_nested_analysis() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let mut report = report("root", "index.js", true);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut follow = Follow::quiet(FetchPolicy::parse_follow("all").unwrap());
+    follow.cancellation = Some(&flag);
+    let mut session = session_follow(&report, follow);
+    assert!(Arc::ptr_eq(
+        session.opts.cancellation.as_ref().unwrap(),
+        &flag
+    ));
+    flag.store(true, Ordering::Release);
+    session.run(&mut report, vec![("source".to_string(), vec![reference()])]);
+    assert!(
+        !session.out.records.is_empty(),
+        "cancelled work must remain visible as a coverage gap"
+    );
+    assert!(
+        session
+            .opts
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Acquire)
     );
 }

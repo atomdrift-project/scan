@@ -166,7 +166,7 @@ fn finish(
         report,
         ClassifyRequest {
             shap: r.shap.as_ref(),
-            cancellation: analysis.cancellation.map(Arc::as_ref),
+            cancellation: analysis.cancellation,
             interpret: r.interpret.as_ref(),
             fetch: analysis.follow,
             zip_passwords: r.zip_passwords.as_slice(),
@@ -327,14 +327,14 @@ fn small_pool_threads(physical_cores: usize) -> usize {
 }
 
 /// How many *big* whales analyze at once on a host with this many physical
-/// cores; the rest wait their turn. An eighth of the cores, 1–8: 4 cores → 1,
-/// 64 → 8, 128 → 8. With [`whale_pool_threads`] that bounds whale threads at
+/// cores; the rest wait their turn. An eighth of the cores, at least one: 4 cores → 1,
+/// 64 → 8, 128 → 16. With [`whale_pool_threads`] that bounds whale threads at
 /// about two per physical core, oversubscribed enough to keep every core busy
 /// while a whale is in a serial phase, not so much that the global pool's
 /// small work loses its cores.
 #[must_use]
 fn whale_slots(physical_cores: usize) -> usize {
-    (physical_cores / 8).clamp(1, 8)
+    (physical_cores / 8).max(1)
 }
 
 /// Payloads above this many bytes are *big* whales, the ones that take a
@@ -637,7 +637,7 @@ mod whale_pool_tests {
         );
     }
 
-    /// Big-whale slots: an eighth of the cores, 1–8, so slots × threads stays
+    /// Big-whale slots: an eighth of the cores, at least one, so slots × threads stays
     /// near two whale threads per core.
     #[test]
     fn whale_slots_scale_with_cores() {
@@ -646,8 +646,8 @@ mod whale_pool_tests {
         assert_eq!(super::whale_slots(8), 1);
         assert_eq!(super::whale_slots(16), 2);
         assert_eq!(super::whale_slots(64), 8);
-        assert_eq!(super::whale_slots(128), 8);
-        assert_eq!(super::whale_slots(256), 8);
+        assert_eq!(super::whale_slots(128), 16);
+        assert_eq!(super::whale_slots(256), 32);
         for cores in [4, 16, 64, 128] {
             assert!(
                 super::whale_slots(cores) * super::whale_pool_threads(cores) <= 2 * cores.max(4)

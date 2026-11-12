@@ -282,8 +282,10 @@ impl FetchSession {
             progress,
             capture_deps,
             zip_passwords,
+            cancellation,
         } = follow;
         let mut opts = AnalysisOptions {
+            cancellation: cancellation.cloned(),
             compact_members: true, // compact projection only
             skip_predicate: dep_skip_predicate(),
             ..AnalysisOptions::default()
@@ -368,13 +370,21 @@ impl FetchSession {
         }
     }
 
+    fn stopped(&mut self) -> bool {
+        self.opts
+            .cancellation
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            || self.deadline.passed()
+    }
+
     /// Walk the hops: each works from the references found inside the
     /// previous hop's payloads.
     pub(super) fn run(&mut self, report: &mut AnalysisReport, mut worklist: Vec<Group>) {
         let end = self.policy.depth.saturating_add(MAX_REDIRECT_HOPS);
         for hop in 0..end {
             worklist = self.within_depth(worklist, hop);
-            if self.deadline.passed() {
+            if self.stopped() {
                 self.defer_groups(&worklist, hop, "fetch timeout");
                 return;
             }
@@ -561,13 +571,13 @@ impl FetchSession {
         let mut next = Vec::new();
         let mut dropped_old_versions = 0usize;
         let mut exhausted = false;
-        while !exhausted && !self.deadline.passed() {
+        while !exhausted && !self.stopped() {
             let mut plans = Vec::new();
             let mut planned = 0usize;
             while planned < target {
                 // Re-checked per group, not per batch: stopping only at the
                 // batch edge would overrun the cap by a whole batch's fetches.
-                if self.deadline.passed() {
+                if self.stopped() {
                     break;
                 }
                 let Some((source_sha, refs)) = groups.next() else {

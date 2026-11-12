@@ -517,7 +517,7 @@ impl<'a> Session<'a> {
                 config: self.config,
                 model: self.model,
                 shap: self.shap,
-                cancel: Some(self.cancel.as_ref()),
+                cancel: Some(&self.cancel),
             }
             .classify(
                 report,
@@ -848,7 +848,7 @@ struct Classifier<'a> {
     config: &'a ScanConfig,
     model: &'a Model,
     shap: Option<&'a ShapImportance>,
-    cancel: Option<&'a AtomicBool>,
+    cancel: Option<&'a Arc<AtomicBool>>,
 }
 
 impl Classifier<'_> {

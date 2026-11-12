@@ -382,6 +382,8 @@ pub(crate) struct Follow<'a> {
     pub capture_deps: bool,
     /// Passwords to try on encrypted archives among the payloads.
     pub zip_passwords: &'a [String],
+    /// Parent cancellation also stops nested dependency analyses.
+    pub cancellation: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Discover, fetch, and graft, following references up to `policy.depth` hops.

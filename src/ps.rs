@@ -219,7 +219,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
                 &model,
                 shap.as_ref(),
                 config,
-                Some(cancellation.as_ref()),
+                Some(&cancellation),
             )
         });
         let result = match result {
@@ -330,7 +330,7 @@ fn build_result(
     model: &Model,
     shap: Option<&ShapImportance>,
     config: &ScanConfig,
-    cancellation: Option<&AtomicBool>,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let display_path = group.path.as_path();
     // The bloom flag for a known-bad/conflicted process image, re-derived from the
