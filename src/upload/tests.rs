@@ -1,4 +1,6 @@
 use super::*;
+
+mod backpressure;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -172,84 +174,105 @@ fn artifact(sha: &str, size: u64, bytes: ArtifactBytes) -> UploadArtifact {
     }
 }
 
-/// The wire body round-trips through zstd back to the exact JSON serde
-/// produced: this is the same shape hopper's `/api/result` decodes, so an fs
-/// upload is byte-identical to any other client uploading the same payload.
-#[test]
-fn encode_result_body_round_trips_through_zstd() {
-    let payload = ResultPayload {
-        sha256: "a".repeat(64),
-        worker: "scan-fs".to_string(),
-        error: None,
-        duration_ms: 0,
-        envelope: None,
-    };
-    let expected = serde_json::to_vec(&payload).unwrap();
-    let (body, encoding) = encode_result_body(payload, "test").expect("encodes");
-    assert_eq!(encoding, Some("zstd"));
-    let decoded = zstd::decode_all(body.as_slice()).expect("valid zstd");
-    assert_eq!(decoded, expected);
-
-    // The flattened payload carries the transport fields and omits `error`
-    // (skip_serializing_if), matching every other client's wire form.
-    let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-    assert_eq!(value["worker"], "scan-fs");
-    assert_eq!(value["duration_ms"], 0);
-    assert!(value.get("error").is_none());
+/// A one-file report with a large finding, for a result to upload.
+fn fixture_report(evidence: &str) -> cleave::types::CompactReport {
+    serde_json::from_value(serde_json::json!({
+        "rev": "r1",
+        "files": [{"id": 0, "path": "x.txt", "type": "text", "sha": "a".repeat(64), "size": 1,
+                   "traits": [{"id": "x::evidence", "crit": 2, "conf": 1.0, "desc": evidence}]}]
+    }))
+    .expect("fixture report")
 }
 
+/// The decoded lines of a version 8 body.
+fn body_lines(body: &[u8]) -> Vec<serde_json::Value> {
+    body.split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).expect("each line is JSON"))
+        .collect()
+}
+
+/// A result's body is compressed whole and decompresses to the exact lines
+/// the document wrote, filed under the key the caller gave.
 #[test]
-fn encode_result_body_preserves_the_full_typed_report() {
-    let raw: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
-        "files": [
-            {"id": 0, "path": "fixture.zip", "type": "zip", "sha": "root", "size": 128, "depth": 0},
-            {"id": 1, "parent": 0, "path": format!("fixture.zip!!{}.py", "member".repeat(4096)),
-             "type": "python", "sha": "child", "size": 32, "depth": 1}
-        ]
-    }))
-    .expect("typed raw report");
-    assert_eq!(raw.files.len(), 2);
-    let raw = crate::engine::StoredReport::new(&raw)
-        .expect("serializes")
-        .json;
-    let raw_json = raw.get().to_owned();
-    let payload = ResultPayload {
-        sha256: "a".repeat(64),
-        worker: "fixture".into(),
-        error: None,
-        duration_ms: 42,
-        envelope: Some(ScanResultEnvelope {
-            ml: crate::engine::MlSection {
-                v: "7",
-                probability: 0.0,
-                level: crate::model::Level::Clean,
-                conf: Some(100),
-                class: None,
-                model_scores: Vec::new(),
-                skipped_models: Vec::new(),
-                version: "fixture".into(),
-                eng: "fixture",
-                analyzed_at: "2026-10-19T00:00:00Z".into(),
-                files: Vec::new(),
-                pids: None,
-                deleted: None,
-            },
-            llm: None,
-            raw,
-        }),
+fn a_result_body_round_trips_through_zstd() {
+    let result = crate::engine::fixture_result(&"a".repeat(64), &fixture_report("e"));
+    let doc = result.upload.as_ref().expect("classified for upload");
+    let stamp = UploadStamp {
+        at: "2026-11-12T00:00:00Z",
+        model: "test",
+        worker: Some("scan-fs"),
+        ms: None,
     };
-    let expected = serde_json::to_vec(&payload).expect("expected JSON");
-    // The stored report rides through the flattened envelope verbatim.
-    assert!(
-        String::from_utf8_lossy(&expected).ends_with(&format!(r#""raw":{raw_json}}}"#)),
-        "raw is embedded as stored"
-    );
-    let (body, encoding) = encode_result_body(payload, "test").expect("encode full report");
-    assert_eq!(encoding, Some("zstd"));
+    let tally = Tally::default();
+    let encoded = prepare_result(doc, &"b".repeat(64), None, &stamp, &tally).expect("encodes");
+    assert!(encoded.zstd);
+    let body = zstd::decode_all(encoded.bytes.as_slice()).expect("valid zstd");
     assert_eq!(
-        zstd::decode_all(body.as_slice()).expect("valid zstd"),
-        expected
+        Some(body.clone()),
+        doc.encode(&"b".repeat(64), None, &stamp)
     );
+    let lines = body_lines(&body);
+    assert_eq!(lines[0]["v"], 8);
+    assert_eq!(
+        lines[0]["scan"]["worker"], "scan-fs",
+        "hopper requires an uploader's name"
+    );
+    assert_eq!(
+        lines[1]["sha256"],
+        "b".repeat(64),
+        "filed under the caller's key"
+    );
+    assert_eq!(tally.failed.load(Ordering::Relaxed), 0);
+}
+
+/// A caller posting its own results sends exactly the body the uploader
+/// would, and nothing for a result classified without one.
+#[test]
+fn an_exported_body_is_the_uploaders() {
+    let mut result = crate::engine::fixture_result(&"a".repeat(64), &fixture_report("e"));
+    result.analyzed_at = "2026-11-12T00:00:00Z".to_owned();
+    let (bytes, encoding) =
+        encode_result_body(&result, &"a".repeat(64), "postdoc-1", Some(412)).expect("encodes");
+    assert_eq!(encoding, Some("zstd"));
+    let stamp = UploadStamp {
+        at: &result.analyzed_at,
+        model: &result.version,
+        worker: Some("postdoc-1"),
+        ms: Some(412),
+    };
+    let doc = result.upload.as_ref().expect("classified for upload");
+    let body = zstd::decode_all(bytes.as_slice()).expect("valid zstd");
+    assert_eq!(
+        Some(body.clone()),
+        doc.encode(&"a".repeat(64), None, &stamp)
+    );
+    assert_eq!(
+        body_lines(&body)[0]["scan"]["ms"],
+        412,
+        "the caller's timing"
+    );
+    result.upload = None;
+    assert!(encode_result_body(&result, &"a".repeat(64), "postdoc-1", None).is_none());
+}
+
+/// A result classified without an upload body cannot be renewed; that is a
+/// lost verdict, counted where an operator sees it.
+#[test]
+fn a_result_without_an_upload_body_is_counted_lost() {
+    let (tx, _jobs) = queue::channel::<Job>(UPLOAD_QUEUE_DEPTH);
+    let uploader = Uploader {
+        tx: Some(tx),
+        worker: None,
+        worker_name: "test".to_owned(),
+        pending: Arc::default(),
+        tally: Arc::default(),
+    };
+    let mut result = crate::engine::fixture_result(&"a".repeat(64), &fixture_report("e"));
+    result.upload = None;
+    uploader.submit("a".repeat(64), None, &result);
+    assert_eq!(uploader.stats().failed, 1);
+    assert_eq!(uploader.stats().pending, 0);
 }
 
 #[test]
@@ -261,7 +284,7 @@ fn default_worker_name_is_valid_for_hopper() {
     assert!(name.chars().all(|c| c.is_ascii_graphic()));
 }
 
-/// The `/api/known` probe walks the list like every other call.
+/// The `/v1/intake/held` probe walks the list like every other call.
 ///
 /// Its failure is safe — an unanswered probe makes the uploader treat
 /// every artifact as missing, and hopper's upsert is idempotent — but it
@@ -332,10 +355,10 @@ fn an_artifact_streams_from_disk_after_its_provenance() {
 }
 
 /// An artifact over `HOPPER_MAX_UPLOAD_ARTIFACT_BYTES` must never reach
-/// `/api/upload` at all — hopper would reject it outright, and the
+/// `/v1/intake/upload` at all — hopper would reject it outright, and the
 /// connection-drop that rejection produces looks identical to a real
 /// network fault (see the constant's doc comment). `reconcile` is expected
-/// to skip straight past it after the `/api/known` probe reports it
+/// to skip straight past it after the `/v1/intake/held` probe reports it
 /// missing, rather than attempting and retrying a doomed upload.
 #[test]
 fn oversized_artifact_skips_the_byte_upload() {
@@ -358,7 +381,7 @@ fn oversized_artifact_skips_the_byte_upload() {
         .expect("nonblocking upload listener");
 
     let mut hopper = hopper_at(&format!("http://{known_addr}"));
-    hopper.upload = Route::new(&[format!("http://{upload_addr}")], "/api/upload");
+    hopper.upload = Route::new(&[format!("http://{upload_addr}")], "/v1/intake/upload");
     let art = artifact(
         &"d".repeat(64),
         HOPPER_MAX_UPLOAD_ARTIFACT_BYTES + 1,
@@ -395,7 +418,7 @@ fn a_refused_job_does_not_leak_the_pending_count() {
         provenance: None,
         verdict: None,
         members: crate::engine::MemberEvals::new(),
-        report: None,
+        upload: None,
     };
     uploader.submit_dependencies(vec![dep], "v", "t");
     uploader.submit_artifacts(vec![artifact(
@@ -463,7 +486,7 @@ fn dep_artifact_loads_bytes_lazily_and_is_backfillable() {
         )),
         verdict: None,
         members: crate::engine::MemberEvals::new(),
-        report: None,
+        upload: None,
     };
     let art = dep_artifact(&dep, "scan+test", "2026-06-28T00:00:00Z").expect("sidecar builds");
     assert_eq!(art.sha256, "c".repeat(64));

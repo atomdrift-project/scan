@@ -110,20 +110,22 @@ up a new setting with `POST /_/reload` — no restart.
 `-f` is a global flag, so it comes before the path:
 
 ```bash
-atomscan -f json ./pkg/    # NDJSON, one envelope per file, including archive members
+atomscan -f json ./pkg/       # NDJSON, one decision per file
+atomscan -f json-full ./pkg/  # the full result per file, as uploaded to hopper
 atomscan -f tiny ./pkg/    # compact text, built to feed a local LLM
 atomscan ./pkg/            # default: human-readable terminal output
 ```
 
-JSON gives you one line per file whatever the verdict. Read `ml.lvl` for the
-result (`-1` means not flagged) and `ml.prob` for the score. The field names
-are short on purpose; [JSON.md](JSON.md) is the key. The envelope is stable
-within a major version.
+JSON gives you one line per file whatever the verdict: the same decision
+`/v1/analyze` answers with. Read `decision` to act, `severity` for the grade
+and `fires_at` for the level (`-1` means not flagged). `json-full` is the
+whole result: every juror's opinion, the archive's members and each file's
+findings. [JSON.md](JSON.md) describes both.
 
 ## A second opinion: `--llm`
 
 `--llm` sends non-trivial samples to a **local** LLM and blends its
-read into the verdict (kept in the `llm` JSON section). It talks to an
+read into the verdict (kept in the full result's `llm` object). It talks to an
 OpenAI-compatible endpoint at `http://localhost:8000/v1` by default. Nothing
 leaves your network.
 

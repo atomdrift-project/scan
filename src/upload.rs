@@ -1,10 +1,10 @@
 //! Best-effort upload of scan results to a hopper instance.
 //!
-//! Speaks hopper's `/api/result` contract — the `ResultPayload` wire shape, a
+//! Speaks hopper's `/v1/work/result` contract — the `ResultPayload` wire shape, a
 //! zstd-compressed envelope — that its pull-based workers speak, but driven
 //! by a local `scan path` run instead of a poll loop. `scan path --hopper=<url>`
 //! uses it to *renew* a sample hopper has already ingested with this build's
-//! traits and model: hopper's `/api/result` is a lease-free `UPDATE ... WHERE
+//! traits and model: hopper's `/v1/work/result` is a lease-free `UPDATE ... WHERE
 //! sha256 = ?`, so posting a result for an already-scanned SHA replaces its
 //! stored analysis envelope (and an unknown SHA is a harmless no-op).
 //!
@@ -28,19 +28,18 @@ use serde::{Deserialize, Serialize};
 
 mod queue;
 
-use crate::engine::ScanResultEnvelope;
+use crate::engine::{ScanResult, UploadDoc, UploadStamp};
 use crate::hopper::{Route, bearer, endpoints, error_chain};
+use crate::interpret::Interpretation;
 use crate::retry::{backoff, fuzz, is_transient, parse_retry_after};
-
-/// Hopper bounds the decompressed result body at 512 MiB (`maxResultBodyBytes`
-/// in hopper's api.go); a larger document is truncated mid-stream and rejected
-/// as invalid JSON, so an over-limit report is sent ML-verdict-only.
-const HOPPER_MAX_RESULT_BODY_BYTES: usize = 512 << 20;
 
 /// zstd's default level. Cleave reports are large, highly repetitive JSON that
 /// zstd shrinks 3-5x on the wire; the compression cost is dwarfed by the
 /// analysis that produced the payload.
 const ZSTD_RESULT_LEVEL: i32 = 3;
+
+/// The media type of a version 8 result body: JSON lines.
+pub const RESULT_CONTENT_TYPE: &str = "application/x-ndjson";
 
 /// Bound on resident jobs buffered ahead of the uploader thread. Overflow is
 /// spooled to temporary files rather than blocking analysis or retaining large
@@ -61,7 +60,7 @@ struct Renewal {
 /// bounds it near 10 MB). See the clear in the uploader loop.
 const SEEN_SHAS_MAX: usize = 100_000;
 
-/// Per-attempt request timeouts for `/api/upload`, separate from
+/// Per-attempt request timeouts for `/v1/intake/upload`, separate from
 /// [`REQUEST_TIMEOUT`] because that ceiling was sized for the small JSON
 /// verdicts a renewal sends, not for streaming a multi-GiB artifact: with
 /// artifacts up to [`HOPPER_MAX_UPLOAD_ARTIFACT_BYTES`], a legitimate transfer
@@ -122,75 +121,19 @@ const RENEW_MIN_ATTEMPT: Duration = Duration::from_secs(10);
 /// Hopper's `validWorkerName` cap (`maxWorkerNameLen` in api.go).
 const MAX_WORKER_NAME_LEN: usize = 64;
 
-/// The JSON body POSTed to hopper's `/api/result`. The `{ml, llm?, raw}`
-/// envelope is flattened onto the payload so the wire form is
-/// `{sha256, worker, duration_ms, ml, llm, raw}` — byte-for-byte the shape
-/// hopper's pull-based workers send, so hopper handles both identically.
-#[derive(Debug, Serialize)]
-pub struct ResultPayload {
-    /// SHA-256 of the analyzed artifact.
-    pub sha256: String,
-    /// Name of the worker that produced the result.
-    pub worker: String,
-    /// Error reported instead of an analysis envelope, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Analysis duration in milliseconds.
-    pub duration_ms: i64,
-    /// The ML, LLM and raw report fields.
-    #[serde(flatten)]
-    pub envelope: Option<ScanResultEnvelope>,
-}
-
-/// Serialize and zstd-compress a result payload for upload. Returns the body
-/// bytes and the `Content-Encoding` to advertise (`Some("zstd")` when
-/// compression succeeded, `None` when it degraded to raw JSON). Returns `None`
-/// only when serialization is unrecoverable — the result is then dropped.
-///
-/// If the serialized envelope exceeds hopper's body limit, the raw cleave report
-/// is dropped and the ML verdict is sent alone: hopper still records the verdict
-/// and only skips archive explosion, which beats losing the whole result.
-pub fn encode_result_body(
-    mut payload: ResultPayload,
-    sha256: &str,
-) -> Option<(Vec<u8>, Option<&'static str>)> {
-    let json = serialize(&payload, sha256)?;
-    let json = if json.len() > HOPPER_MAX_RESULT_BODY_BYTES {
-        tracing::warn!(
-            sha256 = %sha256,
-            json_bytes = json.len(),
-            limit_bytes = HOPPER_MAX_RESULT_BODY_BYTES,
-            "upload: result JSON exceeds hopper's body limit; dropping raw report, posting ML verdict only",
-        );
-        // Empty the cleave report but keep the ml/llm verdict. An empty report
-        // (not null) mirrors the envelope scan emits when there is no cleave
-        // report, so the dropped-raw form stays a structurally valid envelope.
-        if let Some(envelope) = payload.envelope.as_mut() {
-            envelope.raw = std::sync::Arc::clone(crate::engine::empty_report());
-        }
-        // Moving/dropping the old buffer matters: shadowing it alone keeps
-        // the oversized JSON allocation alive through the compression step.
-        drop(json);
-        serialize(&payload, sha256)?
-    } else {
-        json
-    };
-    // The JSON now owns everything needed for upload. Release the payload
-    // before allocating the compressor and its output buffer.
-    drop(payload);
-    match zstd::encode_all(json.as_slice(), ZSTD_RESULT_LEVEL) {
-        Ok(compressed) => Some((compressed, Some("zstd"))),
+/// Compress a version 8 result body for upload, falling back to sending it
+/// as it is when compression fails.
+fn compress_body(body: Vec<u8>, sha256: &str) -> EncodedResult {
+    match zstd::encode_all(body.as_slice(), ZSTD_RESULT_LEVEL) {
+        Ok(bytes) => EncodedResult { bytes, zstd: true },
         Err(e) => {
             tracing::warn!(sha256 = %sha256, error = %e, "upload: zstd compress failed; sending uncompressed");
-            Some((json, None))
+            EncodedResult {
+                bytes: body,
+                zstd: false,
+            }
         }
     }
-}
-
-fn serialize(payload: &ResultPayload, sha256: &str) -> Option<Vec<u8>> {
-    serde_json::to_vec(payload)
-        .inspect_err(|e| tracing::error!(sha256 = %sha256, error = %e, "upload: serialize failed"))
-        .ok()
 }
 
 /// Worker identity tagged on uploaded results. Hopper's `validWorkerName`
@@ -314,27 +257,63 @@ struct EncodedResult {
     zstd: bool,
 }
 
+/// Encode one result's version 8 body under `sha256` and compress it. A
+/// body that cannot be written is counted as a lost renewal.
 fn prepare_result(
-    worker: &str,
+    doc: &UploadDoc,
     sha256: &str,
-    envelope: ScanResultEnvelope,
+    llm: Option<&Interpretation>,
+    stamp: &UploadStamp<'_>,
     tally: &Tally,
 ) -> Option<EncodedResult> {
-    let payload = ResultPayload {
-        sha256: sha256.to_owned(),
-        worker: worker.to_owned(),
-        error: None,
-        duration_ms: 0,
-        envelope: Some(envelope),
-    };
-    let Some((bytes, encoding)) = encode_result_body(payload, sha256) else {
+    let Some(body) = doc.encode(sha256, llm, stamp) else {
         tally.failed.fetch_add(1, Ordering::Relaxed);
         return None;
     };
-    Some(EncodedResult {
-        bytes,
-        zstd: encoding.is_some(),
-    })
+    Some(compress_body(body, sha256))
+}
+
+/// `result`'s version 8 body under `sha256`, stamped with `worker` and the
+/// analysis time `ms`, and compressed. A result classified without an upload body, or whose body
+/// cannot be written, is counted as a lost renewal.
+fn encode_result(
+    result: &ScanResult,
+    sha256: &str,
+    worker: &str,
+    ms: Option<u64>,
+    tally: &Tally,
+) -> Option<EncodedResult> {
+    let Some(doc) = &result.upload else {
+        tally.failed.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(sha256 = %sha256, "upload: result was not classified for upload");
+        return None;
+    };
+    let at = crate::engine::analyzed_at(&result.analyzed_at);
+    let stamp = UploadStamp {
+        at: &at,
+        model: &result.version,
+        worker: Some(worker),
+        ms,
+    };
+    prepare_result(doc, sha256, result.interpretation.as_ref(), &stamp, tally)
+}
+
+/// The body hopper's `/v1/work/result` takes for `result`, filed under `sha256`,
+/// naming `worker` as its uploader and `ms` as the analysis time when the
+/// caller timed it: version 8 JSON lines
+/// ([`RESULT_CONTENT_TYPE`]), with the `Content-Encoding` they were
+/// compressed with, if any. For callers that post results themselves, so
+/// they send exactly what [`Uploader::submit`] sends. `None`, logged, when
+/// the result was not classified for upload or its body cannot be written.
+#[must_use]
+pub fn encode_result_body(
+    result: &ScanResult,
+    sha256: &str,
+    worker: &str,
+    ms: Option<u64>,
+) -> Option<(Vec<u8>, Option<&'static str>)> {
+    let encoded = encode_result(result, sha256, worker, ms, &Tally::default())?;
+    Some((encoded.bytes, encoded.zstd.then_some("zstd")))
 }
 
 /// Only upload inputs cross the queue, not the dependency's analysis graph.
@@ -354,11 +333,21 @@ fn prepare_dependencies(
     tally: &Tally,
 ) -> Vec<PreparedDependency> {
     let collector = format!("scan+{worker}");
+    let at = crate::engine::analyzed_at(analyzed_at);
+    let stamp = UploadStamp {
+        at: &at,
+        model: version,
+        worker: Some(worker),
+        ms: None,
+    };
     deps.into_iter()
         .map(|dep| {
             let artifact = dep_artifact(&dep, &collector, analyzed_at);
-            let result = crate::engine::dep_envelope(&dep, version, analyzed_at)
-                .and_then(|envelope| prepare_result(worker, &dep.sha256, envelope, tally));
+            // No body without a verdict: scan posts none it did not compute.
+            let result = dep
+                .verdict
+                .and(dep.upload.as_ref())
+                .and_then(|doc| prepare_result(doc, &dep.sha256, None, &stamp, tally));
             PreparedDependency {
                 sha256: dep.sha256,
                 locator: dep.locator,
@@ -523,9 +512,11 @@ impl Uploader {
         })
     }
 
-    /// Queue a result for upload. A failed handoff is logged and counted.
-    pub fn submit(&self, sha256: String, purl: Option<String>, envelope: ScanResultEnvelope) {
-        let Some(body) = prepare_result(&self.worker_name, &sha256, envelope, &self.tally) else {
+    /// Queue `result` for upload, filed under `sha256`. A result classified
+    /// without an upload body, or a failed handoff, is logged and counted.
+    pub fn submit(&self, sha256: String, purl: Option<String>, result: &ScanResult) {
+        let Some(body) = encode_result(result, &sha256, &self.worker_name, None, &self.tally)
+        else {
             return;
         };
         let job = Job::Result { sha256, purl, body };
@@ -556,7 +547,7 @@ impl Uploader {
     /// verdict is ready, while this uploader may still be waiting behind other
     /// jobs. Keeping an independent on-disk copy makes the handoff reliable
     /// without retaining a potentially large upload in memory or reading it
-    /// before `/api/known` says hopper needs it.
+    /// before `/v1/intake/held` says hopper needs it.
     ///
     /// # Errors
     /// Returns an error when staging fails or the uploader has stopped.
@@ -723,9 +714,9 @@ impl Hopper {
         let bases = endpoints(hopper_url);
         Self {
             http,
-            result: Route::new(&bases, "/api/result"),
-            known: Route::new(&bases, "/api/known"),
-            upload: Route::new(&bases, "/api/upload"),
+            result: Route::new(&bases, "/v1/work/result"),
+            known: Route::new(&bases, "/v1/intake/held"),
+            upload: Route::new(&bases, "/v1/intake/upload"),
             token: crate::hopper::token(),
             worker,
             tally,
@@ -838,7 +829,7 @@ impl Hopper {
     }
 
     /// Reconcile a batch of artifacts against hopper: negotiate which it's
-    /// missing (one `/api/known` round-trip), then upload only those — bytes
+    /// missing (one `/v1/intake/held` round-trip), then upload only those — bytes
     /// plus provenance. `seen` dedups across batches so a dependency shared by
     /// many files is handled once. Best-effort throughout: a failure logs and
     /// the scan continues.
@@ -945,7 +936,7 @@ impl Hopper {
             return;
         }
         // Bytes + provenance first, so each dependency's row exists before its
-        // verdict UPDATE (hopper's `/api/result` no-ops on a missing row). The
+        // verdict UPDATE (hopper's `/v1/work/result` no-ops on a missing row). The
         // local seen set starts empty — the run-level dedup above already
         // removed repeats.
         let artifacts: Vec<UploadArtifact> =
@@ -984,7 +975,7 @@ impl Hopper {
         }
     }
 
-    /// POST the batch existence probe (`/api/known`) and return the digests
+    /// POST the batch existence probe (`/v1/intake/held`) and return the digests
     /// whose bytes hopper already holds. On any failure returns an empty set —
     /// the caller then treats every artifact as missing, which is the safe
     /// direction: a failed probe re-sends bytes hopper had, where the other way
@@ -1037,7 +1028,7 @@ impl Hopper {
         HashSet::new()
     }
 
-    /// The multipart `/api/upload` body: the provenance part first, as hopper's
+    /// The multipart `/v1/intake/upload` body: the provenance part first, as hopper's
     /// handler requires, then the file part when there are bytes to send. Built
     /// afresh per attempt — a form is consumed by sending it — from bytes that
     /// are never copied.
@@ -1126,7 +1117,7 @@ impl Hopper {
             let remaining = RENEW_BUDGET.saturating_sub(started.elapsed());
             let request = bearer(self.http.post(self.result.at(attempt - 1)), self.token)
                 .timeout(remaining.max(RENEW_MIN_ATTEMPT))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, RESULT_CONTENT_TYPE)
                 // Claim hopper's reserved lane: this renewal is one-shot, and the
                 // caller is already holding the verdict in its cache.
                 .header(HOPPER_LANE_HEADER, HOPPER_LANE_RENEW)

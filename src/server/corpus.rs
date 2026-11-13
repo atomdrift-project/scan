@@ -223,7 +223,7 @@ impl Corpus {
     /// names internal addresses: log it, do not serve it.
     pub(super) async fn sample(&self, sha: &str, max_bytes: usize) -> Result<Sample, SampleError> {
         use sha2::Digest as _;
-        let path = format!("/api/file/{sha}");
+        let path = format!("/v1/files/{sha}");
         let mut last = "Hopper did not serve the sample".to_string();
         for base in self.order_at(Instant::now()) {
             let mut request = self
@@ -535,6 +535,8 @@ impl Corpus {
             }
             return match status {
                 200 => match response.json::<Record>().await {
+                    // "Held, nobody has looked at it": no verdict, and no failure.
+                    Ok(record) if record.is_pending() => Some((Reached::Nothing, source)),
                     Ok(record) => Some((Reached::Record(Box::new(record)), source)),
                     // Reachable, but not speaking our protocol — a proxy's error
                     // page, a schema we do not know. Not a reason to try the other
@@ -546,9 +548,8 @@ impl Corpus {
                         Some((Reached::Unreachable, source))
                     }
                 },
-                // 404 is "nothing stored"; 202 is "held, nobody has looked at it".
-                // Neither is a verdict, and neither is a failure.
-                404 | 202 => Some((Reached::Nothing, source)),
+                // "Nothing stored": not a verdict, and not a failure.
+                404 => Some((Reached::Nothing, source)),
                 // Being turned away is about this endpoint, not about the query:
                 // a credential can be wrong for one address and right for the
                 // next, and 403 is exactly how a replica declines a route it will
@@ -1032,6 +1033,23 @@ mod tests {
                 .await
                 .0,
             Reached::Unreachable,
+        );
+    }
+
+    /// Bytes hopper holds but nobody has analyzed are an answer with no
+    /// verdict in it: `Nothing`, never a record a gate would read a level from.
+    #[tokio::test]
+    async fn a_pending_record_is_nothing() {
+        let held = endpoint(
+            "200 OK",
+            r#"{"sha256":"abc","state":"pending","fires_at":null}"#,
+        );
+        let c = corpus(&held);
+        assert_eq!(
+            c.known_with_source(None, Some("pkg:npm/left-pad@1.3.0"), false)
+                .await
+                .0,
+            Reached::Nothing,
         );
     }
 

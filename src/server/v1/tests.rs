@@ -170,6 +170,76 @@ async fn a_pending_analysis_streams_progress_before_its_decision() -> anyhow::Re
     Ok(())
 }
 
+/// A pending full result streams like a decision and ends with the version 8
+/// body, header first, so a caller behind a proxy that cuts idle connections
+/// is kept talking for as long as the analysis takes.
+#[tokio::test]
+async fn a_pending_full_result_streams_progress_then_its_body() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use futures_core::Stream as _;
+    use std::future::poll_fn;
+    use std::pin::Pin;
+
+    let purl = "pkg:npm/stream-fixture@1.0.0";
+    let flights = Arc::new(super::super::flight::Flights::default());
+    let attachment = flights.join(FlightKey::new(Artifact::Purl(purl.into()), 0, 0));
+    let publisher = flights.publisher(attachment.flight());
+    let request = V1Analyze {
+        request_id: 1,
+        started: Instant::now(),
+        q: V1Query::parse(Some("full=1")),
+        budget: 25,
+        follow: RequestFollow {
+            policy: crate::fetch::FetchPolicy::default(),
+            refresh: false,
+        },
+        purl: Some((purl.into(), purl.into())),
+        url: None,
+        path: None,
+    };
+    let named = Named::Purl {
+        key: purl.into(),
+        asked: purl.into(),
+    };
+    let response =
+        tokio::time::timeout(Duration::from_secs(1), answer(&request, attachment, named))
+            .await
+            .context("a pending analysis did not send headers within one second")?;
+    let mut body = response.into_body().into_data_stream();
+    let mut next = async || {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| Pin::new(&mut body).poll_next(cx)),
+        )
+        .await
+    };
+    let progress = next()
+        .await
+        .context("no progress frame")?
+        .context("ended")??;
+    let progress: serde_json::Value = serde_json::from_slice(&progress)?;
+    assert_eq!(progress["state"], "analyzing");
+
+    let report: cleave::types::CompactReport = serde_json::from_value(serde_json::json!({
+        "rev": "r1",
+        "files": [{"id": 0, "path": "x.tgz", "type": "npm", "sha": "a".repeat(64), "size": 1, "traits": []}]
+    }))?;
+    let result = crate::engine::fixture_result(&"a".repeat(64), &report);
+    let expected = result.full_body(false).context("fixture writes a body")?;
+    publisher.publish(Outcome::Report(Box::new(result)));
+    let rest = next().await.context("no full result")?.context("ended")??;
+    assert_eq!(
+        rest.as_ref(),
+        expected.as_slice(),
+        "the body, whole, ends the stream"
+    );
+    let header: serde_json::Value =
+        serde_json::from_slice(rest.split(|&b| b == b'\n').next().unwrap_or_default())?;
+    assert_eq!(header["v"], 8);
+    assert!(next().await.context("did not end")?.is_none());
+    Ok(())
+}
+
 /// A finding says only what is known about it.
 ///
 /// The decision object around it keeps every key at all times; a finding
@@ -270,6 +340,17 @@ fn only_an_affirmative_fresh_bypasses_the_filters() {
     assert!(both.fresh && !both.force);
     let other = q("purl=pkg:npm/left-pad@1.3.0&fresh=0&force=1");
     assert!(!other.fresh && other.force);
+}
+
+/// The full result is only ever an analysis's, so asking for it spends a
+/// slot as `force` does, on the same affirmative-only terms.
+#[test]
+fn asking_for_the_full_result_forces_an_analysis() {
+    let q = |raw| V1Query::parse(Some(raw));
+    let full = q("purl=pkg:npm/left-pad@1.3.0&full=1");
+    assert!(full.full && full.force);
+    let not = q("purl=pkg:npm/left-pad@1.3.0&full=0");
+    assert!(!not.full && !not.force);
 }
 
 /// The header spelling is an alias, not an override: either opts in, and a

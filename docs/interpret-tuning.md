@@ -49,7 +49,7 @@ offline (below), not product surface.
 `interpret::gate::admit` evaluates every admission and logs which fired. A
 sample is sent when any of these holds:
 
-- ML placed it anywhere on the calibrated level grid (`ml.lvl` ≥ 0);
+- ML placed it anywhere on the calibrated level grid (`fires_at` ≥ 0);
 - its raw probability is at least `DEFAULT_LLM_MIN_PROB`, which covers files
   the grid never placed;
 - cleave reported a hostile finding;
@@ -78,8 +78,8 @@ ML decides; the LLM steers (`interpret::blend`):
    so ML's ranking is preserved.
 2. **The hostile boundary is earned.** Crossing it in either direction
    requires ML to already sit within one steer of it
-   (`within_one_steer_of_hostile_boundary`), measured in the same confidence
-   space as `ml.conf`. The one relaxation is an escalation corroborated by a
+   (`within_one_steer_of_hostile_boundary`), measured in the confidence space
+   `level_confidence` maps levels into. The one relaxation is an escalation corroborated by a
    cleave hostile finding. The suspicious boundary is ungated: it routes a file
    to a human rather than spending a false-positive budget, so an ML false
    negative with an LLM-hostile read always lands on suspicious.
@@ -88,10 +88,10 @@ ML decides; the LLM steers (`interpret::blend`):
    (`addresses_the_analyzer`) may not lower the class or the score. An author
    gains nothing by talking their own sample up, so only softening is guarded
    (`untrusted_read_never_softens_the_verdict`).
-4. **The level follows the class.** The verdict travels as `ml.lvl`, so an
+4. **The level follows the class.** The verdict travels as `fires_at`, so an
    LLM-shifted verdict gets a synthetic level in its new band
-   (`engine::interpreted_level`) and `ml.cls` beside it; `ml.conf` follows from
-   the level. Classifying a steered probability against thresholds would be
+   (`engine::interpreted_level`), and the verdict names the LLM as the juror
+   that decided it (`"by":"llm"`). Classifying a steered probability against thresholds would be
    wrong for routes with their own cutoffs; the level axis is the coordinate
    every decision path shares.
 

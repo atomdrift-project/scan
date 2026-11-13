@@ -24,7 +24,7 @@ mod analyze;
 mod config;
 mod corpus;
 mod cpu_busy;
-mod decision;
+pub(crate) mod decision;
 mod diag;
 mod error;
 mod flight;

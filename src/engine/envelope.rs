@@ -1,14 +1,8 @@
-//! The scan result and the JSON envelope it serializes to.
-
-use std::sync::{Arc, OnceLock};
+//! The scan result: one analysis, and what each output reads from it.
 
 use cleave::types::{CompactReport, CompactTrait};
-use serde_json::value::RawValue;
 
-use super::{
-    ENGINE_VERSION, FindingCounts, FloorDecision, PendingLlm, Reason, SCHEMA_VERSION,
-    UNANALYZED_MEMBER_RISK, level_confidence,
-};
+use super::{FindingCounts, FloorDecision, PendingLlm, Reason, UploadDoc};
 use crate::interpret::Interpretation;
 use crate::lookup::{Hit, collect_hits};
 use crate::model::{Classification, Decision, Level, RouteScore, SkippedRoute};
@@ -19,12 +13,9 @@ use crate::model::{Classification, Decision, Level, RouteScore, SkippedRoute};
 /// every scanned item is emitted as a `ScanResult`.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    /// Schema version.
-    pub v: &'static str,
     /// Model classification outcome.
     pub classification: Classification,
     /// Dependency attention counts retained even when the report is dropped.
-    /// Detailed records remain in the JSON envelope's raw report.
     pub dependency_attention: super::DependencyAttention,
     /// Probability the verdict was decided on.
     pub probability: f32,
@@ -41,9 +32,8 @@ pub struct ScanResult {
     pub version: String,
     /// UTC timestamp of when this analysis was performed (RFC 3339).
     pub analyzed_at: String,
-    /// The compact cleave report as stored: retention applied, dependency
-    /// verdicts pinned, facts reduced to the model's. `None` when the caller
-    /// had no use for it.
+    /// What the result keeps of its cleave report (see [`StoredReport`]).
+    /// `None` when the caller had no use for it.
     pub cleave: Option<StoredReport>,
     /// PIDs running this binary (process scan only).
     pub pids: Option<Vec<u32>>,
@@ -128,6 +118,10 @@ pub struct ScanResult {
     /// artifact clean — the floor has no way to say benign. Not serialized,
     /// for the same reason as [`model`](Self::model).
     pub floor: Option<FloorDecision>,
+    /// What a hopper upload of this result says: the version 8 body, short of
+    /// the run stamp. `None` unless the result was classified for upload.
+    /// Never part of the JSON envelope.
+    pub upload: Option<UploadDoc>,
 }
 
 /// See [`ScanResult::hopper_route`].
@@ -147,60 +141,26 @@ pub enum HopperRoute {
     Suppress,
 }
 
-/// A compact cleave report serialized for storage, with the few facts later
-/// stages read back from it.
+/// What a finished result keeps of its cleave report: the worst findings,
+/// which the verdict index and the JSON decision report.
 ///
-/// A typed [`CompactReport`] takes several times its JSON size, and a result
-/// lives for the whole job — upload, a pending LLM amendment, its re-post — so
-/// a finished scan keeps the JSON alone. It is shared, not copied, when a
-/// result is cloned or turned into an envelope.
+/// The report itself is not kept. The terminal card is rendered and the
+/// upload document built before a result leaves the pipeline, and a result
+/// lives for the whole job, so holding the report would cost its full size
+/// for nothing.
 #[derive(Debug, Clone)]
 pub struct StoredReport {
-    /// The report's JSON, embedded verbatim as the envelope's `raw`.
-    pub json: Arc<RawValue>,
-    /// The traits revision the report was produced with (`rev`).
-    pub traits_version: Option<String>,
-    /// The analyzed files, in report order: the rows of `ml.files`.
-    pub files: Vec<StoredFile>,
     /// The worst findings, attributed to no PURL; see [`Self::hits`].
     hits: Vec<Hit>,
 }
 
-/// A file of a [`StoredReport`] that was analyzed.
-#[derive(Debug, Clone)]
-pub struct StoredFile {
-    /// The report's `files[].id`.
-    pub id: u64,
-    /// Detected file type.
-    pub file_type: String,
-    /// Whether this is the root (`depth == 0`), which carries the envelope's
-    /// own verdict.
-    pub root: bool,
-}
-
 impl StoredReport {
-    /// Serialize `report` for storage.
-    ///
-    /// # Errors
-    /// The report does not serialize.
-    pub fn new(report: &CompactReport) -> serde_json::Result<Self> {
-        Ok(Self {
-            json: serde_json::value::to_raw_value(report)?.into(),
-            traits_version: report.traits_version.clone(),
-            files: report
-                .files
-                .iter()
-                // Listing-only members (`--show=all`) were never analyzed; they
-                // stay in the JSON's `files` manifest but get no `ml.files` row.
-                .filter(|f| f.risk != UNANALYZED_MEMBER_RISK)
-                .map(|f| StoredFile {
-                    id: u64::from(f.id),
-                    file_type: f.file_type.clone(),
-                    root: f.depth == 0,
-                })
-                .collect(),
+    /// Keep what a finished result needs of `report`.
+    #[must_use]
+    pub fn new(report: &CompactReport) -> Self {
+        Self {
             hits: collect_hits(report),
-        })
+        }
     }
 
     /// The worst findings, most critical first. A finding not from a
@@ -219,18 +179,6 @@ impl StoredReport {
     }
 }
 
-/// The `raw` of a result without a report: an empty report of the current
-/// schema.
-pub(crate) fn empty_report() -> &'static Arc<RawValue> {
-    static EMPTY: OnceLock<Arc<RawValue>> = OnceLock::new();
-    EMPTY.get_or_init(|| {
-        // An empty report always serializes; `null` only satisfies the type.
-        serde_json::value::to_raw_value(&CompactReport::default())
-            .unwrap_or_else(|_| RawValue::NULL.to_owned())
-            .into()
-    })
-}
-
 /// A fetched dependency to mirror into hopper as its own sample: the aggregate
 /// verdict scan computed for it during the parent analysis, plus its standalone
 /// compact cleave report and the registry provenance captured during analysis.
@@ -238,7 +186,7 @@ pub(crate) fn empty_report() -> &'static Arc<RawValue> {
 /// time.
 #[derive(Debug, Clone)]
 pub struct DepResult {
-    /// SHA-256 of the dependency's bytes — its identity and `/api/result` key.
+    /// SHA-256 of the dependency's bytes — its identity and `/v1/work/result` key.
     pub sha256: String,
     /// The reference locator (PURL/URL) the bytes were fetched from.
     pub locator: String,
@@ -265,9 +213,10 @@ pub struct DepResult {
     /// Without it every member of a dependency reached hopper with no verdict at
     /// all, while the members of a directly-scanned package got theirs.
     pub members: MemberEvals,
-    /// The dependency's own compact cleave report — the `raw` for its result.
-    /// `None` when it did not parse, in which case there is no verdict either.
-    pub report: Option<StoredReport>,
+    /// The version 8 body for the dependency's own result, built from its
+    /// standalone report. `None` without a verdict, or when the scan was not
+    /// classified for upload.
+    pub upload: Option<UploadDoc>,
 }
 
 /// A representative cleave finding surfaced alongside a classification.
@@ -387,178 +336,29 @@ impl EmbeddedFile {
     }
 }
 
-/// Build the `/api/result` envelope for a fetched dependency: the standalone
-/// cleave report scan captured for it as `raw`, and the aggregate verdict it
-/// computed as the `ml` section — the same shape a first-hand scan of those bytes
-/// would post, so hopper records the dependency exactly as if it had been scanned
-/// directly. `version`/`analyzed_at` are the parent run's, identifying the build.
-///
-/// `None` when the dependency carries no verdict (see [`DepResult::verdict`])
-/// — there is nothing to post, and scan does not invent one.
-#[must_use]
-pub(crate) fn dep_envelope(
-    dep: &DepResult,
-    version: &str,
-    analyzed_at: &str,
-) -> Option<ScanResultEnvelope> {
-    let (Some(verdict), Some(report)) = (dep.verdict, &dep.report) else {
-        return None;
-    };
-    let level = verdict.level;
-    Some(ScanResultEnvelope {
-        ml: MlSection {
-            v: SCHEMA_VERSION,
-            probability: verdict.probability,
-            level,
-            conf: level_confidence(level),
-            class: None,
-            model_scores: Vec::new(),
-            skipped_models: Vec::new(),
-            version: version.to_string(),
-            eng: ENGINE_VERSION,
-            analyzed_at: analyzed_at.to_string(),
-            files: ml_files(&report.files, verdict.probability, level, &dep.members),
-            pids: None,
-            deleted: None,
-        },
-        llm: None,
-        raw: Arc::clone(&report.json),
-    })
-}
-
-/// One row of `ml.files`: a report node and, when it was evaluated, its own
-/// verdict.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct MlFile {
-    pub id: u64,
-    #[serde(rename = "type")]
-    pub file_type: String,
-    /// Absent, not defaulted, for a node nobody evaluated: hopper reads a
-    /// prob-less row as "not analyzed", which is the truth.
-    #[serde(flatten)]
-    pub verdict: Option<MlFileVerdict>,
-}
-
-/// The verdict fields of an evaluated [`MlFile`] row.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-pub struct MlFileVerdict {
-    /// Widened to `f64` because these rows were built with `json!`, which
-    /// widens; a direct `f32` would print fewer digits and change the bytes.
-    pub prob: f64,
-    pub lvl: Level,
-    pub conf: Option<u8>,
-}
-
-/// Build the `ml.files` rows, one per analyzed report file.
-///
-/// The root (`depth == 0`) carries the envelope's probability and level;
-/// members are joined by id and report their *own* — so every row's `lvl` is
-/// the level-independent marker for that file. A member with no evaluation gets
-/// no verdict fields. It must NEVER inherit the root's verdict: a member can
-/// occur in many containers, and hopper mirrors these rows into the member's
-/// own sample row (`litmusResultForMember`), so a fabricated value becomes that
-/// file's grade everywhere it appears.
-fn ml_files(
-    files: &[StoredFile],
-    root_prob: f32,
-    root_level: Level,
-    members: &MemberEvals,
-) -> Vec<MlFile> {
-    files
-        .iter()
-        .map(|file| {
-            let evaluation = if file.root {
-                Some((root_prob, root_level))
-            } else {
-                members.get(&file.id).map(|ef| (ef.probability, ef.level))
-            };
-            MlFile {
-                id: file.id,
-                file_type: file.file_type.clone(),
-                verdict: evaluation.map(|(prob, lvl)| MlFileVerdict {
-                    prob: f64::from(prob),
-                    lvl,
-                    conf: level_confidence(lvl),
-                }),
-            }
-        })
-        .collect()
-}
-
-/// Top-level JSON envelope: `{"ml": {...}, "llm": {...}, "raw": {...}}`.
-#[derive(Debug, serde::Serialize)]
-pub struct ScanResultEnvelope {
-    /// ML classification section.
-    pub ml: MlSection,
-    /// LLM interpretation section (`--llm`); omitted when not run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm: Option<Interpretation>,
-    /// Raw cleave analysis report.
-    pub raw: Arc<RawValue>,
-}
-
-/// The envelope with the interpretation borrowed, for writing a result
-/// without cloning it. Serializes to the same bytes as [`ScanResultEnvelope`].
-#[derive(Debug, serde::Serialize)]
-pub struct ScanResultEnvelopeRef<'a> {
-    /// ML classification section.
-    pub ml: MlSection,
-    /// LLM interpretation section (`--llm`); omitted when not run.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm: Option<&'a Interpretation>,
-    /// Raw cleave analysis report.
-    pub raw: &'a RawValue,
-}
-
-/// The `ml` section of the response envelope.
-#[derive(Debug, serde::Serialize)]
-pub struct MlSection {
-    /// Result schema version.
-    pub v: &'static str,
-    /// Probability assigned to the selected classification.
-    #[serde(rename = "prob")]
-    pub probability: f32,
-    /// Level-independent verdict marker, always serialized (`null` in
-    /// manual-threshold mode). See [`ScanResult::level`].
-    #[serde(rename = "lvl")]
-    pub level: Level,
-    /// Pessimistic integer confidence percent derived from `level`; `null` when no
-    /// level table applies (manual-threshold mode).
-    pub conf: Option<u8>,
-    /// The class of record when the LLM placed `level` rather than the sweep
-    /// measuring it; omitted otherwise.
-    ///
-    /// A placed level is deploy-relative (the hostile rung is the deploy's own
-    /// `-l`), so decoding it at another level can misread it. When this is
-    /// present it is the verdict, graded at the level the scan ran at, and
-    /// `llm.before.lvl` holds what the model measured. Absent on every
-    /// unsteered record, so the common envelope stays byte-identical across
-    /// deploy levels and pays nothing for it.
-    #[serde(rename = "cls", skip_serializing_if = "Option::is_none")]
-    pub class: Option<Classification>,
-    /// Scores from models that ran.
-    #[serde(rename = "mods", skip_serializing_if = "Vec::is_empty")]
-    pub model_scores: Vec<RouteScore>,
-    /// Models skipped while producing this result.
-    #[serde(rename = "skip", skip_serializing_if = "Vec::is_empty")]
-    pub skipped_models: Vec<SkippedRoute>,
-    /// Model bundle version.
-    pub version: String,
-    /// Scan engine build (`CARGO_PKG_VERSION`) that produced this report.
-    pub eng: &'static str,
-    /// UTC analysis timestamp.
-    pub analyzed_at: String,
-    /// Per-file ML results.
-    pub files: Vec<MlFile>,
-    /// Process identifiers, when analyzing a live process.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pids: Option<Vec<u32>>,
-    /// Whether the analyzed process was deleted, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted: Option<bool>,
-}
-
 impl ScanResult {
+    /// The full result: the version 8 body as it is uploaded, but naming no
+    /// worker. With `every`, it names every member the document holds
+    /// (`--all-members`). `None` when the result was not classified for upload
+    /// or its body cannot be written.
+    #[must_use]
+    pub fn full_body(&self, every: bool) -> Option<Vec<u8>> {
+        let doc = self.upload.as_ref()?;
+        let at = super::analyzed_at(&self.analyzed_at);
+        let stamp = super::UploadStamp {
+            at: &at,
+            model: &self.version,
+            worker: None,
+            ms: None,
+        };
+        let llm = self.interpretation.as_ref();
+        if every {
+            doc.encode_every(&self.sha256, llm, &stamp)
+        } else {
+            doc.encode(&self.sha256, llm, &stamp)
+        }
+    }
+
     /// Static findings remain attention-worthy when the model grades benign.
     pub(crate) fn has_severe_findings(&self) -> bool {
         self.finding_counts.hostile > 0
@@ -574,266 +374,15 @@ impl ScanResult {
                     .any(|finding| finding.crit >= cleave::Criticality::Suspicious)
             })
     }
-
-    /// The `ml` section. Clones only the small fields; `files` is built here.
-    fn ml_section(&self) -> MlSection {
-        MlSection {
-            v: self.v,
-            probability: self.probability,
-            level: self.level,
-            conf: level_confidence(self.level),
-            // The class beside `level` when the LLM placed it: the blend is
-            // the last thing to touch `level`, so a difference from
-            // `llm.before.lvl` is exactly a placed one.
-            class: match &self.interpretation {
-                Some(Interpretation::Graded(graded)) if graded.before.lvl != self.level => {
-                    Some(self.classification)
-                }
-                _ => None,
-            },
-            model_scores: self.model_scores.clone(),
-            skipped_models: self.skipped_models.clone(),
-            version: self.version.clone(),
-            eng: ENGINE_VERSION,
-            analyzed_at: self.analyzed_at.clone(),
-            files: self.cleave.as_ref().map_or_else(Vec::new, |report| {
-                ml_files(
-                    &report.files,
-                    self.probability,
-                    self.level,
-                    &self.embedded_files,
-                )
-            }),
-            pids: self.pids.clone(),
-            deleted: self.deleted,
-        }
-    }
-
-    /// Build the envelope, sharing the cleave report.
-    #[must_use]
-    pub fn to_envelope(&self) -> ScanResultEnvelope {
-        ScanResultEnvelope {
-            ml: self.ml_section(),
-            llm: self.interpretation.clone(),
-            raw: Arc::clone(self.raw()),
-        }
-    }
-
-    /// Build the envelope, consuming the result so the interpretation moves
-    /// instead of being cloned.
-    #[must_use]
-    pub fn into_envelope(self) -> ScanResultEnvelope {
-        ScanResultEnvelope {
-            ml: self.ml_section(),
-            llm: self.interpretation,
-            raw: self
-                .cleave
-                .map_or_else(|| Arc::clone(empty_report()), |r| r.json),
-        }
-    }
-
-    /// The envelope with everything borrowed, for the JSON output path.
-    #[must_use]
-    pub fn envelope_ref(&self) -> ScanResultEnvelopeRef<'_> {
-        ScanResultEnvelopeRef {
-            ml: self.ml_section(),
-            llm: self.interpretation.as_ref(),
-            raw: self.raw(),
-        }
-    }
-
-    /// The envelope's `raw`: the stored report, or an empty one.
-    fn raw(&self) -> &Arc<RawValue> {
-        match &self.cleave {
-            Some(report) => &report.json,
-            None => empty_report(),
-        }
-    }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
 
-    /// Decode a wire-shaped fixture and store it the way the pipeline does,
-    /// so these tests exercise the same reader production does.
-    fn report(v: serde_json::Value) -> StoredReport {
-        StoredReport::new(&serde_json::from_value(v).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn ml_files_drops_listing_only_members() {
-        // A root file, an analyzed member, and a listing-only member (risk -1).
-        let report = report(serde_json::json!({
-            "files": [
-                {"id": 0, "path": "app.zip", "type": "zip", "sha": "r", "size": 4096, "depth": 0},
-                {"id": 1, "path": "app.zip!!evil.sh", "type": "shell", "sha": "a", "size": 200, "depth": 1, "risk": 9},
-                {"id": 2, "path": "app.zip!!README.md", "type": "markdown", "sha": "b", "size": 1024, "depth": 1, "risk": -1},
-            ]
-        }));
-        let ml = ml_files(&report.files, 0.9, Level::At(100), &MemberEvals::new());
-        let ids: Vec<u64> = ml.iter().map(|f| f.id).collect();
-        assert_eq!(
-            ids,
-            vec![0, 1],
-            "listing-only member is excluded from ml.files"
-        );
-    }
-
-    #[test]
-    fn ml_files_never_stamps_members_with_root_verdict() {
-        // A hostile container with three members: one evaluated benign, one
-        // evaluated with the same basename as another node, one never
-        // evaluated. No member may inherit the root's verdict — hopper mirrors
-        // these entries into each member's own sample row, and a member can
-        // occur in many containers.
-        let report = report(serde_json::json!({
-            "files": [
-                {"id": 0, "path": "evil.elf", "type": "elf", "sha": "0", "size": 9, "depth": 0},
-                {"id": 1, "path": "compatibility", "type": "unknown", "sha": "1", "size": 1, "depth": 1},
-                {"id": 2, "path": "a!!page", "type": "unknown", "sha": "2", "size": 1, "depth": 2},
-                {"id": 3, "path": "b!!page", "type": "unknown", "sha": "3", "size": 1, "depth": 2},
-                {"id": 4, "path": "never-scored", "type": "unknown", "sha": "4", "size": 1, "depth": 1},
-            ]
-        }));
-        let member = |id: u64, path: &str, prob: f32, level: Level| EmbeddedFile {
-            floor: None,
-            id,
-            sha256: String::new(),
-            path: path.to_string(),
-            file_type: "unknown".to_string(),
-            classification: Classification::Benign,
-            probability: prob,
-            threshold: 0.8,
-            level,
-            model_scores: Vec::new(),
-            skipped_models: Vec::new(),
-            formula: String::new(),
-            top_findings: Vec::new(),
-        };
-        let evaluated = MemberEvals::from([
-            (1, member(1, "compatibility", 0.00001, Level::Clean)),
-            (2, member(2, "page", 0.00002, Level::Clean)),
-            (3, member(3, "page", 0.7, Level::At(3000))),
-        ]);
-        let ml =
-            serde_json::to_value(ml_files(&report.files, 0.99, Level::At(0), &evaluated)).unwrap();
-
-        assert!(
-            (ml[0]["prob"].as_f64().unwrap() - 0.99).abs() < 1e-6,
-            "root keeps its own"
-        );
-        assert!(
-            (ml[1]["prob"].as_f64().unwrap() - 0.00001).abs() < 1e-9,
-            "evaluated member reports its own probability, not the root's"
-        );
-        assert_eq!(ml[1]["lvl"].as_i64(), Some(-1));
-        // Same basename, different nodes: id keys the join, so each reports
-        // its own evaluation (a path-suffix match would return the first).
-        assert!((ml[2]["prob"].as_f64().unwrap() - 0.00002).abs() < 1e-9);
-        assert_eq!(ml[3]["lvl"].as_i64(), Some(3000));
-        // Never evaluated: no verdict fields at all — absence, not inheritance.
-        assert_eq!(ml[4]["id"].as_u64(), Some(4));
-        assert!(
-            ml[4].get("prob").is_none()
-                && ml[4].get("lvl").is_none()
-                && ml[4].get("conf").is_none(),
-            "unevaluated member carries no fabricated verdict"
-        );
-    }
-
-    /// A dependency carrying the verdict scan computed for it.
-    fn evaluated_dep() -> DepResult {
-        DepResult {
-            sha256: "d".repeat(64),
-            locator: "pkg:npm/evil@1.0.0".to_string(),
-            url: "https://reg/evil-1.0.0.tgz".to_string(),
-            size: 1234,
-            provenance: None,
-            verdict: Some(Decision {
-                class: Classification::Hostile,
-                probability: 0.97,
-                threshold: 0.65,
-                level: Level::At(100),
-            }),
-            members: MemberEvals::new(),
-            report: Some(report(serde_json::json!({"files": [
-                {"id": 0, "path": "evil-1.0.0.tgz", "size": 1234, "sha": "d".repeat(64), "type": "npm"}
-            ]}))),
-        }
-    }
-
-    #[test]
-    fn dep_envelope_carries_verdict_and_report() {
-        // A dependency's verdict envelope encodes its aggregate level as `ml.lvl`
-        // and passes its standalone report through as `raw`, so hopper keeps the
-        // dependency's own analysis rather than a slice of its parent's.
-        let env = dep_envelope(&evaluated_dep(), "model-9", "2026-06-28T00:00:00Z")
-            .expect("a dependency with a verdict yields an envelope");
-        assert_eq!(
-            env.ml.level,
-            Level::At(100),
-            "aggregate verdict rides in ml.lvl"
-        );
-        assert_eq!(env.ml.probability, 0.97);
-        assert_eq!(env.ml.version, "model-9");
-        assert_eq!(env.ml.analyzed_at, "2026-06-28T00:00:00Z");
-        let raw: serde_json::Value = serde_json::from_str(env.raw.get()).unwrap();
-        assert_eq!(
-            raw["files"][0]["type"], "npm",
-            "the dependency's own report is the result raw, so hopper keeps its FileType",
-        );
-    }
-
-    #[test]
-    fn dep_envelope_absent_without_a_verdict() {
-        // A dependency the embedded pass never reached has no verdict, so there is
-        // no result to post. Inventing a benign one would be indistinguishable
-        // from a real evaluation — and would bless the package in the known-good
-        // bloom filter, suppressing every future fetch of it. The bytes and
-        // provenance still upload, so hopper holds the artifact and can analyze it.
-        let dep = DepResult {
-            verdict: None,
-            ..evaluated_dep()
-        };
-        assert!(
-            dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z").is_none(),
-            "an unevaluated dependency posts no verdict",
-        );
-    }
-
-    /// `ml.files` is a wire format hopper stores: probabilities print widened
-    /// to f64, rows keep `id, type, prob, lvl, conf` order, and an unevaluated
-    /// row is `{id, type}` alone.
-    #[test]
-    fn ml_files_bytes_are_pinned() {
-        let report = report(serde_json::json!({
-            "files": [
-                {"id": 0, "path": "a.zip", "type": "zip", "sha": "r", "size": 1, "depth": 0},
-                {"id": 1, "path": "a.zip!!x", "type": "js", "sha": "x", "size": 1, "depth": 1},
-            ]
-        }));
-        let rows = ml_files(&report.files, 0.42, Level::Manual, &MemberEvals::new());
-        assert_eq!(
-            serde_json::to_string(&rows).unwrap(),
-            r#"[{"id":0,"type":"zip","prob":0.41999998688697815,"lvl":null,"conf":null},{"id":1,"type":"js"}]"#
-        );
-        let rows = ml_files(&report.files, 0.42, Level::Clean, &MemberEvals::new());
-        assert_eq!(
-            serde_json::to_string(&rows).unwrap(),
-            r#"[{"id":0,"type":"zip","prob":0.41999998688697815,"lvl":-1,"conf":0},{"id":1,"type":"js"}]"#
-        );
-        let rows = ml_files(&report.files, 0.42, Level::At(25), &MemberEvals::new());
-        assert_eq!(
-            serde_json::to_string(&rows).unwrap(),
-            r#"[{"id":0,"type":"zip","prob":0.41999998688697815,"lvl":25,"conf":92},{"id":1,"type":"js"}]"#
-        );
-    }
-
     pub(crate) fn base_result() -> ScanResult {
         ScanResult {
             dependency_attention: super::super::DependencyAttention::default(),
-            v: SCHEMA_VERSION,
             model: Decision {
                 class: Classification::Benign,
                 probability: 0.10,
@@ -870,189 +419,7 @@ pub(super) mod tests {
             dependency_results: Vec::new(),
             bloom_mark: None,
             hopper_route: HopperRoute::Normal,
+            upload: None,
         }
-    }
-
-    /// `ml.cls` appears exactly when the LLM placed `lvl`: the class of record
-    /// beside a deploy-relative number, and nothing on a measured one.
-    #[test]
-    fn ml_cls_marks_only_llm_placed_levels() {
-        use crate::interpret::{Graded, LlmGrade, MlVerdict};
-        let graded = |before: Level| {
-            Interpretation::Graded(Graded {
-                grade: LlmGrade::Suspicious,
-                outcome: Classification::Suspicious,
-                corroborated: false,
-                may_soften: false,
-                blended: 0.5,
-                interpretation: String::new(),
-                model: "m".to_string(),
-                analyzer_directed: false,
-                cached: false,
-                before: MlVerdict {
-                    class: Classification::Benign,
-                    prob: 0.1,
-                    lvl: before,
-                },
-            })
-        };
-        let ml = |r: &ScanResult| serde_json::to_value(r.ml_section()).unwrap();
-
-        // No interpretation: no cls.
-        let mut r = base_result();
-        assert!(ml(&r).get("cls").is_none());
-
-        // Graded, but the blend left the measured level alone: no cls.
-        r.interpretation = Some(graded(Level::Clean));
-        assert!(ml(&r).get("cls").is_none());
-
-        // The LLM lifted a model-clean file into suspicious at a placed level.
-        r.classification = Classification::Suspicious;
-        r.level = Level::At(255);
-        let v = ml(&r);
-        assert_eq!(v["cls"], 1, "suspicious is ordinal 1, as in mods[].cls");
-        assert_eq!(v["lvl"], 255);
-    }
-
-    #[test]
-    fn envelope_serializes_lvl_and_drops_legacy_fields() {
-        // `ml.lvl` is the model's level-independent marker, serialized verbatim
-        // (`-1` for a file that never fires). The dropped v5 fields must not
-        // appear anywhere in the envelope.
-        let r = base_result();
-        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["v"].as_str(), Some("7"));
-        assert_eq!(json["ml"]["lvl"].as_i64(), Some(-1));
-        assert_eq!(json["ml"]["conf"].as_u64(), Some(0));
-        for dropped in [
-            "class",
-            "l",
-            "threshold",
-            "level",
-            "thresholds",
-            "oclass",
-            "oprob",
-        ] {
-            assert!(
-                json["ml"].get(dropped).is_none(),
-                "v7 envelope must not emit `{dropped}`"
-            );
-        }
-    }
-
-    /// A result without a report carries an empty one of the current schema;
-    /// one with a report embeds its stored JSON byte for byte.
-    #[test]
-    fn envelope_raw_is_the_stored_report_or_an_empty_one() {
-        let mut r = base_result();
-        let json = serde_json::to_value(r.envelope_ref()).expect("serialize");
-        assert_eq!(
-            json["raw"],
-            serde_json::json!({"v": CompactReport::default().version, "files": []})
-        );
-        let stored = report(serde_json::json!({
-            "files": [{"id": 0, "size": 1, "sha": "a", "path": "x", "type": "zip"}]
-        }));
-        let expected = format!(r#""raw":{}}}"#, stored.json.get());
-        r.cleave = Some(stored);
-        let json = serde_json::to_string(&r.into_envelope()).expect("serialize");
-        assert!(json.ends_with(&expected), "{json}");
-    }
-
-    #[test]
-    fn envelope_emits_null_lvl_in_manual_mode() {
-        let mut r = base_result();
-        r.level = Level::Manual;
-        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert!(
-            json["ml"]["lvl"].is_null(),
-            "manual-threshold mode (no level table) serializes lvl as null"
-        );
-        assert!(
-            json["ml"]["conf"].is_null(),
-            "manual-threshold mode serializes conf as null"
-        );
-    }
-
-    #[test]
-    fn envelope_emits_firing_level() {
-        let mut r = base_result();
-        r.classification = Classification::Hostile;
-        r.probability = 0.99;
-        r.level = Level::At(7);
-        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["lvl"].as_i64(), Some(7));
-        assert_eq!(json["ml"]["conf"].as_u64(), Some(94));
-    }
-
-    #[test]
-    fn envelope_level_is_independent_of_verdict() {
-        // A file the model only flags at a high level reports that true level
-        // even when the active caps render it benign — the envelope (hence the
-        // cache key) is identical regardless of the deploy `-l`.
-        let mut r = base_result();
-        r.classification = Classification::Benign;
-        r.level = Level::At(500);
-        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        assert_eq!(json["ml"]["lvl"].as_i64(), Some(500));
-    }
-
-    #[test]
-    fn envelope_per_file_level_reflects_each_member() {
-        // Each `files[]` row reports its own file's lowest-firing-level: the root
-        // carries the envelope `lvl`, members their own (matched by path suffix).
-        let mut r = base_result();
-        r.level = Level::At(20);
-        r.probability = 0.97;
-        r.cleave = Some(report(serde_json::json!({
-            "files": [
-                {"id": 0, "size": 1, "depth": 0, "sha": "a", "path": "/tmp/x", "type": "zip"},
-                {"id": 1, "size": 1, "depth": 1, "sha": "b", "path": "/tmp/x!!evil.sh", "type": "shell"},
-                {"id": 2, "size": 1, "depth": 1, "sha": "c", "path": "/tmp/x!!readme.txt", "type": "text"},
-            ]
-        })));
-        let member = |id: u64, path: &str, level: Level, prob: f32| EmbeddedFile {
-            floor: None,
-            id,
-            sha256: String::new(),
-            path: path.to_string(),
-            file_type: "unknown".to_string(),
-            classification: Classification::Benign,
-            probability: prob,
-            threshold: 0.8,
-            level,
-            model_scores: Vec::new(),
-            skipped_models: Vec::new(),
-            formula: String::new(),
-            top_findings: Vec::new(),
-        };
-        r.embedded_files = MemberEvals::from([
-            (1, member(1, "evil.sh", Level::At(2), 0.99)),
-            (2, member(2, "readme.txt", Level::Clean, 0.01)),
-        ]);
-        let json = serde_json::to_value(r.to_envelope()).expect("serialize");
-        let files = json["ml"]["files"].as_array().expect("files array");
-        assert_eq!(
-            files[0]["lvl"].as_i64(),
-            Some(20),
-            "root row carries envelope lvl"
-        );
-        assert_eq!(
-            files[1]["lvl"].as_i64(),
-            Some(2),
-            "evil.sh reports its own lvl"
-        );
-        assert_eq!(
-            files[2]["lvl"].as_i64(),
-            Some(-1),
-            "readme.txt reports its own lvl"
-        );
-        assert_eq!(
-            files[0]["type"].as_str(),
-            Some("zip"),
-            "each row carries its file type"
-        );
-        assert_eq!(files[1]["type"].as_str(), Some("shell"));
-        assert_eq!(files[2]["type"].as_str(), Some("text"));
     }
 }

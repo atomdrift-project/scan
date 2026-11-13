@@ -2,7 +2,7 @@
 //!
 //! A collector runs `fletch registry <purl>` at fetch time and stores its
 //! `{record, sources}` envelope in the sample's sidecar under `registry`. Both
-//! a hosted worker (over HTTP, from `/api/provenance/{sha256}`) and the CLI
+//! a hosted worker (over HTTP, from `/v1/files/{sha256}/provenance`) and the CLI
 //! (`--registry-map <file>`) read that sidecar to recover the normalized
 //! [`fletch::Registry`] a scan reasons over, so a hopper-sourced scan sees the
 //! same registry facts a live `pkg`/`url` scan fetches — without a refetch.
@@ -394,7 +394,7 @@ impl RegistryProvenance {
     /// without materializing ignored raw provider fields. Accepts any of three
     /// shapes:
     /// - a hopper sidecar (record nested under `registry`, as a hosted worker
-    ///   receives it from `/api/provenance/{sha256}`),
+    ///   receives it from `/v1/files/{sha256}/provenance`),
     /// - a bare `fletch registry` envelope (`{record, sources}`, straight from
     ///   fletch's stdout), or
     /// - a bare normalized [`Registry`] record for legacy `--registry-map` callers.

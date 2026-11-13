@@ -143,17 +143,8 @@ fn hex_len(s: &str) -> Option<usize> {
 /// branch moves under the caller: a corpus answer for it may describe a
 /// different, older release than the one a fetch would get, so it must never
 /// stand in for that fetch.
-fn pins_exact_version(purl: &str) -> bool {
-    let Some(version) = Coordinate::of(purl).and_then(|c| c.version) else {
-        return false;
-    };
-    let numeric = version.strip_prefix('v').unwrap_or(version);
-    let commit = matches!(hex_len(version), Some(40 | 64));
-    (numeric.starts_with(|c: char| c.is_ascii_digit()) || commit)
-        && !version.contains(['*', '^', '~', '<', '>', '=', '|', ',', ' '])
-        && !version
-            .split('.')
-            .any(|part| part.eq_ignore_ascii_case("x"))
+pub(crate) fn pins_exact_version(purl: &str) -> bool {
+    fletch::purl::Purl::parse(purl).is_ok_and(|p| p.pins_exact_version())
 }
 
 /// Seconds in a day.
@@ -318,7 +309,7 @@ pub struct FetchedDependency {
     /// Size of the fetched bytes, recorded in the provenance sidecar.
     pub size: u64,
     /// The dependency's own compact cleave report as **JSON text** (`raw` for
-    /// its `/api/result`). Text form on purpose: a `serde_json::Value` tree
+    /// its `/v1/work/result`). Text form on purpose: a `serde_json::Value` tree
     /// costs 3-6x the text size, and several jobs' dependencies can be
     /// co-resident in one process from graft until their result POST, where
     /// retained `Value` trees reach hundreds of megabytes. The envelope build

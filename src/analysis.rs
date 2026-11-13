@@ -39,6 +39,8 @@ pub struct Analysis<'a> {
     /// Capture each fetched dependency's standalone report, for callers that
     /// renew results on hopper.
     pub deps_for_upload: bool,
+    /// Build the version 8 body a hopper renewal sends.
+    pub upload: bool,
     pub cpu_lease: Option<CpuLease>,
 }
 
@@ -63,6 +65,7 @@ impl<'a> Analysis<'a> {
             root_registry: None,
             follow: resources.fetch,
             deps_for_upload: false,
+            upload: false,
             cpu_lease: None,
         }
     }
@@ -173,6 +176,7 @@ fn finish(
             // The JSON envelope only: no renders, fetch log, or manifest.
             needs: OutputNeeds {
                 deps_for_upload: analysis.deps_for_upload,
+                upload: analysis.upload,
                 ..OutputNeeds::default()
             },
             root_registry: analysis.root_registry,

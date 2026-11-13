@@ -121,8 +121,8 @@ pub fn warn_if_cleartext(raw: &str) {
 /// puts last.
 ///
 /// Worker routes are the exception to the rule above. A replica answers
-/// lookups and relays renewals, but it refuses `/api/next` and the plain
-/// `/api/result` with a 403 even when its relay is enabled — the work queue
+/// lookups and relays renewals, but it refuses `/v1/work/next` and the plain
+/// `/v1/work/result` with a 403 even when its relay is enabled — the work queue
 /// is the primary's to hand out, and passing the worker firehose through a
 /// replica helps no one. So there is nothing to fail over to here: the second
 /// address is not another way to reach the same answer, it is the only one.
@@ -207,7 +207,7 @@ pub(crate) fn bearer(
 
 /// Request timeout per call, the same for every attempt.
 ///
-/// `/api/result` is not a request a client can abandon cheaply. Hopper writes
+/// `/v1/work/result` is not a request a client can abandon cheaply. Hopper writes
 /// the parent and every archive member in one transaction, on a context
 /// detached from the request, so a client that gives up cancels nothing: the
 /// first store keeps running and holding one of hopper's reserved renewal
@@ -249,13 +249,15 @@ pub(crate) const LOOKUP_RETRY_BUDGET: Duration = Duration::from_secs(15);
 /// The sha256 of the content hopper holds under `purl`, asking each address
 /// in turn and retrying transient failures within `LOOKUP_RETRY_BUDGET`;
 /// `None` on any failure or absence, so a caller posts nothing rather than
-/// guess.
+/// guess. A pending record (bytes held, never analyzed) counts as absence.
 #[must_use]
 pub(crate) fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct LookupResponse {
         #[serde(default)]
         sha256: Option<String>,
+        #[serde(default)]
+        state: Option<State>,
     }
     let client = http()?;
     let _span = tracing::info_span!("purl_lookup", purl).entered();
@@ -270,6 +272,7 @@ pub(crate) fn sha_for_purl(hopper_url: &str, purl: &str) -> Option<String> {
                     .json::<LookupResponse>()
                     .map_err(|e| tracing::warn!(endpoint = %base, error = %error_chain(&e), "hopper: purl lookup answer unreadable"))
                     .ok()
+                    .filter(|r| r.state != Some(State::Pending))
                     .and_then(|r| r.sha256);
             }
             Ok(resp) => {
@@ -300,6 +303,9 @@ pub struct Record {
     /// Whether the artifact was analyzed. Hopper's own answers carry none.
     #[serde(default)]
     pub status: Option<Status>,
+    /// Hopper's own word on the same question; Uplink's answers carry none.
+    #[serde(default)]
+    pub state: Option<State>,
     /// The tightest false-positive budget at which it grades hostile.
     #[serde(default)]
     pub fires_at: crate::model::Level,
@@ -318,6 +324,28 @@ pub struct Record {
     /// Its strongest traits.
     #[serde(default)]
     pub findings: Vec<Finding>,
+}
+
+impl Record {
+    /// Whether hopper holds the artifact's bytes but nobody has analyzed
+    /// them: an answer from the corpus, but no verdict.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.state == Some(State::Pending)
+    }
+}
+
+/// Hopper's `state` for a looked-up artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// Analyzed; the record carries the verdict.
+    Analyzed,
+    /// The bytes are held, but nothing has analyzed them yet.
+    Pending,
+    /// A state this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether a looked-up artifact was analyzed.
@@ -381,7 +409,7 @@ mod tests {
         assert!(endpoints(" , , ").is_empty());
     }
 
-    /// Queue polling is the exception: hopper refuses `/api/next` on a replica
+    /// Queue polling is the exception: hopper refuses `/v1/work/next` on a replica
     /// with a 403 whether or not its relay is on, so a worker takes the primary
     /// — the last address — and nothing else. Handing it the raw string would
     /// put the commas inside a hostname and fail every poll with
@@ -421,18 +449,18 @@ mod tests {
     #[test]
     fn a_retry_moves_to_the_next_address() {
         let bases = endpoints("https://ro,http://rw");
-        let route = Route::new(&bases, "/api/result");
-        assert_eq!(route.at(0), "https://ro/api/result");
-        assert_eq!(route.at(1), "http://rw/api/result");
-        assert_eq!(route.at(9), "http://rw/api/result");
+        let route = Route::new(&bases, "/v1/work/result");
+        assert_eq!(route.at(0), "https://ro/v1/work/result");
+        assert_eq!(route.at(1), "http://rw/v1/work/result");
+        assert_eq!(route.at(9), "http://rw/v1/work/result");
     }
 
     /// One address is the ordinary case, and every attempt uses it.
     #[test]
     fn a_single_address_is_used_for_every_attempt() {
-        let route = Route::new(&endpoints("https://only"), "/api/known");
-        assert_eq!(route.at(0), "https://only/api/known");
-        assert_eq!(route.at(5), "https://only/api/known");
+        let route = Route::new(&endpoints("https://only"), "/v1/intake/held");
+        assert_eq!(route.at(0), "https://only/v1/intake/held");
+        assert_eq!(route.at(5), "https://only/v1/intake/held");
     }
 
     /// 408 and 429 ask to be retried; every other 4xx is final.

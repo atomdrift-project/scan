@@ -214,10 +214,17 @@ impl Leader {
                 cancellation: Some(&cancellation),
                 phase: Some(&tracker),
                 follow: policy,
+                // Every analysis can be asked for its full result (the body
+                // hopper is sent), whether or not there is a hopper, because
+                // requests asking for different shapes share one analysis.
+                upload: true,
+                // Every job renews its verdict on hopper, when there is one,
+                // and its fetched dependencies with it. A dependency hopper
+                // already holds a current verdict for is adopted by the
+                // corpus precheck, not graded or uploaded again.
+                deps_for_upload: uploader.is_some(),
                 ..Analysis::new("", &resources, slow_rule_ms)
             };
-            // Fetched dependencies ride the hopper renewal, when there is one.
-            let deps_for_upload = uploader.is_some();
             match job {
                 Job::Bytes { filename, bytes } => {
                     let upload = Upload::stage(&filename, &bytes)
@@ -227,21 +234,11 @@ impl Leader {
                 }
                 Job::Purl(purl) => classify_purl(
                     &purl,
-                    Analysis {
-                        deps_for_upload,
-                        ..analysis
-                    },
+                    analysis,
                     uploader.as_deref(),
                     corpus.as_deref().map(|corpus| (corpus, &runtime)),
                 ),
-                Job::Url(url) => classify_url(
-                    &url,
-                    Analysis {
-                        deps_for_upload,
-                        ..analysis
-                    },
-                    uploader.as_deref(),
-                ),
+                Job::Url(url) => classify_url(&url, analysis, uploader.as_deref()),
             }
         };
         let outcome = RequestGuard::new(&self.state, self.request_id, entry, permit)
@@ -422,7 +419,7 @@ fn renew(uploader: &Uploader, result: &mut ScanResult, purl: Option<String>) {
         HopperRoute::Redirect(sha) => sha.clone(),
         HopperRoute::Normal => result.sha256.clone(),
     };
-    uploader.submit(sha, purl, result.to_envelope());
+    uploader.submit(sha, purl, result);
 }
 
 /// Analyze staged bytes, then offer them to hopper.
@@ -820,7 +817,7 @@ mod tests {
     /// into its queryable `purl_base` column is filled only when the locator
     /// carries the `pkg:` prefix. Callers send the canonical form, so this
     /// holds today; if that ever changes, the artifact still uploads but
-    /// `/api/sample?purl=` stops finding it, which is exactly the silent gap
+    /// `/v1/lookup?purl=` stops finding it, which is exactly the silent gap
     /// this whole path exists to close.
     #[test]
     fn fetched_root_offers_cached_bytes_and_its_purl() {

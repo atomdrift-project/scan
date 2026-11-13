@@ -141,7 +141,14 @@ digest of its bytes; `X-Filename` names it so cleave can type it by
 extension. A `?purl=` sent with a body is provenance, not the artifact.
 
 A verdict already held answers immediately and takes no slot. `force=1`
-analyzes regardless. `fresh=1` (or `X-Hopper-Fresh: 1`) skips the bloom
+analyzes regardless. `full=1` answers with the full result instead of the
+decision: the version 8 body scan uploads to hopper (see
+[JSON.md](JSON.md)), as `application/x-ndjson`. Only an analysis produces
+one, and the server keeps none, so `full=1` implies `force=1`: it always runs
+an analysis and takes a slot, even for an artifact whose verdict is already
+held. The analysis cache usually makes a repeat cheap. It streams like a
+decision (below), and its lines end the stream: read until a line carries
+`"v":8`, and that line and every one after it are the result. `fresh=1` (or `X-Hopper-Fresh: 1`) skips the bloom
 filters. `refresh=1` reconciles one digest with hopper, analyzing it here
 when hopper's verdict is missing or from other traits.
 

@@ -402,8 +402,12 @@ impl Precheck {
         false
     }
 
-    /// The policy for this backend's answers.
+    /// The policy for this backend's answers. A pending record — bytes held,
+    /// never analyzed — has no verdict to stand on.
     fn judge(&self, rec: Record, lookup: Lookup) -> Standing {
+        if rec.is_pending() {
+            return Standing::Analyze;
+        }
         match self.backend {
             Backend::Hopper => standing_of(
                 rec,
@@ -439,7 +443,7 @@ impl Precheck {
             return Standing::Analyze;
         };
         if !self.answered(resp.status(), "corpus precheck") {
-            return Standing::Analyze; // 404 unknown, 202 bytes-only, 401/5xx — all "scan it".
+            return Standing::Analyze; // 404 unknown, 401/5xx — all "scan it".
         }
         let rec = match resp.json::<Record>() {
             Ok(rec) => rec,
@@ -707,13 +711,22 @@ pub(crate) fn analyzed_verdict(line: &str) -> Result<(String, Verdict), AnswerEr
     Ok((sha, rec.into()))
 }
 
-/// One answer as a list of items: several keys answer with a list, one with an
-/// object. `None` when the body is not JSON of either shape.
+/// One answer as a list of items: several keys answer with a list (hopper's
+/// wrapped as `{"records": [...]}`), one with an object. `None` when the body
+/// is not JSON of any of those shapes.
 fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
+    #[derive(serde::Deserialize)]
+    struct Batch<'a> {
+        #[serde(borrow)]
+        records: Vec<&'a serde_json::value::RawValue>,
+    }
     if body.trim_ascii_start().starts_with(b"[") {
-        serde_json::from_slice(body).ok()
-    } else {
-        serde_json::from_slice(body).ok().map(|one| vec![one])
+        return serde_json::from_slice(body).ok();
+    }
+    let one: &serde_json::value::RawValue = serde_json::from_slice(body).ok()?;
+    match serde_json::from_str::<Batch<'_>>(one.get()) {
+        Ok(batch) => Some(batch.records),
+        Err(_) => Some(vec![one]),
     }
 }
 
@@ -945,10 +958,10 @@ mod tests {
         let fresh = crate::engine::now_rfc3339();
         let sha = "AB".repeat(32);
         let body = format!(
-            r#"[{{"purl":"pkg:npm/b@1","sha256":"{sha}","fires_at":-1,"analyzed_at":"{fresh}"}},
+            r#"{{"records":[{{"purl":"pkg:npm/b@1","sha256":"{sha}","fires_at":-1,"analyzed_at":"{fresh}"}},
                 {{"sha256":"{sha}","fires_at":-1,"analyzed_at":"{fresh}"}},
                 {{"purl":"pkg:npm/c@1","sha256":"short","fires_at":-1,"analyzed_at":"{fresh}"}},
-                {{"purl":"pkg:npm/d@1","findings":[{{"id":"no-crit"}}]}}]"#
+                {{"purl":"pkg:npm/d@1","findings":[{{"id":"no-crit"}}]}}]}}"#
         );
         let asked: Vec<String> = ["pkg:npm/a@1", "pkg:npm/x@1", "pkg:npm/c@1", "pkg:npm/d@1"]
             .map(String::from)
@@ -972,7 +985,7 @@ mod tests {
         // A batch echoes each purl as the caller spelled it.
         let asked = ["pkg:npm/a@1", "pkg:npm/b@1"].map(String::from).to_vec();
         let mut out = HashMap::new();
-        let body = format!("[{}]", answer("pkg:npm/b@1"));
+        let body = format!(r#"{{"records":[{}]}}"#, answer("pkg:npm/b@1"));
         precheck.collect_hits(&asked, body.as_bytes(), &mut out);
         assert_eq!(out.keys().collect::<Vec<_>>(), ["pkg:npm/b@1"]);
         // A lone purl comes back canonicalized; it still answers what was asked.
@@ -980,6 +993,11 @@ mod tests {
         let mut out = HashMap::new();
         precheck.collect_hits(&asked, answer("pkg:npm/c@1").as_bytes(), &mut out);
         assert_eq!(out.keys().collect::<Vec<_>>(), ["npm/c@1"]);
+        // Bytes held but never analyzed are no verdict, whatever else it says.
+        let pending = answer("pkg:npm/c@1").replacen('{', r#"{"state":"pending","#, 1);
+        let mut out = HashMap::new();
+        precheck.collect_hits(&asked, pending.as_bytes(), &mut out);
+        assert!(out.is_empty(), "a pending record was taken as a verdict");
     }
 
     #[test]

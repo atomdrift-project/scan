@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use cleave::types::{CompactFile, CompactReport, CompactTrait, Facts};
 use cleave::{AnalysisReport, Criticality, FileAnalysis};
 use fletch::fetch::FetchRecord;
@@ -22,15 +22,16 @@ use super::render_context::{
     Fetched, Primary, ReportIndex, recategorize_annotations, render_dependency_context,
     render_interpret_context,
 };
-use super::retention::{ArchiveMemberStub, append_unanalyzed_members, apply_report_retention};
+use super::retention::{apply_report_retention, kept_members};
+use super::v8::{Inputs as UploadInputs, Listed, OwnReading, UploadDoc};
 use super::verdict::{
     apply_trait_floor, decision_outranks, graver, interpreted_level, softened_level, worst_member,
     worst_member_floor, worst_member_model,
 };
 use super::{
     ARCHIVE_DELIMITER, DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute,
-    MemberEvals, Reason, SCHEMA_VERSION, ScanResult, StoredReport, TopFinding, archive_leaf,
-    compact_crit, now_rfc3339,
+    MemberEvals, Reason, ScanResult, StoredReport, TopFinding, archive_leaf, compact_crit,
+    now_rfc3339,
 };
 use crate::explain::ShapImportance;
 use crate::features::{ExtractContext, ParsedReport, RawNeeds};
@@ -109,13 +110,18 @@ pub(crate) struct OutputNeeds {
     pub fetch_progress: bool,
     /// Build the rendered terminal/tiny context body.
     pub render_context: bool,
-    /// List never-analyzed archive members (`--show=all` JSON manifest).
-    pub list_all_members: bool,
     /// Capture and grade each fetched dependency's standalone report
     /// (`dependency_results`) for hopper renewal. Without this — or one of the
     /// render/LLM surfaces above — a scan drops them unread, so the capture
     /// and the per-dependency model pass are skipped entirely.
     pub deps_for_upload: bool,
+    /// Build the version 8 body a hopper renewal sends
+    /// ([`ScanResult::upload`]), and one for each dependency graded.
+    pub upload: bool,
+    /// Name every archive member, analyzed or not, in that body
+    /// (`--all-members`). Only the CLI's output writes them; an upload never
+    /// does.
+    pub all_members: bool,
 }
 
 /// Wall-clock of each post-analysis phase inside `classify_report`. Static
@@ -255,23 +261,42 @@ pub(crate) fn classify_report(
     // embedded pass, renders — consumed the complete report; what remains is
     // what gets stored (hopper bodies, JSON output). Sub-signal member nodes
     // are the bulk of that weight and nobody reads them again, so they are
-    // dropped here (see `apply_report_retention`). A `--show=all` manifest
-    // request is an explicit ask for the complete listing, so it opts out.
+    // dropped here (see `apply_report_retention`).
     let mut compact = prepared.compact;
-    if !needs.list_all_members {
-        apply_report_retention(&mut compact);
+    // The members the stored report and the upload keep, chosen from the
+    // complete report. Every member is already folded into the verdict.
+    let kept = kept_members(&compact, |id| {
+        scored.members.get(&u64::from(id)).map(|m| m.classification)
+    });
+    // The upload reads the complete report too: every member's reading is
+    // folded into its containers before retention drops any of them.
+    let mut upload = if needs.upload {
+        UploadDoc::new(&UploadInputs {
+            report: &compact,
+            root: scored.root,
+            root_mods: &scored.model_scores,
+            root_skip: &scored.skipped_models,
+            members: &scored.members,
+            kept: &kept,
+            every: needs.all_members,
+            listed: &prepared.listed,
+            records: &prepared.fetch.records,
+            level: req.model.active_level(),
+        })
+    } else {
+        None
+    };
+    if let (Some(doc), Some(Interpretation::Graded(graded))) = (&mut upload, &llm.interpretation) {
+        blend_upload(doc, req.model, graded);
     }
-    // Surface the archive members cleave catalogued but never analyzed, so a
-    // `--show=all` JSON manifest lists every file (path/type/size) — not just the
-    // ones that produced findings. Appended last, after featurization and the
-    // embedded-file pass, so the listing never feeds the model.
-    if !prepared.listed_members.is_empty() {
-        append_unanalyzed_members(&mut compact, &prepared.listed_members);
-    }
+    apply_report_retention(&mut compact, &kept);
     // The model has read every fact it featurizes from; what is stored keeps
     // only those, named by the report's `fp`.
     compact.retain_model_facts();
-    let cleave = StoredReport::new(&compact).context("serializing the cleave report")?;
+    let cleave = StoredReport::new(&compact);
+    if let Some(doc) = &mut upload {
+        doc.attach_reports(&compact);
+    }
     drop(compact);
 
     let phase = PhaseTimings {
@@ -283,7 +308,6 @@ pub(crate) fn classify_report(
     Ok(ClassifiedReport {
         phase,
         result: ScanResult {
-            v: SCHEMA_VERSION,
             classification: decision.class,
             dependency_attention: crate::fetch::dependency_attention(&prepared.fetch.records),
             probability: decision.probability,
@@ -315,6 +339,7 @@ pub(crate) fn classify_report(
             hopper_route: HopperRoute::Normal,
             model: scored.model,
             floor: scored.floor,
+            upload,
         },
     })
 }
@@ -331,8 +356,8 @@ struct Prepared {
     /// Per fetch edge, the length of the reference it cites — the span a
     /// dependency backref pins.
     ref_lengths: Vec<u64>,
-    /// `--show=all`: every archive member cleave listed, analyzed or not.
-    listed_members: Vec<ArchiveMemberStub>,
+    /// `--all-members`: every member cleave listed, analyzed or not.
+    listed: Vec<Listed>,
     fetch_time: Duration,
     /// Whether cleave replayed this analysis from its cache.
     analysis_cached: bool,
@@ -346,19 +371,16 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
     // analysis or replayed it from its cache is the difference between a
     // request that did the work and one that did not.
     let analysis_cached = report.cache_hit;
-    // Capture every archive member — including the ones cleave catalogues but
-    // never analyzes (docs, data files, images) — before `finalize()` clears
-    // `archive_contents`. With `--show=all` JSON output these are surfaced as
-    // listing-only entries so the manifest is complete.
-    let listed_members: Vec<ArchiveMemberStub> = if needs.list_all_members {
+    // Captured before `finalize()` clears `archive_contents`.
+    let listed: Vec<Listed> = if needs.all_members {
         report
             .archive_contents
             .iter()
-            .map(|e| ArchiveMemberStub {
+            .map(|e| Listed {
                 path: e.path.clone(),
                 file_type: e.file_type.clone(),
                 sha256: e.sha256.clone(),
-                size_bytes: e.size_bytes,
+                size: e.size_bytes,
             })
             .collect()
     } else {
@@ -465,7 +487,7 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
         own_shas,
         fetch,
         ref_lengths,
-        listed_members,
+        listed,
         fetch_time,
         analysis_cached,
     }
@@ -517,6 +539,8 @@ struct Scored {
     model: Decision,
     /// The gravest trait-floor firing anywhere; see [`ScanResult::floor`].
     floor: Option<FloorDecision>,
+    /// The root's own reading, before any member or dependency raised it.
+    root: OwnReading,
     members: MemberEvals,
     reasons: Vec<Reason>,
     model_scores: Vec<RouteScore>,
@@ -589,6 +613,11 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
         model.grid_max(),
         label,
     );
+    let root = OwnReading {
+        verdict: decision,
+        model: root_model,
+        floor: root_floor,
+    };
 
     // Every embedded file (depth > 0) is scored on its own and may elevate the
     // parent. A count cap here would make the result depend on archive ordering
@@ -654,6 +683,7 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
         decision,
         model: model_decision,
         floor,
+        root,
         members,
         reasons,
         model_scores,
@@ -778,26 +808,54 @@ fn grade_dependencies(
     dependencies
         .into_iter()
         .map(|dep| {
-            let (verdict, members, report) = match serde_json::from_str::<CompactReport>(&dep.raw) {
+            let (graded, upload) = match serde_json::from_str::<CompactReport>(&dep.raw) {
                 Ok(mut report) => {
                     let graded = classify_dependency(&report, &dep.locator, req)?;
+                    let kept = kept_members(&report, |id| {
+                        graded
+                            .as_ref()
+                            .and_then(|g| g.members.get(&u64::from(id)))
+                            .map(|m| m.classification)
+                    });
+                    // Its own upload, read like the root's: from the complete
+                    // report, before retention.
+                    let mut upload = graded
+                        .as_ref()
+                        .filter(|_| req.needs.upload)
+                        .and_then(|g| {
+                            UploadDoc::new(&UploadInputs {
+                                report: &report,
+                                root: g.root,
+                                root_mods: &g.mods,
+                                root_skip: &g.skip,
+                                members: &g.members,
+                                kept: &kept,
+                                every: false,
+                                listed: &[],
+                                records: &[],
+                                level: req.model.active_level(),
+                            })
+                        });
                     // Same retention rubric as the root report: grading consumed
                     // the complete report; the stored body keeps only the nodes
                     // and facts someone will read again.
-                    apply_report_retention(&mut report);
+                    apply_report_retention(&mut report, &kept);
                     report.retain_model_facts();
-                    let report = StoredReport::new(&report)
-                        .with_context(|| format!("serializing report of {}", dep.locator))?;
-                    let (verdict, members) = graded.unzip();
-                    (verdict, members.unwrap_or_default(), Some(report))
+                    if let Some(doc) = &mut upload {
+                        doc.attach_reports(&report);
+                    }
+                    (graded, upload)
                 }
                 Err(error) => {
                     // No verdict rather than an invented one; its bytes and
                     // provenance still go to hopper, which can analyze them.
                     tracing::warn!(locator = %dep.locator, %error, "dependency report does not parse; not graded");
-                    (None, MemberEvals::new(), None)
+                    (None, None)
                 }
             };
+            let (verdict, members) = graded.map_or((None, MemberEvals::new()), |g| {
+                (Some(g.decision), g.members)
+            });
             Ok(DepResult {
                 verdict,
                 members,
@@ -808,10 +866,22 @@ fn grade_dependencies(
                 locator: dep.locator,
                 url: dep.url,
                 size: dep.size,
-                report,
+                upload,
             })
         })
         .collect()
+}
+
+/// A fetched dependency graded on its own report.
+struct DependencyGrade {
+    /// Its verdict: its own reading, elevated by its worst member.
+    decision: Decision,
+    /// Its own reading, before its members.
+    root: OwnReading,
+    /// Its route scores and skipped routes.
+    mods: Vec<RouteScore>,
+    skip: Vec<SkippedRoute>,
+    members: MemberEvals,
 }
 
 /// Grade a fetched dependency on its own standalone report: the container's own
@@ -829,7 +899,7 @@ fn classify_dependency(
     report: &CompactReport,
     label: &str,
     req: &ClassifyRequest<'_>,
-) -> Result<Option<(Decision, MemberEvals)>> {
+) -> Result<Option<DependencyGrade>> {
     let model = req.model;
     let ctx = model.ctx();
     let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
@@ -853,24 +923,31 @@ fn classify_dependency(
         .files
         .first()
         .map_or("unknown", |f| f.file_type.as_str());
-    let mut decision = match model.predict_for_report_detailed(file_type, &features, &parsed) {
-        Ok((decision, _, _)) => decision,
-        Err(error) => {
-            tracing::warn!(
-                dependency = label,
-                error = format!("{error:#}"),
-                "dependency not graded"
-            );
-            return Ok(None);
-        }
-    };
-    apply_trait_floor(
+    let (mut decision, mods, skip) =
+        match model.predict_for_report_detailed(file_type, &features, &parsed) {
+            Ok(scored) => scored,
+            Err(error) => {
+                tracing::warn!(
+                    dependency = label,
+                    error = format!("{error:#}"),
+                    "dependency not graded"
+                );
+                return Ok(None);
+            }
+        };
+    let model_reading = decision;
+    let floor = apply_trait_floor(
         &mut decision,
         root_findings(report),
         model.active_level(),
         model.grid_max(),
         label,
     );
+    let root = OwnReading {
+        verdict: decision,
+        model: model_reading,
+        floor,
+    };
 
     // Every member elevates the dependency as it would in a first-hand scan.
     let entries: Vec<&CompactFile> = embedded_entries(report).collect();
@@ -889,7 +966,13 @@ fn classify_dependency(
         .values()
         .map(EmbeddedFile::decision)
         .fold(decision, graver);
-    Ok(Some((decision, members)))
+    Ok(Some(DependencyGrade {
+        decision,
+        root,
+        mods,
+        skip,
+        members,
+    }))
 }
 
 /// Every analyzed embedded node receives an individual model verdict.
@@ -1155,9 +1238,8 @@ pub(super) fn root_findings(report: &CompactReport) -> &[CompactTrait] {
     report.files.first().map_or(&[], |f| &f.findings)
 }
 
-/// Fold an LLM interpretation into the verdict: the three ways a second
-/// opinion may move class, probability and level. Shared by the inline
-/// path in `classify_report` and the deferred one in
+/// Fold an LLM interpretation into the verdict, logging how it moved. Shared
+/// by the inline path in `classify_report` and the deferred one in
 /// [`apply_pending_interpretation`], so both land on the same answer.
 fn blend_interpretation(
     label: &str,
@@ -1167,6 +1249,73 @@ fn blend_interpretation(
     probability: &mut f32,
     lvl: &mut Level,
 ) {
+    // INFO, not WARN: an LLM override of the ML verdict is normal operation,
+    // not a fault. (It also kept surfacing as the last stderr line a caller
+    // grabbed when a slow run was externally killed, making a benign shift look
+    // like a crash cause.)
+    match blend(model, graded, class, probability, lvl) {
+        Some(Blend::Shifted { from }) => tracing::info!(
+            path = %label,
+            ml = ?from,
+            outcome = ?graded.outcome,
+            grade = graded.grade.as_str(),
+            conf = format!("{:.4}", graded.blended),
+            reason = %graded.interpretation,
+            "LLM interpretation shifted the verdict",
+        ),
+        Some(Blend::Held { to }) => tracing::info!(
+            path = %label,
+            from = 0,
+            to = %to,
+            reason = %graded.interpretation,
+            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
+        ),
+        Some(Blend::Deepened { from, to }) => tracing::info!(
+            path = %label,
+            from,
+            to,
+            "both detectors agree hostile — verdict moved deeper into the band",
+        ),
+        None => {}
+    }
+}
+
+/// The same blend on the verdict an upload carries, which leaves dependencies
+/// out and so can differ from the one the terminal shows. Not logged again:
+/// [`blend_interpretation`] has already said what the opinion was.
+fn blend_upload(doc: &mut UploadDoc, model: &Model, graded: &Graded) {
+    doc.blend(|d| {
+        blend(
+            model,
+            graded,
+            &mut d.class,
+            &mut d.probability,
+            &mut d.level,
+        )
+        .is_some()
+    });
+}
+
+/// How an LLM opinion moved a verdict.
+#[derive(Debug, Clone, Copy)]
+enum Blend {
+    /// It changed the class, which was `from`.
+    Shifted { from: Classification },
+    /// It cleared an L0 hostile, which stays hostile on rung `to`.
+    Held { to: Level },
+    /// It agreed hostile, which moved the verdict deeper into the band.
+    Deepened { from: u16, to: u16 },
+}
+
+/// The three ways a second opinion may move class, probability and level.
+/// `None` when it moves nothing.
+fn blend(
+    model: &Model,
+    graded: &Graded,
+    class: &mut Classification,
+    probability: &mut f32,
+    lvl: &mut Level,
+) -> Option<Blend> {
     // Adopt the blended verdict as the effective one when the LLM out-read ML
     // (escalating a missed threat, or clearing an ML false positive). The `ml`
     // section reflects scan's final answer; the LLM's raw grade + rationale
@@ -1174,26 +1323,11 @@ fn blend_interpretation(
     // band's loosest rung (see `interpreted_level`): the active hostile level for
     // an escalation, the suspicious ceiling for a hold/downgrade, clean for benign.
     if graded.outcome != *class {
-        // INFO, not WARN: an LLM override of the ML verdict is normal operation,
-        // not a fault. (It also kept surfacing as the last stderr line a caller
-        // grabbed when a slow run was externally killed, making a benign shift look
-        // like a crash cause.)
-        tracing::info!(
-            path = %label,
-            ml = ?*class,
-            outcome = ?graded.outcome,
-            grade = graded.grade.as_str(),
-            conf = format!("{:.4}", graded.blended),
-            reason = %graded.interpretation,
-            "LLM interpretation shifted the verdict",
-        );
-        let ml_class = *class;
+        let from = *class;
         let ml_level = *lvl;
         *class = graded.outcome;
         *probability = graded.blended;
-        *lvl = if ml_class == Classification::Hostile
-            && graded.outcome == Classification::Suspicious
-        {
+        *lvl = if from == Classification::Hostile && graded.outcome == Classification::Suspicious {
             // A cleared hostile is placed by how deep ML fired, not pinned to the
             // band's edge: the level ML reached is the budget for how far one
             // contrary opinion may move it.
@@ -1206,7 +1340,9 @@ fn blend_interpretation(
                 graded.corroborated,
             )
         };
-    } else if graded.grade == LlmGrade::Benign
+        return Some(Blend::Shifted { from });
+    }
+    if graded.grade == LlmGrade::Benign
         && graded.may_soften
         && *class == Classification::Hostile
         && *lvl == Level::At(0)
@@ -1215,16 +1351,11 @@ fn blend_interpretation(
         // one contrary opinion, and that stands — but the disagreement is still
         // evidence, so the verdict gives up the depth it cannot justify and sits
         // on the weakest hostile rung instead. Still blocked, still reviewed.
-        let weakened = model.active_level().map_or(Level::Manual, Level::At);
-        tracing::info!(
-            path = %label,
-            from = 0,
-            to = %weakened,
-            reason = %graded.interpretation,
-            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
-        );
-        *lvl = weakened;
-    } else if graded.grade == LlmGrade::Hostile
+        let to = model.active_level().map_or(Level::Manual, Level::At);
+        *lvl = to;
+        return Some(Blend::Held { to });
+    }
+    if graded.grade == LlmGrade::Hostile
         && *class == Classification::Hostile
         && let Level::At(level) = *lvl
         && level > 0
@@ -1241,15 +1372,11 @@ fn blend_interpretation(
         // swept level it does overwrite measured data, and a
         // stricter deploy than this one will read the halved value as hostile
         // where the sweep alone would have said suspicious.
-        let strengthened = level / 2;
-        tracing::info!(
-            path = %label,
-            from = level,
-            to = strengthened,
-            "both detectors agree hostile — verdict moved deeper into the band",
-        );
-        *lvl = Level::At(strengthened);
+        let to = level / 2;
+        *lvl = Level::At(to);
+        return Some(Blend::Deepened { from: level, to });
     }
+    None
 }
 
 /// The INFO line for a graded second opinion, inline or deferred.
@@ -1326,6 +1453,9 @@ pub fn apply_pending_interpretation(
             &mut result.probability,
             &mut result.level,
         );
+        if let Some(doc) = &mut result.upload {
+            blend_upload(doc, model, graded);
+        }
     }
     result.interpretation = Some(interp);
     true

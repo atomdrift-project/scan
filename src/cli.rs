@@ -324,6 +324,12 @@ pub struct GlobalArgs {
     #[arg(long, global = true, hide = true)]
     pub extra: bool,
 
+    /// With `--format json-full`: give every archive member a line, analyzed
+    /// or not, rather than only the members an upload keeps. For tools that
+    /// measure coverage; what is sent to hopper does not change.
+    #[arg(long, global = true, hide = true)]
+    pub all_members: bool,
+
     /// Enable additional LLM interpretation of analyzed samples: a second
     /// opinion blended with the ML verdict (stored in the `llm` JSON section
     /// and shown inline). Given with no value, uses a local model (an

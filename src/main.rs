@@ -410,7 +410,7 @@ enum Commands {
         paths: Vec<PathBuf>,
 
         /// Renew each result on a hopper instance by POSTing its envelope to
-        /// `<URL>/api/result`. A sample hopper has not seen is uploaded first,
+        /// `<URL>/v1/work/result`. A sample hopper has not seen is uploaded first,
         /// bytes and provenance, so it lands as its own record. Upload failures
         /// are reported as errors, but never make the scan fatal. Also settable
         /// via the `SCAN_HOPPER` env var. Authenticates with `~/.tok/hopper`;
@@ -553,7 +553,7 @@ struct ServeArgs {
     /// The hopper this server reads from and files to.
     ///
     /// Every analyzed result (parent and members) is renewed by POSTing to
-    /// `<URL>/api/result` as analyses complete, and a lookup this server's
+    /// `<URL>/v1/work/result` as analyses complete, and a lookup this server's
     /// own index cannot answer is deferred to the same place.
     ///
     /// Several addresses may be given, comma-separated, in preference order:
@@ -927,14 +927,15 @@ fn scan_config(
     // resolving triggers the auto-clone.
     let model_dir = scan::cli::resolve_model_dir(None)?;
     let level = scan::cli::operating_level(global.level, false, &model_dir);
-    Ok(scan::ScanConfig::new(model_dir, global.format, None)?
+    scan::ScanConfig::new(model_dir, global.format, None)?
         .with_filter(global.display_filter())
         .with_extra(global.extra)
         .with_level(level)
         .with_interpret(interpret)
         .with_fetch(fetch)
         .with_zip_passwords(global.zip_passwords.clone())
-        .with_hopper(resolve_hopper(hopper)))
+        .with_hopper(resolve_hopper(hopper))
+        .with_all_members(global.all_members)
 }
 
 /// `atomscan path`: scan files and directories.

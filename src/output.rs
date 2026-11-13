@@ -21,6 +21,11 @@ impl OutputFormat {
     pub(crate) const fn emits_every_result(self) -> bool {
         !matches!(self, Self::Terminal)
     }
+
+    /// Whether this is one of the JSON formats.
+    pub(crate) const fn is_json(self) -> bool {
+        matches!(self, Self::Json | Self::JsonFull)
+    }
 }
 
 /// Return to column 0 and erase the line: how the progress bar, the spinner
@@ -1100,27 +1105,24 @@ impl BloomMark {
     }
 }
 
-/// Report a bloom decision as a real result, not a debug line: a JSON record on
-/// the output stream in `--format json`, a themed one-liner on stderr otherwise.
+/// Report a bloom decision as a real result, not a debug line: a decision on
+/// the output stream in either JSON format, a themed one-liner on stderr
+/// otherwise.
 pub(crate) fn print_bloom_verdict(
     label: &str,
     verdict: BloomVerdict,
     format: OutputFormat,
 ) -> std::io::Result<()> {
-    if matches!(format, OutputFormat::Json) {
-        return writeln!(
-            std::io::stdout().lock(),
-            "{}",
-            serde_json::json!({
-                "path": label,
-                "source": "bloom",
-                "verdict": match verdict {
-                    BloomVerdict::KnownGood => "known-good",
-                    BloomVerdict::Unscanned => "unscanned",
-                },
-                "scanned": false,
-            })
+    // Both JSON formats: a file with no analysis has no full result, only
+    // its decision.
+    if format.is_json() {
+        let decision = crate::server::decision::V1Decision::filtered(
+            label,
+            matches!(verdict, BloomVerdict::KnownGood),
         );
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer(&mut out, &decision)?;
+        return out.write_all(b"\n");
     }
 
     let p = palette();
@@ -1148,10 +1150,10 @@ pub(crate) fn print_bloom_verdict(
 /// Write one artifact Atomdrift Uplink judged (`--uplink`), in place of a local
 /// result.
 ///
-/// JSON gets a record shaped like the bloom one — `"source": "remote"` says
-/// whose verdict it is — carrying what the service said: the level, the digest
-/// it describes, when and by what it was analyzed, and every finding it
-/// reported. Every other format gets one line, naming its first finding.
+/// Either JSON format gets a decision, as for an analysis, carrying what the
+/// service said: the level, the digest it describes, when and by what it was
+/// analyzed, and its strongest findings. Every other format gets one line,
+/// naming its first finding.
 ///
 /// # Errors
 /// Writing to `out` failed.
@@ -1164,33 +1166,15 @@ pub(crate) fn write_remote_verdict(
     class: Classification,
     format: OutputFormat,
 ) -> std::io::Result<()> {
-    let name = class.to_string();
-    if matches!(format, OutputFormat::Json) {
-        let findings: Vec<_> = verdict
-            .findings
-            .iter()
-            .map(|f| {
-                let desc = f.desc.as_deref().unwrap_or_default();
-                serde_json::json!({ "id": f.id, "crit": f.crit, "desc": desc })
-            })
-            .collect();
-        let mut record = serde_json::json!({
-            "path": label,
-            "source": "remote",
-            "verdict": name,
-            "sha256": sha256,
-            "fires_at": verdict.fires_at,
-            "analyzed_at": verdict.analyzed_at,
-            "engine_version": verdict.engine_version,
-            "findings": findings,
-        });
-        if let Some(purl) = purl {
-            record["purl"] = serde_json::Value::from(purl);
-        }
-        serde_json::to_writer(&mut *out, &record)?;
+    // Both JSON formats: a file with no analysis has no full result, only
+    // its decision.
+    if format.is_json() {
+        let decision =
+            crate::server::decision::V1Decision::adopted(label, sha256, purl, verdict, class);
+        serde_json::to_writer(&mut *out, &decision)?;
         return out.write_all(b"\n");
     }
-
+    let name = class.to_string();
     let p = palette();
     let (icon, color) = match class {
         Classification::Hostile => ("\u{2717}", p.hostile),

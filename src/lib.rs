@@ -208,8 +208,13 @@ pub enum OutputFormat {
     /// Human-readable terminal output.
     #[default]
     Terminal,
-    /// Newline-delimited JSON, one object per file.
+    /// Newline-delimited JSON, one decision per file: the shape `/v1/analyze`
+    /// answers with.
     Json,
+    /// The full result per file, exactly as it is uploaded to hopper: version
+    /// 8 JSON lines, a header, one line per file and one per report.
+    #[value(name = "json-full")]
+    JsonFull,
     /// Compact, context-centric text for feeding a local LLM: a scan verdict
     /// line (gate, confidence, matched FP level) followed by cleave's annotated
     /// context. See `crate::engine::write_tiny`.

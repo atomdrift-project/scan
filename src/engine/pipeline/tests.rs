@@ -1,17 +1,15 @@
-use super::super::dep_envelope;
 use super::*;
 use cleave::types::Role;
 
 /// Grade `raw` as `classify_report` grades a fetched dependency.
 fn grade(raw: &str, label: &str, model: &Model) -> Option<(Decision, MemberEvals)> {
+    grade_fully(raw, label, model).map(|g| (g.decision, g.members))
+}
+
+fn grade_fully(raw: &str, label: &str, model: &Model) -> Option<DependencyGrade> {
     let report: CompactReport = serde_json::from_str(raw).expect("dependency report parses");
     let req = ClassifyRequest::new(label, std::path::Path::new(label), model);
     classify_dependency(&report, label, &req).expect("not cancelled")
-}
-
-/// Store `raw` the way `classify_report` stores a report.
-fn stored(raw: &str) -> StoredReport {
-    StoredReport::new(&serde_json::from_str(raw).expect("report parses")).expect("serializes")
 }
 
 /// The former production cutoff. Tests deliberately put evidence beyond it
@@ -166,8 +164,8 @@ fn declines_to_grade_an_unparseable_report() {
         "an unparseable report must yield no verdict",
     );
     assert!(
-        graded[0].report.is_none(),
-        "an unparseable report has no stored form"
+        graded[0].upload.is_none(),
+        "an unparseable report has nothing to upload"
     );
 }
 
@@ -222,18 +220,12 @@ fn severe_members_do_not_rank_below_clean_ones() {
 }
 
 /// The acceptance test for the whole dependency path: what hopper stores for
-/// a fetched dependency must be the same *shape* as what it stores when the
-/// same bytes are scanned directly with `scan purl`. Anything a first-hand
-/// scan fills and the dependency path leaves empty is a field hopper, the
-/// bloom pool, and prism silently lose for every dependency.
-///
-/// Shape, not values: the two paths legitimately differ in what they measure
-/// (a dependency borrows the parent run's model version and timestamp, and
-/// carries no LLM interpretation — the interpret pass runs on the root only).
-/// Those are asserted as *known* differences, so adding a new one has to be
-/// deliberate rather than accidental.
+/// a fetched dependency must be what it stores when the same bytes are
+/// scanned directly. Every member reaches hopper with its own verdict: the
+/// regression this guards is a dependency whose members were all stored
+/// ungraded, because its result was built with an empty evaluation table.
 #[test]
-fn dependency_envelope_matches_a_direct_scan() {
+fn dependency_upload_grades_every_member() {
     let Some(dir) = model_bundle() else {
         eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
         return;
@@ -244,77 +236,54 @@ fn dependency_envelope_matches_a_direct_scan() {
         3,
         r#"[{"id":"objectives/command-and-control/backdoor::a","crit":5,"conf":1.0}]"#,
     );
-    let (verdict, members) = grade(&raw, "pkg:npm/evil@1.0.0", &model).expect("dependency grades");
-
-    let dep = DepResult {
-        sha256: "d".repeat(64),
-        locator: "pkg:npm/evil@1.0.0".to_string(),
-        url: "https://reg.test/evil-1.0.0.tgz".to_string(),
-        size: 1234,
-        provenance: None,
-        verdict: Some(verdict),
-        members,
-        report: Some(stored(&raw)),
+    let graded = grade_fully(&raw, "pkg:npm/evil@1.0.0", &model).expect("dependency grades");
+    let report: CompactReport = serde_json::from_str(&raw).unwrap();
+    let kept = kept_members(&report, |id| {
+        graded.members.get(&u64::from(id)).map(|m| m.classification)
+    });
+    let mut doc = UploadDoc::new(&UploadInputs {
+        report: &report,
+        root: graded.root,
+        root_mods: &graded.mods,
+        root_skip: &graded.skip,
+        members: &graded.members,
+        kept: &kept,
+        every: false,
+        listed: &[],
+        records: &[],
+        level: model.active_level(),
+    })
+    .expect("a dependency with files yields a document");
+    doc.attach_reports(&report);
+    let stamp = super::super::UploadStamp {
+        at: "2026-06-28T00:00:00Z",
+        model: "model-9",
+        worker: None,
+        ms: None,
     };
-    let dep_env = dep_envelope(&dep, "model-9", "2026-06-28T00:00:00Z")
-        .expect("a graded dependency yields an envelope");
-
-    // The same bytes as a first-hand scan would produce them.
-    let direct = ScanResult {
-        v: SCHEMA_VERSION,
-        classification: verdict.class,
-        probability: verdict.probability,
-        threshold: verdict.threshold,
-        level: verdict.level,
-        version: "model-9".to_string(),
-        analyzed_at: "2026-06-28T00:00:00Z".to_string(),
-        cleave: Some(stored(&raw)),
-        embedded_files: dep.members,
-        ..super::super::envelope::tests::base_result()
-    };
-    let direct_env = direct.to_envelope();
-
+    let body = doc.encode(&"d".repeat(64), None, &stamp).expect("encodes");
+    let lines: Vec<serde_json::Value> = body
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["files"], 4, "the dependency and its three members");
+    for file in &lines[1..=4] {
+        assert!(file["verdict"].is_object(), "every file is graded: {file}");
+        assert!(
+            file["ml"].is_object(),
+            "every file carries the model's reading: {file}"
+        );
+        assert!(
+            file.get("llm").is_none(),
+            "dependencies carry no interpretation"
+        );
+    }
     assert_eq!(
-        dep_env.ml.level, direct_env.ml.level,
-        "verdict marker must match a direct scan",
+        lines[1]["verdict"]["class"],
+        graded.decision.class.to_string(),
+        "the dependency's line carries the verdict scan computed for it",
     );
-    assert_eq!(
-        dep_env.ml.probability, direct_env.ml.probability,
-        "probability must match a direct scan",
-    );
-    assert_eq!(
-        dep_env.ml.conf, direct_env.ml.conf,
-        "confidence must match a direct scan",
-    );
-    assert_eq!(
-        serde_json::to_value(&dep_env.raw).unwrap(),
-        serde_json::to_value(&direct_env.raw).unwrap(),
-        "the stored report must be the dependency's own, unmodified",
-    );
-
-    // The regression this test exists for: ml.files carried no verdicts for a
-    // dependency's members, because the envelope was built with an empty eval
-    // table. hopper mirrors these into each member's own sample row, so every
-    // member of every dependency was stored ungraded.
-    assert_eq!(
-        dep_env.ml.files, direct_env.ml.files,
-        "per-member verdicts must match a direct scan",
-    );
-    assert!(
-        dep_env.ml.files.iter().any(|f| f.verdict.is_some()),
-        "at least one member must carry a verdict: {:?}",
-        dep_env.ml.files,
-    );
-
-    // Known, deliberate differences. A dependency borrows the parent run's
-    // identity because it was graded by that run, and the interpret pass runs
-    // on the root only.
-    assert!(
-        dep_env.llm.is_none(),
-        "dependencies carry no interpretation"
-    );
-    assert_eq!(dep_env.ml.version, direct_env.ml.version);
-    assert_eq!(dep_env.ml.analyzed_at, direct_env.ml.analyzed_at);
 }
 
 /// Selection itself is exhaustive and order-independent. This pure test does

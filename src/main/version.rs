@@ -9,7 +9,10 @@ use std::path::Path;
 pub(super) fn print(format: scan::OutputFormat) -> std::io::Result<()> {
     let bloom = scan::bloom_repo::installed_manifest();
     let nsrl = scan::nsrl_repo::installed_manifest();
-    if format == scan::OutputFormat::Json {
+    if matches!(
+        format,
+        scan::OutputFormat::Json | scan::OutputFormat::JsonFull
+    ) {
         let version = json(bloom.as_ref(), nsrl.as_ref());
         return writeln!(std::io::stdout(), "{version}");
     }

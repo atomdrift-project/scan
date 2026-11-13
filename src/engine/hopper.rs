@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use fletch::fetch::FetchRecord;
 
-use super::{DepResult, HopperRoute, ScanResult, ScanResultEnvelope, now_rfc3339};
+use super::{HopperRoute, ScanResult, now_rfc3339};
 use crate::provenance::{RegistryProvenance, Upload};
 use crate::upload::{ArtifactBytes, UploadArtifact, Uploader};
 
@@ -45,18 +45,11 @@ pub fn upload_collector() -> &'static str {
 /// artifacts are queued before the result so a never-seen top-level file's row
 /// exists before its verdict lands. Blocking (reads sidecars from disk); callers
 /// on an async runtime must run it off the executor.
-fn upload_scan_result(
-    uploader: &Uploader,
-    origin: Origin<'_>,
-    sha256: String,
-    size_bytes: u64,
-    dependency_results: Vec<DepResult>,
-    envelope: ScanResultEnvelope,
-) {
+fn upload_scan_result(uploader: &Uploader, origin: Origin<'_>, mut result: ScanResult) {
     uploader.submit_artifacts(collect_upload_artifacts(
         origin.path,
-        &sha256,
-        size_bytes,
+        &result.sha256,
+        result.size_bytes,
         upload_collector(),
         origin.registry,
         origin.fetch,
@@ -64,17 +57,15 @@ fn upload_scan_result(
     // Each fetched dependency, mirrored into hopper as its own sample: bytes (only
     // if missing) + provenance + the verdict scan computed for it. Queued before
     // the root verdict so a dependency's row exists before its own verdict lands.
+    let dependency_results = std::mem::take(&mut result.dependency_results);
     if !dependency_results.is_empty() {
-        uploader.submit_dependencies(
-            dependency_results,
-            &envelope.ml.version,
-            &envelope.ml.analyzed_at,
-        );
+        uploader.submit_dependencies(dependency_results, &result.version, &result.analyzed_at);
     }
     // `scan purl` names a package outright and a registry URL still identifies
     // one; a local path or an arbitrary URL identifies nothing, and the
     // uploader names those by digest alone.
-    uploader.submit(sha256, artifact_purl(origin.fetch), envelope);
+    let sha256 = std::mem::take(&mut result.sha256);
+    uploader.submit(sha256, artifact_purl(origin.fetch), &result);
 }
 
 /// Renew a CLI result on hopper, routed by [`HopperRoute`] exactly as the
@@ -85,31 +76,15 @@ pub(super) fn renew(
     hopper_url: &str,
     origin: Origin<'_>,
     fallback_purl: Option<&str>,
-    mut result: ScanResult,
+    result: ScanResult,
 ) {
     let route = fallback_purl.map_or(HopperRoute::Normal, |purl| {
         registry_fallback_route(uploader, hopper_url, purl, origin)
     });
     match route {
-        HopperRoute::Normal => {
-            let sha256 = std::mem::take(&mut result.sha256);
-            let size = result.size_bytes;
-            let dependencies = std::mem::take(&mut result.dependency_results);
-            upload_scan_result(
-                uploader,
-                origin,
-                sha256,
-                size,
-                dependencies,
-                result.into_envelope(),
-            );
-        }
+        HopperRoute::Normal => upload_scan_result(uploader, origin, result),
         HopperRoute::Redirect(sha256) => {
-            uploader.submit(
-                sha256,
-                fallback_purl.map(str::to_string),
-                result.into_envelope(),
-            );
+            uploader.submit(sha256, fallback_purl.map(str::to_string), &result);
         }
         HopperRoute::Suppress => {}
     }

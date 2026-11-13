@@ -1,46 +1,28 @@
 //! A stalled Hopper must not park analysis, lose uploads, or reorder a
 //! verdict ahead of its artifact. No model bundle or external server required.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
-use scan::engine::{MlSection, ScanResultEnvelope};
-use scan::model::Level;
-use scan::upload::{ArtifactBytes, UploadArtifact, Uploader};
+use crate::upload::{ArtifactBytes, UploadArtifact, Uploader};
 
 const SAMPLES: usize = 40;
 const DEADLINE: Duration = Duration::from_secs(20);
 
-fn envelope() -> ScanResultEnvelope {
-    ScanResultEnvelope {
-        ml: MlSection {
-            v: "7",
-            probability: 0.0,
-            level: Level::Clean,
-            conf: Some(100),
-            class: None,
-            model_scores: Vec::new(),
-            skipped_models: Vec::new(),
-            version: "fixture".into(),
-            eng: "fixture",
-            analyzed_at: "now".into(),
-            files: Vec::new(),
-            pids: None,
-            deleted: None,
-        },
-        llm: None,
-        raw: Arc::from(
-            serde_json::value::RawValue::from_string(
-                serde_json::json!({"files": [], "evidence": "preserve-me".repeat(4096)})
-                    .to_string(),
-            )
-            .unwrap(),
-        ),
-    }
+/// A benign result for the artifact `sha`, whose report carries a finding
+/// large enough that losing or truncating it would show.
+fn result(sha: &str) -> crate::engine::ScanResult {
+    let report = serde_json::from_value(serde_json::json!({
+        "rev": "r1",
+        "files": [{"id": 0, "path": "x.txt", "type": "text", "sha": sha, "size": 1,
+                   "traits": [{"id": "x::evidence", "crit": 2, "conf": 1.0,
+                               "desc": "preserve-me".repeat(4096)}]}]
+    }))
+    .unwrap();
+    crate::engine::fixture_result(sha, &report)
 }
 
 fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
@@ -113,12 +95,12 @@ fn slow_hopper_spools_overflow_then_flushes_every_verdict_in_order() {
                     .recv_timeout(DEADLINE * 2)
                     .expect("release stalled Hopper");
             }
-            let reply = if headers.starts_with("post /api/known ") {
+            let reply = if headers.starts_with("post /v1/intake/held ") {
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let sha = body["sha256"][0].as_str().expect("known sha").to_owned();
                 assert!(known.insert(sha.clone()), "duplicate artifact probe");
                 serde_json::json!({"known": []}).to_string()
-            } else if headers.starts_with("post /api/upload ") {
+            } else if headers.starts_with("post /v1/intake/upload ") {
                 let sha = format!("{:064x}", index / 3);
                 assert!(known.contains(&sha), "upload preceded probe");
                 let body = String::from_utf8(body).unwrap();
@@ -130,14 +112,19 @@ fn slow_hopper_spools_overflow_then_flushes_every_verdict_in_order() {
                 assert!(stored.insert(sha), "duplicate artifact upload");
                 "{}".to_owned()
             } else {
-                assert!(headers.starts_with("post /api/result "), "{headers}");
-                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let sha = body["sha256"].as_str().expect("result sha").to_owned();
+                assert!(headers.starts_with("post /v1/work/result "), "{headers}");
+                assert!(headers.contains("content-type: application/x-ndjson"));
+                let lines: Vec<serde_json::Value> = body
+                    .split(|&b| b == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice(line).unwrap())
+                    .collect();
+                let sha = lines[1]["sha256"].as_str().expect("result sha").to_owned();
                 assert!(stored.contains(&sha), "verdict preceded artifact upload");
                 assert!(renewed.insert(sha), "duplicate renewal");
-                assert_eq!(body["worker"], "backpressure-test");
-                assert_eq!(body["ml"]["lvl"], -1);
-                assert_eq!(body["raw"]["evidence"], "preserve-me".repeat(4096));
+                assert_eq!(lines[0]["scan"]["worker"], "backpressure-test");
+                assert_eq!(lines[1]["verdict"]["fires_at"], -1);
+                assert_eq!(lines[2]["traits"][0]["desc"], "preserve-me".repeat(4096));
                 "{}".to_owned()
             };
             write!(
@@ -170,7 +157,7 @@ fn slow_hopper_spools_overflow_then_flushes_every_verdict_in_order() {
                     backfill: false,
                 }])
                 .expect("stage and enqueue artifact");
-            uploader.submit(sha, None, envelope());
+            uploader.submit(sha.clone(), None, &result(&sha));
         }
         // The request-owned originals disappear before Hopper resumes. Both
         // resident and spooled jobs must retain their own staged bytes.

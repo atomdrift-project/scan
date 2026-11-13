@@ -1,64 +1,64 @@
-# Atomdrift Scan JSON Report
+# Atomdrift Scan JSON
 
-Every analysis the CLI writes uses the same envelope:
+The CLI writes JSON in two shapes, one record per scanned file:
 
-    {
-      "ml":  { ... curated classification ... },
-      "raw": { ... full cleave report ... }
-    }
+| Format | What each record is |
+| --- | --- |
+| `--format json` | a decision: the object `/v1/analyze` answers with |
+| `--format json-full` | the full result: the version 8 body scan uploads to hopper |
 
-`ml` is Atomdrift Scan. `raw` is the cleave [compact report](../../cleave/docs/JSON.md);
-the cleave repo owns its schema. Scan stores it with `facts` reduced to what
-the models read (named by `fp`), after the models have read the full set.
+The server answers the same two: `/v1/analyze` returns the decision, and
+`/v1/analyze?full=1` returns the full result.
 
-## Why the field names are short
+## `--format json`: the decision
 
-Field names inside `ml` are abbreviated on purpose. The envelope is
-designed to be stored — in object stores, in row-oriented databases,
-in append-only log streams — and replayed later. The cost of every
-field name is paid once per record, and there are a lot of records.
+One JSON object per line, per file, whatever the verdict:
 
-`prob` instead of `probability` saves seven bytes per record. `lvl`
-instead of spelling out the level/verdict is the same trade. `rte`,
-`why`, `skip`, `files` follow the same rule. Over a billion analyses the
-storage difference is not academic, and the names map cleanly to
-obvious things. The tables below are the key.
+```json
+{"decision":"block","purl":null,"path":"./pkg/evil.tgz","sha256":"ab12…","severity":"hostile",
+ "fires_at":12,"reason":null,"findings":[{"id":"objectives/c2/backdoor::a","crit":5,"file":"package/install.js"}],
+ "engine_version":"3.0.0","analyzed_at":"2026-11-12T15:00:00Z"}
+```
 
-## `ml` — `MlSection`
+| Field | Meaning |
+| --- | --- |
+| `decision` | `allow`, `block`, `unanalyzed` or `unavailable` |
+| `severity` | `benign`, `suspicious` or `hostile`; `null` when there is no verdict |
+| `fires_at` | the tightest false-positive level at which the file grades hostile (see below) |
+| `reason` | the LLM's one-sentence rationale, when it gave one |
+| `findings` | at most three findings at crit 4 or 5, worst first |
+| `sha256`, `purl` | what the file is |
+| `engine_version`, `analyzed_at` | which scan build produced it, and when |
 
-`src/engine/envelope.rs`.
+The fields are the server's ([SERVER_API.md](SERVER_API.md)), with those the
+CLI adds: `path`, the file it was asked about; `source`, what answered for a
+file the CLI did not analyze (`bloom` or `uplink`); and for `atomscan ps`,
+`pids` and `deleted`.
 
-| JSON          | Rust                      | Type                   | Meaning                                              |
-| ------------- | ------------------------- | ---------------------- | ---------------------------------------------------- |
-| `v`           | `v`                       | string                 | Envelope schema version. Currently `"7"`.            |
-| `prob`        | `probability`             | f32 in `[0, 1]`        | Probability the verdict was decided on.              |
-| `lvl`         | `level`                   | i32 or null            | Lowest-false-positive-level marker. See **The verdict encoding** below. |
-| `conf`        | `conf`                    | u8 percent or null     | Pessimistic display/export confidence derived from `lvl`; `null` when no level table applies. |
-| `cls`         | `class`                   | u8 (0/1/2), optional   | Class of record when `--llm` *placed* `lvl` rather than the sweep measuring it. Omitted otherwise. See **LLM-placed levels** below. |
-| `mods`        | `model_scores`            | array of `RouteScore`  | Per-route ensemble scores. Omitted if empty.         |
-| `skip`        | `skipped_models`          | array of `SkippedRoute`| Routes that were applicable but unused.              |
-| `version`     | `version`                 | string                 | Model version: spec, ABI, hash prefix.               |
-| `eng`         | `eng`                     | string                 | Scan engine build (`CARGO_PKG_VERSION`) that produced this report. |
-| `analyzed_at` | `analyzed_at`             | string (RFC 3339, UTC) | Completion timestamp.                                |
-| `files`       | `files`                   | array of file summaries| Per-file model summaries, including archive members. See **`ml.files[]` entry** below. |
-| `pids`        | `pids`                    | array of u32           | Running PIDs. Present only on process scans.         |
-| `deleted`     | `deleted`                 | bool                   | Whether the on-disk binary was deleted (process scan). |
+The CLI decides by the class it graded the file at, which follows its own
+`-l` exactly as the terminal does, so the JSON and the terminal agree. The
+server reaches the same answer from `fires_at` and the caller's
+`false_positive_budget`.
 
-## The verdict encoding
+Files the CLI did not analyze still get a line:
 
-The envelope carries no `threshold`, and no `class` except on an LLM-placed
-level (see **LLM-placed levels**). Instead it reports a
-single number — `lvl` — that is a **property of the file and the model,
-not of your deploy setting**:
+| Case | `decision` | `source` | `reason` |
+| --- | --- | --- | --- |
+| known good to the bloom filters | `allow`, severity `benign` | `bloom` | `known good` |
+| in neither filter set, fast mode | `unanalyzed` | `bloom` | why it was not analyzed |
+| taken from the corpus (`--uplink`) | the corpus verdict at the CLI's level | `uplink` | the corpus's |
+| analysis failed | `unavailable` | | the error |
 
-> `lvl` is the lowest pool-adjusted false-positive level at which the model
-> flags this file as hostile.
+A failed file still makes the process exit 3.
 
-Levels are defined in [INTEGRATION.md](INTEGRATION.md#set-the-false-positive-level).
+### `fires_at`
 
-A consumer reads it as:
+`fires_at` is a property of the file and the model, not of anyone's
+setting: the lowest pool-adjusted false-positive level at which the model
+flags the file as hostile. Levels are defined in
+[INTEGRATION.md](INTEGRATION.md#set-the-false-positive-level).
 
-- `lvl` in the calibrated grid (`0..=25000` today; consumers should
+- `fires_at` in the calibrated grid (`0..=25000` today; consumers should
   tolerate `50000`) → the lowest level at which the file fires. Lower
   means it fires under a stricter calibrated allowance: `lvl=2` fires at
   one FP plus an estimated additional 1/100M; `lvl=500` fires at one FP
@@ -72,228 +72,46 @@ A consumer reads it as:
 - `lvl == null` → a library caller supplied manual probability cutoffs, so
   no level table applies.
 
-`conf` is the same `lvl` rendered as a deliberately pessimistic integer
-percentage for humans and APIs that need a confidence-style field. It
-is not a posterior probability and it does not replace `prob`. The
-current anchors are:
+A file is **hostile** at level `N` when `fires_at <= N`, **suspicious** when
+`fires_at <= min(grid_max, max(500, 100 × N))`, and **benign** otherwise.
+`N` defaults to the model bundle's `default_severity_level` (`25` on current
+bundles), so the default suspicious ceiling is L2500.
 
-| `lvl` | `conf` |
-| --- | ------ |
-| `0` | `100` |
-| `1` | `99` |
-| `2` | `98` |
-| `3` | `97` |
-| `4` | `96` |
-| `5` | `95` |
-| `10` | `94` |
-| `20` | `93` |
-| `30` | `92` |
-| `40` | `91` |
-| `50` | `90` |
-| `60` | `89` |
-| `70` | `88` |
-| `80` | `87` |
-| `90` | `86` |
-| `100` | `85` |
-| `200` | `82` |
-| `300` | `80` |
-| `500` | `78` |
-| `1000` | `75` |
-| `2000` | `66` |
-| `5000` | `54` |
-| `7500` | `49` |
-| `10000` | `45` |
-| `15000` | `38` |
-| `20000` | `33` |
-| `25000` | `29` |
-| `25001` | `28` |
-| `25002` | `27` |
-| `50000` | `17` |
+## `--format json-full`: the full result
 
-Future `50001`/`50002` override markers are reserved as `16`/`15`.
-Intermediate non-grid levels round down to the next-lower confidence
-bucket.
+The body scan uploads to hopper, written to stdout: JSON lines, a header,
+one line per file, then one line per report. Several files scanned in one
+run write one body each, each starting with its header. The format is
+specified in `JSON_PLAN.md` at the repository root; in short:
 
-**`lvl` does not depend on `-l`.** It is computed by sweeping the full
-level grid regardless of the deploy level, so the entire `ml` envelope
-(including `prob` and `mods[]`) is byte-identical no matter what
-`-l` the caller used. That is deliberate: a result can be **cached once
-and shared across every deploy level**.
+- **Header:** `{"v":8,"scan":{"engine","ruleset","level","at"},"files":N}`.
+  An upload also names its `worker`, which hopper requires, and postdoc's
+  adds `ms`, how long the analysis took.
+- **File lines:** the scanned artifact first, then up to 256 of its members,
+  the gravest first, and the containers on the way to them. Each carries
+  `sha256`, `size`, `type`, its `verdict`, one object per juror (`ml`,
+  `floor`, and on the artifact `llm`), `ident` when the file claims an
+  identity, `contents` for a container, `refs` on the artifact, and `report`,
+  the sha256 of its report line.
+- **Report lines:** each file's cleave findings and facts, with nothing that
+  says where the file sat; a source in another file is cited by its sha256.
 
-### Deriving the verdict
+A file with no analysis has no full result: a bloom, Uplink or failed file
+gets its decision line instead, as in `--format json`. A reader tells the two
+apart by the header's `"v":8` against a decision's `decision` key.
 
-The hostile/suspicious/benign label is *not* stored — the consumer
-derives it from `lvl` and the active level `N`. `N` defaults to the model
-bundle's own `default_severity_level` (`25` on current bundles; see
-`DEFAULT_SEVERITY_LEVEL`):
-
-- **hostile** when `lvl <= N` (default: `lvl <= 25`),
-- **suspicious** when `lvl <= min(grid_max, max(500, 100 × N))` (default:
-  `lvl <= 2500`). The suspicious ceiling is 100× the hostile budget with a
-  floor of L500 (`suspicious_ceiling`, `SUSPICIOUS_CEILING_MULTIPLE`,
-  `SUSPICIOUS_CEILING_FLOOR`): `-l 0` reviews through L500, `-l 25` through
-  L2500, and `-l 250` or looser through the whole grid.
-- **benign** otherwise. Note a file with, say, `lvl = 5000` is benign
-  under the default caps yet still reports `lvl = 5000`. Raising `-l` widens
-  both lines: at `-l 50` that same envelope is suspicious, and at `-l 5000`
-  hostile.
-
-### LLM-placed levels
-
-With `--llm`, the blend can move a verdict the model did not reach — lift a
-model-clean file into suspicious, clear a hostile one into suspicious — and the
-moved verdict still travels as `lvl`. Such a level is *placed*, not measured,
-and the envelope says so with `cls`: present exactly when the blend changed
-`lvl` from what the model measured (`llm.before.lvl`), holding the class graded
-at the level the scan ran at.
-
-Placed suspicious levels are anchored to the default band so they decode the
-same everywhere: geometrically across `26..=2500` (uncorroborated L255,
-cleave-corroborated L81), then clamped into the writing deploy's own band. A
-placed hostile level is the writing deploy's `-l`. Readers at another level
-should prefer `cls` when present; readers of `lvl` alone still get suspicious
-for any placed-suspicious verdict whose writer's band overlaps the default's.
-
-The Atomdrift Scan CLI/server applies these caps internally to pick exit codes
-and terminal output; downstream consumers reading stored envelopes
-apply whichever caps they prefer.
-
-`prob` is the value the firing decision was made on — the firing
-route's probability for OR-rule policies, the blend's sigmoid output
-for learned-blend policies, or the elevating embedded file's
-probability when an archive member outranked its parent. It is raw
-model confidence, not a verdict; use `conf` for the level-derived
-confidence-style figure.
-
-Each `ml.files[]` entry carries its **own** `prob`, `lvl`, and `conf`: the
-root file (`dp=0`) repeats the envelope's, and every archive member
-reports the lowest firing level and derived confidence for that
-specific member.
-
-## `RouteScore`
-
-`src/model/verdict.rs`.
-
-| JSON    | Rust             | Type   | Meaning                                  |
-| ------- | ---------------- | ------ | ---------------------------------------- |
-| `rte`   | `model`          | string | Route name, e.g. `az`, `az/native`, `az/elf`. |
-| `prob`  | `probability`    | f32    | This route's probability — the value thresholds live in and the verdict is decided on. |
-| `raw`   | `raw`            | f32    | The route model's own score. Scan applies no transform, so it equals `prob`; kept on the wire for existing consumers. |
-| `cls`   | `classification` | u8     | This route's classification.             |
-
-## `SkippedRoute`
-
-`src/model/verdict.rs`.
-
-| JSON  | Rust     | Type   | Meaning                              |
-| ----- | -------- | ------ | ------------------------------------ |
-| `rte` | `model`  | string | Route name.                          |
-| `why` | `reason` | string | Why this route was not scored.       |
-
-## `ml.files[]` entry
-
-`src/engine/envelope.rs` (`ml_files`). One compact summary per analyzed
-file: the root file (`id = 0`), plus one per archive member when the
-input is an archive. Listing-only members — carried in the raw manifest
-for `--show=all` but never classified — are excluded here.
-
-| JSON   | Type              | Meaning                                                           |
-| ------ | ----------------- | ----------------------------------------------------------------- |
-| `id`   | u64               | File id, matching the entry's `id` in the raw cleave manifest.    |
-| `type` | string            | Detected file type (empty string if unknown).                     |
-| `prob` | f32               | Per-file model probability. The root repeats `ml.prob`.           |
-| `lvl`  | i32 or null       | Per-file lowest-firing-level marker (same encoding as `ml.lvl`).  |
-| `conf` | u8 percent or null| Per-file confidence derived from `lvl`.                           |
-
-Per-file findings, molecular formulae, and route breakdowns are **not**
-duplicated here — they live in the `raw` cleave report, whose schema the
-[cleave repo](../../cleave/docs/JSON.md) owns.
-
-## Errors
-
-Errors share a single shape regardless of status code:
-
-    { "error": "string", "detail": "optional chain" }
-
-The status code carries the category; see
-[SERVER_API.md#status-codes](SERVER_API.md#status-codes).
-
-## Records that are not analyses
-
-A file scan writes one line per artifact, and not every line is an analysis.
-Two kinds answer without one, and say so with `source`:
-
-- `"source": "bloom"` — the known-good/known-bad filters decided it
-  (`verdict`, `scanned`).
-- `"source": "remote"` — under `--uplink`, Atomdrift Uplink already held a verdict
-  for these bytes (or this package), and it stands in place of local analysis:
-
-```json
-{"path": "pkg:npm/left-pad@1.3.0", "source": "remote", "verdict": "benign",
- "sha256": "870c0fe1…", "fires_at": -1, "analyzed_at": "2026-10-10T23:13:19Z",
- "engine_version": null, "findings": [], "purl": "pkg:npm/left-pad@1.3.0"}
-```
-
-`verdict` is `hostile`, `suspicious`, or `benign`, graded from `fires_at` at
-this run's level exactly as a local verdict is; `findings` holds at most three
-(`id`, `crit`, `desc`). `--analyze=local` never produces one.
-
-## A complete example
-
-A hostile verdict produced at level 3:
-
-    {
-      "ml": {
-        "v": "7",
-        "prob": 0.998,
-        "lvl": 3,
-        "conf": 97,
-        "mods": [
-          { "rte": "az/native", "prob": 0.998, "raw": 0.94, "cls": 2 },
-          { "rte": "az",        "prob": 0.71,  "raw": 0.68, "cls": 1 }
-        ],
-        "skip": [
-          { "rte": "az/elf", "why": "wrong-format" }
-        ],
-        "version": "spec=4 abi=1 hash=8f3a91",
-        "eng": "2.2.0",
-        "analyzed_at": "2026-05-14T18:22:01Z",
-        "files": [
-          { "id": 0, "type": "elf", "prob": 0.998, "lvl": 3, "conf": 97 }
-        ]
-      },
-      "raw": { "...": "full cleave AnalysisReport" }
-    }
-
-A benign verdict (sentinel `lvl = -1`):
-
-    {
-      "ml": {
-        "v": "7",
-        "prob": 0.04,
-        "lvl": -1,
-        "conf": 0,
-        "version": "spec=4 abi=1 hash=8f3a91",
-        "eng": "2.2.0",
-        "analyzed_at": "2026-05-14T18:22:01Z",
-        "files": [
-          { "id": 0, "type": "elf", "prob": 0.04, "lvl": -1, "conf": 0 }
-        ]
-      },
-      "raw": { "...": "full cleave AnalysisReport" }
-    }
-
-The hostile envelope above fired because `prob` (0.998) crossed the
-level-3 hostile cutoff. The `az/native` specialist route drove the
-decision; the general `az` route alone would have been suspicious.
-
+`--all-members` (hidden, for coverage tools) gives every member cleave listed
+a line, analyzed or not, rather than the 256 an upload keeps: a member with no
+`verdict` was listed and not analyzed. It needs `--format json-full`, and it
+changes only what is written to stdout: an upload with `--hopper` is the same
+with or without it.
 
 ## Render saved reports locally
 
 **Experimental:** the `render` command and its candidate JSON formats may change.
 
 `atomscan render report.json --format interpret` reads a saved cleave report
-(or a scan envelope's `raw` report) and uses the live primary-context budget and
+(or the `raw` report of a JSON line saved by an older scan) and uses the live primary-context budget and
 annotation rewrite. It does not load models, analyze the original files, fetch
 references, or update rules. `--format tiny` and `terminal` render cleave's
 corresponding context views; they do not synthesize an ML verdict. Use `-` as
@@ -325,5 +143,4 @@ its analysis did.
 The initial interpretation replay supports artifacts and their archive members.
 Fetched subjects and registry sidecars additionally require saved dependency
 verdicts and registry provenance, which the compact report does not fully carry;
-those inputs are rejected rather than rendered with missing subjects. Existing
-scan JSON `raw` remains the compact storage representation.
+those inputs are rejected rather than rendered with missing subjects.

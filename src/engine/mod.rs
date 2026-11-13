@@ -23,20 +23,22 @@ mod render_cards;
 mod render_context;
 mod retention;
 mod run;
+mod v8;
 mod verdict;
 
-pub(crate) use self::envelope::empty_report;
 pub use self::envelope::{
-    DepResult, EmbeddedFile, HopperRoute, MemberEvals, MlSection, ScanResult, ScanResultEnvelope,
-    ScanResultEnvelopeRef, StoredFile, StoredReport, TopFinding,
+    DepResult, EmbeddedFile, HopperRoute, MemberEvals, ScanResult, StoredReport, TopFinding,
 };
 pub use self::pipeline::PendingLlm;
 pub(crate) use self::run::{Fetched, FetchedKind, report_remote, run_bytes, run_with};
 pub use self::run::{run, run_paths};
+pub use self::v8::Stamp as UploadStamp;
+#[cfg(test)]
+pub(crate) use self::v8::fixture_result;
+pub use self::v8::{Juror, OpinionError, Scanner, UploadDoc};
 pub(crate) use self::verdict::level_confidence;
 pub use self::verdict::{FloorArm, FloorDecision, synthesized_level};
 
-pub(crate) use self::envelope::dep_envelope;
 pub(crate) use self::hopper::artifact_filename;
 #[doc(hidden)]
 pub use self::hopper::{collect_upload_artifacts, registry_fallback_artifact, upload_collector};
@@ -52,8 +54,6 @@ pub(crate) use self::run::{
     DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, emit_result,
     scan_bytes, scan_file, tiny_opts_for,
 };
-
-use self::retention::UNANALYZED_MEMBER_RISK;
 
 /// Terminal display policy for scan verdicts and severe static findings.
 ///
@@ -99,14 +99,6 @@ impl DisplayFilter {
             Classification::Benign => self.benign,
         }
     }
-
-    /// Returns true when every classification is admitted (`--show=all`). This is
-    /// the cue to emit a complete archive manifest in JSON output — every member,
-    /// including the ones cleave never analyzed because they carry no findings.
-    #[must_use]
-    const fn is_all(self) -> bool {
-        self.hostile && self.suspicious && self.benign
-    }
 }
 
 impl Default for DisplayFilter {
@@ -137,6 +129,7 @@ pub struct ScanConfig {
     mode: crate::Mode,
     bloom: Option<Arc<Lookup>>,
     sidecars: bool,
+    all_members: bool,
 }
 
 pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords: &[String]) {
@@ -196,6 +189,7 @@ impl ScanConfig {
             mode: crate::Mode::Slow,
             bloom: None,
             sidecars: false,
+            all_members: false,
         })
     }
 
@@ -222,13 +216,33 @@ impl ScanConfig {
     }
 
     /// Upload (renew) each scan result on the hopper instance at `url` by POSTing
-    /// its envelope to `/api/result`. `None` (default) disables uploading. Used by
+    /// its envelope to `/v1/work/result`. `None` (default) disables uploading. Used by
     /// `scan path --hopper`; failures are reported as errors but never affect the
     /// scan's outcome.
     #[must_use]
     pub fn with_hopper(mut self, url: Option<String>) -> Self {
         self.hopper = url;
         self
+    }
+
+    /// Give every archive member a line in `--format json-full` output, not
+    /// only the ones an upload keeps (`--all-members`). An upload is the same
+    /// with or without it.
+    ///
+    /// # Errors
+    /// The format is not `json-full`.
+    pub fn with_all_members(mut self, all: bool) -> Result<Self> {
+        if all && self.format != OutputFormat::JsonFull {
+            anyhow::bail!("--all-members needs --format json-full");
+        }
+        self.all_members = all;
+        Ok(self)
+    }
+
+    /// Whether `--format json-full` output names every archive member.
+    #[must_use]
+    pub const fn all_members(&self) -> bool {
+        self.all_members
     }
 
     /// Add passwords to try when cleave encounters encrypted archives.
@@ -268,19 +282,18 @@ impl ScanConfig {
             // the machine formats stay clean (the edges ride along in the JSON
             // `fetched` array regardless).
             fetch_progress: format == OutputFormat::Terminal,
-            render_context: format != OutputFormat::Json,
-            // `--show=all` with JSON output: list every archive member, even
-            // the no-finding ones cleave skipped analyzing.
-            list_all_members: format == OutputFormat::Json && self.filter.is_all(),
+            render_context: !format.is_json(),
             deps_for_upload: self.upload_hopper().is_some(),
+            // The full JSON format is the upload body, written to stdout.
+            upload: self.upload_hopper().is_some() || format == OutputFormat::JsonFull,
+            all_members: self.all_members,
         }
     }
 
-    /// Whether results keep cleave's report: JSON output and hopper renewals
-    /// carry it (hopper stores it and explodes archive members); the terminal
-    /// never reads it.
+    /// Whether results keep cleave's report: JSON output reads its findings,
+    /// and a hopper renewal sends them; the terminal never reads it.
     pub(crate) fn keeps_report(&self) -> bool {
-        self.format == OutputFormat::Json || self.upload_hopper().is_some()
+        self.format.is_json() || self.upload_hopper().is_some()
     }
 
     /// Set the external-reference fetch policy: which kinds of reference
@@ -486,13 +499,20 @@ pub(crate) fn now_rfc3339() -> String {
     )
 }
 
+/// The analysis time a version 8 body is stamped with: `at`, or now when a
+/// result carries none, since hopper requires one.
+pub(crate) fn analyzed_at(at: &str) -> std::borrow::Cow<'_, str> {
+    if at.is_empty() {
+        std::borrow::Cow::Owned(now_rfc3339())
+    } else {
+        std::borrow::Cow::Borrowed(at)
+    }
+}
+
 /// This scan build, stamped into every `ml` envelope (`eng`) so a stored result
 /// records which engine produced it. Distinct from `version` (the ML model) and
 /// `raw.tv` (the traits-repo commit); together they pin the build behind a report.
 pub(crate) const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The `ml.v` envelope schema this build writes.
-pub(crate) const SCHEMA_VERSION: &str = "7";
 
 /// The criticality a [`cleave::Criticality::rank`] encodes, or `None` for a
 /// byte no rank produces. Decoded through `rank` itself, so the two cannot
@@ -545,7 +565,7 @@ pub fn render_saved_report(
         crate::OutputFormat::Terminal => Ok(format_context(&loaded.report, &TinyOpts::terminal())),
         crate::OutputFormat::Tiny => Ok(format_context(&loaded.report, &TinyOpts::tiny())),
         crate::OutputFormat::Interpret => render_context::render_saved_interpret(loaded),
-        crate::OutputFormat::Json => {
+        crate::OutputFormat::Json | crate::OutputFormat::JsonFull => {
             anyhow::bail!("render supports --format terminal, tiny, or interpret")
         }
     }
@@ -579,16 +599,20 @@ mod tests {
         assert_eq!(crit_from_rank(u8::MAX), None);
     }
 
+    /// A full member listing is the full JSON format's alone.
     #[test]
-    fn is_all_only_when_every_class_shown() {
-        assert!(DisplayFilter::all().is_all());
-        assert!(!DisplayFilter::alerts_only().is_all());
+    fn all_members_needs_the_full_json_format() {
+        let config = |format| ScanConfig::new("/tmp/models", format, None).unwrap();
+        assert!(config(OutputFormat::Json).with_all_members(true).is_err());
         assert!(
-            !DisplayFilter {
-                benign: false,
-                ..DisplayFilter::all()
-            }
-            .is_all()
+            config(OutputFormat::JsonFull)
+                .with_all_members(true)
+                .is_ok()
+        );
+        assert!(
+            config(OutputFormat::Terminal)
+                .with_all_members(false)
+                .is_ok()
         );
     }
 

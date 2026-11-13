@@ -43,7 +43,7 @@ const GRID_MAX: u16 = 25_000;
 /// What a caller should do about this package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum Decision {
+pub(crate) enum Decision {
     /// Analyzed, and not hostile at the caller's threshold.
     Allow,
     /// Analyzed, and hostile at the caller's threshold.
@@ -59,10 +59,21 @@ pub(super) enum Decision {
     Unavailable,
 }
 
+impl Severity {
+    /// The same grade under its wire name.
+    const fn of(class: crate::model::Classification) -> Self {
+        match class {
+            crate::model::Classification::Benign => Self::Benign,
+            crate::model::Classification::Suspicious => Self::Suspicious,
+            crate::model::Classification::Hostile => Self::Hostile,
+        }
+    }
+}
+
 /// How bad the artifact is, independent of anyone's threshold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum Severity {
+pub(crate) enum Severity {
     /// Fires at no level, or only above the suspicious ceiling.
     Benign,
     /// Fires, but only under a budget looser than the ceiling.
@@ -106,11 +117,25 @@ pub(super) fn decide(fires_at: Level, budget: u16) -> (Decision, Severity) {
 /// a shape that does not move, and a generated type has no optionals to unwrap
 /// that are really just "we had nothing to say".
 #[derive(serde::Serialize)]
-pub(super) struct V1Decision {
+pub(crate) struct V1Decision {
     pub(super) decision: Decision,
     pub(super) purl: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) url: Option<String>,
+    /// The file a CLI scan was asked about. Absent from the server, whose
+    /// callers name artifacts by package, URL or upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) path: Option<String>,
+    /// For a CLI process scan: the PIDs running the binary, and whether it was
+    /// deleted from disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) deleted: Option<bool>,
+    /// For a CLI file that was not analyzed here: what answered for it,
+    /// `bloom` or `uplink`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) source: Option<&'static str>,
     pub(super) sha256: Option<String>,
     pub(super) severity: Option<Severity>,
     /// The tightest pool-adjusted false-positive level at which
@@ -164,6 +189,10 @@ impl V1Decision {
             decision: decided,
             purl: purl.map(str::to_owned),
             url: None,
+            path: None,
+            pids: None,
+            deleted: None,
+            source: None,
             sha256: sha.map(str::to_owned),
             severity: Some(severity),
             fires_at,
@@ -184,6 +213,10 @@ impl V1Decision {
             decision: decided,
             purl: purl.map(str::to_owned),
             url: None,
+            path: None,
+            pids: None,
+            deleted: None,
+            source: None,
             sha256: sha.map(str::to_owned),
             severity: None,
             fires_at: Level::Manual,
@@ -248,6 +281,10 @@ impl V1Decision {
             // only fills in what it could not.
             purl: v.purl.clone().or_else(|| purl.map(str::to_owned)),
             url: None,
+            path: None,
+            pids: None,
+            deleted: None,
+            source: None,
             sha256: Some(v.sha256.clone()),
             severity: Some(severity),
             fires_at: v.lvl,
@@ -273,6 +310,10 @@ impl V1Decision {
             decision: decided,
             purl: r.purl.clone().or_else(|| purl.map(str::to_owned)),
             url: None,
+            path: None,
+            pids: None,
+            deleted: None,
+            source: None,
             // Empty is absent. A record standing on threat-feed citations for a
             // package nobody has analyzed names no bytes, and the corpus sends
             // the field as "" rather than omitting it — which would put an
@@ -290,6 +331,101 @@ impl V1Decision {
             findings: V1Finding::worth_reporting(r.findings.iter().map(V1Finding::from_corpus)),
             engine_version: r.engine_version.clone(),
             analyzed_at: r.analyzed_at.clone(),
+        }
+    }
+
+    /// A file this process analyzed, as the CLI reports it at `path`.
+    ///
+    /// Decided by the class scan graded the result at, which is the CLI's own
+    /// level (`-l`), so the JSON says what the terminal says. The server
+    /// reaches the same answer from `fires_at` and its budget; under manual
+    /// thresholds, where no budget applies, this still has the class.
+    pub(crate) fn scanned(result: &crate::engine::ScanResult, path: &str) -> Self {
+        let verdict = crate::lookup::Verdict::from_scan(result, None);
+        let severity = Severity::of(result.classification);
+        Self {
+            decision: if severity == Severity::Hostile {
+                Decision::Block
+            } else {
+                Decision::Allow
+            },
+            purl: verdict.purl,
+            url: None,
+            path: Some(path.to_owned()),
+            pids: result.pids.clone(),
+            deleted: result.deleted,
+            source: None,
+            sha256: Some(verdict.sha256),
+            severity: Some(severity),
+            fires_at: verdict.lvl,
+            reason: verdict.why,
+            findings: V1Finding::worth_reporting(verdict.hits.iter().map(V1Finding::from_hit)),
+            engine_version: Some(verdict.eng),
+            analyzed_at: Some(verdict.at),
+        }
+    }
+
+    /// A file the CLI's filters answered for without analyzing it: known good,
+    /// or, in fast mode, in neither set and so left unscanned.
+    pub(crate) fn filtered(path: &str, known_good: bool) -> Self {
+        let mut d = if known_good {
+            Self {
+                severity: Some(Severity::Benign),
+                fires_at: Level::Clean,
+                reason: Some("known good".to_owned()),
+                ..Self::empty(Decision::Allow, None, None)
+            }
+        } else {
+            Self {
+                reason: Some("not in the known sets; not analyzed in fast mode".to_owned()),
+                ..Self::empty(Decision::Unanalyzed, None, None)
+            }
+        };
+        d.path = Some(path.to_owned());
+        d.source = Some("bloom");
+        d
+    }
+
+    /// A file the CLI took the corpus's verdict for (`--uplink`), graded as
+    /// `class` at the CLI's level.
+    pub(crate) fn adopted(
+        path: &str,
+        sha256: &str,
+        purl: Option<&str>,
+        verdict: &crate::corpus_precheck::Verdict,
+        class: crate::model::Classification,
+    ) -> Self {
+        let severity = Severity::of(class);
+        Self {
+            decision: if severity == Severity::Hostile {
+                Decision::Block
+            } else {
+                Decision::Allow
+            },
+            purl: purl.map(str::to_owned),
+            url: None,
+            path: Some(path.to_owned()),
+            pids: None,
+            deleted: None,
+            source: Some("uplink"),
+            sha256: Some(sha256.to_owned()),
+            severity: Some(severity),
+            fires_at: verdict.fires_at,
+            reason: verdict.reason.clone(),
+            findings: V1Finding::worth_reporting(
+                verdict.findings.iter().map(V1Finding::from_corpus),
+            ),
+            engine_version: verdict.engine_version.clone(),
+            analyzed_at: verdict.analyzed_at.clone(),
+        }
+    }
+
+    /// A file the CLI could not analyze, and why.
+    pub(crate) fn failed(path: &str, error: &str) -> Self {
+        Self {
+            path: Some(path.to_owned()),
+            reason: Some(error.to_owned()),
+            ..Self::empty(Decision::Unavailable, None, None)
         }
     }
 
@@ -352,7 +488,7 @@ impl V1Decision {
 /// from, four nulls per corpus finding is most of the object, and a reader
 /// checking `desc` has to handle absence anyway.
 #[derive(Clone, Debug, serde::Serialize)]
-pub(super) struct V1Finding {
+pub(crate) struct V1Finding {
     pub(super) id: String,
     pub(super) crit: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -564,5 +700,68 @@ mod tests {
                 assert_eq!(severity, expected_severity, "level={level} budget={budget}");
             }
         }
+    }
+
+    /// The CLI's decision is the class scan graded the result at, so its JSON
+    /// says what its terminal says, and it names the file it was asked about.
+    #[test]
+    fn a_cli_decision_follows_the_results_own_class() {
+        let mut result = crate::engine::fixture_result(&"a".repeat(64), &Default::default());
+        result.classification = crate::model::Classification::Hostile;
+        result.level = Level::At(12);
+        result.pids = Some(vec![41]);
+        let value = serde_json::to_value(V1Decision::scanned(&result, "/tmp/x")).unwrap();
+        assert_eq!(value["decision"], "block");
+        assert_eq!(value["severity"], "hostile");
+        assert_eq!(value["fires_at"], 12);
+        assert_eq!(value["path"], "/tmp/x");
+        assert_eq!(value["pids"], serde_json::json!([41]));
+        assert_eq!(value["sha256"], "a".repeat(64));
+
+        // Under manual thresholds there is no level, and the class still stands.
+        result.classification = crate::model::Classification::Suspicious;
+        result.level = Level::Manual;
+        let value = serde_json::to_value(V1Decision::scanned(&result, "/tmp/x")).unwrap();
+        assert_eq!(value["decision"], "allow");
+        assert_eq!(value["severity"], "suspicious");
+        assert!(value["fires_at"].is_null());
+    }
+
+    /// A file the CLI could not analyze says so and nothing more; the server's
+    /// shape carries no CLI fields.
+    #[test]
+    fn a_failure_says_nothing_about_the_file() {
+        let value = serde_json::to_value(V1Decision::failed("/tmp/x", "unreadable")).unwrap();
+        assert_eq!(value["decision"], "unavailable");
+        assert!(value["severity"].is_null() && value["fires_at"].is_null());
+        assert_eq!(value["reason"], "unreadable");
+        let server = serde_json::to_value(V1Decision::unanalyzed(None, None)).unwrap();
+        for key in ["path", "pids", "deleted", "source"] {
+            assert!(server.get(key).is_none(), "{key} is the CLI's");
+        }
+    }
+
+    /// A file the CLI did not analyze names what answered for it.
+    #[test]
+    fn a_file_not_analyzed_here_names_its_source() {
+        let bloom = serde_json::to_value(V1Decision::filtered("/tmp/x", true)).unwrap();
+        assert_eq!(bloom["source"], "bloom");
+        assert_eq!(bloom["decision"], "allow");
+        let unscanned = serde_json::to_value(V1Decision::filtered("/tmp/x", false)).unwrap();
+        assert_eq!(unscanned["decision"], "unanalyzed");
+        let verdict = crate::corpus_precheck::Verdict {
+            fires_at: Level::At(3),
+            ..Default::default()
+        };
+        let uplink = serde_json::to_value(V1Decision::adopted(
+            "/tmp/x",
+            &"a".repeat(64),
+            None,
+            &verdict,
+            crate::model::Classification::Hostile,
+        ))
+        .unwrap();
+        assert_eq!(uplink["source"], "uplink");
+        assert_eq!(uplink["decision"], "block");
     }
 }

@@ -15,7 +15,7 @@ use super::pipeline::{ClassifyRequest, classify_report};
 use super::progress::{Progress, Spinner};
 use super::render_cards::write_tiny;
 use super::{
-    DisplayFilter, ENGINE_VERSION, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
+    DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources,
 };
 use crate::bloom_repo::Decision as BloomDecision;
@@ -700,18 +700,12 @@ impl<'a> Session<'a> {
         tracing::error!(path = %path.display(), error = %msg, "analysis failed");
         // A failed file still gets a line on stdout under `--format json`, so a
         // consumer reading the NDJSON sees *that* it failed and why, instead of
-        // inferring it from a record that never arrives. This does not make the
-        // failure anything other than a failure: the tally below still counts it,
-        // the process still exits 3, and nothing is handed to hopper — an error
-        // envelope carries an empty file type, which hopper reads as a delete.
-        //
-        // `raw.files` is deliberately empty, and that is load-bearing for
-        // compatibility. Readers that predate this record skip a fileless entry
-        // and report the sample as having produced no result — which is exactly
-        // right. A record carrying a file entry would instead be scored, and an
-        // absent `ml.lvl` decodes to 0 in a JSON reader that defaults its
-        // numbers, which reads as *hostile*. Keep the list empty.
-        if self.config.format() == OutputFormat::Json
+        // inferring it from a record that never arrives: an `unavailable`
+        // decision, which says nothing about the file, in either JSON format.
+        // It does not make the failure anything other than a failure: the tally
+        // below still counts it, the process still exits 3, and nothing is
+        // handed to hopper.
+        if self.config.format().is_json()
             && let Err(error) = write_error_record(path, &msg)
         {
             self.output_failed(&error);
@@ -911,20 +905,20 @@ impl Classifier<'_> {
 /// The write failed; `BrokenPipe` means nobody is reading any more.
 pub(crate) fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
     match config.format() {
+        // Serialized before stdout is taken, so one large result does not park
+        // every other completed scan behind its encoding, and written whole
+        // under one lock so records cannot mix.
         OutputFormat::Json => {
-            // Archive reports can contain thousands of members. Serialize on
-            // the caller's worker before taking stdout, otherwise one large
-            // report parks every other completed scan behind its encoding.
-            // Keep the complete line under one lock so records cannot mix.
-            let started = Instant::now();
-            let mut bytes = serde_json::to_vec(&r.envelope_ref())?;
+            let mut bytes =
+                serde_json::to_vec(&crate::server::decision::V1Decision::scanned(r, &r.path))?;
             bytes.push(b'\n');
-            let encoded = started.elapsed();
-            io::stdout().lock().write_all(&bytes)?;
-            tracing::debug!(target: "scan::json_timing", bytes = bytes.len(),
-                encode_ms = encoded.as_millis(), write_ms = started.elapsed().saturating_sub(encoded).as_millis(),
-                "JSON result written");
-            Ok(())
+            io::stdout().lock().write_all(&bytes)
+        }
+        OutputFormat::JsonFull => {
+            let body = r.full_body(config.all_members()).ok_or_else(|| {
+                io::Error::other("result could not be written in the full JSON format")
+            })?;
+            io::stdout().lock().write_all(&body)
         }
         // The terminal result card was built in `classify_report`; write it
         // verbatim, then flush before the stderr footer.
@@ -956,19 +950,12 @@ pub(crate) fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()>
     }
 }
 
-/// Write a JSON error record for a file that failed analysis.
+/// Write the `unavailable` decision for a file that failed analysis.
 fn write_error_record(file_path: &Path, msg: &str) -> io::Result<()> {
-    let path = file_path.display().to_string();
-    let record = ErrorRecord {
-        err: ErrSection {
-            path: &path,
-            msg,
-            eng: ENGINE_VERSION,
-        },
-        raw: EmptyRaw { files: [] },
-    };
+    let decision =
+        crate::server::decision::V1Decision::failed(&file_path.display().to_string(), msg);
     let mut out = io::stdout().lock();
-    serde_json::to_writer(&mut out, &record)?;
+    serde_json::to_writer(&mut out, &decision)?;
     out.write_all(b"\n")
 }
 
@@ -1017,8 +1004,7 @@ fn bloom_gate(
     // Known-good/unscanned are benign-tier: print the per-file line only when
     // benign output is requested, so a large directory scan isn't spammed. The
     // aggregate tally always reports them in the summary regardless.
-    let show_quiet =
-        config.format() == OutputFormat::Json || config.filter().shows(Classification::Benign);
+    let show_quiet = config.format().is_json() || config.filter().shows(Classification::Benign);
     tally_bloom(decision, fast && decision == BloomDecision::Unknown, label);
     match decision {
         BloomDecision::Skip => {
@@ -1354,31 +1340,6 @@ fn file_touched_within(path: &Path, window: Duration, now: SystemTime) -> bool {
         }
     }
     false
-}
-
-/// The `err` section of an error record: the file that failed, and why.
-#[derive(Debug, serde::Serialize)]
-struct ErrSection<'a> {
-    path: &'a str,
-    msg: &'a str,
-    /// Scan engine build that produced this record, mirroring [`MlSection::eng`]
-    /// so an error line is attributable to a build like a successful one is.
-    eng: &'static str,
-}
-
-/// An error line: `{"err": {...}, "raw": {"files": []}}`.
-///
-/// Shaped to sit in the same NDJSON stream as [`ScanResultEnvelopeRef`] without
-/// being mistaken for one. See the call site for why `raw.files` must stay empty.
-#[derive(Debug, serde::Serialize)]
-struct ErrorRecord<'a> {
-    err: ErrSection<'a>,
-    raw: EmptyRaw,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct EmptyRaw {
-    files: [(); 0],
 }
 
 #[cfg(test)]

@@ -100,9 +100,7 @@ impl fmt::Display for FlightKey {
 /// The finished analysis, shared by every request attached to a flight.
 #[derive(Debug)]
 pub(super) enum Outcome {
-    /// A completed report. Each waiter serializes it through
-    /// [`ScanResult::envelope_ref`], which borrows the cleave report rather
-    /// than cloning it — the report can be hundreds of kilobytes.
+    /// A completed report, which each waiter renders in its own route's shape.
     Report(Box<ScanResult>),
     /// Anything that ends in an error response. `anyhow::Error` is not `Clone`,
     /// so a failure, a timeout, or a panic is turned into its answer once by

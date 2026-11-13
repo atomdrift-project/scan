@@ -80,6 +80,10 @@ pub(super) struct V1Query {
     /// followed. Repeated keys and comma-separated values are both accepted.
     /// Empty means use the deployment policy.
     follow: Vec<String>,
+    /// Whether the caller wants the full result, the version 8 body that is
+    /// uploaded to hopper, rather than the decision (`/v1/analyze` only). Only
+    /// an analysis produces one, so it implies [`Self::force`].
+    full: bool,
 }
 
 /// The spellings that opt in to a boolean flag. Anything else — including a
@@ -132,11 +136,13 @@ impl V1Query {
                 "refresh" => q.refresh = value.as_ref() == "1",
                 "path" => q.path.push(value.into_owned()),
                 "follow" => q.follow.push(value.into_owned()),
+                "full" => q.full = affirmative(value.as_ref()),
                 // Unknown parameters are ignored, so a caller can carry their
                 // own tracing keys through without us rejecting the request.
                 _ => {}
             }
         }
+        q.force |= q.full;
         q
     }
 
@@ -1061,6 +1067,8 @@ struct V1Framing {
     budget: u16,
     started: Instant,
     follow: Option<String>,
+    /// Whether the answer is the full result rather than the decision.
+    full: bool,
 }
 
 /// Answer within the grace window if the analysis lands inside it, otherwise
@@ -1071,6 +1079,7 @@ async fn answer(req: &V1Analyze, attachment: Attachment, named: Named) -> Respon
         budget: req.budget,
         started: req.started,
         follow: req.follow.policy.follow_name(),
+        full: req.q.full,
     };
     // Inside the grace window the ordinary response still applies, which is
     // what keeps `429 At capacity` a real 429 the router can act on rather than
@@ -1085,7 +1094,21 @@ async fn answer(req: &V1Analyze, attachment: Attachment, named: Named) -> Respon
     }
 }
 
-/// A finished analysis, as a decision.
+/// The full result: the version 8 body hopper is sent, without the worker
+/// name. A body that cannot be written is logged and answered as a failure.
+fn full_result(
+    result: &crate::engine::ScanResult,
+    named: &Named,
+    request_id: u64,
+) -> Result<Vec<u8>, ApiError> {
+    result.full_body(false).ok_or_else(|| {
+        tracing::error!(id = request_id, subject = %named.subject(), "full result could not be written");
+        ApiError::internal()
+    })
+}
+
+/// A finished analysis, as a decision, or as the full result when that was
+/// asked for.
 fn outcome_response(
     outcome: &Outcome,
     named: &Named,
@@ -1094,7 +1117,23 @@ fn outcome_response(
 ) -> Response {
     let mut resp = match outcome {
         Outcome::Report(result) => {
-            let mut resp = Json(named.decision(result, framing.budget)).into_response();
+            let mut resp = if framing.full {
+                full_result(result, named, framing.request_id).map_or_else(
+                    |refusal| refusal.response(),
+                    |body| {
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                HeaderValue::from_static(crate::upload::RESULT_CONTENT_TYPE),
+                            )],
+                            body,
+                        )
+                            .into_response()
+                    },
+                )
+            } else {
+                Json(named.decision(result, framing.budget)).into_response()
+            };
             resp.headers_mut().insert(
                 "X-Total-Ms",
                 crate::duration_ms(framing.started.elapsed()).into(),
@@ -1178,8 +1217,10 @@ fn progress_frame(attachment: &Attachment, named: &Named, started: Instant) -> s
 /// The same answer, delivered as a stream that reports progress until the
 /// analysis lands.
 ///
-/// Newline-delimited JSON: zero or more progress frames, then the decision.
-/// A caller reads lines until one carries `decision`, and that is the answer;
+/// Newline-delimited JSON: zero or more progress frames, then the decision —
+/// or, with `full=1`, the full result's lines, starting with its `"v":8`
+/// header. A caller reads lines until one carries `decision` (or `v`), and
+/// that is the answer;
 /// an analysis that finishes before the first frame is due emits nothing but
 /// the decision, so a fast call still looks like a single JSON object and still
 /// parses as one.
@@ -1202,6 +1243,7 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
         budget,
         started,
         follow,
+        full,
     } = framing;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
     let canonical = named.key().map(str::to_owned);
@@ -1232,7 +1274,20 @@ fn streamed(attachment: Attachment, named: Named, framing: V1Framing) -> Respons
         let decided = match outcome.as_ref() {
             Outcome::Report(result) => {
                 tracing::info!(id = request_id, subject = %named.subject(), elapsed_ms = elapsed, "streamed analysis answered");
-                named.decision(result, budget)
+                if full {
+                    // The body's lines end the stream, its header first: a
+                    // reader takes a line carrying `"v":8` as the start of the
+                    // answer and everything after it as the rest of it.
+                    match full_result(result, &named, request_id) {
+                        Ok(body) => {
+                            let _ = tx.send(Ok(bytes::Bytes::from(body))).await;
+                            return;
+                        }
+                        Err(_) => named.unavailable(),
+                    }
+                } else {
+                    named.decision(result, budget)
+                }
             }
             Outcome::Failed(refusal) if refusal.status == StatusCode::TOO_MANY_REQUESTS => {
                 // Refused after the stream began (a big whale found every slot

@@ -436,7 +436,7 @@ fn dep_render_fixture() -> (
             level: Level::Manual,
         }),
         members: MemberEvals::new(),
-        report: None,
+        upload: None,
     }];
     (vec![edge], deps, report)
 }
@@ -573,7 +573,7 @@ fn provenance_fixture() -> (
             level: Level::Manual,
         }),
         members: MemberEvals::new(),
-        report: None,
+        upload: None,
     }];
     let registries = vec![crate::fetch::DependencyRegistry {
         locator: "pkg:test/dep@1".to_string(),

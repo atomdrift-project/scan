@@ -66,7 +66,7 @@ async fn stub_corpus(holds: Holds) -> Result<(String, Arc<Asked>)> {
                     Holds::Verdict => (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        r#"{"sha256":null,"purl":null,"fires_at":3,
+                        r#"{"sha256":null,"purl":null,"state":"analyzed","fires_at":3,
                             "engine_version":"corpus-probe",
                             "analyzed_at":"2026-08-01T00:00:00Z",
                             "reason":null,"findings":[]}"#,
@@ -74,7 +74,7 @@ async fn stub_corpus(holds: Holds) -> Result<(String, Arc<Asked>)> {
                     Holds::Nothing => (
                         StatusCode::NOT_FOUND,
                         [("content-type", "application/json")],
-                        r#"{"error":"unknown"}"#,
+                        r#"{"error":{"code":"unknown_artifact","message":"Nothing stored for that artifact."}}"#,
                     ),
                 }
             }
