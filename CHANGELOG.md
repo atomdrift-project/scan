@@ -2,6 +2,24 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.0.0-beta.2 (2026-11-13)
+
+### Features
+
+- `--format json` now prints the same decision the server returns, one line per file.
+- `--format json-full` prints the entire v8 result, exactly what hopper receives.
+- `/v1/analyze?full=1` returns the full result, always analyzes, and keeps nothing.
+- breaking: the ml/raw envelope is gone, so read `fires_at` and adjust your parsers.
+- breaking: hopper routes moved to /v1, and old hopper will not talk to this, so upgrade both.
+
+### Fixes
+
+- cancellation never reached dependency fetching, so work ran to the deadline; it stops now.
+
+### Optimizations
+
+- whale slots were capped at 8 regardless of cores, leaving big machines idle; the cap is gone.
+
 ## 3.0.0-beta.1 (2026-11-09)
 
 ### Security
