@@ -491,13 +491,19 @@ pub(crate) fn terminal_trailer(reasons: &[crate::explain::Reason]) -> Option<Str
         .map(|r| r.description.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    Some(reason_line(&body))
+}
+
+/// The card's one-line reason slot: a dim `·` in the glyph gutter, then
+/// `body` in the reason ink.
+fn reason_line(body: &str) -> String {
     let p = palette();
     let lead = if color_enabled() {
         terminal_marker_prefix_with_width(1, &fg(p.dim, "\u{00b7}"), 1)
     } else {
         "\u{00b7} ".to_string()
     };
-    Some(format!("{lead}{}", fg(p.reason, &body)))
+    format!("{lead}{}", fg(p.reason, body))
 }
 
 /// The LLM interpretation as its own headline-grade line, sitting directly
@@ -719,11 +725,15 @@ pub(crate) fn terminal_artifact_line(
     };
     let meta = type_and_size(file_type, size);
     let p = palette();
+    let meta = if meta.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", fg(p.dim, &format!("\u{00b7} {meta}")))
+    };
     format!(
-        "{}{} {}",
+        "{}{}{meta}",
         rail(1, glyph, ""),
         fg_bold(p.path_name, &label),
-        fg(p.dim, &format!("\u{00b7} {meta}")),
     )
 }
 
@@ -1152,8 +1162,9 @@ pub(crate) fn print_bloom_verdict(
 ///
 /// Either JSON format gets a decision, as for an analysis, carrying what the
 /// service said: the level, the digest it describes, when and by what it was
-/// analyzed, and its strongest findings. Every other format gets one line,
-/// naming its first finding.
+/// analyzed, and its strongest findings. The terminal gets the same card a
+/// local analysis does, its hash line marked ⚡ for Uplink. The LLM-facing
+/// formats get one line, naming the first finding.
 ///
 /// # Errors
 /// Writing to `out` failed.
@@ -1173,6 +1184,9 @@ pub(crate) fn write_remote_verdict(
             crate::server::decision::V1Decision::adopted(label, sha256, purl, verdict, class);
         serde_json::to_writer(&mut *out, &decision)?;
         return out.write_all(b"\n");
+    }
+    if format == OutputFormat::Terminal {
+        return out.write_all(remote_card(label, sha256, purl, verdict, class).as_bytes());
     }
     let name = class.to_string();
     let p = palette();
@@ -1200,6 +1214,118 @@ pub(crate) fn write_remote_verdict(
         fg(p.very_dim, &format!("Uplink{when}{why}")),
         fg(p.header_path, &tty_text(label)),
     )
+}
+
+/// The terminal card for an Uplink verdict, laid out as a local result's:
+/// rule and stamp, artifact, claimed identity, SHA-256, reason, findings.
+///
+/// Nothing was analyzed here, so the type is the one the name declares, the
+/// size is the file's on disk (absent for a coordinate), and findings show
+/// their trait ids. The hash line carries ⚡ where a local result carries
+/// 🧬 or 🚩, with the analysis date, so the verdict's origin is never in doubt.
+fn remote_card(
+    label: &str,
+    sha256: &str,
+    purl: Option<&str>,
+    verdict: &crate::corpus_precheck::Verdict,
+    class: Classification,
+) -> String {
+    let path = std::path::Path::new(label);
+    let declared = filefacts::fileid::declared_file_type(path);
+    let file_type = if declared == filefacts::FileType::Unknown {
+        String::new()
+    } else {
+        declared.to_string()
+    };
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+
+    // Each card leads with its blank separator and ends flush.
+    let mut out = String::from("\n");
+    // No model ran here: the level alone carries the confidence.
+    let (probability, threshold) = (0.0, 1.0);
+    if color_enabled() {
+        out.push_str(&terminal_rule(
+            class,
+            probability,
+            threshold,
+            verdict.fires_at,
+            cleave::output::terminal_width(),
+        ));
+        out.push('\n');
+    } else {
+        out.push_str(&terminal_badge(class, probability, threshold, verdict.fires_at).0);
+        out.push(' ');
+    }
+    out.push_str(&terminal_artifact_line(
+        label,
+        &file_type,
+        size,
+        declared.is_archive(),
+    ));
+    out.push('\n');
+
+    let identity = purl
+        .filter(|purl| *purl != label)
+        .and_then(|purl| terminal_identity_line(&tty_text(purl)));
+    let reason = verdict
+        .reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| reason_line(&tty_text(r)));
+    for row in [identity, uplink_hash_line(sha256, verdict), reason]
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&row);
+        out.push('\n');
+    }
+
+    let traits: Vec<TerminalTrait> = verdict
+        .findings
+        .iter()
+        .map(|f| TerminalTrait {
+            criticality: match f.crit {
+                5 => cleave::Criticality::Hostile,
+                4 => cleave::Criticality::Suspicious,
+                3 => cleave::Criticality::Notable,
+                _ => cleave::Criticality::Baseline,
+            },
+            description: tty_text(f.desc.as_deref().unwrap_or(&f.id)).into_owned(),
+            location: String::new(),
+        })
+        .collect();
+    let body = terminal_trait_rows(&traits, cleave::output::terminal_width());
+    if !body.trim().is_empty() {
+        out.push_str(&body);
+        out.push('\n');
+    }
+    out
+}
+
+/// An Uplink verdict's hash line: ⚡, the SHA-256, then `Uplink · analyzed
+/// <day>`. Plain mode keeps the marker as text after the hash, as a bloom
+/// mark does. `None` when the hash is absent.
+fn uplink_hash_line(sha256: &str, verdict: &crate::corpus_precheck::Verdict) -> Option<String> {
+    if sha256.is_empty() {
+        return None;
+    }
+    let when = verdict
+        .analyzed_at
+        .as_deref()
+        .and_then(|at| at.get(..10))
+        .map(|day| format!(" \u{b7} analyzed {}", tty_text(day)))
+        .unwrap_or_default();
+    let sha256 = tty_text(sha256);
+    if !color_enabled() {
+        return Some(format!("{sha256}  \u{26a1} uplink{when}"));
+    }
+    let p = palette();
+    Some(format!(
+        "{}{}  {}",
+        terminal_marker_prefix(1, "\u{26a1}"), // ⚡
+        fg(p.very_dim, &sha256),
+        fg(p.dim, &format!("Uplink{when}")),
+    ))
 }
 
 /// Print scan summary. A flagged scan closes its card sequence with a heavy
@@ -1359,13 +1485,13 @@ fn summary_counts(summary: &ScanSummary, p: &Palette, ink: Ink) -> Vec<(String, 
     parts
 }
 
-/// `TYPE · size`, the size omitted when it renders empty.
+/// `TYPE · size`, either omitted when it renders empty.
 fn type_and_size(file_type: &str, size: u64) -> String {
     let size = human_size(size);
-    if size.is_empty() {
-        file_type.to_uppercase()
-    } else {
-        format!("{} \u{00b7} {size}", file_type.to_uppercase())
+    match (file_type.is_empty(), size.is_empty()) {
+        (true, _) => size,
+        (false, true) => file_type.to_uppercase(),
+        (false, false) => format!("{} \u{00b7} {size}", file_type.to_uppercase()),
     }
 }
 

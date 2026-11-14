@@ -75,6 +75,56 @@ fn hash_line_carries_the_bloom_glyph() {
 }
 
 #[test]
+fn uplink_verdict_renders_as_a_card() {
+    // An Uplink verdict reads like a local result: stamp, artifact, hash,
+    // findings — the hash marked ⚡ with the analysis day, not 🚩 or 🧬.
+    // (These tests run uncolored, so the plain card form is checked.)
+    let verdict = crate::corpus_precheck::Verdict {
+        fires_at: Level::At(0),
+        reason: None,
+        findings: vec![crate::hopper::Finding {
+            id: "intel/feed/malicious".to_string(),
+            crit: 5,
+            desc: None,
+        }],
+        analyzed_at: Some("2026-10-22T08:00:00Z".to_string()),
+        engine_version: None,
+    };
+    let mut out = Vec::new();
+    write_remote_verdict(
+        &mut out,
+        "/nonexistent/litellm-1.107.0-py3-none-any.whl",
+        "2befe2a7",
+        None,
+        &verdict,
+        Classification::Hostile,
+        OutputFormat::Terminal,
+    )
+    .expect("write");
+    let card = String::from_utf8(out).expect("utf-8");
+    let lines: Vec<&str> = card.lines().collect();
+    assert_eq!(lines[0], "", "a card leads with its blank separator");
+    assert!(lines[1].starts_with("HOSTILE["), "{card}");
+    assert!(
+        lines[1].ends_with("litellm-1.107.0-py3-none-any.whl \u{b7} WHL"),
+        "{card}"
+    );
+    assert_eq!(
+        lines[2],
+        "2befe2a7  \u{26a1} uplink \u{b7} analyzed 2026-10-22"
+    );
+    assert!(lines[3].ends_with("intel/feed/malicious"), "{card}");
+    assert!(!card.contains(BloomMark::KnownBad.glyph()));
+    assert!(card.ends_with('\n') && !card.ends_with("\n\n"));
+}
+
+#[test]
+fn artifact_line_omits_unknown_metadata() {
+    assert!(terminal_artifact_line("pkg:npm/x@1", "", 0, false).ends_with("pkg:npm/x@1"));
+    assert!(terminal_artifact_line("a", "", 2048, false).ends_with("a \u{b7} 2.0KB"));
+}
+
+#[test]
 fn human_size_compact_units() {
     assert_eq!(human_size(0), "");
     assert_eq!(human_size(352), "352B");
@@ -91,6 +141,7 @@ fn card_markers_share_one_content_column() {
         "🚩",
         "📡",
         "🏴",
+        "⚡",
         "🪪",
         "✨",
         "●",
