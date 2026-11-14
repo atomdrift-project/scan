@@ -1,9 +1,8 @@
 //! The feature spec a model was trained with: its vocabularies, groups and
 //! layout, and the checks that a spec matches what this extractor emits.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 
@@ -233,16 +232,10 @@ impl FeatureSpec {
                 spec.version,
             );
         }
-        // An ensemble loads many specs of one version, some concurrently:
-        // note an older one once per version for the process.
-        static WARNED_OLD_VERSIONS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
-        if spec.version < EXPECTED_SPEC_VERSION
-            && WARNED_OLD_VERSIONS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(spec.version)
-        {
-            tracing::warn!(
+        // Older-but-loadable specs are normal while an ensemble is retrained
+        // piecemeal; `atomscan version` and `update-rules` surface it as a hint.
+        if spec.version < EXPECTED_SPEC_VERSION {
+            tracing::debug!(
                 version = spec.version,
                 expected = EXPECTED_SPEC_VERSION,
                 "loading an older feature spec; features added since its version are absent from the model",

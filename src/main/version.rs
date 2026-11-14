@@ -28,7 +28,11 @@ pub(super) fn print(format: scan::OutputFormat) -> std::io::Result<()> {
         bloom_count,
         rules,
         &rows(&info, bloom.as_ref(), nsrl.as_ref()),
-    )
+    )?;
+    if let Some(hint) = scan::models_repo::outdated_spec_hint() {
+        writeln!(std::io::stdout(), "{hint}")?;
+    }
+    Ok(())
 }
 
 /// `atomscan -f json version`: the build and each rule source's identity.

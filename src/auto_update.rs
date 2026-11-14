@@ -30,16 +30,20 @@ struct Stamp {
     checked_unix: u64,
 }
 
-/// Path to the stamp in [`crate::cache_dir`], one per rules channel: the
-/// uplink tree goes stale on its own clock, and a host that switches to
-/// `--uplink` must not inherit the open-source tree's "checked an hour ago".
+/// Path to the stamp in [`crate::cache_dir`], one per rules channel *and* per
+/// build. The uplink tree goes stale on its own clock, and a host that
+/// switches to `--uplink` must not inherit the open-source tree's "checked an
+/// hour ago". Likewise an upgraded (or downgraded, or side-by-side) build must
+/// not inherit another version's "checked an hour ago": the data that version
+/// was content with may be in a format this one cannot read, so each version
+/// gets its own clock and refreshes once on first use.
 fn stamp_path() -> Option<PathBuf> {
-    let name = if cleave::enriched::enabled() {
-        "rules-update-enriched.toml"
-    } else {
-        "rules-update.toml"
-    };
-    Some(crate::cache_dir()?.join(name))
+    Some(crate::cache_dir()?.join(stamp_file_name(cleave::enriched::enabled())))
+}
+
+fn stamp_file_name(enriched: bool) -> String {
+    let channel = if enriched { "-enriched" } else { "" };
+    format!("rules-update{channel}-{}.toml", env!("CARGO_PKG_VERSION"))
 }
 
 /// Stamp the current time (best-effort; failures are non-fatal).
@@ -188,4 +192,21 @@ fn print_checkmark(mode: Mode) {
         crate::output::detection_inventory_text(counts.hashes_and_purls, counts.rules),
     );
     let _ = std::io::stderr().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp_file_name;
+
+    #[test]
+    fn stamp_is_keyed_by_build_version_and_channel() {
+        let oss = stamp_file_name(false);
+        let enriched = stamp_file_name(true);
+        assert!(oss.contains(env!("CARGO_PKG_VERSION")), "{oss}");
+        assert!(enriched.contains(env!("CARGO_PKG_VERSION")), "{enriched}");
+        assert_ne!(oss, enriched);
+        // A stamp from the pre-versioning layout must never be read back.
+        assert_ne!(oss, "rules-update.toml");
+        assert_ne!(enriched, "rules-update-enriched.toml");
+    }
 }

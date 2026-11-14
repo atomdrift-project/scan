@@ -1092,6 +1092,9 @@ fn update_rules() -> ExitCode {
             code = ExitCode::FAILURE;
         }
     }
+    if let Some(hint) = scan::models_repo::outdated_spec_hint() {
+        eprintln!("{hint}");
+    }
     code
 }
 

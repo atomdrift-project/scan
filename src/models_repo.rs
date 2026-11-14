@@ -104,6 +104,52 @@ pub fn model_count() -> Option<usize> {
     (n > 0).then_some(n)
 }
 
+/// How many route models in the installed bundle use a feature spec older than
+/// this build's current one, as `(outdated, total)`. `None` when no bundle is
+/// installed. Older specs still load; their models just lack newer features.
+#[must_use]
+pub fn outdated_spec_count() -> Option<(usize, usize)> {
+    #[derive(serde::Deserialize)]
+    struct Ver {
+        version: u32,
+    }
+    let base = install_target().ok()?;
+    if !base.is_dir() {
+        return None;
+    }
+    let (mut outdated, mut total) = (0, 0);
+    for entry in walkdir::WalkDir::new(&base)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == "feature_spec.json")
+    {
+        let Some(v) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<Ver>(&t).ok())
+        else {
+            continue;
+        };
+        total += 1;
+        if v.version < crate::features::EXPECTED_SPEC_VERSION {
+            outdated += 1;
+        }
+    }
+    (total > 0).then_some((outdated, total))
+}
+
+/// The parenthetical hint for [`outdated_spec_count`], or `None` when every
+/// route model is current.
+#[must_use]
+pub fn outdated_spec_hint() -> Option<String> {
+    let (outdated, total) = outdated_spec_count()?;
+    (outdated > 0).then(|| {
+        format!(
+            "({outdated} of {total} models use an older feature spec than v{}; they lack newer features until retrained)",
+            crate::features::EXPECTED_SPEC_VERSION
+        )
+    })
+}
+
 /// Default on-disk path for the model bundle: `<data_dir>/atomdrift/scan/models/azoth`
 /// (the directory name is the bundle's, kept so existing installs are found).
 fn default_models_dir() -> Result<PathBuf> {
