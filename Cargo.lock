@@ -897,7 +897,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.3"
-source = "git+https://github.com/atomdrift-project/cleave.git#7b52cae183f29f8f513432fa2c7042fdfcfa37ef"
+source = "git+https://github.com/atomdrift-project/cleave.git#a525265a5620f855d9db30dbaff247c829f57ac3"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -976,7 +976,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7b52cae183f29f8f513432fa2c7042fdfcfa37ef"
+source = "git+https://github.com/atomdrift-project/cleave.git#a525265a5620f855d9db30dbaff247c829f57ac3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3141,9 +3141,9 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
 
 [[package]]
 name = "lzfse"
@@ -3214,7 +3214,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7b52cae183f29f8f513432fa2c7042fdfcfa37ef"
+source = "git+https://github.com/atomdrift-project/cleave.git#a525265a5620f855d9db30dbaff247c829f57ac3"
 
 [[package]]
 name = "lzxd"
@@ -5527,7 +5527,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7b52cae183f29f8f513432fa2c7042fdfcfa37ef"
+source = "git+https://github.com/atomdrift-project/cleave.git#a525265a5620f855d9db30dbaff247c829f57ac3"
 
 [[package]]
 name = "tap"
@@ -7373,7 +7373,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7b52cae183f29f8f513432fa2c7042fdfcfa37ef"
+source = "git+https://github.com/atomdrift-project/cleave.git#a525265a5620f855d9db30dbaff247c829f57ac3"
 
 [[package]]
 name = "yara-x"
