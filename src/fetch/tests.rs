@@ -311,6 +311,52 @@ fn fetched_record() -> FetchRecord {
     }
 }
 
+#[test]
+fn unresolved_extension_count_only_counts_a_registry_without_the_release() {
+    let mut records = Vec::new();
+    for (locator, outcome) in [
+        (
+            "pkg:vscode/dart-code/dart-code",
+            Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease),
+        ),
+        (
+            "pkg:openvsx/org/example",
+            Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease),
+        ),
+        (
+            "pkg:vscode/publisher_with_underscore/name",
+            Outcome::Unresolved(fletch::fetch::Unresolved::UnsafeCoordinate),
+        ),
+        (
+            "pkg:vscode/publisher/name",
+            Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
+        ),
+        (
+            "pkg:npm/missing-package",
+            Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease),
+        ),
+    ] {
+        let mut record = fetched_record();
+        record.locator = locator.to_owned();
+        record.outcome = outcome;
+        records.push(record);
+    }
+
+    let tallies = tally_by_source(&records);
+    let mut metrics = BTreeMap::new();
+    write_reference_metrics(
+        &mut metrics,
+        tallies.get("s".repeat(64).as_str()),
+        RegistryTally::default(),
+    );
+
+    assert_eq!(metrics.get("references.unresolved_count"), Some(&5.0));
+    assert_eq!(
+        metrics.get("references.unresolved_extension_count"),
+        Some(&2.0)
+    );
+}
+
 /// Registry/package composites must be grafted before `capture_dependency`
 /// consumes its snapshot; otherwise Hopper grades the dependency as clean and
 /// the parent never receives a dependency-verdict back-reference.

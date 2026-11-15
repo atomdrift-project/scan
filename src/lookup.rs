@@ -139,24 +139,35 @@ impl Verdict {
 ///
 /// One selection rule, shared by everything that reports findings, so two
 /// consumers never disagree about which ones matter. Notable and above
-/// ([`MIN_HIT_CRIT`]), native matches only, deduplicated, capped at
+/// ([`MIN_HIT_CRIT`]), including cross-file composites, deduplicated, capped at
 /// [`MAX_STORED_HITS`]. A finding from a dependency names it in `pkg`; any
 /// other leaves `pkg` empty for the caller to attribute.
 #[must_use]
 pub(crate) fn collect_hits(report: &cleave::types::CompactReport) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let files_by_id: std::collections::HashMap<_, _> =
+        report.files.iter().map(|file| (file.id, file)).collect();
     for file in &report.files {
         for finding in &file.findings {
             if finding.criticality < MIN_HIT_CRIT {
                 continue;
             }
-            // Native matches only. A finding with `from` is the same match
-            // reported again on an enclosing archive; the member's own copy
-            // carries the real path and byte offset, and we walk every file,
-            // so it is already in hand — or is a cross-file composite, which
-            // has no single place to point at.
-            if !finding.from.is_empty() {
+            // Skip an inherited duplicate only when a contributor actually
+            // carries this same finding. A container composite's contributors
+            // can carry only its component traits; dropping that composite
+            // would erase the only suspicious/hostile finding from JSON.
+            if finding.from.iter().any(|source| {
+                source.file != file.id
+                    && files_by_id.get(&source.file).is_some_and(|member| {
+                        member.findings.iter().any(|candidate| {
+                            candidate.id == finding.id
+                                && candidate.criticality >= MIN_HIT_CRIT
+                                && candidate.dep.as_ref().map(|d| &d.locator)
+                                    == finding.dep.as_ref().map(|d| &d.locator)
+                        })
+                    })
+            }) {
                 continue;
             }
             let pkg = finding.dep.as_ref().map_or("", |d| d.locator.as_str());
@@ -597,6 +608,56 @@ pub(crate) fn pick_verdict(
 mod tests {
     use super::*;
     use crate::bloom_repo::Decision;
+
+    #[test]
+    fn collect_hits_preserves_cross_file_composite_and_deduplicates_inheritance() {
+        use cleave::types::{CompactFile, CompactReport, CompactTrait};
+        let source = |file| serde_json::from_value(serde_json::json!({"file":file})).unwrap();
+        let composite = CompactTrait {
+            id: "objectives/test::cross-file-clock".into(),
+            criticality: 4,
+            from: vec![source(1), source(2)],
+            ..Default::default()
+        };
+        let native = CompactTrait {
+            id: "objectives/test::native-payload".into(),
+            criticality: 5,
+            ev: vec![[12, 3]],
+            ..Default::default()
+        };
+        let mut inherited = native.clone();
+        inherited.from = vec![source(1)];
+        inherited.ev.clear();
+        let report = CompactReport {
+            files: vec![
+                CompactFile {
+                    id: 0,
+                    path: "extension.vsix".into(),
+                    findings: vec![composite, inherited],
+                    ..Default::default()
+                },
+                CompactFile {
+                    id: 1,
+                    path: "extension.vsix!!extension.js".into(),
+                    findings: vec![native],
+                    ..Default::default()
+                },
+                CompactFile {
+                    id: 2,
+                    path: "extension.vsix!!package.json".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let hits = collect_hits(&report);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].file, "extension.vsix!!extension.js");
+        assert_eq!(hits[0].off, Some(12));
+        assert_eq!(hits[1].id, "objectives/test::cross-file-clock");
+        assert_eq!(hits[1].file, "extension.vsix");
+        assert_eq!((hits[1].off, hits[1].line), (None, None));
+    }
 
     /// No filter had an opinion, so there is nothing to say — this must stay a
     /// miss rather than becoming a fabricated `allow`.

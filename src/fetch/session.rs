@@ -1580,15 +1580,16 @@ pub(super) fn attribute_reference_outcomes(
 
 /// What became of the references one file declared, as its fetch records say.
 #[derive(Default)]
-struct SourceTally<'a> {
+pub(super) struct SourceTally<'a> {
     declared: u64,
     unresolved: Vec<&'a str>,
+    unresolved_extensions: u64,
     unavailable_commands: u64,
     unavailable_command_spans: Vec<filefacts::Span>,
 }
 
 /// [`SourceTally`] per declaring sha.
-fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceTally<'_>> {
+pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceTally<'_>> {
     let mut by_source: BTreeMap<&str, SourceTally<'_>> = BTreeMap::new();
     for rec in records {
         let Some(source) = rec.source_sha256.as_deref() else {
@@ -1609,15 +1610,24 @@ fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceTally<'_>> {
                     .push(filefacts::Span::new(offset, 1));
             }
         }
-        if matches!(rec.outcome, Outcome::Unresolved(_)) {
+        if let Outcome::Unresolved(reason) = rec.outcome {
             tally.unresolved.push(rec.locator.as_str());
+            // Only a registry answer that names no release means the
+            // extension is absent from its gallery. Unsupported or unsafe
+            // coordinates are parser/resolver limits, not marketplace pulls.
+            if reason == fletch::fetch::Unresolved::NoRelease
+                && Coordinate::of(&rec.locator)
+                    .is_some_and(|c| matches!(c.typ, "vscode" | "openvsx"))
+            {
+                tally.unresolved_extensions += 1;
+            }
         }
     }
     by_source
 }
 
 /// Write one declaring file's `references.*` metrics.
-fn write_reference_metrics(
+pub(super) fn write_reference_metrics(
     metrics: &mut BTreeMap<String, f64>,
     fetched: Option<&SourceTally<'_>>,
     registry: RegistryTally,
@@ -1634,26 +1644,8 @@ fn write_reference_metrics(
         "references.security_hold_count".to_string(),
         registry.security_held as f64,
     );
-    // Editor-marketplace removals get their own count, because they do not
-    // mean what a registry 404 means. npm serves a 404 for a private name,
-    // a typo, or a package that moved; the VS Code and Open VSX galleries
-    // *remove* extensions, and removal is what they do to malware. A rule
-    // convicting on the first would be noise and on the second is not.
-    //
-    // Two fixed keys rather than one per ecosystem: the metric catalog
-    // checks exact names, so a key built from whatever PURL type happened
-    // to appear could never be declared, and an undeclared key validates
-    // against nothing. An archive member also carries no values tree for a
-    // `type: value` list to read, so a metric is the only surface that
-    // survives member retention.
-    let extension_unresolved = fetched.map_or(0, |t| {
-        t.unresolved
-            .iter()
-            .filter(|l| Coordinate::of(l).is_some_and(|c| matches!(c.typ, "vscode" | "openvsx")))
-            .count()
-    });
     metrics.insert(
         "references.unresolved_extension_count".to_string(),
-        extension_unresolved as f64,
+        fetched.map_or(0, |t| t.unresolved_extensions) as f64,
     );
 }
