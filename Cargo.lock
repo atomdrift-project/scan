@@ -1920,7 +1920,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#0d7b4982573aee4e9c50a1a2f9045e7b92d7738a"
+source = "git+https://github.com/atomdrift-project/filefacts.git#95c5fd2d8757105de3495a4952efef22c989bce4"
 dependencies = [
  "aes 0.9.4",
  "aho-corasick",
@@ -2038,7 +2038,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "3.0.0-beta.1"
-source = "git+https://github.com/atomdrift-project/fletch.git#d5ed78ee977421c8329748f1b0b058aefd0cff28"
+source = "git+https://github.com/atomdrift-project/fletch.git#cc7a92c922dcbfc58103ddfcfe0b5de070e6d5e2"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -5389,8 +5389,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stng"
-version = "3.0.0-beta.2"
-source = "git+https://github.com/atomdrift-project/stng.git#45cb466b85aaa6d8a74e5344fb12a5bc33550dae"
+version = "3.0.0-beta.3"
+source = "git+https://github.com/atomdrift-project/stng.git#372c924fb7e4706a6016550a39f401eee2d41274"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -6166,7 +6166,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#0d7b4982573aee4e9c50a1a2f9045e7b92d7738a"
+source = "git+https://github.com/atomdrift-project/filefacts.git#95c5fd2d8757105de3495a4952efef22c989bce4"
 dependencies = [
  "cc",
  "tree-sitter-language",
