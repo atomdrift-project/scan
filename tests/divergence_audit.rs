@@ -24,6 +24,7 @@ fn family_of(name: &str) -> &'static str {
         "trigram:",
         "tierbi:",
         "tiertri:",
+        "tierquad:",
         "kv:",
         "symbol_bi:",
         "symbol_tri:",

@@ -1534,8 +1534,20 @@ pub(super) fn attribute_reference_outcomes(
             continue;
         }
         let registry = registry.copied().unwrap_or_default();
+        let hard_unresolved = fetched.map_or(0, |t| {
+            file.filefacts.as_ref().map_or(0, |facts| {
+                count_unresolved_hard_extensions(
+                    &facts.references,
+                    &t.unresolved_extension_locators,
+                )
+            })
+        });
         let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
         write_reference_metrics(metrics, fetched, registry);
+        metrics.insert(
+            "references.unresolved_required_extension_count".to_string(),
+            hard_unresolved as f64,
+        );
         // The pass below covers every file with this sha at once.
         if !touched.contains(&file.sha256) {
             touched.push(file.sha256.clone());
@@ -1551,10 +1563,16 @@ pub(super) fn attribute_reference_outcomes(
             let spans = by_source
                 .get(sha.as_str())
                 .map(|t| {
-                    BTreeMap::from([(
-                        "references.unavailable_command_count".to_string(),
-                        t.unavailable_command_spans.clone(),
-                    )])
+                    BTreeMap::from([
+                        (
+                            "references.unavailable_command_count".to_string(),
+                            t.unavailable_command_spans.clone(),
+                        ),
+                        (
+                            "references.unavailable_vsix_url_count".to_string(),
+                            t.unavailable_vsix_url_spans.clone(),
+                        ),
+                    ])
                 })
                 .unwrap_or_default();
             (sha, spans)
@@ -1584,8 +1602,10 @@ pub(super) struct SourceTally<'a> {
     declared: u64,
     unresolved: Vec<&'a str>,
     unresolved_extensions: u64,
+    unresolved_extension_locators: Vec<&'a str>,
     unavailable_commands: u64,
     unavailable_command_spans: Vec<filefacts::Span>,
+    unavailable_vsix_url_spans: Vec<filefacts::Span>,
 }
 
 /// [`SourceTally`] per declaring sha.
@@ -1610,6 +1630,22 @@ pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceT
                     .push(filefacts::Span::new(offset, 1));
             }
         }
+        // An HTTP absence for a concrete VSIX URL is distinct from an
+        // unreachable gallery, a transport failure, or an unrelated URL.
+        // Require an offset so source-scoped composites can correlate it.
+        if rec.kind == RefKind::UrlFetch
+            && matches!(rec.outcome, Outcome::Failed(FetchError::Status(status)) if gone_status(status))
+            && artifact_absent(rec)
+            && Url::parse(&rec.locator).ok().is_some_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.path().to_ascii_lowercase().ends_with(".vsix")
+            })
+            && let Some(offset) = rec.source_offset
+        {
+            tally
+                .unavailable_vsix_url_spans
+                .push(filefacts::Span::new(offset, 1));
+        }
         if let Outcome::Unresolved(reason) = rec.outcome {
             tally.unresolved.push(rec.locator.as_str());
             // Only a registry answer that names no release means the
@@ -1620,10 +1656,29 @@ pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceT
                     .is_some_and(|c| matches!(c.typ, "vscode" | "openvsx"))
             {
                 tally.unresolved_extensions += 1;
+                tally
+                    .unresolved_extension_locators
+                    .push(rec.locator.as_str());
             }
         }
     }
     by_source
+}
+
+/// Count unavailable gallery coordinates actually named as hard dependencies.
+/// An extension may also appear in extensionPack; the hard relationship still
+/// applies. Unresolved fetch records retain the original unversioned locator.
+pub(super) fn count_unresolved_hard_extensions(
+    references: &[Reference],
+    unresolved: &[&str],
+) -> usize {
+    references
+        .iter()
+        .filter(|r| r.source == "extensionDependencies")
+        .map(locator)
+        .filter(|loc| unresolved.iter().any(|u| u.eq_ignore_ascii_case(loc)))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Write one declaring file's `references.*` metrics.
@@ -1639,6 +1694,10 @@ pub(super) fn write_reference_metrics(
     metrics.insert(
         "references.unavailable_command_count".to_string(),
         fetched.map_or(0, |t| t.unavailable_commands) as f64,
+    );
+    metrics.insert(
+        "references.unavailable_vsix_url_count".to_string(),
+        fetched.map_or(0, |t| t.unavailable_vsix_url_spans.len()) as f64,
     );
     metrics.insert(
         "references.security_hold_count".to_string(),

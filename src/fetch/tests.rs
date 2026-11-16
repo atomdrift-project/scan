@@ -1863,3 +1863,166 @@ fn colocated_python_locks_pin_pyproject_ranges() {
         "a lock in another directory pins nothing"
     );
 }
+
+#[test]
+fn unavailable_extension_counts_only_matching_hard_dependencies() {
+    let reference = |source: &str, locator: &str| -> Reference {
+        serde_json::from_value(serde_json::json!({
+            "locator": {"purl": locator},
+            "kind": "dependency",
+            "source": source,
+            "evidence": "example.extension"
+        }))
+        .unwrap()
+    };
+    let refs = vec![
+        reference("extensionDependencies", "pkg:vscode/example/required"),
+        reference("extensionPack", "pkg:vscode/example/optional"),
+    ];
+    assert_eq!(
+        count_unresolved_hard_extensions(&refs, &["pkg:vscode/example/optional"]),
+        0
+    );
+    assert_eq!(
+        count_unresolved_hard_extensions(&refs, &["pkg:vscode/example/required"]),
+        1
+    );
+    assert_eq!(
+        count_unresolved_hard_extensions(
+            &refs,
+            &["pkg:vscode/example/required", "pkg:vscode/example/optional"]
+        ),
+        1
+    );
+    assert_eq!(count_unresolved_hard_extensions(&refs, &[]), 0);
+}
+
+#[test]
+fn unavailable_hard_extension_metric_is_attributed_from_mixed_manifest() {
+    let sha = "a".repeat(64);
+    let report_json = serde_json::json!({
+        "version": "3", "files": [{"id": 0, "path": "package.json", "depth": 0,
+        "file_type": "package.json", "sha256": sha, "size": 100u64,
+        "filefacts": {"references": [
+            {"locator": {"purl": "pkg:vscode/example/required"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "example.required"},
+            {"locator": {"purl": "pkg:vscode/example/optional"}, "kind": "dependency", "source": "extensionPack", "evidence": "example.optional"}
+        ]}}]
+    });
+    for (unavailable, expected) in [("optional", 0.0), ("required", 1.0)] {
+        let mut report: AnalysisReport = serde_json::from_value(report_json.clone()).unwrap();
+        let mut record = fetched_record();
+        record.source_sha256 = Some(sha.clone());
+        record.locator = format!("pkg:vscode/example/{unavailable}");
+        record.outcome = Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease);
+        attribute_reference_outcomes(&mut report, &[record], &BTreeMap::new());
+        let metrics = report.files[0].filefacts_metrics.as_ref().unwrap();
+        assert_eq!(metrics["references.unresolved_extension_count"], 1.0);
+        assert_eq!(
+            metrics["references.unresolved_required_extension_count"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn malformed_extension_registry_response_is_not_an_unavailable_dependency() {
+    let sha = "e".repeat(64);
+    let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({
+        "version": "3", "files": [{"id": 0, "path": "package.json", "depth": 0,
+        "file_type": "package.json", "sha256": sha, "size": 100u64,
+        "filefacts": {"references": [
+            {"locator": {"purl": "pkg:vscode/example/required"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "example.required"}
+        ]}}]
+    })).unwrap();
+    let mut record = fetched_record();
+    record.source_sha256 = Some(sha);
+    record.locator = "pkg:vscode/example/required".to_string();
+    record.outcome = serde_json::from_value(serde_json::json!({"unresolved": "invalid_response"}))
+        .expect("requires fletch with invalid-response support");
+    attribute_reference_outcomes(&mut report, &[record], &BTreeMap::new());
+    let metrics = report.files[0].filefacts_metrics.as_ref().unwrap();
+    assert_eq!(metrics["references.unresolved_required_extension_count"], 0.0);
+}
+
+#[test]
+fn unavailable_extension_listed_as_both_hard_dependency_and_pack_is_required() {
+    let sha = "s".repeat(64);
+    let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({
+        "version": "3", "files": [{"id": 0, "path": "package.json", "depth": 0,
+        "file_type": "package.json", "sha256": sha, "size": 100u64,
+        "filefacts": {"references": [
+            {"locator": {"purl": "pkg:vscode/Example/Shared"}, "kind": "dependency", "source": "extensionPack", "evidence": "Example.Shared"},
+            {"locator": {"purl": "pkg:vscode/Example/Shared"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "Example.Shared"}
+        ]}}]
+    })).unwrap();
+    let mut record = fetched_record();
+    record.locator = "pkg:vscode/example/shared".to_string();
+    record.outcome = Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease);
+    attribute_reference_outcomes(&mut report, &[record], &BTreeMap::new());
+    let metrics = report.files[0].filefacts_metrics.as_ref().unwrap();
+    assert_eq!(
+        metrics["references.unresolved_required_extension_count"],
+        1.0
+    );
+}
+
+#[test]
+fn unavailable_vsix_urls_require_explicit_absence_and_source_offset() {
+    let sha = "a".repeat(64);
+    let json = serde_json::json!({"version":"3", "files":[{"id":0,"path":"extension.js",
+        "depth":0,"file_type":"javascript","sha256":sha,"size":100u64}]});
+    let mut records = Vec::new();
+    for (url, kind, status, offset) in [
+        (
+            "https://example.test/first.vsix?version=2",
+            RefKind::UrlFetch,
+            404,
+            Some(10),
+        ),
+        (
+            "https://example.test/SECOND.VSIX",
+            RefKind::UrlFetch,
+            410,
+            Some(20),
+        ),
+        (
+            "https://example.test/third.vsix",
+            RefKind::UrlFetch,
+            403,
+            Some(30),
+        ),
+        (
+            "https://example.test/config.json",
+            RefKind::UrlFetch,
+            404,
+            Some(40),
+        ),
+        (
+            "https://example.test/unlocated.vsix",
+            RefKind::UrlFetch,
+            404,
+            None,
+        ),
+        (
+            "https://example.test/command.vsix",
+            RefKind::Command,
+            404,
+            Some(50),
+        ),
+    ] {
+        let mut r = fetched_record();
+        r.source_sha256 = Some(sha.clone());
+        r.locator = url.to_string();
+        r.kind = kind;
+        r.status = Some(status);
+        r.source_offset = offset;
+        r.outcome = Outcome::Failed(FetchError::Status(status));
+        records.push(r);
+    }
+    let mut report: AnalysisReport = serde_json::from_value(json).unwrap();
+    attribute_reference_outcomes(&mut report, &records, &BTreeMap::new());
+    assert_eq!(
+        report.files[0].filefacts_metrics.as_ref().unwrap()["references.unavailable_vsix_url_count"],
+        2.0
+    );
+}
