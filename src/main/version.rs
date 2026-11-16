@@ -24,7 +24,7 @@ pub(super) fn print(format: scan::OutputFormat) -> std::io::Result<()> {
     let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
     scan::output::print_version(
         env!("CARGO_PKG_VERSION"),
-        &info.traits_edition.styled(),
+        &info.traits_edition.to_string(),
         bloom_count,
         rules,
         &rows(&info, bloom.as_ref(), nsrl.as_ref()),

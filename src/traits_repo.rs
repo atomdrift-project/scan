@@ -21,8 +21,8 @@ pub fn prepare_runtime_env() {
     if env_set || cleave::traits_repo::override_dir().is_some() {
         return;
     }
-    // `traits-enriched` when this run is Enriched, `traits-oss` otherwise.
-    let installed = cleave::traits_repo::installed_dir(cleave::enriched::enabled());
+    // The tree of the feed this run uses.
+    let installed = cleave::traits_repo::installed_dir(cleave::feed::current());
     let local = looks_like_traits(Path::new("traits"));
     if !local && !looks_like_traits(&installed) {
         return;
@@ -47,30 +47,30 @@ fn looks_like_traits(path: &Path) -> bool {
 /// Install or refresh cleave traits from the published bundle, the same path
 /// `cleave update-rules` uses. Returns `true` when the installed commit changed.
 ///
-/// The target is read again afterwards: a refused token without `--uplink`
-/// falls the run back to the open-source tree, and it is that tree's commit
-/// that then answers.
+/// The target is read again afterwards: a feed that was refused and not named
+/// with `--feed` falls the run back to another feed's tree, and it is that
+/// tree's commit that then answers.
 pub fn update(force: bool, quiet: bool) -> Result<bool> {
     prepare_runtime_env();
     let commit =
         || cleave::rule_update::installed(&cleave::traits_repo::install_target()).map(|i| i.commit);
     let before = commit();
     // Kept as the source, not flattened into text: auto-update tells a refused
-    // uplink token (an error) from an unreachable bucket (not one) by it.
+    // feed (an error) from an unreachable bucket (not one) by it.
     cleave::rule_update::refresh(force, quiet)
         .map_err(|e| anyhow::Error::new(e).context("traits update failed"))?;
     Ok(before != commit())
 }
 
-/// Why `--uplink` cannot be honoured, when that is what `error` says: no
-/// token, or one the rules channel refused. Without `--uplink` a refusal
-/// never gets this far — the run has fallen back to the open-source rules.
-/// Every other update failure — the network, the bucket, the disk — is one a
-/// host rides out on the rules it has.
+/// Why the feed named with `--feed` cannot be had, when that is what `error`
+/// says: no token, or one the rules service refused for it. A feed that was
+/// not named never gets this far — the run has fallen back to another. Every
+/// other update failure — the network, the bucket, the disk — is one a host
+/// rides out on the rules it has.
 #[must_use]
-pub fn enriched_refusal(error: &anyhow::Error) -> Option<&str> {
+pub fn feed_refusal(error: &anyhow::Error) -> Option<&str> {
     match error.downcast_ref::<cleave::rule_update::Error>()? {
-        cleave::rule_update::Error::Enriched(why) => Some(why),
+        cleave::rule_update::Error::Refused(refusal) => Some(&refusal.message),
         cleave::rule_update::Error::Other(_) => None,
     }
 }

@@ -46,7 +46,7 @@ vars! {
     SCAN_HOPPER: Text, "Hopper base URL(s), when `--hopper` is not given.";
     SCAN_FOLLOW: Text, "Reference categories to follow, when `--follow` is not given.";
     SCAN_REGISTRY_MAP: Text, "Registry metadata map file, when `--registry-map` is not given.";
-    ATOMDRIFT_UPLINK: Text, "`1` insists on Atomdrift Uplink, `0` keeps the open-source rules.";
+    ATOMDRIFT_FEED: Text, "Rule feed for this run, when `--feed` is not given: zero-day, supporter, or oss-delayed.";
     SCAN_NO_UPLOAD: Flag, "Disable CLI result and artifact uploads while retaining Hopper corpus lookups.";
     SCAN_MODELS_DIR: Text, "Use the model bundle in this directory, and never update it.";
     SCAN_NO_ANALYSIS_CACHE: Flag, "Disable every analysis cache in the stack, for benchmarks.";

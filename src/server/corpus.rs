@@ -190,6 +190,7 @@ impl Corpus {
         // on the same TLS-backend failure that failed this build.
         let client = reqwest::Client::builder()
             .timeout(READ_TIMEOUT)
+            .user_agent(concat!("atomdrift-scan/", env!("CARGO_PKG_VERSION")))
             .build()
             .inspect_err(|e| {
                 tracing::error!(error = %e, "cannot build the corpus HTTP client; lookups answer from the local index alone");

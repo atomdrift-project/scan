@@ -259,26 +259,22 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_update: bool,
 
-    /// Insist on Atomdrift Uplink: zero-hour rules the moment they clear QA,
-    /// remote dependency and hash verdicts (see `--analyze`), and a default
-    /// hosted LLM endpoint (raw files stay local unless `--analyze=remote`).
-    /// A computer that holds a token (`ISOTOPE13_TOKEN`, or the one saved when
-    /// it was connected) uses Uplink without this flag. With it, a computer
-    /// that holds none is connected — a terminal shows a code to approve at
-    /// dash.isotope13.io — and a refused token stops the scan instead of
-    /// falling back to the open-source rules. Also settable via
-    /// `ATOMDRIFT_UPLINK=1`; `=0` keeps the open-source rules.
-    #[arg(long, global = true, env = "ATOMDRIFT_UPLINK", value_parser = clap::builder::FalseyValueParser::new())]
-    pub uplink: bool,
+    /// Rule feed for this run: zero-day, supporter, or oss-delayed. Overrides
+    /// the feed saved by `atomscan feed <name>` (shared with cleave). A paid
+    /// feed with no token held connects this computer on a terminal — a code
+    /// to approve at dash.isotope13.io — and a refusal stops the scan instead
+    /// of falling back. Also settable via `ATOMDRIFT_FEED`.
+    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_FEED")]
+    pub feed: Option<cleave::feed::Feed>,
 
     /// Where artifacts are judged. `auto` (the default) asks Atomdrift Uplink
     /// for a verdict it already holds — sending only the SHA-256 of local
     /// files of 1 MiB or more, and the PURLs of packages on mainstream public
     /// registries — and analyzes locally whatever it does not know; it needs
-    /// Atomdrift Uplink (a token, or `--uplink`), and without it is the same
+    /// a paid isotope13 plan (a paid feed in use), and without one is the same
     /// as `local`. `local` never asks, and is the reproducible mode. `remote`
     /// sends everything to Uplink for analysis, uploading local files'
-    /// contents, and needs Atomdrift Uplink.
+    /// contents, and connects this computer if it holds no token.
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub analyze: crate::remote::Analyze,
 

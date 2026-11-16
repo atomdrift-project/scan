@@ -1,4 +1,4 @@
-//! Where an artifact is judged under `--uplink`: here, or via Atomdrift Uplink.
+//! Where an artifact is judged on a paid plan: here, or via Atomdrift Uplink.
 //!
 //! `--analyze=auto` asks Uplink for verdicts it already holds and analyzes
 //! locally whatever it does not know. The asking goes through
@@ -55,7 +55,7 @@ const ANALYZE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 /// `--analyze`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Analyze {
-    /// Ask Atomdrift Uplink first under `--uplink`; otherwise the same as `local`.
+    /// Ask Atomdrift Uplink first on a paid plan; otherwise the same as `local`.
     #[default]
     Auto,
     /// Analyze everything here.
@@ -69,24 +69,24 @@ pub enum Analyze {
 /// Process-wide: [`resolve`] sets it once, before any scan starts, and the
 /// scan paths read it through [`mode`] and [`analyze`] rather than being
 /// handed it.
-static RESOLVED: OnceLock<(Analyze, Option<cleave::enriched::Token>)> = OnceLock::new();
+static RESOLVED: OnceLock<(Analyze, Option<cleave::feed::Token>)> = OnceLock::new();
 
-/// Resolve `--analyze` against whether this run uses Atomdrift Uplink (a held
-/// token, or `--uplink`), once, before any scan starts.
+/// Resolve `--analyze` against whether this run is on a paid plan — a paid
+/// rule feed in use, which a refused token has already fallen back from —
+/// once, before any scan starts.
 ///
 /// `auto` on an open-source run is `local`: no new traffic for anyone who did
-/// not ask for the service. On an Uplink run, `auto` arms the Uplink
-/// lookups and `remote` holds the token for uploads. A missing token is asked
-/// for here, on a terminal, and checked against the rules channel before it
-/// is used.
+/// not ask for the service. On a paid run, `auto` arms the Uplink lookups and
+/// `remote` holds the token for uploads. A missing token is asked for here,
+/// on a terminal, and checked against the rules service before it is used.
 ///
 /// # Errors
-/// `remote` on an open-source run, or an Uplink run with no usable token.
-pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
-    let resolved = match (analyze, enriched) {
-        (Analyze::Remote, false) => {
-            anyhow::bail!("--analyze=remote requires Atomdrift Uplink: a token, or --uplink")
-        }
+/// `remote` on an open-source run, or a paid run with no usable token.
+pub fn resolve(analyze: Analyze, paid: bool) -> Result<Analyze> {
+    let resolved = match (analyze, paid) {
+        (Analyze::Remote, false) => anyhow::bail!(
+            "--analyze=remote requires Atomdrift Uplink on a paid plan: switch to a paid rule feed (`atomscan feed supporter`), which connects this computer"
+        ),
         (Analyze::Local, _) | (Analyze::Auto, false) => (Analyze::Local, None),
         (mode, true) => {
             let token = token()?;
@@ -96,7 +96,7 @@ pub fn resolve(analyze: Analyze, enriched: bool) -> Result<Analyze> {
             (mode, Some(token))
         }
     };
-    tracing::info!(event = "remote.mode", analyze = ?resolved.0, enriched);
+    tracing::info!(event = "remote.mode", analyze = ?resolved.0, paid);
     let mode = resolved.0;
     // Once per process. A second resolve keeps the first answer, which every
     // scan already started has acted on.
@@ -117,12 +117,12 @@ pub(crate) fn mode() -> Analyze {
 
 /// The subscription token, asking for one (and saving it, once the rules
 /// channel has honoured it) when there is none.
-fn token() -> Result<cleave::enriched::Token> {
-    if let Some((token, _)) = cleave::enriched::token()? {
+fn token() -> Result<cleave::feed::Token> {
+    if let Some((token, _)) = cleave::feed::token()? {
         return Ok(token);
     }
-    cleave::rule_update::enrich()?;
-    cleave::enriched::token()?
+    cleave::rule_update::connect()?;
+    cleave::feed::token()?
         .map(|(token, _)| token)
         .context("Uplink token was accepted but could not be read back")
 }

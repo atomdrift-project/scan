@@ -492,6 +492,13 @@ enum Commands {
     /// Update models, cleave traits, and the known-file filters
     UpdateRules,
 
+    /// Show the rule feeds, or switch to one (zero-day, supporter, oss-delayed)
+    Feed {
+        /// Feed to switch to; omit to list them
+        #[arg(value_enum)]
+        name: Option<cleave::feed::Feed>,
+    },
+
     /// Validate the model bundle and benign fixture corpus
     Validate,
 
@@ -695,6 +702,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Commands::Serve(args) => serve(global, args, interpret, fetch),
         Commands::UpdateRules => Ok(update_rules()),
+        Commands::Feed { name: None } => {
+            print!("{}", cleave::feed::list());
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Feed { name: Some(feed) } => {
+            cleave::rule_update::switch(feed)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Validate => {
             let model_dir = scan::cli::resolve_model_dir(None)?;
             let level = scan::cli::operating_level(global.level, false, &model_dir);
@@ -754,9 +769,9 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
         );
     }
 
-    // A held token picks the Uplink rules tree, `--uplink` insists on it, and
-    // `ATOMDRIFT_UPLINK=0` opts out: decided before anything resolves one.
-    cleave::enriched::resolve(global.uplink)?;
+    // The rule feed — `--feed`, the saved choice, or what a held token
+    // implies — decided before anything resolves a rules tree.
+    cleave::feed::resolve(global.feed)?;
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
     // default traits checkout was installed by cleave or another scan run.
@@ -786,20 +801,19 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
     // `--no-update` disables it. Scanning commands only: the daemons refresh on
     // restart, and `version`/`update-rules` manage updates themselves.
     if command.is_scan() {
-        // `--uplink` needs a token before the refresh below would ask for
-        // one mid-download; asked here, once.
-        if cleave::enriched::required() {
-            cleave::rule_update::sign_in()?;
-        }
+        // A paid feed named with `--feed` needs a token before the refresh
+        // below would ask for one mid-download; asked here, once.
+        cleave::rule_update::sign_in()?;
         scan::auto_update::refresh_if_stale(
             global.refresh(),
             global.mode,
             global.format == scan::OutputFormat::Terminal,
         )?;
-        // Where artifacts are judged, settled once the rules are: an uplink
-        // scan that needed a token has been asked for it by now, and one whose
-        // token was refused has fallen back to open source, and asks nothing.
-        scan::remote::resolve(global.analyze, cleave::enriched::enabled())?;
+        // Where artifacts are judged, settled once the rules are: a paid feed
+        // that needed a token has been asked for it by now, and one whose
+        // token was refused has fallen back, possibly to open source, which
+        // asks nothing.
+        scan::remote::resolve(global.analyze, cleave::feed::current().needs_token())?;
     }
     Ok(interpret)
 }
