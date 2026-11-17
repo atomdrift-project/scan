@@ -158,11 +158,12 @@ impl Refreshed {
             .filter_map(|(source, result)| result.as_ref().err().map(|e| (*source, e)))
     }
 
-    /// Why `--uplink` cannot be honoured, when the traits refresh says so.
+    /// Why the feed named with `--feed` cannot be had, when the traits
+    /// refresh says so.
     #[must_use]
-    pub(crate) fn enriched_refusal(&self) -> Option<&str> {
+    pub(crate) fn feed_refusal(&self) -> Option<&str> {
         self.failures()
-            .find_map(|(_, e)| crate::traits_repo::enriched_refusal(e))
+            .find_map(|(_, e)| crate::traits_repo::feed_refusal(e))
     }
 }
 
@@ -217,9 +218,9 @@ pub fn refresh(
 /// server comes up healthy and fails every analysis.
 ///
 /// # Errors
-/// The one failure that is fatal: `--uplink` was asked for and the token is
-/// missing or refused. A daemon that came up anyway would serve rules nobody
-/// deployed it with.
+/// The one failure that is fatal: a feed named with `--feed` cannot be had —
+/// no token, or one refused for it. A daemon that came up anyway would serve
+/// rules nobody deployed it with.
 pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
     if refresh == Refresh::Skip {
         tracing::warn!("--no-update: skipping the startup rules refresh");
@@ -233,8 +234,8 @@ pub fn refresh_rules_at_startup(refresh: Refresh) -> Result<()> {
             "startup rules refresh failed"
         );
     }
-    match refreshed.enriched_refusal() {
-        Some(why) => anyhow::bail!("uplink rules unavailable: {why}"),
+    match refreshed.feed_refusal() {
+        Some(why) => anyhow::bail!("{} unavailable: {why}", cleave::feed::current()),
         None => Ok(()),
     }
 }

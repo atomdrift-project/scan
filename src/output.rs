@@ -1157,7 +1157,7 @@ pub(crate) fn print_bloom_verdict(
     )
 }
 
-/// Write one artifact Atomdrift Uplink judged (`--uplink`), in place of a local
+/// Write one artifact Atomdrift Uplink judged (a paid plan), in place of a local
 /// result.
 ///
 /// Either JSON format gets a decision, as for an analysis, carrying what the
@@ -1512,8 +1512,8 @@ pub(crate) fn print_permission_warning(count: u32) {
 }
 
 /// Print the scan banner shared by every scanning subcommand (`ps`, directory,
-/// multi-path): the atom mark, version, and the two detection inventories already
-/// resident in memory. SHA-256/PURL Bloom entries stay distinct from executable
+/// multi-path): the atom mark, version, the rule feed and revision in use, and
+/// the two detection inventories already resident in memory. SHA-256/PURL Bloom entries stay distinct from executable
 /// trait/composite/YARA rules instead of inflating a misleading "rules" total.
 pub(crate) fn print_banner(counts: crate::engine::DetectionCounts) {
     let p = palette();
@@ -1523,7 +1523,11 @@ pub(crate) fn print_banner(counts: crate::engine::DetectionCounts) {
         " \u{269b}\u{fe0f} {} {}",
         ink.fg_bold(
             p.path_name,
-            &format!("Atomdrift Scan v{}", env!("CARGO_PKG_VERSION"))
+            &format!(
+                "Atomdrift Scan v{} [{}]",
+                env!("CARGO_PKG_VERSION"),
+                cleave::rules_label()
+            )
         ),
         ink.fg(
             p.very_dim,

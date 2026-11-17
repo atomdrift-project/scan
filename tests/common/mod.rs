@@ -47,7 +47,7 @@ pub(crate) fn unready_config() -> ServerConfig {
 /// Keep this test process's caches in a private directory. Opening the
 /// verdict index prunes every version but its own, so a shared index would
 /// lose a developer's real verdicts to a test run.
-#[expect(
+#[allow(
     clippy::expect_used,
     reason = "a harness that cannot isolate its caches must stop before touching a real index"
 )]

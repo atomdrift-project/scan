@@ -173,6 +173,21 @@ The default build matrix covers Linux, macOS, FreeBSD, OpenBSD, NetBSD, illumos,
 varies by target; see the [build workflow](.github/workflows/build.yml) for the
 current matrix.
 
+## Rule feeds
+
+Scan's rules come from one of three feeds. They carry the same rules and
+differ only in how long a ruleset waits after it passes QA: `oss-delayed` (up
+to 8 days, no account), `supporter` (72 hours, an isotope¹³ Early Supporter
+plan), and `zero-day` (no delay, a Business or Critical plan).
+
+```bash
+atomscan feed               # list the feeds and what's installed
+atomscan feed supporter     # switch; connects this computer if needed
+```
+
+The choice is shared with cleave. `--feed <name>` or `ATOMDRIFT_FEED` picks a
+feed for one run, and CI can supply a token with `ISOTOPE13_TOKEN`.
+
 ## NSRL Modern allowlist
 
 `atomscan update-rules` installs the NSRL Modern allowlist as its own Bloom

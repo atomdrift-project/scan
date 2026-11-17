@@ -386,7 +386,7 @@ impl V1Decision {
         d
     }
 
-    /// A file the CLI took the corpus's verdict for (`--uplink`), graded as
+    /// A file the CLI took the corpus's verdict for (Atomdrift Uplink), graded as
     /// `class` at the CLI's level.
     pub(crate) fn adopted(
         path: &str,

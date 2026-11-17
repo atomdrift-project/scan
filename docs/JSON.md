@@ -46,7 +46,7 @@ Files the CLI did not analyze still get a line:
 | --- | --- | --- | --- |
 | known good to the bloom filters | `allow`, severity `benign` | `bloom` | `known good` |
 | in neither filter set, fast mode | `unanalyzed` | `bloom` | why it was not analyzed |
-| taken from the corpus (`--uplink`) | the corpus verdict at the CLI's level | `uplink` | the corpus's |
+| taken from the corpus (Atomdrift Uplink) | the corpus verdict at the CLI's level | `uplink` | the corpus's |
 | analysis failed | `unavailable` | | the error |
 
 A failed file still makes the process exit 3.

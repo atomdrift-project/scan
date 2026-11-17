@@ -29,7 +29,7 @@
 //!
 //! # Atomdrift Uplink
 //!
-//! `--uplink` scans arm the same precheck against Uplink's API instead
+//! Scans on a paid plan arm the same precheck against Uplink's API instead
 //! (`configure_uplink`), with the subscription token. The wire is the
 //! same `/v1/lookup`; what changes is whose judgment it is. Hopper is a corpus
 //! of other runs, so only the same analyzer's verdict is ours. Uplink is the
@@ -156,8 +156,8 @@ pub(crate) struct Precheck {
 enum Backend {
     /// The hopper this process submits to. Only a same-analyzer verdict is ours.
     Hopper,
-    /// Uplink's API under `--uplink`. Its analyzed verdicts are the answer.
-    Uplink(cleave::enriched::Token),
+    /// Uplink's API on a paid plan. Its analyzed verdicts are the answer.
+    Uplink(cleave::feed::Token),
 }
 
 /// The armed precheck.
@@ -174,10 +174,10 @@ static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 const DEFAULT_MAX_AGE: Duration =
     Duration::from_secs(DEFAULT_MAX_AGE_DAYS * crate::civil::SECS_PER_DAY.unsigned_abs());
 
-/// Arm the precheck against Uplink's API, for an `--uplink` scan in
+/// Arm the precheck against Uplink's API, for a paid-plan scan in
 /// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
 /// hopper a process submits to is still the one it asks.
-pub(crate) fn configure_uplink(token: cleave::enriched::Token) {
+pub(crate) fn configure_uplink(token: cleave::feed::Token) {
     let precheck = Precheck {
         lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
         max_age: DEFAULT_MAX_AGE,
@@ -316,7 +316,7 @@ impl Precheck {
         })
     }
 
-    /// Whether this precheck asks Uplink (`--uplink`) rather than hopper.
+    /// Whether this precheck asks Uplink (a paid plan) rather than hopper.
     pub(crate) fn is_uplink(&self) -> bool {
         matches!(self.backend, Backend::Uplink(_))
     }
@@ -731,7 +731,7 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
 }
 
 /// Uplink's policy, pure for the same reason as [`standing_of`]: an
-/// analyzed verdict is adopted — the service's judgment is what an enriched
+/// analyzed verdict is adopted — the service's judgment is what a paid
 /// scan asked for — except a clean one older than `max_age_s`, which is
 /// analyzed again rather than trusted past its freshness. Anything not
 /// `analyzed`, or with no level, is analyzed here.
@@ -1145,12 +1145,12 @@ mod tests {
             max_age: Duration::from_secs(30 * DAY),
             breaker: Breaker::default(),
             backend: Backend::Uplink(
-                cleave::enriched::Token::parse("i13_test_token").expect("a token"),
+                cleave::feed::Token::parse("i13_test_token").expect("a token"),
             ),
         }
     }
 
-    /// Uplink is the judge an enriched scan asked for: an analyzed verdict
+    /// Uplink is the judge a paid scan asked for: an analyzed verdict
     /// stands whatever produced it, but a stale clean one, an unanalyzed one,
     /// or one with no level is analyzed here.
     #[test]

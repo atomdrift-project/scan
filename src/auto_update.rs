@@ -30,20 +30,23 @@ struct Stamp {
     checked_unix: u64,
 }
 
-/// Path to the stamp in [`crate::cache_dir`], one per rules channel *and* per
-/// build. The uplink tree goes stale on its own clock, and a host that
-/// switches to `--uplink` must not inherit the open-source tree's "checked an
-/// hour ago". Likewise an upgraded (or downgraded, or side-by-side) build must
-/// not inherit another version's "checked an hour ago": the data that version
-/// was content with may be in a format this one cannot read, so each version
-/// gets its own clock and refreshes once on first use.
+/// Path to the stamp in [`crate::cache_dir`], one per rule feed *and* per
+/// build. Each feed's tree goes stale on its own clock, and a host that
+/// switches feeds must not inherit another tree's "checked an hour ago".
+/// Likewise an upgraded (or downgraded, or side-by-side) build must not
+/// inherit another version's "checked an hour ago": the data that version was
+/// content with may be in a format this one cannot read, so each version gets
+/// its own clock and refreshes once on first use.
 fn stamp_path() -> Option<PathBuf> {
-    Some(crate::cache_dir()?.join(stamp_file_name(cleave::enriched::enabled())))
+    Some(crate::cache_dir()?.join(stamp_file_name(cleave::feed::current())))
 }
 
-fn stamp_file_name(enriched: bool) -> String {
-    let channel = if enriched { "-enriched" } else { "" };
-    format!("rules-update{channel}-{}.toml", env!("CARGO_PKG_VERSION"))
+fn stamp_file_name(feed: cleave::feed::Feed) -> String {
+    format!(
+        "rules-update-{}-{}.toml",
+        feed.slug(),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Stamp the current time (best-effort; failures are non-fatal).
@@ -72,9 +75,9 @@ fn write_stamp() {
 /// bucket can't cause a refresh storm.
 ///
 /// # Errors
-/// The one failure that is not best-effort: `--uplink` was asked for and the
-/// token is missing or refused. Scanning on with other rules would answer a
-/// question nobody asked.
+/// The one failure that is not best-effort: a feed named with `--feed` cannot
+/// be had — no token, or one refused for it. Scanning on with other rules
+/// would answer a question nobody asked.
 pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow::Result<()> {
     if refresh == Refresh::Skip {
         return Ok(());
@@ -136,7 +139,7 @@ pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow:
 struct Outcome {
     changed: bool,
     failed: bool,
-    /// Why `--uplink` cannot be honoured, when it cannot.
+    /// Why the feed named with `--feed` cannot be had, when it cannot.
     refused: Option<String>,
 }
 
@@ -155,7 +158,7 @@ fn refresh() -> Outcome {
     Outcome {
         changed: refreshed.changed(),
         failed: refreshed.failures().next().is_some(),
-        refused: refreshed.enriched_refusal().map(str::to_owned),
+        refused: refreshed.feed_refusal().map(str::to_owned),
     }
 }
 
@@ -199,14 +202,18 @@ mod tests {
     use super::stamp_file_name;
 
     #[test]
-    fn stamp_is_keyed_by_build_version_and_channel() {
-        let oss = stamp_file_name(false);
-        let enriched = stamp_file_name(true);
-        assert!(oss.contains(env!("CARGO_PKG_VERSION")), "{oss}");
-        assert!(enriched.contains(env!("CARGO_PKG_VERSION")), "{enriched}");
-        assert_ne!(oss, enriched);
-        // A stamp from the pre-versioning layout must never be read back.
-        assert_ne!(oss, "rules-update.toml");
-        assert_ne!(enriched, "rules-update-enriched.toml");
+    fn stamp_is_keyed_by_build_version_and_feed() {
+        use cleave::feed::Feed;
+        let names: Vec<_> = Feed::ALL.into_iter().map(stamp_file_name).collect();
+        for name in &names {
+            assert!(name.contains(env!("CARGO_PKG_VERSION")), "{name}");
+        }
+        assert!(names[0] != names[1] && names[1] != names[2] && names[0] != names[2]);
+        // A stamp from an older layout must never be read back.
+        for old in ["rules-update.toml", "rules-update-enriched.toml"] {
+            assert!(!names.iter().any(|name| name == old), "{old}");
+        }
+        let pre_feed = format!("rules-update-{}.toml", env!("CARGO_PKG_VERSION"));
+        assert!(!names.contains(&pre_feed), "{pre_feed}");
     }
 }

@@ -58,6 +58,8 @@ pub fn http() -> Option<&'static reqwest::blocking::Client> {
             // A blackholed address must fail fast so the retry moves on to the
             // next endpoint, rather than spend the transfer ceiling connecting.
             .connect_timeout(CONNECT_TIMEOUT)
+            // Hopper refuses a client that does not name itself.
+            .user_agent(concat!("atomdrift-scan/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| {
                 tracing::error!(error = %error_chain(&e), "cannot build the hopper HTTP client; hopper calls disabled");
