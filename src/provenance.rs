@@ -99,7 +99,7 @@ impl Upload<'_> {
     ///
     /// # Errors
     /// Returns serde's error if the document cannot be parsed or serialized.
-    pub(crate) fn sidecar_from_provenance(
+    pub fn sidecar_from_provenance(
         &self,
         provenance: &RegistryProvenance,
     ) -> Result<Vec<u8>, serde_json::Error> {
