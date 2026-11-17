@@ -1001,7 +1001,7 @@ fn scan_paths(
     // of those workers is the first to hit `yara_engine()`, the init's internal
     // par_iter deadlocks against its peers parked on the OnceLock. Prefetching
     // from main (non-rayon) fills the OnceLock safely.
-    scan::engine::prefetch_cleave_resources();
+    scan::engine::prefetch_cleave_resources_for(paths);
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.
     let summary = scan::engine::run_paths(paths, &config, registry_map.as_ref())?;

@@ -16,7 +16,7 @@ use super::progress::{Progress, Spinner};
 use super::render_cards::write_tiny;
 use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
-    prefetch_cleave_resources,
+    prefetch_cleave_resources_for,
 };
 use crate::bloom_repo::Decision as BloomDecision;
 use crate::corpus_precheck::Verdict;
@@ -100,7 +100,7 @@ fn run_paths_with(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources_for(paths);
     let mut session = Session::start(config, model, shap);
 
     // Partition the requested paths: explicit files become one unfiltered batch

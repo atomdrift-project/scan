@@ -490,6 +490,23 @@ pub fn prefetch_cleave_resources() {
     cleave::prefetch_shared_resources(true);
 }
 
+/// The most named files a scan may have and still warm lazily (see
+/// [`prefetch_cleave_resources_for`]). Past a handful, enough workers meet
+/// the same file types at once that building each index once up front wins.
+const FEW_FILES: usize = 4;
+
+/// [`prefetch_cleave_resources`] for a scan of `paths`. A scan of a few
+/// named files leaves cleave's fan-out indexes to their first use: building
+/// every file type's regex set costs ~0.5 s of CPU, and such a scan meets one
+/// or two types. Anything else (a directory, a large batch) warms them all.
+pub fn prefetch_cleave_resources_for(paths: &[std::path::PathBuf]) {
+    if paths.len() <= FEW_FILES && paths.iter().all(|path| path.is_file()) {
+        cleave::prefetch_shared_resources_for_few_files(true);
+    } else {
+        prefetch_cleave_resources();
+    }
+}
+
 /// The current time as an RFC 3339 string in UTC (`2026-10-01T13:02:22Z`).
 pub(crate) fn now_rfc3339() -> String {
     crate::civil::rfc3339(
