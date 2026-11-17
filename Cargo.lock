@@ -897,7 +897,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.3"
-source = "git+https://github.com/atomdrift-project/cleave.git#bf15fae2645f374ec37016ccd15293f5e76fc797"
+source = "git+https://github.com/atomdrift-project/cleave.git#33290f1a61a7f8a8592a5793b1e989eb8400b5a3"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -976,7 +976,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#bf15fae2645f374ec37016ccd15293f5e76fc797"
+source = "git+https://github.com/atomdrift-project/cleave.git#33290f1a61a7f8a8592a5793b1e989eb8400b5a3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3214,7 +3214,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#bf15fae2645f374ec37016ccd15293f5e76fc797"
+source = "git+https://github.com/atomdrift-project/cleave.git#33290f1a61a7f8a8592a5793b1e989eb8400b5a3"
 
 [[package]]
 name = "lzxd"
@@ -5539,7 +5539,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#bf15fae2645f374ec37016ccd15293f5e76fc797"
+source = "git+https://github.com/atomdrift-project/cleave.git#33290f1a61a7f8a8592a5793b1e989eb8400b5a3"
 
 [[package]]
 name = "tap"
@@ -7385,7 +7385,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#bf15fae2645f374ec37016ccd15293f5e76fc797"
+source = "git+https://github.com/atomdrift-project/cleave.git#33290f1a61a7f8a8592a5793b1e989eb8400b5a3"
 
 [[package]]
 name = "yara-x"
