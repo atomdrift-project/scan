@@ -996,12 +996,12 @@ fn scan_paths(
         }
         None => None,
     };
-    // Warm YARA + capability mapper off the rayon pool before any analysis
-    // spawns rayon work. Directory scans run on a dedicated rayon pool; if any
-    // of those workers is the first to hit `yara_engine()`, the init's internal
-    // par_iter deadlocks against its peers parked on the OnceLock. Prefetching
-    // from main (non-rayon) fills the OnceLock safely.
-    scan::engine::prefetch_cleave_resources();
+    // `run_paths` warms YARA and the capability mapper on this (non-rayon)
+    // thread before any analysis spawns rayon work, loading the model
+    // alongside. Directory scans run on a dedicated rayon pool; if any of
+    // those workers were the first to hit `yara_engine()`, the init's
+    // internal par_iter would deadlock against its peers parked on the
+    // OnceLock.
     // Explicit files are analyzed as one parallel batch and each directory is
     // streamed; run_paths shares one model load and verdict tally across all.
     let summary = scan::engine::run_paths(paths, &config, registry_map.as_ref())?;

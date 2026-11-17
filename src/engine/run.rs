@@ -16,7 +16,7 @@ use super::progress::{Progress, Spinner};
 use super::render_cards::write_tiny;
 use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
-    prefetch_cleave_resources,
+    prefetch_cleave_resources_for,
 };
 use crate::bloom_repo::Decision as BloomDecision;
 use crate::corpus_precheck::Verdict;
@@ -85,7 +85,25 @@ pub fn run_paths(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    let (model, shap) = load_model(config)?;
+    // The model and cleave's rules load independently, so load the model on
+    // a thread of its own while this one prefetches the rules: one after the
+    // other, the model's ~60 ms was added to every one-shot scan's startup.
+    // The prefetch stays on the calling thread, which is not a rayon worker
+    // (see `prefetch_cleave_resources`).
+    let loaded = std::thread::scope(|scope| {
+        let model = std::thread::Builder::new()
+            .name("model-load".into())
+            .spawn_scoped(scope, || load_model(config));
+        prefetch_cleave_resources_for(paths);
+        match model {
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            // No thread to spare: load it here instead.
+            Err(_) => load_model(config),
+        }
+    });
+    let (model, shap) = loaded?;
     run_paths_with(&model, shap.as_ref(), paths, config, registry_map)
 }
 
@@ -100,7 +118,7 @@ fn run_paths_with(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources();
+    prefetch_cleave_resources_for(paths);
     let mut session = Session::start(config, model, shap);
 
     // Partition the requested paths: explicit files become one unfiltered batch
