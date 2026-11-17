@@ -73,6 +73,9 @@ pub mod features;
 pub mod fetch;
 #[doc(hidden)]
 pub mod freebsd_malloc;
+/// Sampling live-heap profiler for Windows builds.
+#[cfg(all(windows, feature = "heap-sample"))]
+pub mod heap_sample;
 #[doc(hidden)]
 pub mod hopper;
 #[doc(hidden)]

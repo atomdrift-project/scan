@@ -178,9 +178,9 @@ pub fn model_default_level(model_dir: &Path) -> Option<u16> {
 #[derive(Debug)]
 pub struct Model {
     inner: Backend,
-    spec: FeatureSpec,
-    /// Extraction tables for `spec`, built once at load.
-    ctx: ExtractContext,
+    /// The general route's feature spec and the extraction tables built
+    /// from it, shared with the specialists trained on the same layout.
+    tables: Arc<load::SpecTables>,
     thresholds: Thresholds,
     info: ModelInfo,
     routes: RouteSet,
@@ -301,13 +301,13 @@ impl Model {
 
         tracing::info!(
             n_members = general.backend.n_members(),
-            features = general.spec.total_features(),
-            model_abi_version = general.spec.abi_version(),
+            features = general.tables.spec.total_features(),
+            model_abi_version = general.tables.spec.abi_version(),
             threshold_suspicious = thresholds.suspicious,
             threshold_hostile = thresholds.hostile,
             threshold_source,
             diagnostic_level,
-            spec_version = general.spec.version(),
+            spec_version = general.tables.spec.version(),
             filegroups = routes.filegroups.len(),
             filetypes = routes.filetypes.len(),
             "model loaded",
@@ -331,14 +331,12 @@ impl Model {
         grid_max: u16,
     ) -> Self {
         let info = ModelInfo {
-            version: general.spec.version(),
-            abi_version: general.spec.abi_version(),
+            version: general.tables.spec.version(),
+            abi_version: general.tables.spec.abi_version(),
         };
-        let ctx = ExtractContext::new(&general.spec);
         Self {
             inner: general.backend,
-            spec: general.spec,
-            ctx,
+            tables: general.tables,
             thresholds,
             info,
             routes,
@@ -387,8 +385,8 @@ impl Model {
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
         let needs = self.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
         let parsed = ParsedReport::from_compact_report(report, needs, None);
-        let mut features = self.ctx.extract_from_parsed(&parsed);
-        self.spec.standardize(&mut features);
+        let mut features = self.tables.ctx.extract_from_parsed(&parsed);
+        self.tables.spec.standardize(&mut features);
         let file_type = report
             .files
             .first()
@@ -442,7 +440,7 @@ impl Model {
             None => own.map_or(Classification::Benign, |t| t.classify(probability)),
         };
         let score_general = || -> Result<Scored> {
-            self.ctx.validate_keyword_inputs(parsed)?;
+            self.tables.ctx.validate_keyword_inputs(parsed)?;
             let probability = self.inner.predict(general_features)?;
             Ok(Scored {
                 route: RouteId::GENERAL,
@@ -454,9 +452,9 @@ impl Model {
             let Some((id, route)) = entry else {
                 return Ok(None);
             };
-            route.ctx.validate_keyword_inputs(parsed)?;
-            let mut features = route.ctx.extract_from_parsed(parsed);
-            route.spec.standardize(&mut features);
+            route.tables.ctx.validate_keyword_inputs(parsed)?;
+            let mut features = route.tables.ctx.extract_from_parsed(parsed);
+            route.tables.spec.standardize(&mut features);
             let probability = route.backend.predict(&features)?;
             Ok(Some(Scored {
                 route: *id,
@@ -649,14 +647,14 @@ impl Model {
 
     /// Feature specification used to build input vectors.
     #[must_use]
-    pub const fn spec(&self) -> &FeatureSpec {
-        &self.spec
+    pub fn spec(&self) -> &FeatureSpec {
+        &self.tables.spec
     }
 
     /// Extraction tables for [`Self::spec`], built once at load.
     #[must_use]
-    pub const fn ctx(&self) -> &ExtractContext {
-        &self.ctx
+    pub fn ctx(&self) -> &ExtractContext {
+        &self.tables.ctx
     }
 
     /// The optional raw inputs a report must have parsed for every route that
@@ -664,7 +662,7 @@ impl Model {
     /// `file_types` selects. Specialists load here if they have not yet;
     /// scoring the same types would load them next anyway.
     pub(crate) fn raw_needs<'a>(&self, file_types: impl IntoIterator<Item = &'a str>) -> RawNeeds {
-        let mut needs = self.ctx.raw_needs();
+        let mut needs = self.tables.ctx.raw_needs();
         let mut seen = HashSet::new();
         for file_type in file_types {
             if !seen.insert(file_type) {
@@ -677,7 +675,7 @@ impl Model {
                 .routes
                 .additional_policy_routes(file_type, &type_key, group_key);
             for (_, route) in group.iter().chain(filetype.iter()).chain(additional.iter()) {
-                needs = needs.union(route.ctx.raw_needs());
+                needs = needs.union(route.tables.ctx.raw_needs());
             }
         }
         needs

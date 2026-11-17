@@ -195,6 +195,8 @@ mimalloc = { version = "0.1", default-features = false }
 # src/main.rs routes through.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
 tree-sitter = "0.28"
+# Symbol names for the `heap-sample` profiler's reports.
+backtrace = { version = "0.3", optional = true }
 
 # Keep this target list in lockstep with the `cfg` on the jemalloc
 # `mod allocator` in src/main.rs, and with its negation on the fallback one.
@@ -227,6 +229,11 @@ fletch = { git = "https://github.com/atomdrift-project/fletch.git", features = [
 #     ./out/scan.heap -f json <sample>
 # Analyze with: jeprof --text ./out/scan.heap out/heap/jeprof.*.heap
 jemalloc-prof = ["tikv-jemallocator/profiling"]
+# Windows counterpart: a sampling live-heap profiler over mimalloc (see
+# src/heap_sample.rs). Build with:
+#   cargo build --profile profiling --features heap-sample --bin atomscan
+# Run with SCAN_HEAP_SAMPLE=<report file>.
+heap-sample = ["dep:backtrace"]
 # Exposes `bloom_repo::test_support` so embedders' tests can load a fixture
 # bloom bundle from a directory of their choosing.
 test-support = []
@@ -345,3 +352,7 @@ tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 # own standalone builds. Remove all three once a release carries the fix.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
+
+# Local development: build the sibling cleave checkout instead of the git pin.
+[patch."https://github.com/atomdrift-project/cleave.git"]
+cleave = { path = "../cleave" }

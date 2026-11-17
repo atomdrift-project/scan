@@ -139,14 +139,29 @@ mod allocator {
 /// convoys under many-way archive-member analysis.
 #[cfg(windows)]
 mod allocator {
+    #[cfg(not(feature = "heap-sample"))]
     #[global_allocator]
     static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+    #[cfg(feature = "heap-sample")]
+    #[global_allocator]
+    static GLOBAL: scan::heap_sample::Sampling<mimalloc::MiMalloc> =
+        scan::heap_sample::Sampling(mimalloc::MiMalloc);
+
+    #[cfg(not(feature = "heap-sample"))]
     tree_sitter_allocator!(
         libmimalloc_sys::mi_malloc,
         libmimalloc_sys::mi_calloc,
         libmimalloc_sys::mi_realloc,
         libmimalloc_sys::mi_free
+    );
+
+    #[cfg(feature = "heap-sample")]
+    tree_sitter_allocator!(
+        scan::heap_sample::c_malloc,
+        scan::heap_sample::c_calloc,
+        scan::heap_sample::c_realloc,
+        scan::heap_sample::c_free
     );
 }
 
@@ -765,6 +780,8 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
     scan::freebsd_malloc::check_settings();
     scan::runtime::install_rayon_pool();
     scan::runtime::install_diagnostics();
+    #[cfg(all(windows, feature = "heap-sample"))]
+    scan::heap_sample::start();
 
     #[cfg(debug_assertions)]
     tracing::warn!(

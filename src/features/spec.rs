@@ -223,7 +223,15 @@ impl FeatureSpec {
     /// this build reads, or it fails [`Self::validate`].
     pub fn load(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context("reading feature spec")?;
-        let spec: Self = serde_json::from_str(&data).context("parsing feature spec")?;
+        Self::parse(&data)
+    }
+
+    /// Parse and validate the contents of a `feature_spec.json`.
+    ///
+    /// # Errors
+    /// As [`Self::load`], less the read.
+    pub fn parse(data: &str) -> Result<Self> {
+        let spec: Self = serde_json::from_str(data).context("parsing feature spec")?;
 
         if !(MIN_LOADABLE_SPEC_VERSION..=EXPECTED_SPEC_VERSION).contains(&spec.version) {
             anyhow::bail!(

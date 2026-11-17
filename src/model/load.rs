@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -57,7 +57,57 @@ impl BundleConfig {
 /// One route's model and the feature spec it was trained with.
 pub(super) struct LoadedBundle {
     pub(super) backend: Backend,
+    pub(super) tables: Arc<SpecTables>,
+}
+
+/// A parsed feature spec and the extraction tables built from it.
+#[derive(Debug)]
+pub(super) struct SpecTables {
     pub(super) spec: FeatureSpec,
+    pub(super) ctx: ExtractContext,
+}
+
+/// The spec at `path` with its extraction tables, shared with every other
+/// route whose `feature_spec.json` has the same bytes.
+///
+/// A spec names over a hundred thousand features and its tables index them
+/// again, tens of megabytes a route. Routes retrained on one feature layout
+/// ship byte-identical specs (sixteen of them in one installed bundle), so
+/// each distinct spec is parsed and held once. Entries are weak: dropping
+/// the last route that uses a spec frees it.
+fn shared_spec_tables(path: &Path) -> Result<Arc<SpecTables>> {
+    use sha2::Digest as _;
+    static SHARED: Mutex<Option<HashMap<[u8; 32], Weak<SpecTables>>>> = Mutex::new(None);
+    let lock = || {
+        SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+
+    let data = std::fs::read_to_string(path).context("reading feature spec")?;
+    let key: [u8; 32] = sha2::Sha256::digest(data.as_bytes()).into();
+    let held = lock()
+        .as_ref()
+        .and_then(|shared| shared.get(&key))
+        .and_then(Weak::upgrade);
+    if let Some(tables) = held {
+        return Ok(tables);
+    }
+    // Parsed outside the lock: a route build must never wait on another's.
+    let spec = FeatureSpec::parse(&data)?;
+    drop(data);
+    let built = Arc::new(SpecTables {
+        ctx: ExtractContext::new(&spec),
+        spec,
+    });
+    let mut guard = lock();
+    let shared = guard.get_or_insert_with(HashMap::new);
+    shared.retain(|_, tables| tables.strong_count() > 0);
+    if let Some(raced) = shared.get(&key).and_then(Weak::upgrade) {
+        return Ok(raced);
+    }
+    shared.insert(key, Arc::downgrade(&built));
+    Ok(built)
 }
 
 /// Load the inference backend for a route directory: every member at
@@ -157,8 +207,9 @@ pub(super) fn load_bundle(bundle_dir: &Path) -> Result<LoadedBundle> {
     );
     let backend = load_backend(bundle_dir)?;
     tracing::debug!(path = %spec_path.display(), "loading feature spec");
-    let spec = FeatureSpec::load(&spec_path)
+    let tables = shared_spec_tables(&spec_path)
         .with_context(|| format!("loading feature spec from {}", spec_path.display()))?;
+    let spec = &tables.spec;
     anyhow::ensure!(
         spec.total_features() == backend.num_features(),
         "feature count mismatch: feature_spec.json has {} features but the model expects {} — \
@@ -166,7 +217,7 @@ pub(super) fn load_bundle(bundle_dir: &Path) -> Result<LoadedBundle> {
         spec.total_features(),
         backend.num_features(),
     );
-    Ok(LoadedBundle { backend, spec })
+    Ok(LoadedBundle { backend, tables })
 }
 
 /// Walk a `filegroups/` or `filetypes/` directory and register each
@@ -245,8 +296,9 @@ fn load_specialists(
 #[derive(Debug)]
 pub(super) struct Route {
     pub(super) backend: Backend,
-    pub(super) spec: FeatureSpec,
-    pub(super) ctx: ExtractContext,
+    /// The route's spec and extraction tables, shared with the routes
+    /// trained on the same feature layout.
+    pub(super) tables: Arc<SpecTables>,
     /// The route's thresholds at the diagnostic level, when the config has
     /// them; a route named only by policies has none.
     pub(super) thresholds: Option<Thresholds>,
@@ -344,9 +396,8 @@ impl LazyRoute {
             "the model bundle was replaced on disk after it was loaded; reload to use the new one"
         );
         Ok(Route {
-            ctx: ExtractContext::new(&bundle.spec),
             backend: bundle.backend,
-            spec: bundle.spec,
+            tables: bundle.tables,
             thresholds: self.thresholds,
         })
     }
