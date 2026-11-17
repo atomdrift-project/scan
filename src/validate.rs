@@ -16,7 +16,8 @@ const SLOW_FIXTURE_THRESHOLD: Duration = Duration::from_secs(15);
 /// Run validation: model loading, feature-layout checks, and benign fixture inference.
 ///
 /// The analyzed corpus mirrors the model false-positive gate: common platform
-/// utilities plus every file in the cleave traits `testdata/does-nothing` tree.
+/// utilities plus every file in the cleave traits `testdata/baseline/does-nothing` tree
+/// (`testdata/does-nothing` in older rulesets).
 /// Full cleave trait-rule validation remains the job of `cleave validate`;
 /// running it here as a second uncached pass made this command too slow for a
 /// local deploy/pre-commit gate.
@@ -231,6 +232,14 @@ fn collect_targets() -> Result<Vec<PathBuf>> {
         "/bin/sulogin",
         "/bin/gpgconf",
         "/usr/lib/systemd/system/arptables.service",
+        // Windows has none of the above; without these a host with no traits
+        // checkout would have an empty corpus.
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32
+otepad.exe",
+        r"C:\Windows\System32\curl.exe",
+        r"C:\Windows\System32	ar.exe",
+        r"C:\Windows\System32\whoami.exe",
     ]
     .into_iter()
     .map(PathBuf::from)
@@ -238,8 +247,15 @@ fn collect_targets() -> Result<Vec<PathBuf>> {
     .collect();
 
     if let Ok(traits_dir) = cleave::traits_repo::try_resolve() {
-        let dn_dir = traits_dir.join("testdata").join("does-nothing");
-        if dn_dir.is_dir() {
+        let testdata = traits_dir.join("testdata");
+        // The corpus moved under `baseline/`; older rulesets keep it at the top.
+        let dn_dir = [
+            testdata.join("baseline").join("does-nothing"),
+            testdata.join("does-nothing"),
+        ]
+        .into_iter()
+        .find(|dir| dir.is_dir());
+        if let Some(dn_dir) = dn_dir {
             walk_files(&dn_dir, &mut targets)?;
         }
     }
