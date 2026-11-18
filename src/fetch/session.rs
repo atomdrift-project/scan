@@ -1690,9 +1690,11 @@ pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceT
             // Only a registry answer that names no release means the
             // extension is absent from its gallery. Unsupported or unsafe
             // coordinates are parser/resolver limits, not marketplace pulls.
+            // Editor-bundled extensions do not need gallery releases.
             if reason == fletch::fetch::Unresolved::NoRelease
-                && Coordinate::of(&rec.locator)
-                    .is_some_and(|c| matches!(c.typ, "vscode" | "openvsx"))
+                && Coordinate::of(&rec.locator).is_some_and(|c| {
+                    matches!(c.typ, "vscode" | "openvsx") && !is_bundled_extension(c)
+                })
             {
                 tally.unresolved_extensions += 1;
                 tally
@@ -1702,6 +1704,22 @@ pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceT
         }
     }
     by_source
+}
+
+fn is_bundled_extension(coordinate: Coordinate<'_>) -> bool {
+    // These IDs come from the built-in extension manifests in microsoft/vscode.
+    // Match individual IDs so an unknown name in the same namespace still
+    // requires a gallery lookup.
+    coordinate.version.is_none()
+        && [
+            "vscode/git",
+            "vscode/git-base",
+            "vscode/github",
+            "vscode/github-authentication",
+            "vscode/microsoft-authentication",
+        ]
+        .iter()
+        .any(|id| coordinate.path.eq_ignore_ascii_case(id))
 }
 
 /// Count unavailable gallery coordinates actually named as hard dependencies.

@@ -1905,21 +1905,33 @@ fn unavailable_hard_extension_metric_is_attributed_from_mixed_manifest() {
         "file_type": "package.json", "sha256": sha, "size": 100u64,
         "filefacts": {"references": [
             {"locator": {"purl": "pkg:vscode/example/required"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "example.required"},
-            {"locator": {"purl": "pkg:vscode/example/optional"}, "kind": "dependency", "source": "extensionPack", "evidence": "example.optional"}
+            {"locator": {"purl": "pkg:vscode/example/optional"}, "kind": "dependency", "source": "extensionPack", "evidence": "example.optional"},
+            {"locator": {"purl": "pkg:vscode/vscode/git"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "vscode.git"},
+            {"locator": {"purl": "pkg:openvsx/vscode/github"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "vscode.github"},
+            {"locator": {"purl": "pkg:vscode/vscode/git-lookalike"}, "kind": "dependency", "source": "extensionDependencies", "evidence": "vscode.git-lookalike"}
         ]}}]
     });
-    for (unavailable, expected) in [("optional", 0.0), ("required", 1.0)] {
+    for (unavailable, expected_all, expected_required) in [
+        ("pkg:vscode/example/optional", 1.0, 0.0),
+        ("pkg:vscode/example/required", 1.0, 1.0),
+        ("pkg:vscode/VSCode/Git", 0.0, 0.0),
+        ("pkg:openvsx/vscode/github", 0.0, 0.0),
+        ("pkg:vscode/vscode/git-lookalike", 1.0, 1.0),
+    ] {
         let mut report: AnalysisReport = serde_json::from_value(report_json.clone()).unwrap();
         let mut record = fetched_record();
         record.source_sha256 = Some(sha.clone());
-        record.locator = format!("pkg:vscode/example/{unavailable}");
+        record.locator = unavailable.to_string();
         record.outcome = Outcome::Unresolved(fletch::fetch::Unresolved::NoRelease);
         attribute_reference_outcomes(&mut report, &[record], &BTreeMap::new());
         let metrics = report.files[0].filefacts_metrics.as_ref().unwrap();
-        assert_eq!(metrics["references.unresolved_extension_count"], 1.0);
+        assert_eq!(
+            metrics["references.unresolved_extension_count"],
+            expected_all
+        );
         assert_eq!(
             metrics["references.unresolved_required_extension_count"],
-            expected
+            expected_required
         );
     }
 }
