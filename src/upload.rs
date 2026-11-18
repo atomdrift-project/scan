@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 mod queue;
 
 use crate::engine::{ScanResult, UploadDoc, UploadStamp};
-use crate::hopper::{Route, bearer, endpoints, error_chain};
+use crate::hopper::{bearer, error_chain, worker_endpoint};
 use crate::interpret::Interpretation;
 use crate::retry::{backoff, fuzz, is_transient, parse_retry_after};
 
@@ -688,14 +688,14 @@ impl Drop for Uploader {
     }
 }
 
-/// One hopper, as every call to it needs it: the HTTP client, each route at
-/// every address `--hopper` named, the bearer token, and the name results are
-/// filed under.
+/// One hopper, as every call to it needs it: the HTTP client, each write
+/// route on the primary, the bearer token, and the name results are filed
+/// under.
 struct Hopper {
     http: reqwest::blocking::Client,
-    result: Route,
-    known: Route,
-    upload: Route,
+    result: String,
+    known: String,
+    upload: String,
     token: Option<&'static str>,
     worker: String,
     tally: Arc<Tally>,
@@ -708,15 +708,16 @@ impl Hopper {
         worker: String,
         tally: Arc<Tally>,
     ) -> Self {
-        // One entry per address `--hopper` named, in preference order. A retry
-        // walks down the list, so a replica that stops answering costs the
-        // first attempt and the primary takes the rest.
-        let bases = endpoints(hopper_url);
+        // Every call here is a write (the held probe is a POST on the
+        // intake path), so all of them go to the primary: the last address
+        // `--hopper` names. A replica ahead of it serves reads; sending it
+        // writes only adds a hop, or a refusal when it runs no relay.
+        let primary = worker_endpoint(hopper_url).unwrap_or_default();
         Self {
             http,
-            result: Route::new(&bases, "/v1/work/result"),
-            known: Route::new(&bases, "/v1/intake/held"),
-            upload: Route::new(&bases, "/v1/intake/upload"),
+            result: format!("{primary}/v1/work/result"),
+            known: format!("{primary}/v1/intake/held"),
+            upload: format!("{primary}/v1/intake/upload"),
             token: crate::hopper::token(),
             worker,
             tally,
@@ -995,37 +996,29 @@ impl Hopper {
             #[serde(default)]
             known: Vec<String>,
         }
-        // Each address in turn. Failing this probe is safe but not free: the
-        // caller then treats every artifact as missing and pushes bytes hopper
-        // already holds, so stopping at an unreachable replica would spend an
-        // outage re-uploading the corpus to a primary that is up and one line down
-        // the list. A decode failure is not retried elsewhere — the next address
-        // runs the same build and would answer the same way.
-        for url in self.known.each() {
-            let resp = crate::retry::send(
-                "hopper known probe",
-                crate::hopper::LOOKUP_RETRY_BUDGET,
-                |_| bearer(self.http.post(url), self.token).json(&KnownRequest { sha256: shas }),
-            );
-            match resp {
-                Ok(resp) if resp.status().is_success() => {
-                    return match resp.json::<KnownResponse>() {
-                        Ok(kr) => kr.known.into_iter().collect(),
-                        Err(e) => {
-                            tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
-                            HashSet::new()
-                        }
-                    };
-                }
-                Ok(resp) => {
-                    tracing::warn!(endpoint = %url, status = %resp.status(), "upload: known probe non-success");
-                }
+        let url = &self.known;
+        let resp = crate::retry::send(
+            "hopper known probe",
+            crate::hopper::LOOKUP_RETRY_BUDGET,
+            |_| bearer(self.http.post(url), self.token).json(&KnownRequest { sha256: shas }),
+        );
+        match resp {
+            Ok(resp) if resp.status().is_success() => match resp.json::<KnownResponse>() {
+                Ok(kr) => kr.known.into_iter().collect(),
                 Err(e) => {
-                    tracing::warn!(endpoint = %url, error = %error_chain(&e), "upload: known probe failed");
+                    tracing::warn!(error = %error_chain(&e), "upload: known response decode failed");
+                    HashSet::new()
                 }
+            },
+            Ok(resp) => {
+                tracing::warn!(endpoint = %url, status = %resp.status(), "upload: known probe non-success");
+                HashSet::new()
+            }
+            Err(e) => {
+                tracing::warn!(endpoint = %url, error = %error_chain(&e), "upload: known probe failed");
+                HashSet::new()
             }
         }
-        HashSet::new()
     }
 
     /// The multipart `/v1/intake/upload` body: the provenance part first, as hopper's
@@ -1065,7 +1058,7 @@ impl Hopper {
                     return false;
                 }
             };
-            let request = bearer(self.http.post(self.upload.at(attempt)), self.token)
+            let request = bearer(self.http.post(&self.upload), self.token)
                 .timeout(timeout)
                 .multipart(form);
             retry_after = None;
@@ -1115,7 +1108,7 @@ impl Hopper {
             // Each attempt runs only until the budget ends, but never shorter
             // than RENEW_MIN_ATTEMPT, so a late one still has time to land.
             let remaining = RENEW_BUDGET.saturating_sub(started.elapsed());
-            let request = bearer(self.http.post(self.result.at(attempt - 1)), self.token)
+            let request = bearer(self.http.post(&self.result), self.token)
                 .timeout(remaining.max(RENEW_MIN_ATTEMPT))
                 .header(reqwest::header::CONTENT_TYPE, RESULT_CONTENT_TYPE)
                 // Claim hopper's reserved lane: this renewal is one-shot, and the

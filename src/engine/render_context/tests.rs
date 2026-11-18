@@ -279,9 +279,10 @@ fn finding(id: &str, desc: &str, crit: cleave::Criticality) -> cleave::Finding {
     f
 }
 
-/// Members with nothing suspicious to say go first; the root and any
-/// suspicious member survive whatever the budget, and a dropped container
-/// takes its nested members with it.
+/// Members with nothing suspicious to say go first. A suspicious member
+/// outranks them, and it is dropped only once nothing weaker is left and the
+/// render is still over budget. A dropped container takes its nested members
+/// with it. The root stays.
 #[test]
 fn interpret_render_budget_drops_weakest_members_first() {
     use cleave::types::{Criticality, FindingKind};
@@ -325,44 +326,278 @@ fn interpret_render_budget_drops_weakest_members_first() {
     let mut report = empty_report();
     report.files = files;
 
-    let (full, dropped) = budget_primary_context(&mut report.clone(), usize::MAX);
-    assert_eq!(dropped, 0, "budget 0 must disable the cap");
+    let full = budget_primary_context(&mut report.clone(), usize::MAX);
+    assert_eq!(full.members_omitted, 0, "an unlimited budget drops nothing");
     for id in 0..6 {
         assert!(
-            full.contains(&format!("m{id}.py")),
-            "uncapped render lists m{id}:\n{full}"
+            full.text.contains(&format!("m{id}.py")),
+            "uncapped render lists m{id}:\n{}",
+            full.text
         );
     }
 
-    // A budget nobody can meet still keeps the root and the suspicious
-    // member: those are never on the table.
-    let (tight, dropped) = budget_primary_context(&mut report.clone(), 1);
-    assert!(tight.contains("m0.py"), "root survives: {tight}");
+    // A budget nobody can meet keeps the root and sheds every member. The
+    // suspicious member outranks the notables, and it still goes: the
+    // alternative is a prompt the endpoint refuses whole.
+    let tight = budget_primary_context(&mut report.clone(), 1);
     assert!(
-        tight.contains("m1.py"),
-        "suspicious member survives: {tight}"
+        tight.text.contains("m0.py"),
+        "root survives: {}",
+        tight.text
     );
-    assert_eq!(dropped, 4, "every droppable member went: {tight}");
+    assert!(
+        !tight.text.contains("m1.py"),
+        "suspicious member yields once nothing weaker is left: {}",
+        tight.text
+    );
+    assert_eq!(
+        tight.members_omitted, 5,
+        "every member went: {}",
+        tight.text
+    );
 
     // Just over the line: the member with the least to say (one notable
     // finding) goes first, and its nested child goes with it even though
     // the child alone, with four findings, would have outranked m2 and m3.
-    let over = full.len() - 1;
-    let (capped, dropped) = budget_primary_context(&mut report, over);
-    assert!(capped.len() <= over, "{} > {over}", capped.len());
+    // The suspicious member is a stronger rank and stays.
+    let over = full.text.len() - 1;
+    let capped = budget_primary_context(&mut report, over);
+    assert!(capped.text.len() <= over, "{} > {over}", capped.text.len());
     assert!(
-        !capped.contains("m4.py"),
-        "weakest member dropped first: {capped}"
+        !capped.text.contains("m4.py"),
+        "weakest member dropped first: {}",
+        capped.text
     );
     assert!(
-        !capped.contains("m5.py"),
-        "nested member follows its container: {capped}"
+        !capped.text.contains("m5.py"),
+        "nested member follows its container: {}",
+        capped.text
     );
     assert!(
-        capped.contains("m2.py") && capped.contains("m3.py"),
-        "notable members kept: {capped}"
+        capped.text.contains("m1.py"),
+        "suspicious member outranks notables: {}",
+        capped.text
     );
-    assert_eq!(dropped, 2);
+    assert!(
+        capped.text.contains("m2.py") && capped.text.contains("m3.py"),
+        "notable members kept: {}",
+        capped.text
+    );
+    assert_eq!(capped.members_omitted, 2);
+}
+
+/// Once every non-suspicious member is gone, the weakest suspicious member
+/// goes and the hostile one stays. That is the smallest relevant prompt: the
+/// evidence that changes a grade, not every suspicious file.
+#[test]
+fn interpret_render_budget_keeps_the_strongest_suspicious_member() {
+    let mut report = empty_report();
+    let mut root = cleave::FileAnalysis {
+        id: 0,
+        path: "root.py".to_string(),
+        file_type: "python".to_string(),
+        sha256: format!("{:064}", 0),
+        size: 100,
+        ..cleave::FileAnalysis::default()
+    };
+    root.findings.push(finding(
+        "meta/root::note",
+        "root note",
+        cleave::Criticality::Notable,
+    ));
+    let mut hostile = cleave::FileAnalysis {
+        id: 1,
+        path: "keep-hostile.py".to_string(),
+        file_type: "python".to_string(),
+        sha256: format!("{:064}", 1),
+        size: 100,
+        depth: 1,
+        parent_id: Some(0),
+        ..cleave::FileAnalysis::default()
+    };
+    hostile.findings.push(finding(
+        "objectives/keep::hostile",
+        "KEEP_HOSTILE",
+        cleave::Criticality::Hostile,
+    ));
+    let mut suspicious = cleave::FileAnalysis {
+        id: 2,
+        path: "drop-suspicious.py".to_string(),
+        file_type: "python".to_string(),
+        sha256: format!("{:064}", 2),
+        size: 100,
+        depth: 1,
+        parent_id: Some(0),
+        ..cleave::FileAnalysis::default()
+    };
+    suspicious.findings.push(finding(
+        "objectives/drop::suspicious",
+        &format!("DROP_SUSPICIOUS {}", "x".repeat(8_000)),
+        cleave::Criticality::Suspicious,
+    ));
+    report.files = vec![root, hostile, suspicious];
+
+    let mut kept = report.clone();
+    kept.files.retain(|f| f.id != 2);
+    let fit = budget_primary_context(&mut kept, usize::MAX);
+    let capped = budget_primary_context(&mut report, fit.text.len());
+    assert!(
+        capped.text.len() <= fit.text.len(),
+        "{} > {}",
+        capped.text.len(),
+        fit.text.len()
+    );
+    assert!(
+        capped.text.contains("KEEP_HOSTILE"),
+        "hostile member stays: {}",
+        capped.text
+    );
+    assert!(
+        !capped.text.contains("DROP_SUSPICIOUS"),
+        "weaker suspicious member goes: {}",
+        capped.text
+    );
+}
+
+/// A single file has no member to drop. Its weakest findings go, and the
+/// strongest stays, so one huge source file cannot become the whole prompt.
+#[test]
+fn interpret_render_budget_trims_findings_on_the_root() {
+    let mut file = cleave::FileAnalysis {
+        id: 0,
+        path: "big.py".to_string(),
+        file_type: "python".to_string(),
+        sha256: "b".repeat(64),
+        size: 100,
+        ..cleave::FileAnalysis::default()
+    };
+    file.findings.push(finding(
+        "objectives/keep::best",
+        "KEEP_BEST",
+        cleave::Criticality::Hostile,
+    ));
+    file.findings.last_mut().unwrap().conf = 0.99;
+    for i in 0..40 {
+        let mut weak = finding(
+            &format!("objectives/noise::n{i}"),
+            &format!("NOISE_{i} {}", "y".repeat(500)),
+            cleave::Criticality::Suspicious,
+        );
+        weak.conf = 0.1;
+        file.findings.push(weak);
+    }
+    let mut report = empty_report();
+    report.files = vec![file];
+    let capped = budget_primary_context(&mut report, 2_000);
+    assert!(
+        capped.text.len() <= 2_000,
+        "root trimmed to the budget, len {}",
+        capped.text.len()
+    );
+    assert!(
+        capped.text.contains("KEEP_BEST"),
+        "strongest finding stays: {}",
+        capped.text
+    );
+    assert!(capped.findings_omitted > 0, "weaker findings were the trim");
+}
+
+/// A fetched dependency is the same kind of prompt as the primary. A package
+/// of suspicious members must be trimmed into the shared budget rather than
+/// appended whole — that is the 2 MB call the endpoint refuses.
+#[test]
+fn interpret_render_budgets_a_fat_dependency() {
+    let mut root = cleave::FileAnalysis {
+        id: 0,
+        path: "root.tgz".to_string(),
+        sha256: "r".repeat(64),
+        ..cleave::FileAnalysis::default()
+    };
+    root.findings.push(finding(
+        "root/notable",
+        "primary package finding",
+        cleave::Criticality::Notable,
+    ));
+    let mut dep = cleave::FileAnalysis {
+        id: 1,
+        parent_id: Some(0),
+        depth: 1,
+        rel: cleave::types::Rel::Fetched,
+        path: "dep.tgz".to_string(),
+        sha256: "d".repeat(64),
+        ..cleave::FileAnalysis::default()
+    };
+    dep.findings.push(finding(
+        "dep/hostile",
+        "DEP_ROOT_HIT",
+        cleave::Criticality::Hostile,
+    ));
+    let mut files = vec![root, dep];
+    for i in 0..30 {
+        let mut member = cleave::FileAnalysis {
+            id: 10 + i,
+            parent_id: Some(1),
+            depth: 2,
+            rel: cleave::types::Rel::Fetched,
+            path: format!("dep.tgz!!m{i}.py"),
+            file_type: "python".to_string(),
+            sha256: format!("{:064x}", i + 3),
+            size: 100,
+            ..cleave::FileAnalysis::default()
+        };
+        member.findings.push(finding(
+            &format!("objectives/member::m{i}"),
+            &format!("MEMBER_{i} {}", "z".repeat(8_000)),
+            cleave::Criticality::Suspicious,
+        ));
+        files.push(member);
+    }
+    let mut report = empty_report();
+    report.files = files;
+    let edge: fletch::fetch::FetchRecord = serde_json::from_value(serde_json::json!({
+        "source_sha256": "r".repeat(64),
+        "kind": "dependency",
+        "locator": "pkg:test/fat@1",
+        "content_sha256": "d".repeat(64),
+        "fetched_at": 1,
+        "served": "network",
+        "outcome": "ok",
+    }))
+    .unwrap();
+    let deps = vec![DepResult {
+        sha256: "d".repeat(64),
+        locator: "pkg:test/fat@1".to_string(),
+        url: "https://example.test/fat.tgz".to_string(),
+        size: 0,
+        provenance: None,
+        verdict: Some(Decision {
+            class: Classification::Hostile,
+            probability: 0.97,
+            threshold: 0.5,
+            level: Level::Manual,
+        }),
+        members: MemberEvals::new(),
+        upload: None,
+    }];
+    let ctx = interpret(
+        "root.tgz",
+        &"r".repeat(64),
+        None,
+        &[edge],
+        &deps,
+        &[],
+        &report,
+    );
+    assert!(
+        ctx.len() <= INTERPRET_PROMPT_BUDGET_BYTES,
+        "prompt {} exceeds {}",
+        ctx.len(),
+        INTERPRET_PROMPT_BUDGET_BYTES
+    );
+    assert!(
+        ctx.contains("DEP_ROOT_HIT"),
+        "the dependency's own hit stays: {ctx}"
+    );
 }
 
 /// A report shaped like a real fetched-dependency scan: the sample's

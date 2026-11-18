@@ -72,12 +72,9 @@ pub fn http() -> Option<&'static reqwest::blocking::Client> {
 /// Split `--hopper` into the endpoints to try, in preference order.
 ///
 /// One address is the ordinary case. Several, comma-separated, name the same
-/// hopper reached two ways: put the replica first and the primary behind it,
-/// and a replica outage costs a retry rather than a lost verdict. Reads and
-/// writes take the same list on purpose. Routing them separately is a topology
-/// this server would have to
-/// know, and hopper's write relay exists precisely so it does not: a replica
-/// answers lookups locally and forwards the renewals.
+/// hopper reached two ways: put the replica first and the primary last, and a
+/// replica outage costs a lookup a retry rather than an answer. Only reads walk
+/// this list; every write goes to the primary alone ([`worker_endpoint`]).
 #[must_use]
 pub fn endpoints(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -119,49 +116,19 @@ pub fn warn_if_cleartext(raw: &str) {
     }
 }
 
-/// The one address a queue worker may poll: the primary, which [`endpoints`]
-/// puts last.
+/// The one address writes go to: the primary, which [`endpoints`] puts last.
 ///
-/// Worker routes are the exception to the rule above. A replica answers
-/// lookups and relays renewals, but it refuses `/v1/work/next` and the plain
-/// `/v1/work/result` with a 403 even when its relay is enabled — the work queue
-/// is the primary's to hand out, and passing the worker firehose through a
-/// replica helps no one. So there is nothing to fail over to here: the second
-/// address is not another way to reach the same answer, it is the only one.
+/// Queue polls, results, renewals and uploads all land here. A replica serves
+/// reads; a write sent to it either costs an extra hop through its relay or,
+/// without one, is refused outright, and it refuses the work queue even with a
+/// relay. So there is nothing to fail over to: the replica is not another way to
+/// reach the same answer, the primary is the only one.
 ///
 /// Returns `None` for an empty or blank `--hopper`, which is how the deploy
 /// says "do not file results anywhere".
 #[must_use]
 pub fn worker_endpoint(raw: &str) -> Option<String> {
     endpoints(raw).pop()
-}
-
-/// One hopper route, at every address it can be reached.
-///
-/// Ordered as `--hopper` named them. A retry walks down the list rather than
-/// hammering one address, so the second attempt after a replica stops answering
-/// lands on the primary instead of on the same silence.
-#[derive(Debug, Clone)]
-pub(crate) struct Route(Vec<String>);
-
-impl Route {
-    pub(crate) fn new(bases: &[String], suffix: &str) -> Self {
-        Self(bases.iter().map(|base| format!("{base}{suffix}")).collect())
-    }
-
-    /// The address to use on this attempt, clamped to the last: a budget longer
-    /// than the list keeps retrying the final address rather than wrapping back
-    /// to one already known to be failing.
-    pub(crate) fn at(&self, attempt: usize) -> &str {
-        let last = self.0.len().saturating_sub(1);
-        self.0.get(attempt.min(last)).map_or("", String::as_str)
-    }
-
-    /// Every address, for a caller that tries each exactly once rather than
-    /// retrying on a schedule.
-    pub(crate) fn each(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(String::as_str)
-    }
 }
 
 /// Point this process at `hopper_url`: report where the bearer token came
@@ -442,27 +409,6 @@ mod tests {
                 "a worker was handed a list: {picked}"
             );
         }
-    }
-
-    /// A retry walks down the list rather than hammering one address, so the
-    /// attempt after a replica stops answering lands on the primary instead of
-    /// on the same silence. Past the end it holds on the last: a budget longer
-    /// than the list must not wrap back to an address already known to fail.
-    #[test]
-    fn a_retry_moves_to_the_next_address() {
-        let bases = endpoints("https://ro,http://rw");
-        let route = Route::new(&bases, "/v1/work/result");
-        assert_eq!(route.at(0), "https://ro/v1/work/result");
-        assert_eq!(route.at(1), "http://rw/v1/work/result");
-        assert_eq!(route.at(9), "http://rw/v1/work/result");
-    }
-
-    /// One address is the ordinary case, and every attempt uses it.
-    #[test]
-    fn a_single_address_is_used_for_every_attempt() {
-        let route = Route::new(&endpoints("https://only"), "/v1/intake/held");
-        assert_eq!(route.at(0), "https://only/v1/intake/held");
-        assert_eq!(route.at(5), "https://only/v1/intake/held");
     }
 
     /// 408 and 429 ask to be retried; every other 4xx is final.

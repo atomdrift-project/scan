@@ -19,7 +19,7 @@ use super::render_cards::{
     CardHead, CardProvenance, render_terminal_context, render_terminal_fetch_context,
 };
 use super::render_context::{
-    Fetched, Primary, ReportIndex, recategorize_annotations, render_dependency_context,
+    Fetched, Primary, ReportIndex, interpret_user_message, render_dependency_context,
     render_interpret_context,
 };
 use super::retention::{apply_report_retention, kept_members};
@@ -1203,7 +1203,7 @@ fn render(
         // render back and recognizes annotation lines by the `SEV` letter this
         // transform removes. The dependency appendix is already part of that
         // render.
-        return recategorize_annotations(llm_context.unwrap_or_default());
+        return interpret_user_message(llm_context.unwrap_or_default()).0;
     }
     if req.tiny_opts.header == cleave::output::HeaderStyle::Rich {
         // The terminal card covers the sample's own files; fetched payloads and
@@ -1268,7 +1268,7 @@ fn blend_interpretation(
             from = 0,
             to = %to,
             reason = %graded.interpretation,
-            "LLM cleared an L0 hostile — held in band, moved to the weakest rung",
+            "benign LLM grade moved an L0 verdict to the weakest hostile level",
         ),
         Some(Blend::Deepened { from, to }) => tracing::info!(
             path = %label,

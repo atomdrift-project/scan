@@ -49,7 +49,7 @@ pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,
     print_above_bar,
 };
-pub(crate) use self::render_context::{recategorize_annotations, split_annotation};
+pub(crate) use self::render_context::{interpret_user_message, split_annotation};
 pub(crate) use self::run::{
     DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, emit_result,
     scan_bytes, scan_file, tiny_opts_for,

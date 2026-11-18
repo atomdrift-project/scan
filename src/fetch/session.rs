@@ -47,14 +47,19 @@ use super::render::{
 };
 use super::urls::{
     AsClient, MAX_REDIRECT_HOPS, client_user_agent, has_unexpanded_url_placeholder,
-    is_download_to_file_url, is_eval_pipeline_url, is_redirect_destination,
-    looks_like_dropper_download_url, valid_discovered_url_host,
+    is_browser_script_reference, is_download_to_file_url, is_eval_pipeline_url,
+    is_redirect_destination, looks_like_dropper_download_url, valid_discovered_url_host,
 };
 use super::{
     BATCH_PAYLOAD_TARGET, Coordinate, DependencyRegistry, FetchOutcome, Follow, Group, Resources,
     fetch_work_key, immutable_coordinate, locator, pin_verified, pins_exact_version,
     registry_digest, report_file_type,
 };
+
+fn is_explicit_url_fetch(reference: &Reference) -> bool {
+    is_browser_script_reference(reference)
+        || (reference.kind == RefKind::UrlFetch && reference.source == "ast-fetch-call")
+}
 
 pub(super) fn is_registry_security_hold_finding(id: &str) -> bool {
     id.strip_prefix("metadata/registry::")
@@ -648,7 +653,7 @@ impl FetchSession {
             if let Some(reason) = self.fetch_skip_reason(&r) {
                 // A downloader the code calls is evidence, so its exclusion is
                 // recorded; any other unfetchable reference only logs.
-                if r.source == "ast-fetch-call" {
+                if is_explicit_url_fetch(&r) {
                     self.out.records.push(skipped_record(
                         source_sha,
                         &r,
@@ -702,9 +707,8 @@ impl FetchSession {
             return Some("publisher-controlled or boilerplate URL");
         }
         if r.kind == RefKind::UrlFetch
-            // An AST-observed downloader call is already a fetch operation;
-            // its endpoint need not have a script/archive filename suffix.
-            && r.source != "ast-fetch-call"
+            // An AST-observed fetch or code load can use an opaque endpoint.
+            && !is_explicit_url_fetch(r)
             && !looks_like_dropper_download_url(&url)
             && !is_eval_pipeline_url(r)
             && !is_download_to_file_url(r)

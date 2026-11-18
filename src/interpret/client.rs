@@ -168,7 +168,7 @@ pub(super) fn request(
 pub fn grade_render(cfg: &InterpretConfig, context: &str) -> Result<serde_json::Value> {
     // A render is normally recategorized already, and recategorizing is
     // idempotent; doing it here keeps this the live path for any render.
-    let user = crate::engine::recategorize_annotations(context);
+    let (user, _) = crate::engine::interpret_user_message(context);
     let priority = LlmCaller::Background.priority(user.len());
     let (grade, reason, model) = request(cfg, &user, priority).map_err(CallError::into_inner)?;
     Ok(serde_json::json!({"grade": grade.as_str(), "model": model, "reason": reason}))

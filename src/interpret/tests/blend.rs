@@ -567,6 +567,29 @@ fn a_hostile_finding_vetoes_every_softening() {
 }
 
 #[test]
+fn decision_reason_explains_why_a_benign_grade_kept_a_block() {
+    let Interpretation::Graded(graded) = blended(
+        "model".to_owned(),
+        Classification::Hostile,
+        0.6,
+        LlmGrade::Benign,
+        "Security test fixtures".to_owned(),
+        ev_at(Level::At(0)),
+        false,
+    ) else {
+        panic!("expected a grade");
+    };
+    assert_eq!(graded.outcome, Classification::Hostile);
+    assert_eq!(graded.interpretation, "Security test fixtures");
+    assert_eq!(
+        graded.decision_reason().as_deref(),
+        Some(
+            "Kept hostile despite a benign LLM grade because the initial verdict reached L0, the strictest calibrated level."
+        )
+    );
+}
+
+#[test]
 fn manual_threshold_mode_abstains_from_the_proximity_gate() {
     // With no level table there is no calibrated axis to measure against, so
     // the gate has nothing to say and the other guards carry the decision.

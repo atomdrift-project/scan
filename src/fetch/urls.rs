@@ -10,6 +10,14 @@ use reqwest::Url;
 
 use crate::hosts::{self, UrlHost};
 
+pub(super) fn is_browser_script_reference(reference: &Reference) -> bool {
+    reference.kind == RefKind::UrlFetch
+        && matches!(
+            reference.source.as_str(),
+            "browser.script.src" | "javascript.dynamic-import" | "javascript.module-source"
+        )
+}
+
 /// URL suffixes that are normally pages, API responses, or other site
 /// resources rather than a payload a dropper would retrieve.
 const NON_PAYLOAD_URL_EXTENSIONS: &[&str] = &[

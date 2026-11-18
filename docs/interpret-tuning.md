@@ -76,16 +76,19 @@ ML decides; the LLM steers (`interpret::blend`):
    argues for. Benign + LLM-hostile becomes suspicious; hostile + LLM-benign
    becomes suspicious at most. The cap is a fraction of the remaining range,
    so ML's ranking is preserved.
-2. **The hostile boundary is earned.** Crossing it in either direction
+2. **The hostile boundary is earned.** Escalating across it
    requires ML to already sit within one steer of it
    (`within_one_steer_of_hostile_boundary`), measured in the confidence space
    `level_confidence` maps levels into. The one relaxation is an escalation corroborated by a
-   cleave hostile finding. The suspicious boundary is ungated: it routes a file
+   cleave hostile finding. An L0 hostile verdict remains hostile even with a
+   trusted benign grade. That grade moves the verdict to the active hostile
+   threshold. The suspicious boundary is ungated: it routes a file
    to a human rather than spending a false-positive budget, so an ML false
    negative with an LLM-hostile read always lands on suspicious.
 3. **Clearing is guarded; escalation is not.** A render that is mostly
-   unreadable (`render_mostly_readable`) or that addresses the analyzer
-   (`addresses_the_analyzer`) may not lower the class or the score. An author
+   unreadable (`render_mostly_readable`), was clipped at the final byte cap,
+   or that addresses the analyzer (`addresses_the_analyzer`) may not lower
+   the class or the score. A hostile finding also vetoes softening. An author
    gains nothing by talking their own sample up, so only softening is guarded
    (`untrusted_read_never_softens_the_verdict`).
 4. **The level follows the class.** The verdict travels as `fires_at`, so an
@@ -134,10 +137,10 @@ blend, and when the serving model changes.
    `--registry-map` rather than live fetches, so every run sees the same input.
 3. **Grade offline** with the harness, `scripts/hacks/interpret-tune/tune.py`,
    which sends each render with each candidate prompt to the endpoint and
-   scores exact matches and acceptable ones. It reads the endpoint token from
-   `~/.tok/llm` (`SCAN_LLM_KEY` overrides) and warns without one: a refused
-   call scores as a miss, so an unauthenticated sweep looks like a model that
-   got everything wrong.
+   scores exact matches and acceptable ones. Use `--templates described
+   --candidate-prompt FILE` to compare prompts over the same production renders.
+   The endpoint token comes from `~/.tok/llm` or `SCAN_LLM_KEY`. A sample needs
+   a valid majority in every arm to count toward paired agreement.
 4. **Repeat each arm three times.** Batched inference is not bit-reproducible
    even at temperature 0, and a borderline file can flip between runs. Treat a
    one-sample move as noise.
@@ -151,7 +154,8 @@ blend, and when the serving model changes.
 
 Verdicts are cached by system prompt, so a prompt change never replays old
 verdicts, and `SCAN_LLM_SYSTEM_PROMPT_FILE` runs a candidate prompt without a
-rebuild. Shipping it means editing `interpret::SYSTEM_PROMPT`.
+rebuild. Both Scan and the harness read the shipped prompt from
+`src/interpret/system_prompt.txt`.
 
 To re-measure `DEFAULT_LLM_MIN_PROB` or `DEFAULT_LLM_BENIGN_NOTABLE_CAP`, use
 the same sets and the `LLM gate` log line, which names every admission that

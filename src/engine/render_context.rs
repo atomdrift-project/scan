@@ -65,8 +65,8 @@ fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32
     }
 }
 
-/// Upper bound, in bytes, on the PRIMARY subject's rendered context before its
-/// weakest members are dropped from the prompt.
+/// Upper bound, in bytes, on the assembled LLM user message: the primary
+/// subject and every dependency subject together.
 ///
 /// The render is one prompt, and the GPU pays for every token of it. Prompts
 /// over 20k tokens are a small share of requests but a large share of all
@@ -76,29 +76,103 @@ fn dep_subject_risk(verdict: Option<Decision>, severe_finding: bool) -> (u8, i32
 /// on those (hex rows and JSON), so 96 KiB is roughly 32–48k tokens, past the
 /// p95 of what the model is asked to read and under the point where one
 /// request holds the KV cache against everyone else.
-const INTERPRET_PRIMARY_BUDGET_BYTES: usize = 96 * 1024;
-
-/// Render `primary` for the LLM, dropping its weakest members until the render
-/// fits in `budget` bytes. Returns the render and how many members went.
 ///
-/// What may go: a member (never the root) none of whose findings reached
-/// suspicious. Everything at or above that line is the evidence the grade rests
-/// on — `docs/interpret-tuning.md`: cut hinting and metadata, never evidence —
-/// and stays whatever it costs, so an archive that is *all* suspicious members
-/// is rendered whole. Among the droppable, the ones with the least to say go
-/// first: lowest peak criticality, then fewest findings, discovery order among
-/// equals. A dropped member takes its own nested members with it, so the render
-/// never shows a child under a container it no longer lists.
-fn budget_primary_context(primary: &mut AnalysisReport, budget: usize) -> (String, usize) {
+/// It is also a hard cap. An endpoint refuses the whole call when the prompt
+/// exceeds the model's context (a 2 MB render was rejected at 262081 input
+/// tokens against a 262144-token window). Keeping every suspicious member
+/// "whatever it costs" produces that refusal, which is zero evidence. The
+/// budget keeps the strongest evidence that fits.
+const INTERPRET_PROMPT_BUDGET_BYTES: usize = 96 * 1024;
+
+/// Bytes held back from the evidence budget for the one-line notes that say
+/// content was cut (`members_omitted`, `deps_omitted`). Those notes are part
+/// of the prompt, and the evidence is sized so they still fit.
+const BUDGET_NOTE: usize = 96;
+
+/// What [`budget_primary_context`] removed so the render would fit.
+struct BudgetedRender {
+    text: String,
+    members_omitted: usize,
+    findings_omitted: usize,
+}
+
+/// Render `primary` for the LLM, dropping the least relevant content until the
+/// render fits in `budget` bytes.
+///
+/// Order is fixed, and each step runs only when the previous one left the
+/// render over budget:
+///
+/// 1. Members (never a root of this view) whose findings all sit below
+///    suspicious. These are hinting and metadata.
+/// 2. The remaining members, weakest first: lowest peak criticality, then
+///    fewest findings. A suspicious member is dropped only once nothing weaker
+///    remains. An over-budget prompt is refused whole, so that member would
+///    not have been read anyway. A dropped member takes its nested members
+///    with it, so the render never shows a child under a container it no
+///    longer lists.
+/// 3. Individual findings on what remains, weakest first, except the single
+///    strongest finding. A subject that is one enormous file cannot shed
+///    members; its least relevant notes go instead.
+///
+/// Within one rank, drops are proportional to the overshoot so a large archive
+/// converges in a handful of renders, and a batch never crosses into a
+/// stronger rank — the hostile member is not spent to pay for a suspicious one.
+fn budget_primary_context(primary: &mut AnalysisReport, budget: usize) -> BudgetedRender {
     let mut rendered = format_context(primary, &TinyOpts::tiny());
     if rendered.len() <= budget {
-        return (rendered, 0);
+        return BudgetedRender {
+            text: rendered,
+            members_omitted: 0,
+            findings_omitted: 0,
+        };
     }
-    let mut order: Vec<((Criticality, usize), u32)> = primary
+    let roots = subject_roots(primary);
+    let mut members_omitted = shed_members(primary, &mut rendered, budget, &roots, |f| {
+        f.findings.iter().all(|t| t.crit < Criticality::Suspicious)
+    });
+    if rendered.len() > budget {
+        members_omitted += shed_members(primary, &mut rendered, budget, &roots, |_| true);
+    }
+    let findings_before: usize = primary.files.iter().map(|f| f.findings.len()).sum();
+    if rendered.len() > budget {
+        shed_findings(primary, &mut rendered, budget);
+    }
+    let findings_after: usize = primary.files.iter().map(|f| f.findings.len()).sum();
+    BudgetedRender {
+        text: rendered,
+        members_omitted,
+        findings_omitted: findings_before.saturating_sub(findings_after),
+    }
+}
+
+/// File ids at the shallowest depth in `report`: the subject this view is
+/// about. A dependency view is a slice of the parent report, so its root is
+/// not file 0 and not depth 0.
+fn subject_roots(report: &AnalysisReport) -> HashSet<u32> {
+    let Some(depth) = report.files.iter().map(|f| f.depth).min() else {
+        return HashSet::new();
+    };
+    report
         .files
         .iter()
-        .filter(|f| f.depth > 0 && f.id != 0)
-        .filter(|f| f.findings.iter().all(|t| t.crit < Criticality::Suspicious))
+        .filter(|f| f.depth == depth)
+        .map(|f| f.id)
+        .collect()
+}
+
+/// Drop members `droppable` names, weakest first, until `rendered` fits.
+/// `roots` are never dropped. Returns how many files went.
+fn shed_members(
+    report: &mut AnalysisReport,
+    rendered: &mut String,
+    budget: usize,
+    roots: &HashSet<u32>,
+    mut droppable: impl FnMut(&FileAnalysis) -> bool,
+) -> usize {
+    let mut order: Vec<((Criticality, usize), u32)> = report
+        .files
+        .iter()
+        .filter(|f| !roots.contains(&f.id) && droppable(f))
         .map(|f| {
             let peak = f.findings.iter().map(|t| t.crit).max().unwrap_or_default();
             ((peak, f.findings.len()), f.id)
@@ -108,16 +182,15 @@ fn budget_primary_context(primary: &mut AnalysisReport, budget: usize) -> (Strin
 
     let mut dropped = 0usize;
     while rendered.len() > budget && !order.is_empty() {
-        // Drop in proportion to the overshoot, so a 200-member archive converges
-        // in a handful of renders rather than two hundred.
-        let per_file = rendered.len() / primary.files.len().max(1);
-        let n = ((rendered.len() - budget) / per_file.max(1)).clamp(1, order.len());
+        let lead = order[0].0;
+        let same = order.iter().take_while(|(key, _)| *key == lead).count();
+        let per_file = rendered.len() / report.files.len().max(1);
+        let n = ((rendered.len() - budget) / per_file.max(1)).clamp(1, same);
         let mut victims: HashSet<u32> = order.drain(..n).map(|(_, id)| id).collect();
-        // Take nested members of a victim along, however deep.
         loop {
             let before = victims.len();
-            for f in &primary.files {
-                if f.parent_id.is_some_and(|p| victims.contains(&p)) {
+            for f in &report.files {
+                if !roots.contains(&f.id) && f.parent_id.is_some_and(|p| victims.contains(&p)) {
                     victims.insert(f.id);
                 }
             }
@@ -126,12 +199,92 @@ fn budget_primary_context(primary: &mut AnalysisReport, budget: usize) -> (Strin
             }
         }
         order.retain(|(_, id)| !victims.contains(id));
-        let before = primary.files.len();
-        primary.files.retain(|f| !victims.contains(&f.id));
-        dropped += before - primary.files.len();
-        rendered = format_context(primary, &TinyOpts::tiny());
+        let before = report.files.len();
+        report.files.retain(|f| !victims.contains(&f.id));
+        dropped += before - report.files.len();
+        *rendered = format_context(report, &TinyOpts::tiny());
     }
-    (rendered, dropped)
+    dropped
+}
+
+/// Drop the weakest findings until `rendered` fits, keeping the single
+/// strongest so a one-finding subject still has something to grade.
+fn shed_findings(report: &mut AnalysisReport, rendered: &mut String, budget: usize) {
+    let protected = report
+        .files
+        .iter()
+        .flat_map(|f| f.findings.iter().map(move |finding| (f.id, finding)))
+        .max_by(|a, b| {
+            a.1.crit
+                .cmp(&b.1.crit)
+                .then(a.1.conf.total_cmp(&b.1.conf))
+                .then(a.0.cmp(&b.0))
+                .then(a.1.id.cmp(&b.1.id))
+        })
+        .map(|(file, finding)| (file, finding.id.clone()));
+    while rendered.len() > budget {
+        let mut ranked: Vec<(Criticality, u32, u32, usize)> = Vec::new();
+        for file in &report.files {
+            for (index, finding) in file.findings.iter().enumerate() {
+                let keep = protected
+                    .as_ref()
+                    .is_some_and(|(id, finding_id)| *id == file.id && finding_id == &finding.id);
+                if keep {
+                    continue;
+                }
+                ranked.push((
+                    finding.crit,
+                    finding.conf.max(0.0).to_bits(),
+                    file.id,
+                    index,
+                ));
+            }
+        }
+        if ranked.is_empty() {
+            break;
+        }
+        ranked.sort_by_key(|key| (key.0, key.1));
+        let lead = (ranked[0].0, ranked[0].1);
+        let same = ranked
+            .iter()
+            .take_while(|key| (key.0, key.1) == lead)
+            .count();
+        // A finding note is a short line; size the batch from that, not from
+        // the whole render, or one window would take every note with it.
+        let n = ((rendered.len() - budget) / 80).clamp(1, same);
+        let mut drop_at: HashMap<u32, HashSet<usize>> = HashMap::new();
+        for (_, _, file_id, index) in ranked.into_iter().take(n) {
+            drop_at.entry(file_id).or_default().insert(index);
+        }
+        // Kept aside so a batch that does not shrink the render is undone.
+        // The prompt is the render; a finding removed only from the report
+        // would be announced as omitted while still sitting in the text.
+        let snapshot: Vec<(u32, Vec<cleave::Finding>)> = report
+            .files
+            .iter()
+            .map(|file| (file.id, file.findings.clone()))
+            .collect();
+        for file in &mut report.files {
+            if let Some(indexes) = drop_at.get(&file.id) {
+                let mut index = 0usize;
+                file.findings.retain(|_| {
+                    let drop = indexes.contains(&index);
+                    index += 1;
+                    !drop
+                });
+            }
+        }
+        let next = format_context(report, &TinyOpts::tiny());
+        if next.len() >= rendered.len() {
+            for file in &mut report.files {
+                if let Some((_, findings)) = snapshot.iter().find(|(id, _)| *id == file.id) {
+                    file.findings.clone_from(findings);
+                }
+            }
+            break;
+        }
+        *rendered = next;
+    }
 }
 
 /// What the fetch phase grafted into the report, as the renders read it.
@@ -302,54 +455,10 @@ pub(super) fn render_interpret_context(
     index: &ReportIndex<'_>,
 ) -> String {
     let now_secs = i64::try_from(crate::civil::now_secs()).unwrap_or(i64::MAX);
-    let budget = INTERPRET_PRIMARY_BUDGET_BYTES;
-    let mut out = String::new();
+    let budget = INTERPRET_PROMPT_BUDGET_BYTES;
 
-    let registry_ids: HashSet<u32> = fetched.registries.iter().map(|r| r.file_id).collect();
-    let mut own = report_view(report, |f| {
-        !index.is_fetched(f.id) && !registry_ids.contains(&f.id)
-    });
-    let (primary_context, members_omitted) = budget_primary_context(&mut own, budget);
-    if members_omitted > 0 {
-        tracing::info!(
-            label = primary.label,
-            members_omitted,
-            budget_bytes = budget,
-            "interpret render over budget; weakest members dropped"
-        );
-    }
-    let shown = interpret_display_name(primary.label);
-    let _ = writeln!(out, "== PRIMARY {shown} ==");
-    let provenance = primary_provenance(shown, primary, now_secs);
-    let _ = writeln!(out, "provenance={provenance}");
-    out.push_str(&primary_context);
-    if members_omitted > 0 {
-        let _ = writeln!(out, "members_omitted={members_omitted} (prompt budget)");
-    }
-    // Restated after the findings. One `provenance=` line at the head of a render
-    // that runs to tens of KB is not read: the grader infers identity from
-    // filenames and source instead, and the registry's claim never enters the
-    // judgment at all. The same bytes at the tail are read: on a mislabelled
-    // sample, head-only provenance grades benign ("standard LDAP gem", describing
-    // the code and ignoring the claim) while the tail restatement catches it
-    // ("registry mismatch").
-    // Only the registry record is restated, never the whole block. The claim is
-    // what the grader needs a second look at.
-    let identity = provenance
-        .get("registry")
-        .and_then(|registry| registry.get("record"))
-        .filter(|record| record.as_object().is_some_and(|r| !r.is_empty()));
-    if let Some(identity) = identity {
-        let line = serde_json::json!({"registry": {"record": identity}});
-        let _ = writeln!(
-            out,
-            "\n== SUBJECT IDENTITY (registry claim for PRIMARY) ==\nprovenance={line}"
-        );
-    }
-
-    // Ranked before anything is rendered: every subject that clears the gate
-    // costs a provenance line and a context block, and only the riskiest few
-    // are kept.
+    // Ranked before the primary is rendered: a hostile dependency is often the
+    // whole verdict, and the primary must leave it room inside the one budget.
     enum Subject<'s, 'a> {
         Fetched(&'s FetchedSubject<'a>),
         RegistryOnly(&'a DependencyRegistry),
@@ -382,37 +491,104 @@ pub(super) fn render_interpret_context(
             ));
         }
     }
-    // Worst first; the sort is stable, so equal risks keep discovery order. The
-    // render is one prompt, and an over-budget prompt is refused whole rather
-    // than truncated by the endpoint.
+    // Worst first; the sort is stable, so equal risks keep discovery order.
     ranked.sort_by_key(|(risk, _)| Reverse(*risk));
     ranked.truncate(MAX_INTERPRET_DEP_SUBJECTS);
-    for (_, subject) in &ranked {
-        match subject {
-            Subject::Fetched(subject) => {
-                render_fetched_subject(&mut out, subject, report, index, now_secs);
-            }
-            Subject::RegistryOnly(registry) => {
-                render_registry_subject(&mut out, registry, report, now_secs);
-            }
-        }
+    let dep_reserve = if ranked.is_empty() { 0 } else { budget / 3 };
+
+    let mut out = String::new();
+    let registry_ids: HashSet<u32> = fetched.registries.iter().map(|r| r.file_id).collect();
+    let mut own = report_view(report, |f| {
+        !index.is_fetched(f.id) && !registry_ids.contains(&f.id)
+    });
+    let shown = interpret_display_name(primary.label);
+    let provenance = primary_provenance(shown, primary, now_secs);
+    let identity = provenance
+        .get("registry")
+        .and_then(|registry| registry.get("record"))
+        .filter(|record| record.as_object().is_some_and(|r| !r.is_empty()))
+        .map(|identity| {
+            let line = serde_json::json!({"registry": {"record": identity}});
+            format!("\n== SUBJECT IDENTITY (registry claim for PRIMARY) ==\nprovenance={line}\n")
+        });
+    let mut head = String::new();
+    let _ = writeln!(head, "== PRIMARY {shown} ==");
+    let _ = writeln!(head, "provenance={provenance}");
+    let context_budget = budget.saturating_sub(
+        dep_reserve + head.len() + identity.as_ref().map_or(0, String::len) + BUDGET_NOTE,
+    );
+    let primary_cut = budget_primary_context(&mut own, context_budget);
+    if primary_cut.members_omitted > 0 || primary_cut.findings_omitted > 0 {
+        tracing::info!(
+            label = primary.label,
+            members_omitted = primary_cut.members_omitted,
+            findings_omitted = primary_cut.findings_omitted,
+            budget_bytes = context_budget,
+            rendered_bytes = primary_cut.text.len(),
+            "interpret render over budget; weakest content dropped"
+        );
+    }
+    out.push_str(&head);
+    out.push_str(&primary_cut.text);
+    write_budget_omission(&mut out, &primary_cut);
+    // Restated after the findings. One `provenance=` line at the head of a render
+    // that runs to tens of KB is not read: the grader infers identity from
+    // filenames and source instead, and the registry's claim never enters the
+    // judgment at all. The same bytes at the tail are read: on a mislabelled
+    // sample, head-only provenance grades benign ("standard LDAP gem", describing
+    // the code and ignoring the claim) while the tail restatement catches it
+    // ("registry mismatch").
+    // Only the registry record is restated, never the whole block. The claim is
+    // what the grader needs a second look at.
+    if let Some(identity) = &identity {
+        out.push_str(identity);
     }
 
-    let omitted = candidates.saturating_sub(ranked.len());
+    let mut shown_deps = 0usize;
+    for (_, subject) in &ranked {
+        let room = budget.saturating_sub(out.len() + BUDGET_NOTE);
+        let block = match subject {
+            Subject::Fetched(subject) => {
+                render_fetched_subject(subject, report, index, now_secs, room)
+            }
+            Subject::RegistryOnly(registry) => {
+                render_registry_subject(registry, report, now_secs, room)
+            }
+        };
+        if block.is_empty() || block.len() > room {
+            continue;
+        }
+        out.push_str(&block);
+        shown_deps += 1;
+    }
+
+    let omitted = candidates.saturating_sub(shown_deps);
     if omitted > 0 {
         let _ = writeln!(out, "\ndeps_omitted={omitted}");
     }
     out
 }
 
-/// One fetched dependency's block: header, provenance, then its own context.
+fn write_budget_omission(out: &mut String, cut: &BudgetedRender) {
+    if cut.members_omitted > 0 || cut.findings_omitted > 0 {
+        let _ = writeln!(
+            out,
+            "members_omitted={} findings_omitted={} (prompt budget)",
+            cut.members_omitted, cut.findings_omitted
+        );
+    }
+}
+
+/// One fetched dependency's block: header, provenance, then its own context,
+/// trimmed to `room` bytes. Empty when nothing relevant fits.
 fn render_fetched_subject(
-    out: &mut String,
     subject: &FetchedSubject<'_>,
     report: &AnalysisReport,
     index: &ReportIndex<'_>,
     now_secs: i64,
-) {
+    room: usize,
+) -> String {
+    let mut block = String::new();
     let class = subject
         .verdict()
         .map_or_else(|| "not-evaluated".to_string(), |v| v.class.to_string());
@@ -421,7 +597,11 @@ fn render_fetched_subject(
     } else {
         "FETCH"
     };
-    let _ = writeln!(out, "\n== {kind} {} class={class} ==", subject.edge.locator);
+    let _ = writeln!(
+        block,
+        "\n== {kind} {} class={class} ==",
+        subject.edge.locator
+    );
     let source_path = subject
         .edge
         .source_sha256
@@ -429,29 +609,43 @@ fn render_fetched_subject(
         .and_then(|sha| index.by_sha.get(sha))
         .map(|file| file.path.as_str());
     let provenance = dependency_provenance(subject.edge, subject.registry, source_path, now_secs);
-    let _ = writeln!(out, "provenance={provenance}");
-    let view = report_view(report, |f| {
+    let _ = writeln!(block, "provenance={provenance}");
+    if block.len().saturating_add(BUDGET_NOTE) >= room {
+        return String::new();
+    }
+    let mut view = report_view(report, |f| {
         subject.files.contains(&f.id) || subject.registry.is_some_and(|r| r.file_id == f.id)
     });
-    out.push_str(&format_context(&view, &TinyOpts::tiny()));
+    let cut = budget_primary_context(&mut view, room - block.len() - BUDGET_NOTE);
+    block.push_str(&cut.text);
+    write_budget_omission(&mut block, &cut);
+    block
 }
 
-/// A dependency known only from its registry record.
+/// A dependency known only from its registry record, trimmed to `room` bytes.
+/// Empty when the record does not fit.
 fn render_registry_subject(
-    out: &mut String,
     registry: &DependencyRegistry,
     report: &AnalysisReport,
     now_secs: i64,
-) {
+    room: usize,
+) -> String {
+    let mut block = String::new();
     let status = registry.artifact_skip.unwrap_or("registry-only");
-    let _ = writeln!(out, "\n== DEP {} artifact={status} ==", registry.locator);
+    let _ = writeln!(block, "\n== DEP {} artifact={status} ==", registry.locator);
     let _ = writeln!(
-        out,
+        block,
         "provenance={}",
         registry_provenance(&registry.provenance, now_secs)
     );
-    let view = report_view(report, |f| f.id == registry.file_id);
-    out.push_str(&format_context(&view, &TinyOpts::tiny()));
+    if block.len().saturating_add(BUDGET_NOTE) >= room {
+        return String::new();
+    }
+    let mut view = report_view(report, |f| f.id == registry.file_id);
+    let cut = budget_primary_context(&mut view, room - block.len() - BUDGET_NOTE);
+    block.push_str(&cut.text);
+    write_budget_omission(&mut block, &cut);
+    block
 }
 
 /// Rewrite each finding annotation from a graded conclusion into a categorized
@@ -478,7 +672,7 @@ fn render_registry_subject(
 /// stays and only its authority is removed.
 ///
 /// The terminal view is untouched — this is the machine/LLM render alone.
-pub(crate) fn recategorize_annotations(rendered: &str) -> String {
+fn recategorize_annotations(rendered: &str) -> String {
     let mut out = String::with_capacity(rendered.len());
     for line in rendered.split_inclusive('\n') {
         match recategorize_annotation(line.trim_end_matches('\n')) {
@@ -492,6 +686,21 @@ pub(crate) fn recategorize_annotations(rendered: &str) -> String {
         }
     }
     out
+}
+
+/// Assemble the exact user message after sanitization. The final cap also
+/// covers a protected finding, header, or source line too large to shed and
+/// accounts for bytes added by rewriting the annotations.
+pub(crate) fn interpret_user_message(context: &str) -> (String, bool) {
+    const TRUNCATED: &str = "\n[Context truncated to fit the prompt budget.]\n";
+    let mut user = recategorize_annotations(context);
+    let truncated = user.len() > INTERPRET_PROMPT_BUDGET_BYTES;
+    if truncated {
+        let end = user.floor_char_boundary(INTERPRET_PROMPT_BUDGET_BYTES - TRUNCATED.len());
+        user.truncate(end);
+        user.push_str(TRUNCATED);
+    }
+    (user, truncated)
 }
 
 /// A cleave finding annotation, split into its parts:
@@ -1130,9 +1339,7 @@ pub(super) fn render_saved_interpret(
     let rendered = render_interpret_context(&primary, fetched, report, &index);
     // The live path sanitizes before it rewrites; so must a replay, or it is
     // not the payload the model saw.
-    Ok(recategorize_annotations(
-        &crate::interpret::sanitize_context(&rendered),
-    ))
+    Ok(interpret_user_message(&crate::interpret::sanitize_context(&rendered)).0)
 }
 
 #[cfg(test)]

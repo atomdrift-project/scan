@@ -1,0 +1,12 @@
+== PRIMARY pkg.tgz ==
+provenance={"artifact":{"path":"pkg.tgz","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}
+pkg.tgz	gzip 100B 0
+// Possible package/manifest — ROOT_NOTE
+
+  keep-suspicious.py	python 100B 0
+  # Possible execution/shell — KEEP_SUSPICIOUS
+
+  keep-hostile.py	python 100B 0
+  # Possible exfiltration/http — KEEP_HOSTILE
+
+members_omitted=2 findings_omitted=0 (prompt budget)

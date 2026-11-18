@@ -112,6 +112,31 @@ pub struct Graded {
     pub before: MlVerdict,
 }
 
+impl Graded {
+    /// Explain a retained verdict with the blend's reason. The LLM's own
+    /// rationale remains available in the full interpretation.
+    pub(crate) fn decision_reason(&self) -> Option<String> {
+        if self.outcome == self.before.class && self.grade.classification() < self.outcome {
+            let reason = if self.corroborated {
+                "static analysis found hostile behavior"
+            } else if self.analyzer_directed {
+                "the excerpts contained text addressed to the grader"
+            } else if !self.may_soften {
+                "the excerpts provided limited readable evidence"
+            } else {
+                "the initial verdict reached L0, the strictest calibrated level"
+            };
+            return Some(format!(
+                "Kept {} despite a {} LLM grade because {reason}.",
+                self.outcome,
+                self.grade.as_str()
+            ));
+        }
+        let reason = self.interpretation.trim();
+        (!reason.is_empty()).then(|| reason.to_owned())
+    }
+}
+
 /// An interpretation pass that was attempted and failed. It repeats the ML
 /// verdict as `outcome`/`conf` so the `llm` section is still self-contained.
 #[derive(Debug, Clone, Serialize)]

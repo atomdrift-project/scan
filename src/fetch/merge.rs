@@ -1,6 +1,7 @@
 //! Analyzing what was fetched and grafting it into the root's report.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
@@ -17,7 +18,7 @@ use super::discover::{
 use super::imports::{is_python_import_candidate, static_es_module_refs};
 use super::render::{delivered_bytes, fetch_target};
 use super::session::Landed;
-use super::urls::mark_redirect_destinations;
+use super::urls::{is_browser_script_reference, mark_redirect_destinations};
 use super::{FetchedDependency, Group, found, locator, report_file_type};
 
 /// Every finding a finalized sub-report carries, flattened across its file
@@ -119,7 +120,7 @@ impl Payloads<'_> {
             return None;
         }
         let content_sha = rec.content_sha256.clone()?;
-        let name = payload_name(rec);
+        let name = analysis_payload_name(rec, &landed.reference);
         let cache_key = crate::analysis_cache::entry_key(&content_sha, &name);
 
         // Warm-cache hit: reuse the prior analysis of these exact bytes under
@@ -630,4 +631,29 @@ pub(super) fn payload_name(rec: &FetchRecord) -> String {
         .map(str::to_string)
         .or_else(|| rec.content_sha256.clone())
         .unwrap_or_else(|| "fetched".to_string())
+}
+
+fn analysis_payload_name(rec: &FetchRecord, reference: &Reference) -> String {
+    let mut name = payload_name(rec);
+    // A browser loader can name an extensionless script endpoint. Use the
+    // response MIME as a filename hint only for an observed script load.
+    if is_browser_script_reference(reference)
+        && Path::new(&name).extension().is_none()
+        && rec.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("content-type")
+                && value.split(';').next().is_some_and(|mime| {
+                    [
+                        "application/javascript",
+                        "text/javascript",
+                        "application/ecmascript",
+                        "text/ecmascript",
+                    ]
+                    .iter()
+                    .any(|kind| mime.trim().eq_ignore_ascii_case(kind))
+                })
+        })
+    {
+        name.push_str(".js");
+    }
+    name
 }

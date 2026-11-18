@@ -99,7 +99,7 @@ pub struct Verdict {
     /// The PURL this artifact was fetched as, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purl: Option<String>,
-    /// One-sentence rationale from the interpreter, when `--llm` ran.
+    /// One-sentence explanation of the interpreted decision, when `--llm` ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     /// Worst findings, most critical first, at most `MAX_STORED_HITS`.
@@ -112,11 +112,7 @@ impl Verdict {
     /// the artifact was requested by, when the request named one.
     pub fn from_scan(result: &crate::engine::ScanResult, purl: Option<&str>) -> Self {
         let why = match &result.interpretation {
-            Some(crate::interpret::Interpretation::Graded(graded))
-                if !graded.interpretation.trim().is_empty() =>
-            {
-                Some(graded.interpretation.trim().to_owned())
-            }
+            Some(crate::interpret::Interpretation::Graded(graded)) => graded.decision_reason(),
             _ => None,
         };
         Self {

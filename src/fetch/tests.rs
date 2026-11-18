@@ -1941,7 +1941,10 @@ fn malformed_extension_registry_response_is_not_an_unavailable_dependency() {
         .expect("requires fletch with invalid-response support");
     attribute_reference_outcomes(&mut report, &[record], &BTreeMap::new());
     let metrics = report.files[0].filefacts_metrics.as_ref().unwrap();
-    assert_eq!(metrics["references.unresolved_required_extension_count"], 0.0);
+    assert_eq!(
+        metrics["references.unresolved_required_extension_count"],
+        0.0
+    );
 }
 
 #[test]

@@ -284,17 +284,18 @@ fn default_worker_name_is_valid_for_hopper() {
     assert!(name.chars().all(|c| c.is_ascii_graphic()));
 }
 
-/// The `/v1/intake/held` probe walks the list like every other call.
-///
-/// Its failure is safe — an unanswered probe makes the uploader treat
-/// every artifact as missing, and hopper's upsert is idempotent — but it
-/// is not free: that is the probe whose whole job is keeping bytes hopper
-/// already holds off the wire. Stopping at a dead replica would spend the
-/// outage re-uploading the corpus to a primary that was up the whole time.
+/// Uploads are writes, so they go to the primary — the last `--hopper`
+/// address — and never to the replica ahead of it. A replica that cannot take
+/// a write (one running no relay, or an older build) answers with a refusal
+/// the uploader treats as final, which dropped every upload on a host that
+/// listed its replica first.
 #[test]
-fn a_dead_replica_does_not_stop_the_known_probe() {
-    // Port 1 refuses immediately, so this measures the decision rather
-    // than a timeout.
+fn writes_go_to_the_primary_not_the_replica() {
+    // Bound but never accepted: any request to the replica would connect
+    // here, which the accept() below catches.
+    let replica = TcpListener::bind("127.0.0.1:0").expect("bind replica");
+    let replica_addr = replica.local_addr().expect("replica address");
+    replica.set_nonblocking(true).expect("nonblocking replica");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("server address");
     let server = serve_one(
@@ -302,11 +303,26 @@ fn a_dead_replica_does_not_stop_the_known_probe() {
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
           Content-Length: 16\r\nConnection: close\r\n\r\n{\"known\":[\"aa\"]}",
     );
-    let hopper = hopper_at(&format!("http://127.0.0.1:1,http://{addr}"));
+    let hopper = hopper_at(&format!("http://{replica_addr},http://{addr}"));
     let known = hopper.known(&["aa", "bb"]);
     server.join().expect("server thread");
     assert!(known.contains("aa"), "the primary's answer was discarded");
     assert!(!known.contains("bb"), "hopper did not claim to hold bb");
+    assert!(
+        hopper.upload.starts_with(&format!("http://{addr}/")),
+        "{}",
+        hopper.upload
+    );
+    assert!(
+        hopper.result.starts_with(&format!("http://{addr}/")),
+        "{}",
+        hopper.result
+    );
+    match replica.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("a write reached the replica"),
+        Err(e) => panic!("unexpected accept error: {e}"),
+    }
 }
 
 #[test]
@@ -381,7 +397,7 @@ fn oversized_artifact_skips_the_byte_upload() {
         .expect("nonblocking upload listener");
 
     let mut hopper = hopper_at(&format!("http://{known_addr}"));
-    hopper.upload = Route::new(&[format!("http://{upload_addr}")], "/v1/intake/upload");
+    hopper.upload = format!("http://{upload_addr}/v1/intake/upload");
     let art = artifact(
         &"d".repeat(64),
         HOPPER_MAX_UPLOAD_ARTIFACT_BYTES + 1,
