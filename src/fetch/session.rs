@@ -1526,7 +1526,7 @@ pub(super) fn attribute_reference_outcomes(
     registry_outcomes: &BTreeMap<String, RegistryTally>,
 ) {
     let by_source = tally_by_source(records);
-    let mut touched: Vec<String> = Vec::new();
+    let mut touched = BTreeMap::new();
     // One pass, two sources. A reference can leave a fetch record, a registry
     // document, or both, and the declarer should carry its outcome either way:
     // reading only the fetch records would attribute nothing to a dependency
@@ -1546,15 +1546,32 @@ pub(super) fn attribute_reference_outcomes(
                 )
             })
         });
+        let browser_failures: Vec<_> = fetched
+            .zip(file.filefacts.as_ref())
+            .into_iter()
+            .flat_map(|(tally, facts)| {
+                facts.references.iter().filter_map(|reference| {
+                    let offset = reference.offset?;
+                    (is_browser_script_reference(reference)
+                        && tally.failed_url_offsets.contains(&offset))
+                    .then(|| filefacts::Span::new(offset, 1))
+                })
+            })
+            .collect();
         let metrics = file.filefacts_metrics.get_or_insert_with(Default::default);
         write_reference_metrics(metrics, fetched, registry);
+        metrics.insert(
+            "references.unavailable_browser_script_count".to_string(),
+            browser_failures.len() as f64,
+        );
         metrics.insert(
             "references.unresolved_required_extension_count".to_string(),
             hard_unresolved as f64,
         );
         // The pass below covers every file with this sha at once.
-        if !touched.contains(&file.sha256) {
-            touched.push(file.sha256.clone());
+        let spans: &mut Vec<_> = touched.entry(file.sha256.clone()).or_default();
+        if spans.is_empty() {
+            *spans = browser_failures;
         }
     }
 
@@ -1563,8 +1580,8 @@ pub(super) fn attribute_reference_outcomes(
     // read `references.*` get their pass.
     let sources: Vec<_> = touched
         .into_iter()
-        .map(|sha| {
-            let spans = by_source
+        .map(|(sha, browser_failures)| {
+            let mut spans = by_source
                 .get(sha.as_str())
                 .map(|t| {
                     BTreeMap::from([
@@ -1579,6 +1596,10 @@ pub(super) fn attribute_reference_outcomes(
                     ])
                 })
                 .unwrap_or_default();
+            spans.insert(
+                "references.unavailable_browser_script_count".to_string(),
+                browser_failures,
+            );
             (sha, spans)
         })
         .collect();
@@ -1610,6 +1631,7 @@ pub(super) struct SourceTally<'a> {
     unavailable_commands: u64,
     unavailable_command_spans: Vec<filefacts::Span>,
     unavailable_vsix_url_spans: Vec<filefacts::Span>,
+    failed_url_offsets: HashSet<u64>,
 }
 
 /// [`SourceTally`] per declaring sha.
@@ -1621,6 +1643,19 @@ pub(super) fn tally_by_source(records: &[FetchRecord]) -> BTreeMap<&str, SourceT
         };
         let tally = by_source.entry(source).or_default();
         tally.declared += 1;
+        // Actual retrieval errors belong to the URL that was tried. Policy
+        // refusals, budget skips and stale-cache successes have other outcomes.
+        if rec.kind == RefKind::UrlFetch
+            && matches!(
+                rec.outcome,
+                Outcome::Failed(
+                    FetchError::Status(_) | FetchError::Timeout | FetchError::Transport(_)
+                )
+            )
+            && let Some(offset) = rec.source_offset
+        {
+            tally.failed_url_offsets.insert(offset);
+        }
         // Only an actual command edge with an explicit absent-artifact HTTP
         // response counts. Unknown resolution, 403, timeouts and docs do not.
         if rec.kind == RefKind::Command

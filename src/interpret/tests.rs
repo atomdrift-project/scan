@@ -178,6 +178,14 @@ fn prefixes_admit_a_family_an_exact_leaf_or_a_glob() {
     assert!(admits(&glob, "fam/upload::shell-curl-form"));
     assert!(!admits(&glob, "fam/upload::wget-form"));
     assert!(!admits(&glob, "fam/download::shell-curl-form"));
+    assert!(!admits(&glob, "fam/upload/file::shell-curl-form"));
+
+    let subtree = ["fam/upload/**::*curl*"];
+    assert!(admits(&subtree, "fam/upload::shell-curl-form"));
+    assert!(admits(&subtree, "fam/upload/file/cli::shell-curl-form"));
+    assert!(!admits(&subtree, "fam/upload/file::wget-form"));
+    assert!(!admits(&subtree, "fam/uploads/file::shell-curl-form"));
+    assert!(!admits(&subtree, "fam/upload/curl-command"));
     // Any one entry suffices; no entries admit nothing.
     assert!(admits(&["x/y", "fam/sub::chosen"], "fam/sub::chosen"));
     assert!(!admits(&[], "fam/sub::chosen"));
@@ -276,6 +284,81 @@ fn finding_severity_reports_every_axis_independently() {
     assert!(!sev.hostile && !sev.gate_trait && !sev.strong_trait);
 }
 
+const OLD_GATE_IDS: [&str; 4] = [
+    "metadata/file/archive::archive-encrypted-member",
+    "micro-behaviors/communications/http/upload::curl-upload-file",
+    "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
+    "micro-behaviors/communications/http/url/query::query-serializer-call",
+];
+const CURRENT_GATE_IDS: [&str; 4] = [
+    "metadata/archive/encryption::archive-encrypted-member",
+    "micro-behaviors/communications/http/upload/body::curl-upload-command",
+    "micro-behaviors/communications/url/scheme::http-url-shaped-text",
+    "micro-behaviors/communications/url/construction/query::query-serializer-call",
+];
+
+#[test]
+fn gate_admits_legacy_and_current_traits_at_the_same_priority() {
+    for ids in [OLD_GATE_IDS, CURRENT_GATE_IDS] {
+        for (i, id) in ids.into_iter().enumerate() {
+            let findings = [finding(id, cleave::Criticality::Notable)];
+            assert_eq!(admits(&findings, 0.0), Some(LlmAdmission::Required), "{id}");
+            let above_cap = if i == 0 {
+                Some(LlmAdmission::Required)
+            } else {
+                None
+            };
+            assert_eq!(admits_sized(&findings, 301, 0.0), above_cap, "{id}");
+        }
+    }
+    for id in [
+        "micro-behaviors/communications/http/request/body/construction::curl-at-source-body-command",
+        "micro-behaviors/communications/http/url/scheme::http-url-shaped-text",
+    ] {
+        let findings = [finding(id, cleave::Criticality::Notable)];
+        assert_eq!(admits(&findings, 0.0), Some(LlmAdmission::Required), "{id}");
+        assert_eq!(admits_sized(&findings, 301, 0.0), None, "{id}");
+    }
+    for id in [
+        "metadata/archive/encryption::archive-encrypted-member-cluster",
+        "micro-behaviors/communications/http/download/cli::curl-command",
+        "micro-behaviors/communications/http/request/body/source::some-other-curl-command",
+        "micro-behaviors/communications/http/upload/file::wget-upload",
+        "micro-behaviors/communications/url/scheme::cleartext-http-url-elf",
+        "micro-behaviors/communications/url/construction/query::query-string",
+    ] {
+        assert_eq!(
+            admits(&[finding(id, cleave::Criticality::Notable)], 0.0),
+            None,
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn gate_validation_accepts_each_taxonomy_layout() {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let missing = validate_gate_prefixes(empty.path()).len();
+    for ids in [OLD_GATE_IDS, CURRENT_GATE_IDS] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for id in ids {
+            let (family, leaf) = id.split_once("::").expect("qualified id");
+            let dir = dir.path().join(family);
+            std::fs::create_dir_all(&dir).expect("create family");
+            std::fs::write(
+                dir.join("rules.yml"),
+                format!("composite_rules:\n- desc: An example\n  id: '{leaf}' # declaration\n"),
+            )
+            .expect("write rule");
+        }
+        assert_eq!(
+            validate_gate_prefixes(dir.path()).len(),
+            missing - ids.len(),
+            "{ids:?}",
+        );
+    }
+}
+
 #[test]
 fn gate_prefix_validation_reports_a_moved_family() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -298,7 +381,7 @@ fn gate_prefix_validation_reports_a_moved_family() {
     std::fs::create_dir_all(&family).expect("create family");
     std::fs::write(
         family.join("javascript.yaml"),
-        "traits:\n  - id: some-other-cookie-trait\n    crit: notable\n",
+        "traits:\n  - id: some-other-cookie-trait\n    unless:\n      - id: document-cookie-split-iterate\n",
     )
     .expect("write traits");
     assert!(

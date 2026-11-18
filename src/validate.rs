@@ -122,7 +122,7 @@ fn check_gate_prefixes() {
             count = problems.len(),
             traits = %traits_dir.display(),
             prefixes = %problems.join("; "),
-            "LLM gate prefixes match nothing in the installed traits; their coverage is \
+            "LLM gate signals match nothing in the installed traits; their coverage is \
              lost until the taxonomy and gate agree (criticality, probability and level \
              admissions still work)",
         );

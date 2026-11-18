@@ -11,11 +11,43 @@ use reqwest::Url;
 use crate::hosts::{self, UrlHost};
 
 pub(super) fn is_browser_script_reference(reference: &Reference) -> bool {
-    reference.kind == RefKind::UrlFetch
+    matches!(reference.kind, RefKind::UrlFetch | RefKind::Local)
         && matches!(
             reference.source.as_str(),
-            "browser.script.src" | "javascript.dynamic-import" | "javascript.module-source"
+            "browser.script.src"
+                | "browser.html-script"
+                | "browser.worker"
+                | "javascript.dynamic-import"
+                | "javascript.module-source"
         )
+}
+
+/// Resolve only references whose base is the fetched document or module.
+/// A DOM-created script and a worker can instead use the embedding page's URL.
+pub(super) fn resolve_relative_browser_scripts(references: &mut [Reference], base: &str) {
+    let Ok(base) = Url::parse(base) else { return };
+    if !matches!(base.scheme(), "http" | "https") {
+        return;
+    }
+    for reference in references {
+        if reference.kind != RefKind::Local
+            || !matches!(
+                reference.source.as_str(),
+                "browser.html-script" | "javascript.dynamic-import" | "javascript.module-source"
+            )
+        {
+            continue;
+        }
+        let RefLocator::Path(path) = &reference.locator else {
+            continue;
+        };
+        if let Ok(url) = base.join(path)
+            && url.origin() == base.origin()
+        {
+            reference.locator = RefLocator::Url(url.into());
+            reference.kind = RefKind::UrlFetch;
+        }
+    }
 }
 
 /// URL suffixes that are normally pages, API responses, or other site

@@ -338,6 +338,7 @@ dependencies = [
  "reqwest 0.12.28",
  "semver",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "sha2 0.10.9",
  "tar",

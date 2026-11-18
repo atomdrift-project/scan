@@ -118,7 +118,7 @@ impl Graded {
     pub(crate) fn decision_reason(&self) -> Option<String> {
         if self.outcome == self.before.class && self.grade.classification() < self.outcome {
             let reason = if self.corroborated {
-                "static analysis found hostile behavior"
+                "static analysis reported a hostile finding"
             } else if self.analyzer_directed {
                 "the excerpts contained text addressed to the grader"
             } else if !self.may_soften {

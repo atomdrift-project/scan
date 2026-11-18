@@ -413,6 +413,7 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
         &mut report,
         req.root_path,
         req.root_bytes.as_deref(),
+        req.root_fetch.and_then(crate::fetch::fetched_url),
         crate::fetch::Follow {
             policy: req.fetch,
             progress: needs.fetch_progress,

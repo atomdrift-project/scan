@@ -313,6 +313,15 @@ pub(super) fn trait_family(id: &str) -> &str {
 /// above the speculative ones that system binaries carry.
 const TRAIT_FLOOR_MIN_CONFIDENCE: f32 = 0.76;
 
+// Each entry must bind the harmful action in its own matcher, pass clean
+// lookalikes, and have an end-to-end default-block regression.
+const REVIEWED_HOSTILE_TRAITS: &[&str] = &[
+    "objectives/impact/crypto-manipulation/hijack-transfer/address::browser-selected-wallet-copy-override",
+    "objectives/exfiltration/stealer/financial/payment-card::payment-input-websocket-value-flow",
+    "objectives/exfiltration/stealer/credential/environment/current-process::httpx-credential-env-values-concealed-upload",
+];
+const REVIEWED_HOSTILE_MIN_CONFIDENCE: f32 = 0.98;
+
 /// Confidence-filtered crit-5/crit-4 tallies, with the trait families each tier
 /// drew from. Only findings scoring `>= TRAIT_FLOOR_MIN_CONFIDENCE` are counted
 /// at all, so an unscored or hedged trait contributes to neither arm.
@@ -380,6 +389,8 @@ fn trait_floor_counts(findings: &[CompactTrait]) -> TraitFloorCounts<'_> {
 /// consumer that reports or meters the floor wants to tell them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloorArm {
+    /// A reviewed trait individually proves the harmful action.
+    Reviewed,
     /// A confident hostile (crit-5) anchor, corroborated across families.
     Crit5,
     /// Confident suspicious (crit-4) traits spanning enough families.
@@ -391,6 +402,7 @@ impl FloorArm {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Reviewed => "reviewed",
             Self::Crit5 => "crit5",
             Self::Crit4 => "crit4",
         }
@@ -505,7 +517,27 @@ fn trait_floor(
     } else {
         TRAIT_FLOOR_HOSTILE_CRIT5
     };
-    let floor = if counts.hostile >= required_crit5
+    let reviewed = findings
+        .iter()
+        .filter(|finding| {
+            compact_crit(finding) == Criticality::Hostile
+                && finding.confidence >= REVIEWED_HOSTILE_MIN_CONFIDENCE
+                && REVIEWED_HOSTILE_TRAITS.contains(&finding.id.as_str())
+        })
+        .map(|finding| finding.confidence)
+        .max_by(f32::total_cmp);
+    let floor = if let Some(confidence) = reviewed {
+        FloorDecision {
+            class: Classification::Hostile,
+            confidence,
+            level: interpreted_level(active_level, grid_max, Classification::Hostile, true),
+            arm: FloorArm::Reviewed,
+            hostile: counts.hostile,
+            suspicious: counts.suspicious,
+            families: counts.severe_families.len(),
+            model,
+        }
+    } else if counts.hostile >= required_crit5
         && counts.severe() >= TRAIT_FLOOR_HOSTILE_SEVERE
         && counts.severe_families.len() >= TRAIT_FLOOR_HOSTILE_FAMILIES
     {
@@ -569,7 +601,7 @@ pub(super) fn apply_trait_floor(
     decision.level = floor.level;
     // One static message with the arm as a field, so an aggregator groups the
     // floor's firings together and facets them, rather than needing to know
-    // both arms' wordings. Every count either arm logged before is here.
+    // separate messages. Each arm reports the evidence counts.
     tracing::info!(
         path = %label,
         arm = floor.arm.as_str(),
@@ -581,7 +613,7 @@ pub(super) fn apply_trait_floor(
         families = floor.families,
         trait_confidence = format!("{:.3}", floor.confidence),
         level = ?floor.level,
-        "TRAIT FLOOR: cleave found corroborated severe traits the model graded lower",
+        "TRAIT FLOOR: Cleave findings raised the model verdict",
     );
     Some(floor)
 }

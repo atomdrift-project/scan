@@ -23,6 +23,13 @@ use crate::model::Classification;
 /// re-measure it.
 pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 
+const ENCRYPTED_ARCHIVE_MEMBER: &[&str] = &[
+    "metadata/archive/**::archive-encrypted-member",
+    "metadata/file/archive/**::archive-encrypted-member",
+];
+const VSIX_PUBLISHER_MISMATCH: &[&str] =
+    &["metadata/package/repository::vsix-publisher-repo-owner-mismatch"];
+
 /// Trait families and ids that admit a sample to the LLM on their own, at
 /// notable criticality or above.
 ///
@@ -32,33 +39,25 @@ pub const DEFAULT_LLM_MIN_PROB: f32 = 0.55;
 /// still admit malicious samples that nothing else, the other entries
 /// included, admits, at little benign cost.
 ///
-/// An entry is either a family (matching every id at or below it) or a
-/// `family::leaf` id, where the leaf may use `*` to match a run of characters
-/// (`family::curl-*`). Prefer a family or a glob to an exact leaf: leaf names
-/// are renamed in passing, and an exact one that stops matching costs its
-/// coverage silently. Keep entries narrow, though: wide families fail the
-/// measurement. `micro-behaviors/communications/http/url` as a family admits
-/// most benign packages, because nearly every package builds a URL, so only
-/// its `scheme` and `query` leaves are listed. Measure a candidate rather than
-/// adding one that reads plausible.
-///
-/// Every id here is declared in the cleave traits tree, which is what lets
-/// [`validate_gate_prefixes`] prove the taxonomy has not moved underneath them.
-pub(super) const LLM_GATE_PREFIXES: &[&str] = &[
-    // Encrypted archive members: almost never benign. Named by leaf so the
-    // rest of the archive metadata family does not enter the gate.
-    "metadata/file/archive::archive-encrypted-member",
+/// Each group describes one signal and lists equivalent selectors from
+/// different taxonomy layouts. One matching selector is enough for admission
+/// and for [`validate_gate_prefixes`]. A family selects its whole subtree,
+/// `family::leaf` selects a leaf in one directory, and `family/**::leaf`
+/// searches for the leaf throughout that subtree, including the root. The leaf
+/// can use `*` as a wildcard. Keep selectors narrow and measure new signals:
+/// a broad family like URL construction would admit many benign packages.
+pub(super) const LLM_GATE_PREFIXES: &[&[&str]] = &[
+    ENCRYPTED_ARCHIVE_MEMBER,
     // Agent/editor config paths — where prompt-injection payloads in agent
     // skills and editor extensions live.
-    "micro-behaviors/fs/path/config/app",
-    "micro-behaviors/communications/email/send",
-    // Any curl upload leaf, not one named one. The family's curl traits all
-    // describe the same act at notable-or-above — a curl invocation moving a
-    // local file or a raw body to a remote host — so they are equally worth a
-    // reader's attention, and a glob keeps admitting them through the leaf
-    // renames that an exact id stops matching silently, and that an installed
-    // traits revision older or newer than this list may not share.
-    "micro-behaviors/communications/http/upload::*curl*",
+    &["micro-behaviors/fs/path/config/app"],
+    &["micro-behaviors/communications/email/send"],
+    // Most curl upload traits moved into upload subfamilies. The at-source
+    // body trait kept its leaf but moved to request/body.
+    &[
+        "micro-behaviors/communications/http/upload/**::*curl*",
+        "micro-behaviors/communications/http/request/body/**::curl-at-source-body-command",
+    ],
     // A marketplace/registry publisher that is not the owner of the repository
     // the package points at — the shape of a squatted or impersonated
     // extension, which is otherwise invisible: the code is usually lifted
@@ -70,10 +69,17 @@ pub(super) const LLM_GATE_PREFIXES: &[&str] = &[
     // disagree with their repository — so a `*mismatch*` glob would admit
     // mostly benign packages. Publisher-is-not-repo-owner is the specific
     // claim worth reading.
-    "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
-    "micro-behaviors/communications/http/url/scheme::cleartext-http-url",
-    "micro-behaviors/communications/http/url/query::query-serializer-call",
-    "micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate",
+    VSIX_PUBLISHER_MISMATCH,
+    &[
+        "micro-behaviors/communications/url/scheme/**::http-url-shaped-text",
+        "micro-behaviors/communications/http/url/scheme/**::http-url-shaped-text",
+        "micro-behaviors/communications/http/url/scheme/**::cleartext-http-url",
+    ],
+    &[
+        "micro-behaviors/communications/url/**::query-serializer-call",
+        "micro-behaviors/communications/http/url/**::query-serializer-call",
+    ],
+    &["micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate"],
 ];
 
 /// Gate prefixes whose ids cleave synthesizes at analysis time rather than
@@ -121,26 +127,26 @@ pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
 /// points the agent at an off-vendor API base URL.
 ///
 /// Prefer families and narrow globs where their whole match set is useful.
-/// The encrypted-member trait moved into a broad family, so its exact id keeps
+/// The encrypted-member trait moved into a broad family, so its exact leaf keeps
 /// unrelated archive findings out of this override. Off-vendor URL assignments
 /// are atomic traits under a shared family; the narrow glob covers their
 /// provider-specific ids without admitting other URL configuration findings.
 /// [`validate_gate_prefixes`] checks these entries against installed traits.
-pub(super) const LLM_GATE_STRONG_PREFIXES: &[&str] = &[
+pub(super) const LLM_GATE_STRONG_PREFIXES: &[&[&str]] = &[
     // Password-protected payload droppers.
-    "metadata/file/archive::archive-encrypted-member",
+    ENCRYPTED_ARCHIVE_MEMBER,
     // Publisher is not the owner of the repository it points at.
-    "metadata/package/repository::vsix-publisher-repo-owner-mismatch",
+    VSIX_PUBLISHER_MISMATCH,
     // Agent instruction files (CLAUDE.md, AGENTS.md, rules).
-    "micro-behaviors/fs/path/agent-instructions",
+    &["micro-behaviors/fs/path/agent-instructions"],
     // Editor/agent *project* settings and tasks — the per-repository files an
     // extension or skill drops to run on open.
-    "micro-behaviors/fs/path/config/app::*project-*",
+    &["micro-behaviors/fs/path/config/app::*project-*"],
     // An off-vendor LLM API base URL assignment can redirect agent traffic;
     // the glob covers every provider's setting of that shape.
-    "micro-behaviors/os/env/provider::*base-url-off-vendor",
+    &["micro-behaviors/os/env/provider::*base-url-off-vendor"],
     // Decoding a payload to a file from a shell command.
-    "micro-behaviors/data/decode/command::*to-file*",
+    &["micro-behaviors/data/decode/command::*to-file*"],
 ];
 
 /// Whether `pattern` matches trait leaf `id`, where `*` stands for any run of
@@ -185,94 +191,107 @@ pub(super) fn leaf_matches(pattern: &str, id: &str) -> bool {
 
 /// Whether any of `prefixes` admits trait `id`.
 ///
-/// A prefix carrying `::` names one trait (its leaf possibly a glob, see
-/// [`leaf_matches`]) and matches only within its own family. A prefix without
-/// it names a family and matches every id at or below it, compared against the
-/// id's head so that `.../archive/member` admits
-/// `.../archive/member::archive-encrypted-member` without also admitting a
-/// sibling family whose name merely starts with the same letters
-/// (`.../archive/members-of-interest`). A synthesized id has no `::` at all, so
-/// it is its own head and the same comparison places it.
+/// Matching descendants requires a path boundary. Synthesized IDs have no
+/// leaf, so only a family selector can admit them.
 pub(super) fn prefix_admits<'a>(prefixes: impl IntoIterator<Item = &'a str>, id: &str) -> bool {
     let head = crate::features::trait_path(id);
+    let leaf = id.split("::").nth(1);
     prefixes.into_iter().any(|prefix| {
-        if let Some((family, leaf)) = prefix.split_once("::") {
-            head == family && id.split("::").nth(1).is_some_and(|l| leaf_matches(leaf, l))
-        } else {
-            head == prefix
-                || head
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }
+        let (family, pattern, recursive) = prefix_parts(prefix);
+        let in_family = head == family
+            || (recursive
+                && head
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('/')));
+        in_family && pattern.is_none_or(|pattern| leaf.is_some_and(|id| leaf_matches(pattern, id)))
     })
 }
 
-/// Check every gate prefix entry against an installed cleave traits
-/// tree, returning one message per broken prefix. An empty vector means the gate
-/// still matches what the matcher will emit.
-///
-/// This exists because a stale prefix fails silently and expensively. Trait ids
-/// are `<directory path>::<leaf id>`, so a taxonomy move — a family renamed, a
-/// leaf re-homed under a sibling — leaves the gate syntactically fine and
-/// matching nothing. Nobody sees an error; the samples that prefix was carrying
-/// simply stop reaching the LLM, and the loss only shows up as a coverage
-/// regression on a corpus nobody reruns. Cheap to check, so check it.
-///
-/// A family prefix must still be a directory. An exact `family::leaf` id must
-/// additionally be declared by some YAML directly in that directory.
-/// Synthesized prefixes have no directory to point at and are not checked
-/// here.
+fn prefix_parts(prefix: &str) -> (&str, Option<&str>, bool) {
+    let Some((family, leaf)) = prefix.split_once("::") else {
+        return (prefix, None, true);
+    };
+    match family.strip_suffix("/**") {
+        Some(root) => (root, Some(leaf), true),
+        None => (family, Some(leaf), false),
+    }
+}
+
+/// Check each traits-backed signal against the installed Cleave tree. Report
+/// the signal once when none of its selectors matches a declaration.
 #[must_use]
 pub fn validate_gate_prefixes(traits_dir: &Path) -> Vec<String> {
     let mut problems = Vec::new();
     let mut checked = HashSet::new();
-    for prefix in LLM_GATE_PREFIXES.iter().chain(LLM_GATE_STRONG_PREFIXES) {
-        if !checked.insert(prefix) {
+    for &selectors in LLM_GATE_PREFIXES.iter().chain(LLM_GATE_STRONG_PREFIXES) {
+        if !checked.insert(selectors) {
             continue;
         }
-        let (family, leaf) = match prefix.split_once("::") {
-            Some((family, leaf)) => (family, Some(leaf)),
-            None => (*prefix, None),
-        };
-        let dir = traits_dir.join(family);
-        let fault = if !dir.is_dir() {
-            format!("names no directory ({})", dir.display())
-        } else if let Some(leaf) = leaf
-            && !trait_declared(&dir, leaf)
-        {
-            format!("matches no trait in {}", dir.display())
-        } else {
-            continue;
-        };
-        problems.push(format!("`{prefix}` {fault}"));
+        // Collecting into Option stops at the first selector that resolves (None).
+        let faults: Option<Vec<_>> = selectors
+            .iter()
+            .map(|prefix| validate_prefix(traits_dir, prefix))
+            .collect();
+        if let Some(faults) = faults {
+            problems.push(faults.join(" or "));
+        }
     }
     problems
 }
 
-/// Whether any YAML directly in `dir` declares a trait with this `id`.
-///
-/// Line-oriented on purpose: a trait declaration is `- id: <leaf>` at any
-/// indentation, and recognizing that costs nothing next to loading a parser to
-/// answer one yes/no question. False negatives are the safe direction — they
-/// fail the check loudly rather than passing a broken prefix.
-fn trait_declared(dir: &Path, id: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "yaml") {
+fn validate_prefix(traits_dir: &Path, prefix: &str) -> Option<String> {
+    let (family, leaf, recursive) = prefix_parts(prefix);
+    let dir = traits_dir.join(family);
+    if !dir.is_dir() {
+        return Some(format!("`{prefix}` names no directory ({})", dir.display()));
+    }
+    if trait_declared(&dir, leaf.unwrap_or("*"), recursive) {
+        return None;
+    }
+    Some(format!("`{prefix}` matches no trait in {}", dir.display()))
+}
+
+#[derive(serde::Deserialize)]
+struct TraitDeclarations {
+    #[serde(default)]
+    traits: Vec<TraitDeclaration>,
+    #[serde(default)]
+    composite_rules: Vec<TraitDeclaration>,
+}
+
+#[derive(serde::Deserialize)]
+struct TraitDeclaration {
+    id: String,
+}
+
+fn trait_declared(dir: &Path, pattern: &str, recursive: bool) -> bool {
+    let mut files = walkdir::WalkDir::new(dir).min_depth(1);
+    if !recursive {
+        files = files.max_depth(1);
+    }
+    let options = serde_saphyr::options! { strict_booleans: true };
+    for file in files.into_iter().flatten() {
+        let path = file.path();
+        if path
+            .extension()
+            .is_none_or(|ext| ext != "yaml" && ext != "yml")
+        {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(contents) = std::fs::read_to_string(path) else {
             continue;
         };
-        let declared = text.lines().any(|line| {
-            let rest = line.trim_start().trim_start_matches("- ").trim_start();
-            rest.strip_prefix("id:")
-                .is_some_and(|value| leaf_matches(id, value.trim().trim_matches(['"', '\''])))
-        });
-        if declared {
+        let Ok(declarations) =
+            serde_saphyr::from_str_with_options::<TraitDeclarations>(&contents, options.clone())
+        else {
+            continue;
+        };
+        if declarations
+            .traits
+            .iter()
+            .chain(&declarations.composite_rules)
+            .any(|rule| leaf_matches(pattern, &rule.id))
+        {
             return true;
         }
     }
@@ -343,11 +362,15 @@ impl FindingSeverity {
                 out.notable += 1;
                 let gate = LLM_GATE_PREFIXES
                     .iter()
-                    .chain(LLM_GATE_SYNTHESIZED_PREFIXES);
-                if prefix_admits(gate.copied(), &finding.id) {
+                    .flat_map(|selectors| selectors.iter().copied())
+                    .chain(LLM_GATE_SYNTHESIZED_PREFIXES.iter().copied());
+                if prefix_admits(gate, &finding.id) {
                     out.gate_trait = true;
                 }
-                if prefix_admits(LLM_GATE_STRONG_PREFIXES.iter().copied(), &finding.id) {
+                let strong = LLM_GATE_STRONG_PREFIXES
+                    .iter()
+                    .flat_map(|selectors| selectors.iter().copied());
+                if prefix_admits(strong, &finding.id) {
                     out.strong_trait = true;
                 }
             }

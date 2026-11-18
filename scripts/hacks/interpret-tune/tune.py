@@ -351,7 +351,7 @@ def main():
     ap.add_argument("--registry-map", default=None, help="registry provenance map passed to the capture scan")
     ap.add_argument("--reuse-renders", action="store_true",
                     help="grade the renders already in --dump-dir instead of rescanning the corpus")
-    ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>/.interpret-renders)")
+    ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>.interpret-renders)")
     ap.add_argument("--emit-labels", action="store_true", help="print a labels template for --corpus and exit")
     args = ap.parse_args()
 
@@ -374,8 +374,7 @@ def main():
         prompts["candidate"] = candidate
     if not templates or args.runs < 1:
         ap.error("choose at least one arm and at least one run")
-    dump_dir = args.dump_dir or os.path.join(args.corpus.rstrip("/") + ".interpret-renders")
-    bin_path = args.bin or find_bin()
+    dump_dir = args.dump_dir or args.corpus.rstrip("/") + ".interpret-renders"
     # Capture is the expensive half — tens of minutes over a real corpus — and it
     # is the half that does not change when the question is which prompt to use.
     # Reuse lets the same renders be graded again, which is also the only way two
@@ -385,6 +384,7 @@ def main():
         print(f"# reusing {len(cached)} renders from {dump_dir}", file=sys.stderr)
         renders = cached
     else:
+        bin_path = args.bin or find_bin()
         print(f"# capturing renders via {bin_path} -f interpret …", file=sys.stderr)
         renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
         print(f"# captured {len(renders)} renders", file=sys.stderr)

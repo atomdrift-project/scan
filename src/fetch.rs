@@ -386,6 +386,7 @@ pub(crate) fn orchestrate(
     report: &mut AnalysisReport,
     root_path: &Path,
     root_bytes: Option<&[u8]>,
+    root_url: Option<&str>,
     follow: Follow<'_>,
 ) -> FetchOutcome {
     let policy = follow.policy;
@@ -403,7 +404,16 @@ pub(crate) fn orchestrate(
     } else {
         CiRefs::Skip
     };
-    let worklist = collect_references_from_input(report, root_path, root_bytes, ci);
+    let mut worklist = collect_references_from_input(report, root_path, root_bytes, ci);
+    if let Some(base) = root_url
+        && let Some(root) = report.files.first()
+    {
+        for (sha, refs) in &mut worklist {
+            if *sha == root.sha256 {
+                urls::resolve_relative_browser_scripts(refs, base);
+            }
+        }
+    }
     attribute_undeclared_npm_imports(report, &worklist);
     let precheck = crate::corpus_precheck::armed();
     let mut session = FetchSession::new(report, &worklist, res, follow, precheck);

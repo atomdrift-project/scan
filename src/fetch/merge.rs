@@ -18,7 +18,9 @@ use super::discover::{
 use super::imports::{is_python_import_candidate, static_es_module_refs};
 use super::render::{delivered_bytes, fetch_target};
 use super::session::Landed;
-use super::urls::{is_browser_script_reference, mark_redirect_destinations};
+use super::urls::{
+    is_browser_script_reference, mark_redirect_destinations, resolve_relative_browser_scripts,
+};
 use super::{FetchedDependency, Group, found, locator, report_file_type};
 
 /// Every finding a finalized sub-report carries, flattened across its file
@@ -424,6 +426,15 @@ pub(super) fn merge_payload(
     // Imports are read against the payload's own paths, before the graft
     // renames them, so local package resolution sees the layout it shipped.
     next.extend(payload_imports(&sub));
+    if rec.kind == fletch::RefKind::UrlFetch
+        && let Some(base) = fetched_url(rec)
+    {
+        for (sha, refs) in &mut next {
+            if *sha == analyzed.content_sha {
+                resolve_relative_browser_scripts(refs, base);
+            }
+        }
+    }
     let first_new = report.files.len();
     graft_subtree(report, graft, rec, sub);
     // If the payload was an archive, its members' facts (declared deps, npm

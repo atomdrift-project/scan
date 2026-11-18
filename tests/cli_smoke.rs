@@ -173,6 +173,168 @@ fn read_bytes(mut file: File) -> Vec<u8> {
     bytes
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn browser_delivery_follows_references_by_default() {
+    use fletch::fetch::{BlobCache, Fixtures, Outcome, fetch_ref};
+    use fletch::{RefKind, RefLocator, Reference};
+
+    const CHILD: &str = "https://assets.atomdrift-replay.test/assets/child";
+    const MODULE: &str = "https://assets.atomdrift-replay.test/assets/entry.js";
+    const ENTRY: &str = "https://assets.atomdrift-replay.test/entry.js";
+    const CLEAN: &str = "https://assets.atomdrift-replay.test/clean.js";
+    const MISSING: &str = "https://assets.atomdrift-replay.test/assets/unavailable";
+    let f = Fixture::new();
+    // A synthetic string carries the verdict. The gate exercises the shipped
+    // reference extractor, default fetch policy, MIME hint and child verdict.
+    let rule_dir = f
+        .traits
+        .join("objectives/impact/crypto-manipulation/hijack-transfer/address");
+    fs::create_dir_all(&rule_dir).unwrap();
+    fs::write(
+        rule_dir.join("release-fixture.yaml"),
+        r#"
+defaults:
+  platforms: [unix, windows]
+  for: [javascript]
+traits:
+  - id: browser-selected-wallet-copy-override
+    desc: Synthetic browser delivery test marker
+    crit: hostile
+    conf: 0.99
+    if: {type: string_literal, exact: atomscan-browser-release-test}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        f.traits.join("metadata/reference-outcome.yaml"),
+        r#"
+defaults:
+  platforms: [unix, windows]
+  for: [javascript]
+traits:
+  - id: browser-script-fetch-failed
+    desc: Browser script fetch failed
+    crit: notable
+    conf: 1.0
+    if: {type: metrics, field: references.unavailable_browser_script_count, min: 1}
+"#,
+    )
+    .unwrap();
+
+    let cache_root = f.root.path().join(if cfg!(target_os = "macos") {
+        "Library/Caches"
+    } else {
+        "cache"
+    });
+    let cache = BlobCache::with_dir(cache_root.join("fletch/refs"));
+    let net = Fixtures::default()
+        .with_headers(
+            CHILD,
+            b"const fixture = 'atomscan-browser-release-test';",
+            &[("content-type", "application/javascript")],
+        )
+        .with(MODULE, format!("import('{CHILD}');").as_bytes())
+        .with(ENTRY, format!("import('{MODULE}');").as_bytes())
+        .with(CLEAN, format!("// import('{CHILD}');").as_bytes());
+    for url in [ENTRY, CLEAN, MODULE, CHILD] {
+        let reference = Reference::new(RefLocator::Url(url.into()), RefKind::UrlFetch, "test", url);
+        assert_eq!(fetch_ref(&reference, &net, &cache).outcome, Outcome::Ok);
+    }
+    let loader = f.root.path().join("loader.js");
+    fs::write(
+        &loader,
+        format!(
+            "function fixture(document) {{ const s = document.createElement('script'); \
+             s.src = '{CHILD}'; document.head.appendChild(s); }}"
+        ),
+    )
+    .unwrap();
+    let image = f.root.path().join("image.js");
+    fs::write(
+        &image,
+        format!("function fixture(document) {{ const i = document.createElement('img'); i.src = '{CHILD}'; document.head.appendChild(i); }}"),
+    ).unwrap();
+    let missing = f.root.path().join("missing.js");
+    fs::write(
+        &missing,
+        format!("function fixture(document) {{ const s = document.createElement('script'); s.src = '{MISSING}'; document.head.appendChild(s); }}"),
+    ).unwrap();
+    let offline_command = |args: &[&str]| {
+        let mut cmd = f.command(args);
+        for key in [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+        ] {
+            cmd.env(key, "http://127.0.0.1:1");
+        }
+        cmd.env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env("ATOMDRIFT_UPLINK", "0")
+            .env("SCAN_NO_ANALYSIS_CACHE", "1");
+        cmd
+    };
+
+    for (target, remote, blocked) in [
+        (loader.to_str().unwrap(), false, true),
+        (image.to_str().unwrap(), false, false),
+        (ENTRY, true, true),
+        (CLEAN, true, false),
+    ] {
+        let mut args = vec!["--analyze", "local", "-f", "json"];
+        if remote {
+            args.push("url");
+        }
+        args.push(target);
+        let mut cmd = offline_command(&args);
+        let output = f.run(&mut cmd, i32::from(blocked), Duration::from_secs(60));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let child_verdict = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "fetch/dependency-verdict"
+                    && finding["desc"]
+                        .as_str()
+                        .is_some_and(|desc| desc.contains(CHILD))
+            });
+        assert_eq!(child_verdict, blocked, "{target}: {report}");
+    }
+
+    for (target, follow, expected) in [
+        (&missing, None, true),
+        (&missing, Some("--follow=none"), false),
+        (&image, None, false),
+    ] {
+        let mut args = vec!["--analyze", "local", "-f", "json-full"];
+        args.extend(follow);
+        args.push(target.to_str().unwrap());
+        let mut cmd = offline_command(&args);
+        let output = f.run(&mut cmd, 0, Duration::from_secs(60));
+        let report = String::from_utf8(output.stdout).unwrap();
+        let mut findings = report
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|line| line["traits"].as_array().cloned())
+            .flatten();
+        let failure =
+            findings.find(|finding| finding["id"] == "metadata::browser-script-fetch-failed");
+        assert_eq!(failure.is_some(), expected, "{target:?}: {report}");
+        if let Some(finding) = failure {
+            assert!(
+                finding["spans"]
+                    .as_array()
+                    .is_some_and(|spans| !spans.is_empty()),
+                "{finding}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "downloads the published rules over the network; CI's release builds run it"]
 fn update_rules_installs_models_and_traits() {

@@ -7,8 +7,8 @@ the system prompt is `interpret::SYSTEM_PROMPT`.
 
 ## What is sent: the render, descriptions kept and hedged
 
-The user message is cleave's sanitized context render: every finding as
-`# SEV LOC desc`, the source lines or byte windows around it, and the file's
+The user message is cleave's sanitized context render: findings as
+`# LOC Possible <category> — <desc>`, the source lines or byte windows around them, and the file's
 identity and registry provenance. `atomscan -f interpret` prints exactly this
 message, without the system prompt, and contacts no LLM.
 
@@ -23,9 +23,10 @@ does not hold up.
 
 Some deliberate choices in the render:
 
-- **Byte windows stay.** They are the evidence the model grades from; the
-  descriptions are hints. Cut hinting and metadata, never evidence
-  (`interpret_render_keeps_byte_windows_as_evidence`).
+- **The request fits in 96 KiB.** The budget keeps evidence around the strongest
+  findings and drops weaker members and findings first. If the request is
+  still too large after sanitizing and rewriting it, the final message marks
+  the cut and the LLM cannot soften the verdict.
 - **Provider documents go; identity stays.** Raw registry documents are mostly
   version history and cost the most tokens. The record derived from them —
   publisher, maintainers, repository, downloads, package and version age,
@@ -53,8 +54,9 @@ sample is sent when any of these holds:
 - its raw probability is at least `DEFAULT_LLM_MIN_PROB`, which covers files
   the grid never placed;
 - cleave reported a hostile finding;
-- a finding matches one of `LLM_GATE_PREFIXES` (trait families with a good
-  malicious-to-benign exchange rate on their own);
+- a notable-or-higher finding matches a selector in `LLM_GATE_PREFIXES` or
+  `LLM_GATE_STRONG_PREFIXES`. These signals have been chosen for how much
+  malicious coverage they add relative to benign reviews;
 - the scan's own class is non-benign — a container elevated by a member must
   reach the LLM even when its own score is low.
 
@@ -64,8 +66,11 @@ large legitimate packages, unless a hostile finding or one of
 `LLM_GATE_STRONG_PREFIXES` is present. A sample placed on the grid is never
 withheld by the veto.
 
-`atomscan validate` checks every gate prefix against the installed traits and
-warns about any that match nothing.
+Trait selectors can cover a whole family, a specific leaf (`family::leaf`),
+or a leaf anywhere in a family subtree (`family/**::leaf`). Leaf names can
+use `*` as a wildcard. Selectors within a group describe the same signal
+across taxonomy layouts. `atomscan validate` warns when none of a group's
+selectors matches a declaration in the installed YAML traits.
 
 ## How the answer moves the verdict: the blend
 
@@ -135,7 +140,7 @@ blend, and when the serving model changes.
    render carries the sample path, and a directory named for the set tells
    the model which set it is grading. Supply registry identity with
    `--registry-map` rather than live fetches, so every run sees the same input.
-3. **Grade offline** with the harness, `scripts/hacks/interpret-tune/tune.py`,
+3. **Grade the captured renders** with `scripts/hacks/interpret-tune/tune.py`,
    which sends each render with each candidate prompt to the endpoint and
    scores exact matches and acceptable ones. Use `--templates described
    --candidate-prompt FILE` to compare prompts over the same production renders.
