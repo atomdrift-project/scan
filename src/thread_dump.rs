@@ -11,7 +11,7 @@
 //! [`register_self`]. On `SIGUSR1` the handler thread calls [`dump_all_threads`],
 //! which signals each registered thread with `SIGUSR2`; the `on_capture`
 //! handler — running on the target thread — walks its own stack with
-//! [`backtrace::trace_unsynchronized`] and stores raw instruction pointers into a
+//! `backtrace::trace_unsynchronized` and stores raw instruction pointers into a
 //! preallocated slot. The coordinator then symbolizes those pointers
 //! (allocation is fine there, off the signal path) and writes them to stderr.
 //!
