@@ -339,6 +339,8 @@ path = "src/bin/bloom_build.rs"
 test = false
 
 [patch.crates-io]
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+regex-syntax = { git = "https://github.com/tstromberg/regex" }
 # [patch] applies only in the root, so the sibling crates' patches are
 # repeated here.
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
