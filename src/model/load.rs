@@ -107,6 +107,7 @@ fn shared_spec_tables(path: &Path) -> Result<Arc<SpecTables>> {
         return Ok(raced);
     }
     shared.insert(key, Arc::downgrade(&built));
+    drop(guard);
     Ok(built)
 }
 

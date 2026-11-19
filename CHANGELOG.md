@@ -2,6 +2,33 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.0.0 (2026-11-19)
+
+### Features
+
+- `atomscan feed` lists and switches rule feeds: oss-delayed, supporter, or zero-day.
+- breaking: --uplink and ATOMDRIFT_UPLINK are gone, so use `--feed` or ATOMDRIFT_FEED instead.
+- A few reviewed traits now convict hostile on their own, without waiting for the model to agree.
+- VS Code extensions whose hard dependencies or VSIX downloads vanished from the gallery now count as evidence.
+- Uplink verdicts get a full terminal card marked ⚡, so nobody mistakes them for local analysis.
+- LLM prompts are capped at 96 KiB, and a truncated prompt is never allowed to soften the verdict.
+
+### Fixes
+
+- Zero-byte files were sent through the model on their filename alone; they keep their static verdict now.
+- JSON output dropped cross-file composite findings, sometimes the only hostile evidence; they are kept now.
+- Hopper writes went to read replicas first, earning refusals or extra hops; they go to the primary.
+- Hopper refuses anonymous clients, so scan now announces itself with a proper `User-Agent`.
+- Built-in VS Code extensions like vscode.git no longer count as pulled from the gallery.
+- Older model bundles no longer spray warnings; one hint says how many routes lack newer features.
+- `atomscan validate` had an empty baseline corpus on Windows; it now checks stock System32 tools.
+
+### Optimizations
+
+- The model now loads alongside the rules, cutting roughly 60 ms from every one-shot scan.
+- Scans of a few named files build regex indexes lazily, saving about half a second of CPU.
+- Specialist models share the general model's feature tables instead of each building a private copy.
+
 ## 3.0.0-beta.2 (2026-11-13)
 
 ### Features

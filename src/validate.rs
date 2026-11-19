@@ -235,10 +235,9 @@ fn collect_targets() -> Result<Vec<PathBuf>> {
         // Windows has none of the above; without these a host with no traits
         // checkout would have an empty corpus.
         r"C:\Windows\System32\cmd.exe",
-        r"C:\Windows\System32
-otepad.exe",
+        r"C:\Windows\System32\notepad.exe",
         r"C:\Windows\System32\curl.exe",
-        r"C:\Windows\System32	ar.exe",
+        r"C:\Windows\System32\tar.exe",
         r"C:\Windows\System32\whoami.exe",
     ]
     .into_iter()
