@@ -898,7 +898,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 [[package]]
 name = "cleave"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7035cad2a54f2c9fa2d9836103a8bd5b0625e2ff"
+source = "git+https://github.com/atomdrift-project/cleave.git#eb14906a13c297b42928088c713d7a425b0c431d"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -979,7 +979,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7035cad2a54f2c9fa2d9836103a8bd5b0625e2ff"
+source = "git+https://github.com/atomdrift-project/cleave.git#eb14906a13c297b42928088c713d7a425b0c431d"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1923,7 +1923,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#29fb23218bef48fb6a7ff558500c20444387454f"
+source = "git+https://github.com/atomdrift-project/filefacts.git#907a8de70104612a75601b3bdee2962b56faeb59"
 dependencies = [
  "aes 0.9.4",
  "aho-corasick",
@@ -2041,7 +2041,7 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#6a40723c73265f4aa5cab77af11635b718ae9986"
+source = "git+https://github.com/atomdrift-project/fletch.git#32befe53abac38cf1cdaae7272b073e2f7d52962"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -3217,7 +3217,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7035cad2a54f2c9fa2d9836103a8bd5b0625e2ff"
+source = "git+https://github.com/atomdrift-project/cleave.git#eb14906a13c297b42928088c713d7a425b0c431d"
 
 [[package]]
 name = "lzxd"
@@ -4178,9 +4178,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.257"
+version = "2.1.258"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e08d72dd5047173b22310be0c2a8b480e30f611545de2dbbd3a94ace2de4d2b8"
+checksum = "3dd856c90936a531c75647b54c4222b4745ceedf60d0a0f14853bb9458d69af9"
 dependencies = [
  "psl-types",
 ]
@@ -5389,7 +5389,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#810c9a1ec100259259b5071048270aa6f242b5cb"
+source = "git+https://github.com/atomdrift-project/stng.git#202206ce021a1422a043643c50eca7b642a8fcd6"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -5526,7 +5526,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7035cad2a54f2c9fa2d9836103a8bd5b0625e2ff"
+source = "git+https://github.com/atomdrift-project/cleave.git#eb14906a13c297b42928088c713d7a425b0c431d"
 
 [[package]]
 name = "tap"
@@ -6165,7 +6165,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#29fb23218bef48fb6a7ff558500c20444387454f"
+source = "git+https://github.com/atomdrift-project/filefacts.git#907a8de70104612a75601b3bdee2962b56faeb59"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -7372,7 +7372,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#7035cad2a54f2c9fa2d9836103a8bd5b0625e2ff"
+source = "git+https://github.com/atomdrift-project/cleave.git#eb14906a13c297b42928088c713d7a425b0c431d"
 
 [[package]]
 name = "yara-x"
@@ -7607,9 +7607,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.7.1"
+version = "9.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2522d7da11cd3f2fe692a06a3bf9cecdbaa3720ede120d5ae9cffe42c56c6029"
+checksum = "63e50f7b2212e4635244be3c363b53273d159f2523eb7db3096c1d2861c1b603"
 dependencies = [
  "aes 0.9.4",
  "bzip2 0.6.1",
