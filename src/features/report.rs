@@ -81,6 +81,7 @@ pub(super) struct FileSummary {
     pub(super) path: String,
     pub(super) file_type: String,
     pub(super) size_bytes: f64,
+    pub(super) content_is_empty: bool,
     pub(super) overall_entropy: f64,
     pub(super) metrics: HashMap<String, HashMap<String, f64>>,
     pub(super) findings: FindingSummary,
@@ -171,6 +172,11 @@ pub(crate) struct ParsedReport {
 }
 
 impl ParsedReport {
+    /// Whether this report describes exactly one verified zero-byte file.
+    pub(crate) fn is_empty_file(&self) -> bool {
+        matches!(self.summaries.as_slice(), [file] if file.content_is_empty)
+    }
+
     /// Reuse decoded facts while rebuilding depth-dependent summaries for a
     /// route. The shared default-depth parse remains untouched for other routes.
     pub(super) fn at_trait_path_depth(&self, depth: usize) -> Arc<Self> {
@@ -387,6 +393,9 @@ impl FileSummary {
             path: file.path.clone(),
             file_type: file.file_type.clone(),
             size_bytes,
+            // Require both size and digest to confirm empty content.
+            content_is_empty: file.size == 0
+                && file.sha == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             overall_entropy,
             metrics,
             findings,

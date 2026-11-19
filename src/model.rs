@@ -407,6 +407,12 @@ impl Model {
         general_features: &[f32],
         parsed: &ParsedReport,
     ) -> Result<(Decision, Vec<RouteScore>, Vec<SkippedRoute>)> {
+        // An empty file can acquire a type from its name and trigger a model
+        // route without any content. Keep the caller's static trait floor.
+        if parsed.is_empty_file() {
+            let level = self.active_level.map_or(Level::Manual, |_| Level::Clean);
+            return Ok((self.benign_fallback(&[], level), Vec::new(), Vec::new()));
+        }
         let policy = self.routes.policies.policy_for(file_type);
         let (route_probs, scores, mut skipped) =
             self.score_routes(file_type, policy, general_features, parsed)?;

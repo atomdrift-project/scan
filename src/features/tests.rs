@@ -1000,3 +1000,25 @@ fn renamed_signature_findings_keep_their_trained_names() {
         assert_eq!(super::names::legacy_finding_id(new), old, "{new}");
     }
 }
+#[test]
+fn only_verified_empty_content_skips_model_scoring() {
+    let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let empty = serde_json::json!({
+        "id": 0, "path": "database.yml", "type": "yaml", "size": 0, "sha": empty_sha,
+    });
+    let nonempty = serde_json::json!({
+        "id": 1, "path": "settings.yml", "type": "yaml", "size": 17, "sha": "a".repeat(64),
+    });
+    let unverified_empty = serde_json::json!({
+        "id": 0, "path": "database.yml", "type": "yaml", "size": 0, "sha": "b".repeat(64),
+    });
+    let is_empty_file = |files: Vec<serde_json::Value>| {
+        let report = serde_json::from_value(serde_json::json!({"v": "8", "files": files}))
+            .expect("compact report parses");
+        ParsedReport::from_compact_report(&report, RawNeeds::default(), None).is_empty_file()
+    };
+    assert!(is_empty_file(vec![empty.clone()]));
+    assert!(!is_empty_file(vec![nonempty.clone()]));
+    assert!(!is_empty_file(vec![unverified_empty]));
+    assert!(!is_empty_file(vec![empty, nonempty]));
+}
