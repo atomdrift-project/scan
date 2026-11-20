@@ -604,6 +604,46 @@ impl RouteSet {
             .collect()
     }
 
+    /// Build the specialists `file_types` are scored by that are not built
+    /// yet, concurrently. Each is a bundle read from disk, and a report's
+    /// first scoring otherwise waits on them one after another.
+    pub(super) fn warm<'a>(&self, file_types: impl IntoIterator<Item = &'a str>) {
+        let mut unbuilt: Vec<&LazyRoute> = Vec::new();
+        for file_type in file_types {
+            let (type_key, group_key) = self.specialist_keys(file_type);
+            let policy = self.policies.route_ids_for(file_type);
+            let named =
+                policy
+                    .iter()
+                    .filter_map(|&id| match RouteKind::parse(self.names.name(id))? {
+                        RouteKind::Group(name) => self.filegroups.lazy.get(name),
+                        RouteKind::Type(name) => self.filetypes.lazy.get(name),
+                        RouteKind::General => None,
+                    });
+            unbuilt.extend(
+                group_key
+                    .and_then(|name| self.filegroups.lazy.get(name))
+                    .into_iter()
+                    .chain(self.filetypes.lazy.get(type_key.as_ref()))
+                    .chain(named)
+                    .filter(|route| route.loaded.get().is_none()),
+            );
+        }
+        unbuilt.sort_unstable_by_key(|route| std::ptr::from_ref(*route));
+        unbuilt.dedup_by_key(|route| std::ptr::from_ref(*route));
+        if unbuilt.len() > 1 {
+            // `load_once` builds on a thread of its own and joins it, so these
+            // only wait.
+            std::thread::scope(|scope| {
+                for route in unbuilt {
+                    scope.spawn(|| {
+                        route.load_once();
+                    });
+                }
+            });
+        }
+    }
+
     pub(super) fn validate_all(&self) -> Result<()> {
         let (filegroups, filetypes) = rayon::join(
             || self.filegroups.validate_all(),

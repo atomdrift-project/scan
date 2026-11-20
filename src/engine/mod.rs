@@ -21,8 +21,10 @@ mod pipeline;
 mod progress;
 mod render_cards;
 mod render_context;
+mod replay;
 mod retention;
 mod run;
+mod score_memo;
 mod v8;
 mod verdict;
 
@@ -45,6 +47,7 @@ pub use self::hopper::{collect_upload_artifacts, registry_fallback_artifact, upl
 pub(crate) use self::pipeline::{ClassifiedReport, ClassifyRequest, OutputNeeds, classify_report};
 #[doc(hidden)]
 pub use self::pipeline::{CpuLease, apply_pending_interpretation};
+pub use self::progress::LogWriter;
 pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,
     print_above_bar,
@@ -145,6 +148,37 @@ pub(crate) fn add_zip_passwords(options: &mut cleave::AnalysisOptions, passwords
 }
 
 impl ScanConfig {
+    /// Every setting, written out, for a key that must change whenever a
+    /// result or its rendering could. Destructured so that a setting added
+    /// later cannot be left out. The text holds archive passwords: hash it,
+    /// never store or log it.
+    pub(crate) fn fingerprint(&self) -> String {
+        let Self {
+            model_dir,
+            format,
+            thresholds,
+            filter,
+            slow_rule_ms,
+            extra,
+            level,
+            interpret,
+            fetch,
+            hopper,
+            no_upload,
+            zip_passwords,
+            mode,
+            bloom,
+            sidecars,
+            all_members,
+        } = self;
+        format!(
+            "{model_dir:?}|{format:?}|{thresholds:?}|{filter:?}|{slow_rule_ms}|{extra}|{level:?}|\
+             {interpret:?}|{fetch:?}|{hopper:?}|{no_upload}|{:?}|{mode:?}|{}|{sidecars}|{all_members}",
+            zip_passwords.as_slice(),
+            bloom.is_some(),
+        )
+    }
+
     /// Create a scan configuration that shows alerts only, with the default
     /// slow-rule warning and no extra diagnostics; the `with_*` methods
     /// change the rest.

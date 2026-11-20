@@ -23,6 +23,7 @@ use super::render_context::{
     render_interpret_context,
 };
 use super::retention::{apply_report_retention, kept_members};
+use super::score_memo::{ScoreTable, Stored};
 use super::v8::{Inputs as UploadInputs, Listed, OwnReading, UploadDoc};
 use super::verdict::{
     apply_trait_floor, decision_outranks, graver, interpreted_level, softened_level, worst_member,
@@ -141,6 +142,11 @@ pub(crate) struct PhaseTimings {
 /// What `classify_report` produced: the result, and where its time went.
 pub(crate) struct ClassifiedReport {
     pub phase: PhaseTimings,
+    /// What the fetch phase left on stderr, when the result is settled:
+    /// another run over the same bytes and the same resolved dependencies
+    /// would reach it, with no analysis cut short, no fetch that failed by
+    /// accident and no LLM opinion still owed. `None` when it is not.
+    pub settled: Option<String>,
     /// The verdict, with `path` set to the request label and the build fields
     /// (`version`, `analyzed_at`) left for [`Self::into_scan_result`].
     pub result: ScanResult,
@@ -187,18 +193,34 @@ pub(crate) fn classify_report(
     // and the potentially slow LLM round trip.
     drop(req.root_bytes.take());
     let index = ReportIndex::new(&prepared.typed);
-    let mut scored = score(&prepared, &req)?;
+    // The dependencies are graded on their own reports while the root is
+    // scored on its own: neither reads the other, and each has a serial
+    // stretch (a large report's parse, a route's first load) the other fills.
+    let dependencies = std::mem::take(&mut prepared.fetch.dependencies);
+    let (scored, dependency_results) = std::thread::scope(|scope| {
+        let (registries, model, cancellation, upload) = (
+            &prepared.fetch.registries,
+            req.model,
+            req.cancellation,
+            needs.upload,
+        );
+        let grading = scope.spawn(move || {
+            grade_dependencies(dependencies, registries, model, cancellation, upload)
+        });
+        let scored = score(&prepared, &req);
+        let graded = grading
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (scored, graded)
+    });
+    let mut scored = scored?;
+    let dependency_results = dependency_results?;
     // Pinned only now, after featurization: a backref is a conclusion about
     // *another* artifact, and fed as a feature of this one it would teach the
     // model that declaring dependencies is itself malicious.
     inject_dependency_backrefs(&mut prepared.compact, &std::mem::take(&mut scored.backrefs));
     let top_findings =
         extract_top_findings(root_findings(&prepared.compact), scored.decision.class);
-    let dependency_results = grade_dependencies(
-        std::mem::take(&mut prepared.fetch.dependencies),
-        &prepared.fetch.registries,
-        &req,
-    )?;
 
     let root = prepared.compact.files.first();
     let sha256 = root.map_or_else(String::new, |f| f.sha.clone());
@@ -289,6 +311,22 @@ pub(crate) fn classify_report(
     if let (Some(doc), Some(Interpretation::Graded(graded))) = (&mut upload, &llm.interpretation) {
         blend_upload(doc, req.model, graded);
     }
+    // Read before retention drops the files it does not keep.
+    let fetches_settled = crate::fetch::settled(&prepared.fetch.records);
+    let unfinished_files = compact
+        .files
+        .iter()
+        .filter(|file| crate::analysis_cache::unfinished(&file.analysis_gaps))
+        .count();
+    let settled = fetches_settled && llm.pending.is_none() && unfinished_files == 0;
+    tracing::debug!(
+        path = req.label,
+        settled,
+        fetches_settled,
+        unfinished_files,
+        llm_pending = llm.pending.is_some(),
+        "whether another run would reach this result"
+    );
     apply_report_retention(&mut compact, &kept);
     // The model has read every fact it featurizes from; what is stored keeps
     // only those, named by the report's `fp`.
@@ -307,6 +345,7 @@ pub(crate) fn classify_report(
     };
     Ok(ClassifiedReport {
         phase,
+        settled: settled.then(|| std::mem::take(&mut prepared.fetch.shown)),
         result: ScanResult {
             classification: decision.class,
             dependency_attention: crate::fetch::dependency_attention(&prepared.fetch.records),
@@ -627,6 +666,7 @@ fn score(prepared: &Prepared, req: &ClassifyRequest<'_>) -> Result<Scored> {
     let mut members = MemberEvals::new();
     for ef in score_embedded_files(
         &entries,
+        compact.files.first().map_or("", |f| f.sha.as_str()),
         label,
         needs,
         ctx,
@@ -800,18 +840,23 @@ impl Declaration<'_> {
 fn grade_dependencies(
     dependencies: Vec<crate::fetch::FetchedDependency>,
     registries: &[crate::fetch::DependencyRegistry],
-    req: &ClassifyRequest<'_>,
+    model: &Model,
+    cancellation: Option<&Arc<AtomicBool>>,
+    upload: bool,
 ) -> Result<Vec<DepResult>> {
+    use rayon::prelude::*;
     let provenance_by_locator: HashMap<&str, &crate::provenance::RegistryProvenance> = registries
         .iter()
         .map(|registry| (registry.locator.as_str(), &registry.provenance))
         .collect();
+    // Each dependency is parsed, graded and trimmed on its own, and a large
+    // one costs as much as the root.
     dependencies
-        .into_iter()
+        .into_par_iter()
         .map(|dep| {
             let (graded, upload) = match serde_json::from_str::<CompactReport>(&dep.raw) {
                 Ok(mut report) => {
-                    let graded = classify_dependency(&report, &dep.locator, req)?;
+                    let graded = classify_dependency(&report, &dep.locator, model, cancellation)?;
                     let kept = kept_members(&report, |id| {
                         graded
                             .as_ref()
@@ -822,7 +867,7 @@ fn grade_dependencies(
                     // report, before retention.
                     let mut upload = graded
                         .as_ref()
-                        .filter(|_| req.needs.upload)
+                        .filter(|_| upload)
                         .and_then(|g| {
                             UploadDoc::new(&UploadInputs {
                                 report: &report,
@@ -834,7 +879,7 @@ fn grade_dependencies(
                                 every: false,
                                 listed: &[],
                                 records: &[],
-                                level: req.model.active_level(),
+                                level: model.active_level(),
                             })
                         });
                     // Same retention rubric as the root report: grading consumed
@@ -899,9 +944,9 @@ struct DependencyGrade {
 fn classify_dependency(
     report: &CompactReport,
     label: &str,
-    req: &ClassifyRequest<'_>,
+    model: &Model,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<Option<DependencyGrade>> {
-    let model = req.model;
     let ctx = model.ctx();
     let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
 
@@ -954,11 +999,12 @@ fn classify_dependency(
     let entries: Vec<&CompactFile> = embedded_entries(report).collect();
     let members: MemberEvals = score_embedded_files(
         &entries,
+        report.files.first().map_or("", |f| f.sha.as_str()),
         label,
         needs,
         ctx,
         model,
-        req.cancellation.map(Arc::as_ref),
+        cancellation.map(Arc::as_ref),
     )?
     .into_iter()
     .map(|ef| (ef.id, ef))
@@ -995,12 +1041,15 @@ fn embedded_entries(report: &CompactReport) -> impl Iterator<Item = &CompactFile
 /// Per-member work is pure and runs in parallel: on reports with thousands of
 /// embedded files (nested npm tarballs, fetched dependency trees), a serial pass
 /// on one rayon worker — not cleave's analysis — would be the scan's wall-clock
-/// tail.
+/// tail. A member whose record is unchanged since the last scan of the report
+/// rooted at `root_sha` reuses the model's reading from then (see
+/// [`ScoreTable`]).
 ///
 /// # Errors
 /// The analysis was cancelled; the partial table is discarded.
 fn score_embedded_files(
     entries: &[&CompactFile],
+    root_sha: &str,
     label: &str,
     needs: RawNeeds,
     ctx: &ExtractContext,
@@ -1009,28 +1058,42 @@ fn score_embedded_files(
 ) -> Result<Vec<EmbeddedFile>> {
     use rayon::prelude::*;
     let is_cancelled = || cancelled.is_some_and(|c| c.load(Ordering::Relaxed));
-    let scored = entries
+    let table = ScoreTable::open(root_sha, model, needs);
+    let scored_anew = AtomicBool::new(false);
+    let (scored, remembered): (Vec<EmbeddedFile>, Vec<_>) = entries
         .par_iter()
         .filter_map(|&ef| {
             if is_cancelled() {
                 return None;
             }
-            let parsed = ParsedReport::from_compact_file(ef, needs);
-            let mut features = ctx.extract_from_parsed(&parsed);
-            model.spec().standardize(&mut features);
-            let (mut decision, model_scores, skipped_models) =
-                match model.predict_for_report_detailed(&ef.file_type, &features, &parsed) {
-                    Ok(scored) => scored,
-                    Err(error) => {
-                        tracing::warn!(
-                            container = label,
-                            member = %ef.path,
-                            error = format!("{error:#}"),
-                            "member not scored; left out of the verdict"
-                        );
-                        return None;
-                    }
-                };
+            let key = table.as_ref().and_then(|t| t.key(ef));
+            let known = key.and_then(|k| table.as_ref()?.get(k));
+            let (entry, (mut decision, model_scores, skipped_models)) = match known {
+                Some((stored, reading)) => (key.map(|k| (k, stored.clone())), reading),
+                None => {
+                    let parsed = ParsedReport::from_compact_file(ef, needs);
+                    let mut features = ctx.extract_from_parsed(&parsed);
+                    model.spec().standardize(&mut features);
+                    let reading = match model.predict_for_report_detailed(
+                        &ef.file_type,
+                        &features,
+                        &parsed,
+                    ) {
+                        Ok(reading) => reading,
+                        Err(error) => {
+                            tracing::warn!(
+                                container = label,
+                                member = %ef.path,
+                                error = format!("{error:#}"),
+                                "member not scored; left out of the verdict"
+                            );
+                            return None;
+                        }
+                    };
+                    scored_anew.store(true, Ordering::Relaxed);
+                    (key.map(|k| (k, Stored::new(&reading))), reading)
+                }
+            };
             // Trait floor on the member's own findings — a sparse, severe
             // dropper (the npm install-hook beacon lives in the embedded
             // package.json) is caught even when the container's findings
@@ -1042,7 +1105,7 @@ fn score_embedded_files(
                 model.grid_max(),
                 if ef.path.is_empty() { label } else { &ef.path },
             );
-            Some(EmbeddedFile {
+            let file = EmbeddedFile {
                 id: u64::from(ef.id),
                 sha256: ef.sha.clone(),
                 path: archive_leaf(&ef.path).to_string(),
@@ -1062,11 +1125,25 @@ fn score_embedded_files(
                     .map(TopFinding::from)
                     .collect(),
                 floor,
-            })
+            };
+            Some((file, entry))
         })
-        .collect();
+        .unzip();
     if is_cancelled() {
         bail!("analysis cancelled during embedded file processing");
+    }
+    let remembered: Vec<_> = remembered.into_iter().flatten().collect();
+    tracing::debug!(
+        container = label,
+        members = scored.len(),
+        remembered = remembered.len(),
+        scored_anew = scored_anew.load(Ordering::Relaxed),
+        "members scored"
+    );
+    // Rewritten only when a member was scored: an unchanged report leaves its
+    // table as it is.
+    if let Some(table) = table.filter(|_| scored_anew.load(Ordering::Relaxed)) {
+        table.store(&remembered);
     }
     Ok(scored)
 }

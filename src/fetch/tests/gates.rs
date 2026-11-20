@@ -560,3 +560,273 @@ fn declared_deps_stop_at_the_first_hop_unless_transitive() {
     let refs: FetchPolicy = "references".parse().unwrap();
     assert!(!refs.wants_at(RefKind::Dependency, 0));
 }
+
+/// The package references discovery reports for `source`, a file named `path`.
+fn discovered(path: &str, file_type: &str, source: &[u8]) -> Vec<Reference> {
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new(path))
+        .open(source);
+    let report = report_of(&serde_json::json!([
+        {"id":0,"path":path,"depth":0,"file_type":file_type,"sha256":"a".repeat(64),"size":source.len(),
+         "filefacts":{"symbols":parsed.symbols(),"values":parsed.values()}}
+    ]));
+    collect_references_from_input(
+        &report,
+        Path::new("not-on-disk"),
+        Some(source),
+        CiRefs::Skip,
+    )
+    .into_iter()
+    .flat_map(|(_, refs)| refs)
+    .filter(|r| matches!(r.locator, RefLocator::Purl(_)))
+    .collect()
+}
+
+/// Answer the registry lookup for `reference` from the memo: release
+/// `version`, published `age` seconds before `now`. The gate then needs no
+/// network, which [`offline::Offline`](super::offline::Offline) refuses.
+fn remember_release(reference: &Reference, ecosystem: &str, version: &str, now: u64, age: u64) {
+    let mut record = crate::test_registry(ecosystem, "fixture", version);
+    record.published_at = Some(now - age);
+    registry_memo()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .put(
+            locator(reference).to_owned(),
+            Memoized {
+                at: now,
+                record: Some(record),
+            },
+        );
+}
+
+fn offline_resources() -> Resources {
+    Resources {
+        net: Box::new(super::offline::Offline),
+        cache: super::offline::cache(),
+    }
+}
+
+/// Known-good filters vouching for exactly `purls`, and the directory they
+/// are read from, which must outlive them.
+fn known_good(purls: &[&str]) -> (tempfile::TempDir, crate::bloom_repo::Lookup) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut sets = burton::KeySets::new();
+    for purl in purls {
+        sets.insert(
+            burton::Tier::Good,
+            burton::Record {
+                purl: crate::bloom_repo::purl_key(purl),
+                sha256: None,
+            },
+        );
+    }
+    burton::write_bundle(
+        dir.path(),
+        &sets.into_filters(1e-9),
+        "2026-11-19",
+        crate::bloom_repo::KEY_SCHEME,
+    )
+    .expect("write bundle");
+    let lookup = crate::bloom_repo::Lookup::load_from(dir.path());
+    (dir, lookup)
+}
+
+/// Each way a file can import a package, per ecosystem: (path, file type,
+/// registry ecosystem, source importing `one` and `two`).
+fn import_forms(one: &str, two: &str) -> [(&'static str, &'static str, &'static str, String); 3] {
+    [
+        (
+            "app.py",
+            "python",
+            "pypi",
+            format!("import {one}\nimport {two}\n"),
+        ),
+        (
+            "app.js",
+            "javascript",
+            "npm",
+            format!("const a = require('{one}');\nconst b = require('{two}');\n"),
+        ),
+        (
+            "app.mjs",
+            "javascript",
+            "npm",
+            format!("import a from '{one}';\nimport b from '{two}';\n"),
+        ),
+    ]
+}
+
+const DAY: u64 = 86_400;
+
+#[test]
+fn imported_packages_meet_the_age_gate_like_declared_ones() {
+    let now = 2_000_000_000;
+    let policy = FetchPolicy::parse_follow("references").unwrap();
+    assert_eq!(policy.max_dep_age_days, DEFAULT_MAX_DEP_AGE_DAYS);
+    let res = offline_resources();
+    for (path, file_type, ecosystem, source) in import_forms("agegateold", "agegateyoung") {
+        let mut refs = discovered(path, file_type, source.as_bytes());
+        assert_eq!(refs.len(), 2, "{path}: {refs:?}");
+        // The manifest's own spelling of the same two packages, for parity.
+        refs.extend(refs.clone().into_iter().map(|mut declared| {
+            declared.kind = RefKind::Dependency;
+            declared.source = "manifest".into();
+            declared.locator = RefLocator::Purl(format!("{}-declared", locator(&declared)));
+            declared
+        }));
+        for reference in &refs {
+            assert!(
+                reference.kind == RefKind::Dependency || is_package_import(reference),
+                "{path}: {reference:?}"
+            );
+            assert!(
+                !pins_exact_version(locator(reference)),
+                "an import names no version: {reference:?}"
+            );
+            let age = if locator(reference).contains("old") {
+                30 * DAY
+            } else {
+                DAY
+            };
+            remember_release(reference, ecosystem, "1.2.3", now, age);
+        }
+        let (keep, gated) = age_gate(refs.clone(), &policy, &res, now, None);
+        let kept: Vec<&str> = keep.iter().map(locator).collect();
+        let young: Vec<&str> = refs
+            .iter()
+            .map(locator)
+            .filter(|l| l.contains("young"))
+            .collect();
+        assert_eq!(
+            kept, young,
+            "{path}: only a release inside the age limit is fetched"
+        );
+        assert_eq!(gated.len(), 4, "{path}: every one resolved a record");
+        for gate in &gated {
+            let expected = locator(&gate.reference)
+                .contains("old")
+                .then_some(SkipReason::AgedOut);
+            assert_eq!(gate.skip, expected, "{path}: {:?}", gate.reference);
+            assert_eq!(gate.record.version, "1.2.3");
+        }
+    }
+}
+
+#[test]
+fn imported_packages_meet_the_known_good_check_at_their_resolved_version() {
+    let now = 2_000_000_000;
+    // No age ceiling, so nothing but the filters can settle a reference.
+    let mut policy = FetchPolicy::parse_follow("references").unwrap();
+    policy.max_dep_age_days = 0;
+    let res = offline_resources();
+    for (path, file_type, ecosystem, source) in import_forms("knowngoodpkg", "knowngoodnewer") {
+        let refs = discovered(path, file_type, source.as_bytes());
+        assert_eq!(refs.len(), 2, "{path}: {refs:?}");
+        assert!(refs.iter().all(is_package_import), "{path}: {refs:?}");
+        // The filters vouch for a release, never for a bare name: the first
+        // import resolves to the vouched release, the second to a later one.
+        let vouched: Vec<String> = refs
+            .iter()
+            .map(|r| format!("{}@1.2.3", locator(r)))
+            .collect();
+        let vouched: Vec<&str> = vouched.iter().map(String::as_str).collect();
+        let (_filters, bloom) = known_good(&vouched);
+        for purl in &vouched {
+            assert!(bloom.decide_purl(purl).may_skip(), "{purl} is vouched for");
+            assert!(immutable_coordinate(purl, Some(30 * DAY)), "{purl}");
+        }
+        remember_release(&refs[0], ecosystem, "1.2.3", now, 30 * DAY);
+        remember_release(&refs[1], ecosystem, "1.2.4", now, 30 * DAY);
+
+        let (keep, gated) = age_gate(refs.clone(), &policy, &res, now, Some(&bloom));
+        assert_eq!(
+            keep.iter().map(locator).collect::<Vec<_>>(),
+            [locator(&refs[1])],
+            "{path}: the vouched release is not fetched; an unvouched one is"
+        );
+        assert_eq!(gated[0].skip, Some(SkipReason::KnownGood), "{path}");
+        assert_eq!(gated[1].skip, None, "{path}");
+
+        // A release published inside the freshness window is re-scanned
+        // whatever the filters say about it.
+        remember_release(&refs[0], ecosystem, "1.2.3", now, 3_600);
+        let (keep, _) = age_gate(refs.clone(), &policy, &res, now, Some(&bloom));
+        assert_eq!(keep.len(), 2, "{path}: a fresh release is fetched");
+
+        // And with no filters installed nothing is vouched for.
+        remember_release(&refs[0], ecosystem, "1.2.3", now, 30 * DAY);
+        let (keep, gated) = age_gate(refs.clone(), &policy, &res, now, None);
+        assert_eq!(keep.len(), 2, "{path}");
+        assert!(gated.iter().all(|gate| gate.skip.is_none()), "{path}");
+    }
+}
+
+#[test]
+fn imported_packages_stop_at_the_first_hop_like_declared_ones() {
+    // A fetched dependency's own imports are the transitive tail a declared
+    // dependency's dependencies are: followed from the scanned artifact,
+    // and past it only by a policy that takes the whole closure.
+    let mut policy: FetchPolicy = "all".parse().unwrap();
+    assert!(!policy.transitive_deps, "interactive default");
+    let imports: Vec<Reference> = import_forms("alphapkg", "betapkg")
+        .into_iter()
+        .flat_map(|(path, file_type, _, source)| discovered(path, file_type, source.as_bytes()))
+        .collect();
+    assert_eq!(imports.len(), 6, "{imports:?}");
+    for import in &imports {
+        assert!(
+            policy.follows_at(import, 0),
+            "{} at the artifact",
+            import.source
+        );
+        assert!(!policy.follows_at(import, 1), "{} past it", import.source);
+        let mut declared = import.clone();
+        declared.kind = RefKind::Dependency;
+        assert_eq!(
+            policy.follows_at(import, 1),
+            policy.follows_at(&declared, 1),
+            "an import and a declaration of {} are followed alike",
+            locator(import)
+        );
+    }
+    // A package an install command names is a dropper step, followed at
+    // every hop.
+    let installed = Reference::new(
+        RefLocator::Purl("pkg:pypi/alphapkg".into()),
+        RefKind::Command,
+        "shell",
+        "pip install alphapkg",
+    );
+    assert!(policy.follows_at(&installed, 1));
+    policy.transitive_deps = true;
+    for import in &imports {
+        assert!(
+            policy.follows_at(import, 3),
+            "{} in the closure",
+            import.source
+        );
+    }
+}
+
+#[test]
+fn a_package_an_install_command_names_is_not_gated() {
+    let now = 2_000_000_000;
+    let policy = FetchPolicy::parse_follow("references").unwrap();
+    let refs = discovered(
+        "install.sh",
+        "shell",
+        b"#!/bin/sh\nnpm install installcmdold\npip install installcmdoldpy\n",
+    );
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    for reference in &refs {
+        assert_eq!(reference.kind, RefKind::Command);
+        assert!(!is_package_import(reference), "{reference:?}");
+        remember_release(reference, "npm", "1.2.3", now, 30 * DAY);
+    }
+    // An install is an acquisition the code performs, however old the
+    // release: it is fetched, and no registry record stands in for it.
+    let (keep, gated) = age_gate(refs.clone(), &policy, &offline_resources(), now, None);
+    assert_eq!(keep, refs);
+    assert!(gated.is_empty());
+}

@@ -7,6 +7,7 @@ use std::time::Duration;
 use fletch::{RefKind, RefLocator, Reference};
 
 use super::Coordinate;
+use super::imports::is_package_import;
 
 /// Default fetch recursion depth — the number of hops followed from the root.
 /// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
@@ -353,6 +354,18 @@ impl FetchPolicy {
     #[must_use]
     pub(super) fn wants_at(&self, kind: RefKind, hop: u8) -> bool {
         self.wants(kind) && (self.transitive_deps || hop == 0 || kind != RefKind::Dependency)
+    }
+
+    /// Whether `reference` is followed on hop `hop`: [`Self::wants_at`], with
+    /// a package the code imports held to the rule for one the manifest
+    /// declares. An import is a dependency the manifest left out, so past the
+    /// first hop it is the same transitive tail: a fetched dependency's own
+    /// imports, each a registry round trip and a download for a release the
+    /// scanned artifact never named.
+    #[must_use]
+    pub(super) fn follows_at(&self, reference: &Reference, hop: u8) -> bool {
+        self.wants_at(reference.kind, hop)
+            && (self.transitive_deps || hop == 0 || !is_package_import(reference))
     }
 }
 

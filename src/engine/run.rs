@@ -14,6 +14,7 @@ use super::hopper::{Origin, renew};
 use super::pipeline::{ClassifyRequest, classify_report};
 use super::progress::{Progress, Spinner};
 use super::render_cards::write_tiny;
+use super::replay::Replay;
 use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources_for,
@@ -55,7 +56,7 @@ pub(crate) fn run_with(
     if !path.is_file() && !path.is_dir() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
-    run_paths_with(model, shap, &[path.to_path_buf()], config, None)
+    run_paths_with(model, shap, &[path.to_path_buf()], config, None, None)
 }
 
 /// The model and SHAP table `config` names.
@@ -90,11 +91,20 @@ pub fn run_paths(
     // other, the model's ~60 ms was added to every one-shot scan's startup.
     // The prefetch stays on the calling thread, which is not a rayon worker
     // (see `prefetch_cleave_resources`).
+    let replay = match paths {
+        [path] if replays_apply(config, registry_map) && path.is_file() => {
+            Replay::load(path, config)
+        }
+        _ => None,
+    };
     let loaded = std::thread::scope(|scope| {
         let model = std::thread::Builder::new()
             .name("model-load".into())
             .spawn_scoped(scope, || load_model(config));
-        prefetch_cleave_resources_for(paths);
+        // Nothing is analyzed in a replay, so no rule is needed.
+        if replay.is_none() {
+            prefetch_cleave_resources_for(paths);
+        }
         match model {
             Ok(handle) => handle
                 .join()
@@ -104,7 +114,19 @@ pub fn run_paths(
         }
     });
     let (model, shap) = loaded?;
-    run_paths_with(&model, shap.as_ref(), paths, config, registry_map)
+    run_paths_with(&model, shap.as_ref(), paths, config, registry_map, replay)
+}
+
+/// Whether a scan under `config` is kept for replay and replayed: only when
+/// its result is a function of the file and the config alone (no registry
+/// map supplying provenance) and printing it is all that is owed (no hopper
+/// to renew). Only the scan of one named file is: with more, a progress bar
+/// shares the terminal and what each file printed depends on the others.
+fn replays_apply(
+    config: &ScanConfig,
+    registry_map: Option<&HashMap<String, RegistryProvenance>>,
+) -> bool {
+    registry_map.is_none() && config.hopper().is_none() && config.upload_hopper().is_none()
 }
 
 /// [`run_paths`] with a model already loaded.
@@ -117,9 +139,15 @@ fn run_paths_with(
     paths: &[PathBuf],
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
+    replay: Option<Replay>,
 ) -> Result<ScanSummary> {
-    prefetch_cleave_resources_for(paths);
     let mut session = Session::start(config, model, shap);
+    // The one named file, scanned the same way before: print what it printed.
+    if let (Some(replay), [path]) = (replay, paths) {
+        session.replay(path, &replay);
+        return session.finish();
+    }
+    prefetch_cleave_resources_for(paths);
 
     // Partition the requested paths: explicit files become one unfiltered batch
     // (a named file is always analyzed), each directory is walked upfront into
@@ -160,6 +188,7 @@ fn scan_partitioned(
     dir_files: Vec<PathBuf>,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<()> {
+    let alone = files.len() == 1 && dir_files.is_empty();
     let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
         // Per-file provenance: match this artifact's content sha to its registry
         // record in `--registry-map`, the registry's own account of the package
@@ -178,6 +207,7 @@ fn scan_partitioned(
         };
         let target = Target {
             sidecar: !named && session.config.sidecars() && is_attached_sidecar(path),
+            replayable: named && alone && replays_apply(session.config, registry_map),
             ..Target::new(origin)
         };
         session.record(&target, analyzed, None);
@@ -377,13 +407,14 @@ pub(crate) fn scan_bytes(
         shap,
         cancel: None,
     };
-    classifier.classify(
+    let (result, _) = classifier.classify(
         report,
         Origin::local(Path::new(filename)),
         None,
         Path::new(filename),
         Some(data),
-    )
+    )?;
+    Ok(result)
 }
 
 /// Scan a payload that already lives on disk, returning the same [`ScanResult`]
@@ -415,13 +446,14 @@ pub(crate) fn scan_file(
         shap,
         cancel: None,
     };
-    classifier.classify(
+    let (result, _) = classifier.classify(
         report,
         Origin::local(Path::new(filename)),
         None,
         read_path,
         None,
-    )
+    )?;
+    Ok(result)
 }
 
 /// The cleave options a config implies, before any per-scan additions.
@@ -547,8 +579,39 @@ impl<'a> Session<'a> {
         });
         self.advance();
         match classified {
-            Ok(result) => self.report(target, result),
+            Ok((result, settled)) => self.report(target, result, settled),
             Err(error) => self.report_error(target.origin.path, &error),
+        }
+    }
+
+    /// Account for a file whose earlier scan is replayed: tallied and shown
+    /// exactly as [`Self::report`] did then.
+    fn replay(&self, path: &Path, replay: &Replay) {
+        if let Some(lookup) = self.config.bloom()
+            && let Some(digest) = burton::parse_sha256_hex(&replay.sha256)
+        {
+            tally_bloom(
+                lookup.decide_sha256(&digest),
+                false,
+                &path.display().to_string(),
+            );
+        }
+        tracing::info!(path = %path.display(), sha256 = %replay.sha256, "scan replayed");
+        self.tally.count(replay.class);
+        self.tally
+            .static_flags
+            .fetch_add(u32::from(replay.severe), Ordering::Relaxed);
+        self.tally
+            .dependency_gaps
+            .fetch_add(replay.dependency_gaps, Ordering::Relaxed);
+        self.tally
+            .flagged_candidates
+            .fetch_add(replay.flagged_candidates, Ordering::Relaxed);
+        // The cosmetic rows first, as they came first; a failed write of
+        // them is as harmless now as it was then.
+        let _ = io::stderr().write_all(replay.notes.as_bytes());
+        if let Some(output) = &replay.output {
+            self.write_result(|| write_stdout(output.as_bytes()));
         }
     }
 
@@ -642,7 +705,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn report(&self, target: &Target<'_>, result: ScanResult) {
+    fn report(&self, target: &Target<'_>, result: ScanResult, settled: Option<String>) {
         self.tally.count(result.classification);
         self.tally
             .static_flags
@@ -687,8 +750,31 @@ impl<'a> Session<'a> {
                     &result.top_findings,
                     &result.embedded_files,
                 ));
+        let mut written = None;
         if shown {
-            self.write_result(|| emit_result(&result, self.config));
+            self.write_result(|| {
+                let bytes = encode_result(&result, self.config)?;
+                write_stdout(&bytes)?;
+                written = Some(bytes);
+                Ok(())
+            });
+        }
+        // Kept only when nothing else is owed for this file (no upload), the
+        // scan is settled, and what was written is all of it.
+        let complete = self.uploader.is_none() && shown == written.is_some();
+        tracing::debug!(
+            path = %target.origin.path.display(),
+            replayable = target.replayable,
+            settled = settled.is_some(),
+            complete,
+            "whether this scan is kept for replay"
+        );
+        if let Some(notes) = settled.filter(|_| target.replayable && complete) {
+            match written.map(String::from_utf8).transpose() {
+                Ok(output) => Replay::new(&result, notes, output, self.config)
+                    .store(&target.origin.path.display().to_string(), self.config),
+                Err(_) => tracing::debug!("scan output is not UTF-8; not kept for replay"),
+            }
         }
         // Renewed after the result is printed, so local output never waits on
         // the handoff; the upload itself runs on the uploader's thread. Only
@@ -841,6 +927,9 @@ struct Target<'a> {
     /// Set when the bytes are a registry-metadata document standing in for a
     /// package that could not be fetched; see [`super::HopperRoute`].
     fallback_purl: Option<&'a str>,
+    /// The one file the operator named, scanned with nothing but its bytes
+    /// and the config: the scan [`Replay`] keeps.
+    replayable: bool,
 }
 
 impl<'a> Target<'a> {
@@ -849,6 +938,7 @@ impl<'a> Target<'a> {
             origin,
             sidecar: false,
             fallback_purl: None,
+            replayable: false,
         }
     }
 }
@@ -867,7 +957,9 @@ impl Classifier<'_> {
     /// Classify `report` the way the config asks: the renders its format
     /// needs, its fetch policy and LLM, and the report kept when JSON output or
     /// a hopper renewal will read it. Always returns a result, benign included;
-    /// the caller decides whether to display it.
+    /// the caller decides whether to display it. With it, what the fetch phase
+    /// left on stderr when the result is settled (see
+    /// `ClassifiedReport::settled`).
     fn classify(
         &self,
         report: AnalysisReport,
@@ -875,7 +967,7 @@ impl Classifier<'_> {
         bloom_mark: Option<BloomMark>,
         root_path: &Path,
         root_bytes: Option<bytes::Bytes>,
-    ) -> Result<ScanResult> {
+    ) -> Result<(ScanResult, Option<String>)> {
         let config = self.config;
         let label = origin.path.display().to_string();
         let classified = classify_report(
@@ -912,7 +1004,10 @@ impl Classifier<'_> {
             total_ms = crate::duration_ms(phase.total),
             "scan phases complete",
         );
-        Ok(classified.into_scan_result(label, self.model, config.keeps_report()))
+        let mut classified = classified;
+        let settled = classified.settled.take();
+        let result = classified.into_scan_result(label, self.model, config.keeps_report());
+        Ok((result, settled))
     }
 }
 
@@ -922,29 +1017,41 @@ impl Classifier<'_> {
 /// # Errors
 /// The write failed; `BrokenPipe` means nobody is reading any more.
 pub(crate) fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()> {
+    write_stdout(&encode_result(r, config)?)
+}
+
+/// Write `bytes` to stdout whole, under one lock so records cannot mix, and
+/// flush: the closing summary goes to stderr, and stdio buffering must not
+/// strand a card's last line beneath it.
+fn write_stdout(bytes: &[u8]) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// One result in the configured format, as the bytes written to stdout.
+/// Built before stdout is taken, so one large result does not park every
+/// other completed scan behind its encoding.
+fn encode_result(r: &ScanResult, config: &ScanConfig) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
     match config.format() {
-        // Serialized before stdout is taken, so one large result does not park
-        // every other completed scan behind its encoding, and written whole
-        // under one lock so records cannot mix.
         OutputFormat::Json => {
-            let mut bytes =
-                serde_json::to_vec(&crate::server::decision::V1Decision::scanned(r, &r.path))?;
-            bytes.push(b'\n');
-            io::stdout().lock().write_all(&bytes)
+            serde_json::to_writer(
+                &mut out,
+                &crate::server::decision::V1Decision::scanned(r, &r.path),
+            )?;
+            out.push(b'\n');
         }
         OutputFormat::JsonFull => {
-            let body = r.full_body(config.all_members()).ok_or_else(|| {
+            out = r.full_body(config.all_members()).ok_or_else(|| {
                 io::Error::other("result could not be written in the full JSON format")
             })?;
-            io::stdout().lock().write_all(&body)
         }
-        // The terminal result card was built in `classify_report`; write it
-        // verbatim, then flush before the stderr footer.
+        // The terminal result card was built in `classify_report`.
         OutputFormat::Terminal => {
-            let mut out = io::stdout().lock();
-            out.write_all(r.rendered_context.as_bytes())?;
+            out.extend_from_slice(r.rendered_context.as_bytes());
             if !r.rendered_context.ends_with('\n') {
-                out.write_all(b"\n")?;
+                out.push(b'\n');
             }
             // A process scan names the processes running the binary.
             if let Some(pids) = &r.pids {
@@ -956,16 +1063,13 @@ pub(crate) fn emit_result(r: &ScanResult, config: &ScanConfig) -> io::Result<()>
             if config.extra() {
                 crate::output::write_extra(&mut out, r)?;
             }
-            // The closing summary is written to stderr. Commit this whole card
-            // first so stdio buffering cannot strand its final trait beneath the
-            // footer (especially visible for a single-file scan).
-            out.flush()
         }
         // `--format tiny` prefixes the machine verdict line, never colored.
-        OutputFormat::Tiny => write_tiny(&mut io::stdout().lock(), r),
+        OutputFormat::Tiny => write_tiny(&mut out, r)?,
         // `--format interpret` is the LLM payload verbatim — no verdict line.
-        OutputFormat::Interpret => io::stdout().lock().write_all(r.rendered_context.as_bytes()),
+        OutputFormat::Interpret => out.extend_from_slice(r.rendered_context.as_bytes()),
     }
+    Ok(out)
 }
 
 /// Write the `unavailable` decision for a file that failed analysis.

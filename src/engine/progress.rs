@@ -159,6 +159,12 @@ fn adjust_external(dependencies: usize, urls: usize, op: fn(u32, u32) -> u32) {
 /// just printed. With no active bar (server/JSON modes, or after the scan ends)
 /// the closure simply runs. Callers must not already hold `draw_lock`.
 pub(crate) fn print_above_bar(print: impl FnOnce()) {
+    // A print that itself logs (see [`LogWriter`]) is already above the bar,
+    // under the lock: taking it again would deadlock.
+    if PRINTING_ABOVE_BAR.get() {
+        print();
+        return;
+    }
     let Some(inner) = active_bar() else {
         print();
         return;
@@ -169,7 +175,33 @@ pub(crate) fn print_above_bar(print: impl FnOnce()) {
     if !inner.stopped.load(Ordering::Relaxed) {
         draw_stderr(ERASE_LINE);
     }
+    PRINTING_ABOVE_BAR.set(true);
     print();
+    PRINTING_ABOVE_BAR.set(false);
+}
+
+thread_local! {
+    /// Whether this thread is inside [`print_above_bar`]'s `print`.
+    static PRINTING_ABOVE_BAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where log lines go: stderr, above any live progress bar. A bare stderr
+/// writer appends each event to the bar's `\r`-parked line, so a warning
+/// reads as the tail of the progress display and the next redraw strands it
+/// there. The log formatter hands over one whole event per `write`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, event: &[u8]) -> std::io::Result<usize> {
+        let mut written = Ok(());
+        print_above_bar(|| written = std::io::stderr().lock().write_all(event));
+        written.map(|()| event.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
 }
 
 impl Inner {

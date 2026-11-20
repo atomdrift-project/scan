@@ -300,12 +300,8 @@ fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() 
     ]));
     let mut record = FetchRecord::terminal("pkg:pypi/scapy@1.0".into(), Outcome::Ok);
     record.content_sha256 = Some("candidate-hash".into());
-    assert!(!annotate_python_import_candidate(
-        &mut record,
-        &reference,
-        Some(&report),
-        None
-    ));
+    assert!(!python_candidate_provides_namespace(&reference, &report));
+    annotate_python_import_candidate(&mut record, false, Some(&report), None);
     assert!(analysis_unavailable(&record));
     assert!(terminal_fetch_row_visible(&record));
     assert_eq!(fetch_row(&record).label, "gap");
@@ -318,12 +314,8 @@ fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() 
     assert!(!python_candidate_provides_namespace(&reference, &report));
     report.files[1].path = "candidate.whl!!scapy/__init__.py".into();
     record.coverage = vec![Coverage::Incomplete];
-    assert!(annotate_python_import_candidate(
-        &mut record,
-        &reference,
-        Some(&report),
-        None
-    ));
+    assert!(python_candidate_provides_namespace(&reference, &report));
+    annotate_python_import_candidate(&mut record, true, Some(&report), None);
     assert_eq!(
         record.coverage,
         [
@@ -339,6 +331,131 @@ fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() 
     assert!(
         !python_candidate_provides_namespace(&reference, &report),
         "sdist contents do not establish an installed module layout"
+    );
+}
+
+/// A ZIP of empty stored members: enough of an archive index to name them.
+fn empty_member_zip(names: &[&str]) -> Vec<u8> {
+    let mut zip = Vec::new();
+    let mut directory = Vec::new();
+    for name in names {
+        let offset = u32::try_from(zip.len()).unwrap();
+        let length = u16::try_from(name.len()).unwrap().to_le_bytes();
+        // Version 2.0, no flags, stored, no timestamp, zero CRC and sizes.
+        let fixed = [&[20, 0][..], &[0; 20], &length, &[0; 2]].concat();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&fixed);
+        zip.extend_from_slice(name.as_bytes());
+        directory.extend_from_slice(b"PK\x01\x02\x14\x00");
+        directory.extend_from_slice(&fixed);
+        // No comment, disk 0, no attributes, then the local header's offset.
+        directory.extend_from_slice(&[0; 10]);
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(name.as_bytes());
+    }
+    let count = u16::try_from(names.len()).unwrap().to_le_bytes();
+    let start = u32::try_from(zip.len()).unwrap();
+    let size = u32::try_from(directory.len()).unwrap();
+    zip.extend_from_slice(&directory);
+    zip.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+    zip.extend_from_slice(&count);
+    zip.extend_from_slice(&count);
+    zip.extend_from_slice(&size.to_le_bytes());
+    zip.extend_from_slice(&start.to_le_bytes());
+    zip.extend_from_slice(&[0; 2]);
+    zip
+}
+
+#[test]
+fn known_good_wheel_namespace_is_read_from_its_archive_index() {
+    // cleave returns a target-only report for bytes the known-good filters
+    // vouch for, so the report cannot say what such a wheel provides.
+    let wheel = empty_member_zip(&[
+        "redis/__init__.py",
+        "redis/commands/core.py",
+        "redis-8.1.0.dist-info/METADATA",
+        "redis-8.1.0.dist-info/WHEEL",
+        "redis-8.1.0.dist-info/RECORD",
+    ]);
+    let name = "redis-8.1.0-py3-none-any.whl";
+    let import = |module: &str| {
+        Reference::new(
+            RefLocator::Purl("pkg:pypi/redis".into()),
+            RefKind::Command,
+            "ast-python-import-candidate",
+            module,
+        )
+    };
+    let stub = report_of(&serde_json::json!([
+        {"id":0,"path":name,"depth":0,"file_type":"","sha256":"vouched","size":wheel.len()}
+    ]));
+    assert!(!python_candidate_provides_namespace(
+        &import("redis"),
+        &stub
+    ));
+    assert!(python_wheel_provides_namespace(
+        &import("redis.commands"),
+        name,
+        &wheel
+    ));
+    assert!(
+        !python_wheel_provides_namespace(&import("dotenv"), name, &wheel),
+        "a same-named project that ships another namespace is still unverified"
+    );
+    assert!(
+        !python_wheel_provides_namespace(&import("redis"), name, b"not an archive"),
+        "bytes with no archive index verify nothing"
+    );
+}
+
+#[test]
+fn coverage_gaps_group_by_reason_and_name_the_declaring_file() {
+    let unverified = |locator: &str| {
+        let mut record = FetchRecord::terminal(locator.into(), Outcome::Ok);
+        annotate_python_import_candidate(&mut record, false, None, None);
+        record
+    };
+    let mut verified = FetchRecord::terminal("pkg:pypi/redis@8.1.0".into(), Outcome::Ok);
+    annotate_python_import_candidate(&mut verified, true, None, None);
+    let mut downloader = FetchRecord::terminal(
+        "wget (unresolved downloader arguments) at byte 17 in declaring-sha".into(),
+        Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
+    );
+    downloader.source_sha256 = Some("declaring-sha".into());
+    downloader.coverage.push(Coverage::Unavailable {
+        reason: Some("downloader arguments require runtime evaluation; no URL inferred".into()),
+    });
+    let failed = FetchRecord::terminal(
+        "pkg:pypi/gone@1.0".into(),
+        Outcome::Failed(FetchError::Status(500)),
+    );
+    let records = [
+        unverified("pkg:pypi/dotenv@0.9.9"),
+        downloader,
+        verified,
+        unverified("pkg:pypi/azure@5.0.0"),
+        // One dependency named by two files is one fact.
+        unverified("pkg:pypi/dotenv@0.9.9"),
+        failed,
+    ];
+    let groups = coverage_gaps(&records, |sha| {
+        (sha == "declaring-sha").then(|| "scripts/install.sh".to_owned())
+    });
+    assert_eq!(
+        groups,
+        [
+            (
+                "Python import provider unresolved; no candidate namespace verified",
+                vec!["dotenv 0.9.9".to_owned(), "azure 5.0.0".to_owned()]
+            ),
+            (
+                "downloader arguments require runtime evaluation; no URL inferred",
+                vec![
+                    "wget (unresolved downloader arguments) at byte 17 in scripts/install.sh"
+                        .to_owned()
+                ]
+            ),
+        ]
     );
 }
 

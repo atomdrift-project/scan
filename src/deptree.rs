@@ -202,6 +202,15 @@ pub(crate) struct DepTree {
     heartbeat: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// The terminal rows a live tree may use, or `None` when stderr cannot hold
+/// one whoever else is drawing: see [`DepTree::activate`].
+pub(crate) fn room() -> Option<usize> {
+    if !std::io::stderr().is_terminal() || tracing::enabled!(target: "scan", tracing::Level::INFO) {
+        return None;
+    }
+    term_rows().filter(|&rows| rows >= MIN_TERM_ROWS)
+}
+
 impl DepTree {
     /// Activate a live tree, or `None` to fall back to the streamed fetch log.
     ///
@@ -212,13 +221,10 @@ impl DepTree {
     /// in-place redraw, and the append-only stream coexists with them cleanly —
     /// or when the heartbeat that draws it cannot start.
     pub(crate) fn activate() -> Option<DepTree> {
-        if !std::io::stderr().is_terminal() || bar_active() {
+        if bar_active() {
             return None;
         }
-        if tracing::enabled!(target: "scan", tracing::Level::INFO) {
-            return None;
-        }
-        let rows = term_rows().filter(|&rows| rows >= MIN_TERM_ROWS)?;
+        let rows = room()?;
         let cols = cleave::output::terminal_width();
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
@@ -297,20 +303,28 @@ impl DepTree {
     /// Stop the heartbeat, render the settled tree one last time, and print
     /// `summary` on the line beneath it. After this the tree is inert scrollback.
     /// A tree that never saw a dependency (nothing was fetched) prints nothing —
-    /// the phase stays silent, matching the streamed log.
-    pub(crate) fn finish(&self, summary: &str) {
+    /// the phase stays silent, matching the streamed log. Returns the lines
+    /// left on screen.
+    pub(crate) fn finish(&self, summary: &str) -> String {
         self.stop();
         let mut state = self.inner.lock();
         if state.entries.is_empty() {
-            return;
+            return String::new();
         }
         let mut frame = render(&mut state, true);
+        let mut left: String = compose(&state, true)
+            .iter()
+            .flat_map(|line| [line.as_str(), "\n"])
+            .collect();
         drop(state);
         if !summary.is_empty() {
-            frame.push_str(summary);
-            frame.push('\n');
+            for text in [&mut frame, &mut left] {
+                text.push_str(summary);
+                text.push('\n');
+            }
         }
         draw(&frame);
+        left
     }
 
     /// Stop and join the heartbeat, so no redraw can follow.

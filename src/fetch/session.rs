@@ -10,7 +10,7 @@ use filefacts::FileType;
 use fletch::fetch::{
     Coverage, FetchBudget, FetchError, FetchRecord, Outcome, UrlFetches, fetch_references,
 };
-use fletch::{RefKind, RefLocator, Reference, find};
+use fletch::{RefKind, RefLocator, Reference, Registry, find};
 use reqwest::Url;
 
 use crate::analysis_cache::AnalysisCache;
@@ -32,12 +32,12 @@ use super::discover::{
 use super::imports::{
     annotate_python_import_candidate, attribute_undeclared_npm_imports, candidate_static_issues,
     declared_npm_imports_in_hop, is_python_import_candidate, python_candidate_provides_namespace,
-    reconcile_python_imports,
+    python_wheel_provides_namespace, reconcile_python_imports,
 };
 use super::merge::{
-    Analyzed, Graft, Payloads, apply_package_composites, capture_dependency, corpus_hit_record,
-    merge_payload, merge_registry, prepare_dependency_report_with, registry_findings_for_reference,
-    sub_findings,
+    Analyzed, Captured, Graft, Payloads, apply_package_composites, corpus_hit_record,
+    merge_payload, merge_registry, payload_name, prepare_dependency_report_with,
+    registry_findings_for_reference, sub_findings,
 };
 use super::policy::{FetchPolicy, Platform, host_platform, off_host_platform};
 use super::registry::{mark_peer_candidate, registry_node};
@@ -263,6 +263,9 @@ pub(super) struct FetchSession {
     pub(super) manifests: HashMap<String, String>,
     pub(super) graft: Graft,
     pub(super) out: FetchOutcome,
+    /// Dependency reports compacted during the current batch's merge, written
+    /// into `out.dependencies` when it ends.
+    captured: Vec<Captured>,
     /// Registry records materialized per declaring file sha.
     registry_outcomes: BTreeMap<String, RegistryTally>,
     /// Locally supplied copies: source sha → locator → path.
@@ -271,6 +274,11 @@ pub(super) struct FetchSession {
     /// declaring sha, offset and locator, so a file seen twice records once.
     unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
 }
+
+/// Why a reference is left pending when the run stopped before reaching it:
+/// its time ran out or it was cancelled. Unlike the depth limit, that is an
+/// accident of this run, and the next may get further.
+pub(super) const FETCH_TIMEOUT: &str = "fetch timeout";
 
 impl FetchSession {
     /// A session for `report`, whose hop-0 work is `worklist`. `precheck` is
@@ -346,6 +354,7 @@ impl FetchSession {
                 .collect(),
             graft: Graft::new(report),
             out: FetchOutcome::default(),
+            captured: Vec::new(),
             registry_outcomes: BTreeMap::new(),
             local_coverage: HashMap::new(),
             unresolved_fetch_calls: HashSet::new(),
@@ -390,7 +399,7 @@ impl FetchSession {
         for hop in 0..end {
             worklist = self.within_depth(worklist, hop);
             if self.stopped() {
-                self.defer_groups(&worklist, hop, "fetch timeout");
+                self.defer_groups(&worklist, hop, FETCH_TIMEOUT);
                 return;
             }
             if worklist.is_empty() {
@@ -446,7 +455,7 @@ impl FetchSession {
         let policy = self.policy;
         for (source, refs) in worklist {
             refs.retain_mut(|reference| {
-                if !policy.wants_at(RefKind::Command, hop)
+                if !policy.follows_at(reference, hop)
                     || reference.kind != RefKind::Command
                     || !matches!(reference.source.as_str(), "ast-call" | "ast-import")
                 {
@@ -484,7 +493,7 @@ impl FetchSession {
         let local = LocalNpmPackages::from_report(report);
         for (source, refs) in worklist {
             refs.retain(|reference| {
-                if !self.policy.wants_at(reference.kind, hop) {
+                if !self.policy.follows_at(reference, hop) {
                     return true;
                 }
                 let workspace = local.workspace_coverage(report, source, reference);
@@ -540,7 +549,7 @@ impl FetchSession {
     /// running cross-hop maximum only rises.
     fn bid_versions(&mut self, worklist: &[Group], hop: u8) {
         for r in worklist.iter().flat_map(|(_, refs)| refs) {
-            if !self.policy.wants_at(r.kind, hop) {
+            if !self.policy.follows_at(r, hop) {
                 continue;
             }
             let Some((key, version)) = versioned_purl(locator(r)) else {
@@ -560,11 +569,11 @@ impl FetchSession {
     /// One hop, in batches. The declaring-file groups of a hop are independent
     /// until their serial merge, but a deep tree yields many small groups — one
     /// per previous-hop payload — and analyzing one group at a time strands most
-    /// of a large machine on the tail. So selection, gating, and fetching stay
-    /// serial in group order (`seen` dedup and budget charges keep their exact
-    /// order), registry-record and payload analysis fan out across the whole
-    /// batch, and merging replays serially in group order — report ids, and
-    /// therefore output, do not depend on batching.
+    /// of a large machine on the tail. So selection and fetching stay serial
+    /// in group order (`seen` dedup and budget charges keep their exact
+    /// order), gating, registry-record and payload analysis fan out across
+    /// the whole batch, and merging replays serially in group order — report
+    /// ids, and therefore output, do not depend on batching.
     pub(super) fn hop(
         &mut self,
         report: &mut AnalysisReport,
@@ -579,23 +588,33 @@ impl FetchSession {
         while !exhausted && !self.stopped() {
             let mut plans = Vec::new();
             let mut planned = 0usize;
-            while planned < target {
-                // Re-checked per group, not per batch: stopping only at the
-                // batch edge would overrun the cap by a whole batch's fetches.
-                if self.stopped() {
-                    break;
+            let mut halted = false;
+            // Rounds, because how many payloads a group yields is only known
+            // once it is gated: each round selects the groups that could fill
+            // the rest of the batch and gates them together.
+            while planned < target && !exhausted && !halted {
+                let mut picked = Vec::new();
+                let mut wanted = planned;
+                while wanted < target {
+                    // Re-checked per group, not per batch: stopping only at the
+                    // batch edge would overrun the cap by a whole batch's fetches.
+                    if self.stopped() {
+                        halted = true;
+                        break;
+                    }
+                    let Some((source_sha, refs)) = groups.next() else {
+                        exhausted = true;
+                        break;
+                    };
+                    let selected = self.select(&source_sha, refs, hop, &mut dropped_old_versions);
+                    if !selected.is_empty() {
+                        wanted += selected.len();
+                        picked.push((source_sha, selected));
+                    }
                 }
-                let Some((source_sha, refs)) = groups.next() else {
-                    exhausted = true;
-                    break;
-                };
-                let selected = self.select(&source_sha, refs, hop, &mut dropped_old_versions);
-                if selected.is_empty() {
-                    continue;
-                }
-                let plan = self.plan(source_sha, selected);
-                planned += plan.selected.len();
-                plans.push(plan);
+                let gated = self.plan(picked);
+                planned += gated.iter().map(|plan| plan.selected.len()).sum::<usize>();
+                plans.extend(gated);
             }
             if plans.is_empty() {
                 continue;
@@ -609,9 +628,17 @@ impl FetchSession {
             for (group, analysis) in batch.into_iter().zip(analyzed) {
                 self.merge_group(report, group, analysis, &mut next);
             }
+            // Written once the batch is merged, all at once: one at a time
+            // inside the merge they were its longest serial stretch.
+            use rayon::prelude::*;
+            self.out.dependencies.par_extend(
+                std::mem::take(&mut self.captured)
+                    .into_par_iter()
+                    .filter_map(Captured::write),
+            );
         }
         let leftovers: Vec<_> = groups.collect();
-        self.defer_groups(&leftovers, hop, "fetch timeout");
+        self.defer_groups(&leftovers, hop, FETCH_TIMEOUT);
         if dropped_old_versions > 0 {
             tracing::info!(
                 skipped = dropped_old_versions,
@@ -634,7 +661,7 @@ impl FetchSession {
     ) -> Vec<Reference> {
         let mut selected = Vec::new();
         for r in refs {
-            if self.policy.wants(r.kind) && !self.policy.wants_at(r.kind, hop) {
+            if self.policy.wants(r.kind) && !self.policy.follows_at(&r, hop) {
                 self.out.records.push(skipped_record(
                     source_sha,
                     &r,
@@ -647,7 +674,7 @@ impl FetchSession {
                 .context
                 .as_ref()
                 .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci);
-            if (ci && !self.policy.ci) || !self.policy.wants_at(r.kind, hop) {
+            if (ci && !self.policy.ci) || !self.policy.follows_at(&r, hop) {
                 continue;
             }
             if let Some(reason) = self.fetch_skip_reason(&r) {
@@ -783,24 +810,38 @@ impl FetchSession {
     /// are trait-matched, and releases older than the age ceiling are dropped
     /// before the expensive fetch+scan of their bytes. Skips are reported, never
     /// silent.
-    fn plan(&self, source_sha: String, selected: Vec<Reference>) -> GroupPlan {
-        let (selected, registries) = age_gate(selected, &self.policy, self.res, self.now);
+    fn plan(&self, picked: Vec<Group>) -> Vec<GroupPlan> {
+        use rayon::prelude::*;
+        let bloom = crate::bloom_repo::global();
+        let (policy, res, now) = (&self.policy, self.res, self.now);
+        let plans: Vec<GroupPlan> = picked
+            .into_par_iter()
+            .map(|(source_sha, selected)| {
+                let (selected, registries) = age_gate(selected, policy, res, now, bloom.as_deref());
+                GroupPlan {
+                    source_sha,
+                    selected,
+                    registries,
+                }
+            })
+            .collect();
         // Reveal the kept (to-fetch) set as pending, so the tree shows the
         // dependencies it will actually scan up front. Aged-out deps are
         // deliberately never announced — for a large npm graph they are the
         // overwhelming majority and only a registry-metadata lookup runs on
         // them, so listing them would bury the handful of live scans.
         if let Reporter::Tree { tree, .. } = &self.reporter {
-            let source = self.manifests.get(&source_sha).map_or("", String::as_str);
-            for r in &selected {
-                tree.add(locator(r), &dep_display_name(r), source);
+            for plan in &plans {
+                let source = self
+                    .manifests
+                    .get(&plan.source_sha)
+                    .map_or("", String::as_str);
+                for r in &plan.selected {
+                    tree.add(locator(r), &dep_display_name(r), source);
+                }
             }
         }
-        GroupPlan {
-            source_sha,
-            selected,
-            registries,
-        }
+        plans
     }
 
     /// Pre-fetch PURL negotiation for a whole batch: hopper may hold a standing
@@ -1179,26 +1220,43 @@ impl FetchSession {
         // metadata (see `apply_package_composites`).
         let mut registry_findings: HashMap<String, Vec<Finding>> = HashMap::new();
         let mut unverified_registry_issues: HashMap<String, BTreeSet<String>> = HashMap::new();
-        let verified_python = verified_python_candidates(&landed, &payloads);
+        let verified: Vec<bool> = landed
+            .iter()
+            .zip(&payloads)
+            .map(|(l, payload)| self.provides_imported_namespace(l, payload.as_ref()))
+            .collect();
+        let verified_python: HashSet<&str> = landed
+            .iter()
+            .zip(&verified)
+            .filter(|&(_, &verified)| verified)
+            .map(|(l, _)| l.reference.evidence.as_str())
+            .collect();
         for (gated, sub) in registries.into_iter().zip(subs) {
             // Registry claims against an unverified name must not convict a
             // Python importer whose distribution identity is still unknown.
             if is_python_import_candidate(&gated.reference)
                 && !verified_python.contains(gated.reference.evidence.as_str())
             {
-                if let Some(sub) = sub {
-                    unverified_registry_issues
+                let issues = sub
+                    .as_ref()
+                    .map(candidate_static_issues)
+                    .unwrap_or_default();
+                match gated.skip {
+                    None => unverified_registry_issues
                         .entry(gated.reference.evidence)
                         .or_default()
-                        .extend(candidate_static_issues(&sub));
+                        .extend(issues),
+                    Some(reason) => {
+                        self.settle_gated_candidate(&source_sha, &gated, reason, issues)
+                    }
                 }
                 continue;
             }
             self.merge_registry_record(report, &source_sha, gated, sub, &mut registry_findings);
         }
-        for (l, payload) in landed.iter_mut().zip(payloads) {
+        for ((l, payload), verified) in landed.iter_mut().zip(payloads).zip(verified) {
             let issues = unverified_registry_issues.get(&l.reference.evidence);
-            if let Some(payload) = self.settle_payload(l, payload, issues) {
+            if let Some(payload) = self.settle_payload(l, payload, verified, issues) {
                 self.merge_landed(report, &source_sha, l, payload, &registry_findings, next);
             }
         }
@@ -1207,13 +1265,44 @@ impl FetchSession {
             .extend(landed.into_iter().map(|l| l.record));
     }
 
+    /// Whether `l` is a Python import candidate whose fetched bytes provide
+    /// the namespace it was imported as. cleave never opens bytes the
+    /// known-good filters vouch for, so such a wheel's namespace is read from
+    /// its archive index rather than its target-only report: the candidates
+    /// most worth trusting must not be the ones reported as unverifiable.
+    fn provides_imported_namespace(&self, l: &Landed, payload: Option<&Analyzed>) -> bool {
+        if !is_python_import_candidate(&l.reference) || !delivered_bytes(&l.record) {
+            return false;
+        }
+        let Some(sub) = payload.and_then(|payload| payload.sub.as_ref()) else {
+            return false;
+        };
+        if python_candidate_provides_namespace(&l.reference, sub) {
+            return true;
+        }
+        let name = payload_name(&l.record);
+        let vouched = l
+            .record
+            .content_sha256
+            .as_deref()
+            .zip(self.opts.skip_predicate.as_ref())
+            .is_some_and(|(sha, skip)| (skip.0)(sha, Path::new(&name)));
+        vouched
+            && self
+                .res
+                .cache
+                .load(&l.record.locator)
+                .is_some_and(|bytes| python_wheel_provides_namespace(&l.reference, &name, &bytes))
+    }
+
     /// Record on `l`'s edge what became of its analysis, and return the payload
     /// to graft: `None` when there is nothing to graft, or when a Python import
-    /// candidate's bytes do not provide the imported namespace.
+    /// candidate's bytes do not provide the imported namespace (`verified`).
     fn settle_payload(
         &self,
         l: &mut Landed,
         payload: Option<Analyzed>,
+        verified: bool,
         registry_issues: Option<&BTreeSet<String>>,
     ) -> Option<Analyzed> {
         if payload.is_none()
@@ -1238,9 +1327,9 @@ impl FetchSession {
         if !is_python_import_candidate(&l.reference) {
             return payload;
         }
-        let verified = annotate_python_import_candidate(
+        annotate_python_import_candidate(
             &mut l.record,
-            &l.reference,
+            verified,
             payload.as_ref().and_then(|p| p.sub.as_ref()),
             registry_issues,
         );
@@ -1326,13 +1415,18 @@ impl FetchSession {
         }
         // The record is materialized either way; only the artifact fetch is
         // skipped. `None` = kept for fetch+scan.
-        let Some(reason) = skip else {
-            return;
-        };
+        if let Some(reason) = skip {
+            self.report_gate_skip(&reference, &record, reason);
+        }
+    }
+
+    /// Say why the registry gate kept an artifact from being fetched, in the
+    /// log and on the progress view.
+    fn report_gate_skip(&self, reference: &Reference, record: &Registry, reason: SkipReason) {
         if reason == SkipReason::KnownGood {
             crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
         }
-        let package = tracing::field::display(locator(&reference));
+        let package = tracing::field::display(locator(reference));
         // Age-outs are the common, expected case; they stay at debug so
         // `--verbose` can still see them, while removals and known-good skips —
         // the interesting decisions — are surfaced at info.
@@ -1359,7 +1453,36 @@ impl FetchSession {
         // Settle the skipped row. The tree shows every reason (so no row is left
         // hanging as pending); the stream keeps flooding-averse behaviour,
         // printing only the surfaced removals/known-good skips.
-        self.reporter.skipped(&reference, &record, self.now, reason);
+        self.reporter.skipped(reference, record, self.now, reason);
+    }
+
+    /// A Python import candidate the registry gate settled without a fetch.
+    /// Its record describes a same-named project, not what the import loads,
+    /// so it is never grafted onto the importer; a severe claim in it stays
+    /// reviewable on the candidate's own edge, which no landed bytes carry.
+    fn settle_gated_candidate(
+        &mut self,
+        source_sha: &str,
+        gated: &Gated,
+        reason: SkipReason,
+        issues: BTreeSet<String>,
+    ) {
+        self.report_gate_skip(&gated.reference, &gated.record, reason);
+        if issues.is_empty() {
+            return;
+        }
+        let mut record = skipped_record(
+            source_sha,
+            &gated.reference,
+            Coverage::Unavailable {
+                reason: Some("Python import provider unresolved; candidate not fetched".into()),
+            },
+        );
+        record.coverage.push(Coverage::CandidateFlagged {
+            findings: issues.into_iter().collect(),
+        });
+        self.reporter.report(&record, "");
+        self.out.records.push(record);
     }
 
     /// Fold one analyzed payload into the run: its redirect credit, its
@@ -1420,10 +1543,8 @@ impl FetchSession {
         // Capture the dependency's standalone report before merge_payload
         // consumes the sub-report into the merged tree — only when a consumer
         // (hopper upload, dependency appendix) will read it.
-        if self.capture_deps
-            && let Some(dep) = capture_dependency(&l.record, &payload)
-        {
-            self.out.dependencies.push(dep);
+        if self.capture_deps {
+            self.captured.extend(Captured::new(&l.record, &payload));
         }
         // A verdict the corpus handed us — from the batch PURL negotiation or
         // the per-sha precheck — is this dependency's evaluation, exactly as if
@@ -1440,32 +1561,11 @@ impl FetchSession {
 
     /// Close out the phase: settle the progress view and record, on each file
     /// that declared references, what became of them.
-    pub(super) fn finish(self, report: &mut AnalysisReport) -> FetchOutcome {
-        self.reporter.finish(&self.out.records);
+    pub(super) fn finish(mut self, report: &mut AnalysisReport) -> FetchOutcome {
+        self.out.shown = self.reporter.finish(&self.out.records);
         attribute_reference_outcomes(report, &self.out.records, &self.registry_outcomes);
         self.out
     }
-}
-
-/// The import evidence of every Python import candidate whose fetched bytes
-/// provide the namespace it was imported as.
-fn verified_python_candidates<'a>(
-    landed: &'a [Landed],
-    payloads: &[Option<Analyzed>],
-) -> HashSet<&'a str> {
-    landed
-        .iter()
-        .zip(payloads)
-        .filter(|(landed, payload)| {
-            is_python_import_candidate(&landed.reference)
-                && delivered_bytes(&landed.record)
-                && payload
-                    .as_ref()
-                    .and_then(|payload| payload.sub.as_ref())
-                    .is_some_and(|sub| python_candidate_provides_namespace(&landed.reference, sub))
-        })
-        .map(|(landed, _)| landed.reference.evidence.as_str())
-        .collect()
 }
 
 /// A copy of `r` whose offset is `index`. fletch drops references it will not

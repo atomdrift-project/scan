@@ -509,13 +509,13 @@ impl Model {
         {
             skipped.push(SkippedRoute {
                 model: format!("az/{name}"),
-                reason: "uncalibrated",
+                reason: SkippedRoute::UNCALIBRATED,
             });
         }
         if filetype.is_none() && self.routes.filetypes.skipped.contains(type_key.as_ref()) {
             skipped.push(SkippedRoute {
                 model: format!("az/{type_key}"),
-                reason: "uncalibrated",
+                reason: SkippedRoute::UNCALIBRATED,
             });
         }
 
@@ -579,7 +579,7 @@ impl Model {
                 if !skipped.iter().any(|s| s.model == model) {
                     skipped.push(SkippedRoute {
                         model,
-                        reason: "unavailable",
+                        reason: SkippedRoute::UNAVAILABLE,
                     });
                 }
             }
@@ -669,11 +669,9 @@ impl Model {
     /// scoring the same types would load them next anyway.
     pub(crate) fn raw_needs<'a>(&self, file_types: impl IntoIterator<Item = &'a str>) -> RawNeeds {
         let mut needs = self.tables.ctx.raw_needs();
-        let mut seen = HashSet::new();
+        let file_types: HashSet<&str> = file_types.into_iter().collect();
+        self.routes.warm(file_types.iter().copied());
         for file_type in file_types {
-            if !seen.insert(file_type) {
-                continue;
-            }
             let (type_key, group_key) = self.routes.specialist_keys(file_type);
             let group = group_key.and_then(|name| self.routes.filegroups.get(name));
             let filetype = self.routes.filetypes.get(&type_key);

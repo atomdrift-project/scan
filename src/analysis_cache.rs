@@ -68,6 +68,12 @@ pub(crate) fn cache_base() -> Option<PathBuf> {
 }
 
 impl AnalysisCache {
+    /// This process's handle, opened on first use as [`Self::open`] does.
+    pub(crate) fn shared() -> Option<&'static Self> {
+        static SHARED: std::sync::OnceLock<Option<AnalysisCache>> = std::sync::OnceLock::new();
+        SHARED.get_or_init(Self::open).as_ref()
+    }
+
     /// Open (creating on first use) the cache directory for the active ruleset
     /// version. `None` when disabled via `SCAN_NO_ANALYSIS_CACHE`, when the OS
     /// has no cache directory, or when the directory can't be created — every
@@ -91,41 +97,48 @@ impl AnalysisCache {
     /// entry, or an unreadable/garbled one — treated as a miss so a corrupt file
     /// self-heals on the next write).
     pub(crate) fn get(&self, key: &str) -> Option<Cached> {
-        let bytes = match std::fs::read(self.path(key)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => {
-                tracing::debug!(key, %error, "analysis cache: unreadable entry; analyzing");
-                return None;
-            }
-        };
-        let cached: Cached = match zstd::decode_all(&bytes[..])
-            .map_err(|e| e.to_string())
-            .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string()))
-        {
-            Ok(cached) => cached,
-            Err(error) => {
-                tracing::debug!(key, %error, "analysis cache: garbled entry; analyzing");
-                return None;
-            }
-        };
+        let cached: Cached = self.read(key)?;
         (!cached.sub.as_ref().is_some_and(incomplete)).then_some(cached)
     }
 
-    /// Store an analysis under `key` (see [`entry_key`]). Best-effort: any failure
-    /// (serialize, compress, write) leaves the cache untouched and is logged at
-    /// debug — the result is already in hand, the cache is only an
-    /// optimization. An [`incomplete`] analysis is not stored.
+    /// Store an analysis under `key` (see [`entry_key`]). Best-effort, as
+    /// [`Self::write`] is. An [`incomplete`] analysis is not stored.
     pub(crate) fn put(
         &self,
         key: &str,
         sub: Option<&AnalysisReport>,
         next: &[(String, Vec<Reference>)],
     ) {
-        if sub.is_some_and(incomplete) {
-            return;
+        if !sub.is_some_and(incomplete) {
+            self.write(key, &StoreRef { sub, next });
         }
-        let compressed = match serde_json::to_vec(&StoreRef { sub, next }) {
+    }
+
+    /// The entry stored under `key`, or `None` on a miss: no entry, or an
+    /// unreadable or garbled one, which the next write replaces.
+    pub(crate) fn read<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let bytes = match std::fs::read(self.path(key)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::debug!(key, %error, "analysis cache: unreadable entry; treated as a miss");
+                return None;
+            }
+        };
+        zstd::decode_all(&bytes[..])
+            .map_err(|e| e.to_string())
+            .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string()))
+            .map_err(|error| {
+                tracing::debug!(key, %error, "analysis cache: garbled entry; treated as a miss");
+            })
+            .ok()
+    }
+
+    /// Store `entry` under `key`. Best-effort: any failure (serialize,
+    /// compress, write) leaves the cache untouched and is logged at debug —
+    /// the result is already in hand, the cache is only an optimization.
+    pub(crate) fn write<T: Serialize>(&self, key: &str, entry: &T) {
+        let compressed = match serde_json::to_vec(entry) {
             Ok(json) => zstd::encode_all(&json[..], ZSTD_LEVEL),
             Err(error) => {
                 tracing::debug!(key, %error, "analysis cache: cannot serialize entry; not stored");
@@ -170,21 +183,24 @@ pub(crate) fn entry_key(content_sha: &str, name: &str) -> String {
 }
 
 /// Whether `report` or any file in it is missing results a later run may
-/// produce: rule evaluation ran out of time (findings depend on how loaded the
-/// machine was) or a source parse was cut short.
+/// produce; see [`unfinished`].
 /// Caching it would serve the shortfall to every later scan of the same bytes.
 /// cleave's own cache makes the same call.
 fn incomplete(report: &AnalysisReport) -> bool {
-    use cleave::types::{AnalysisGap, AnalysisGaps};
-    let incomplete = |gaps: &AnalysisGaps| {
-        [
-            AnalysisGap::EvaluationDeadline,
-            AnalysisGap::SourceParseIncomplete,
-        ]
-        .into_iter()
-        .any(|gap| gaps.contains(gap))
-    };
-    incomplete(&report.analysis_gaps) || report.files.iter().any(|f| incomplete(&f.analysis_gaps))
+    unfinished(&report.analysis_gaps) || report.files.iter().any(|f| unfinished(&f.analysis_gaps))
+}
+
+/// Whether `gaps` name a shortfall of this run rather than of the input: rule
+/// evaluation ran out of time (findings depend on how loaded the machine was)
+/// or a source parse was cut short.
+pub(crate) fn unfinished(gaps: &cleave::types::AnalysisGaps) -> bool {
+    use cleave::types::AnalysisGap;
+    [
+        AnalysisGap::EvaluationDeadline,
+        AnalysisGap::SourceParseIncomplete,
+    ]
+    .into_iter()
+    .any(|gap| gaps.contains(gap))
 }
 
 /// A token identifying the analysis-producing detector, so a rules, model, or

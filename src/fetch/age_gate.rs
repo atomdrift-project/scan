@@ -357,11 +357,18 @@ pub(super) fn lenient_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// ceiling — or one whose coordinate is known-good and whose trust isn't stale —
 /// is dropped before the expensive fetch+scan of its bytes; one whose age is
 /// unknown or under the ceiling is kept — fail open, so a registry hiccup or an
-/// unsupported ecosystem never silently hides a dependency from the scan. URLs
-/// and command-mentioned packages aren't gated: their risk isn't a function of a
-/// registry release date. Returns the refs to fetch plus, for *every* dependency
+/// unsupported ecosystem never silently hides a dependency from the scan.
+///
+/// A package the code imports is gated exactly as a declared one is, in every
+/// ecosystem: it is a dependency the manifest left out, and its record names
+/// the release an install would resolve today. URLs and packages an install
+/// command names aren't gated: their risk isn't a function of a registry
+/// release date. Returns the refs to fetch plus, for *every* dependency
 /// that resolved a registry record, its [`Gated`] — the record is materialized
 /// whether or not its bytes are fetched, and the reason drives the skip report.
+///
+/// `bloom` is the known-good filter set, when one is installed; without it
+/// nothing is vouched for and only age settles a reference.
 ///
 /// Both network steps — resolving a range, and the registry record — are
 /// capped per manifest at [`MAX_REGISTRY_LOOKUPS`]: a crafted lockfile
@@ -373,13 +380,14 @@ pub(super) fn age_gate(
     policy: &FetchPolicy,
     res: &Resources,
     now: u64,
+    bloom: Option<&crate::bloom_repo::Lookup>,
 ) -> (Vec<Reference>, Vec<Gated>) {
     let (selected, mut unresolved) = resolve_ranges(selected, res);
     // `None` ceiling (a `max_dep_age_days` of 0) gates nothing, but registry
     // records are still looked up and materialized.
     let max_age =
         (policy.max_dep_age_days > 0).then(|| u64::from(policy.max_dep_age_days) * SECS_PER_DAY);
-    let mut selected = settle_locally(selected, max_age, now);
+    let mut selected = settle_locally(selected, max_age, now, bloom);
     // The network round-trips run concurrently up front; the gate decision below
     // is then pure, so it stays deterministic in `selected` order.
     if selected.len() > MAX_REGISTRY_LOOKUPS {
@@ -400,7 +408,7 @@ pub(super) fn age_gate(
             keep.push(r);
             continue;
         };
-        let skip = skip_reason(&r, &record, max_age, now);
+        let skip = skip_reason(&r, &record, max_age, now, bloom);
         if skip.is_none() {
             keep.push(r.clone());
         }
@@ -483,14 +491,19 @@ fn resolve_ranges(selected: Vec<Reference>, res: &Resources) -> (Vec<Reference>,
 /// ([`must_rescan`] needs the record this skips), and no `*.registry.json`
 /// node is materialized for it, so its registry metadata contributes no
 /// findings. Both apply *only* to bloom-vouched coordinates.
-fn settle_locally(selected: Vec<Reference>, max_age: Option<u64>, now: u64) -> Vec<Reference> {
+fn settle_locally(
+    selected: Vec<Reference>,
+    max_age: Option<u64>,
+    now: u64,
+    bloom: Option<&crate::bloom_repo::Lookup>,
+) -> Vec<Reference> {
     let mut kept = Vec::with_capacity(selected.len());
     for r in selected {
         // Purl-keyed, so the bloom vouches for the coordinate, not the exact
         // bytes; a mutable coordinate is never vouched for by name.
         let vouched = matches!(&r.locator, RefLocator::Purl(purl)
             if immutable_coordinate(purl, None)
-                && crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(purl).may_skip()));
+                && bloom.is_some_and(|lk| lk.decide_purl(purl).may_skip()));
         if vouched {
             crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
             tracing::debug!(
@@ -533,13 +546,12 @@ fn skip_reason(
     record: &Registry,
     max_age: Option<u64>,
     now: u64,
+    bloom: Option<&crate::bloom_repo::Lookup>,
 ) -> Option<SkipReason> {
     let vouched = || {
         resolved_purl(r, record)
             .filter(|purl| immutable_coordinate(purl, record.age_secs(now)))
-            .is_some_and(|purl| {
-                crate::bloom_repo::global().is_some_and(|lk| lk.decide_purl(&purl).may_skip())
-            })
+            .is_some_and(|purl| bloom.is_some_and(|lk| lk.decide_purl(&purl).may_skip()))
     };
     if record.version_removed == Some(true) {
         Some(SkipReason::Removed)

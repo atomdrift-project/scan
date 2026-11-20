@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use fletch::fetch::{Coverage, FetchError, FetchRecord, Outcome, Served};
+use fletch::fetch::{Coverage, FetchError, FetchRecord, Outcome, Served, Unresolved};
 use fletch::{RefKind, RefLocator, Reference, Registry};
 use reqwest::Url;
 
@@ -39,6 +39,8 @@ pub(super) enum Reporter {
         /// Rows already printed, as `outcome + target`. One dependency named by
         /// many manifests is one fact, not one line per manifest.
         printed: std::sync::Mutex<HashSet<String>>,
+        /// Every row printed, in order: what [`Reporter::finish`] returns.
+        shown: std::sync::Mutex<String>,
     },
     Tree {
         tree: DepTree,
@@ -59,6 +61,7 @@ impl Reporter {
                 external_urls: AtomicU32::new(0),
                 budget_notice: AtomicBool::new(false),
                 printed: std::sync::Mutex::new(HashSet::new()),
+                shown: std::sync::Mutex::default(),
             },
             |tree| Self::Tree {
                 tree,
@@ -162,14 +165,39 @@ impl Reporter {
         if let Self::Stream { .. } = self {
             // The streamed log is the attention channel: successes are carried
             // by the aggregate header and the final summary, and only failures
-            // and pin trouble earn a line.
-            if matches!(rec.outcome, Outcome::Ok) && !analysis_unavailable(rec) {
+            // and pin trouble earn a line. A coverage gap is neither — a
+            // package with hundreds of optional imports has hundreds of them,
+            // and a line above a bar shared by every file being scanned names
+            // no owner — so the file's own card summarizes them (see
+            // [`coverage_gaps`]). A flagged candidate is the exception: that
+            // one is a finding about something this artifact may load.
+            let flagged = rec
+                .coverage
+                .iter()
+                .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }));
+            if coverage_gap(rec) {
+                if !flagged {
+                    return;
+                }
+            } else if matches!(rec.outcome, Outcome::Ok) {
                 return;
             }
             if !self.claim_row(rec) {
                 return;
             }
-            crate::engine::print_above_bar(|| report_fetch(rec));
+            self.say(&fetch_rows(rec));
+        }
+    }
+
+    /// Print `rows` (whole lines) above the scan bar and remember them
+    /// (stream only).
+    fn say(&self, rows: &str) {
+        if let Self::Stream { shown, .. } = self {
+            crate::engine::print_above_bar(|| eprint!("{rows}"));
+            shown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_str(rows);
         }
     }
 
@@ -223,7 +251,7 @@ impl Reporter {
             }
             // Aged-out returned above and known-good is the arm before, so
             // only a withdrawn version reaches the stream.
-            Self::Stream { .. } => crate::engine::print_above_bar(|| report_removed(r, reg, now)),
+            Self::Stream { .. } => self.say(&removed_row(r, reg, now)),
             Self::Tree { tree, .. } => {
                 tree.add(locator(r), &dep_display_name(r), "");
                 tree.set(locator(r), skip_state(reg, now, reason));
@@ -233,31 +261,37 @@ impl Reporter {
 
     /// Close out the phase: the stream prints its one-line tally (only if it ever
     /// printed a row); the tree settles and prints the same tally beneath the
-    /// dependency rows.
-    pub(super) fn finish(&self, records: &[FetchRecord]) {
+    /// dependency rows. Returns what the phase leaves on stderr, so a replay
+    /// of the scan can show it again.
+    pub(super) fn finish(&self, records: &[FetchRecord]) -> String {
         match self {
-            Self::Off => {}
+            Self::Off => String::new(),
             Self::Stream {
                 external_dependencies,
                 external_urls,
+                shown,
                 ..
             } => {
                 let dependencies = external_dependencies.swap(0, Ordering::Relaxed);
                 let urls = external_urls.swap(0, Ordering::Relaxed);
                 crate::engine::external_fetch_finished(dependencies as usize, urls as usize);
+                std::mem::take(&mut *shown.lock().unwrap_or_else(PoisonError::into_inner))
             }
             Self::Tree {
                 tree,
                 budget_notice,
             } => {
-                tree.finish(&summary_line(records));
+                let mut left = tree.finish(&summary_line(records));
                 let message = budget_notice
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .take();
                 if let Some(message) = message {
-                    eprintln!("    {message}");
+                    let line = format!("    {message}\n");
+                    eprint!("{line}");
+                    left.push_str(&line);
                 }
+                left
             }
         }
     }
@@ -368,7 +402,7 @@ pub(super) fn done_state(rec: &FetchRecord) -> DepState {
     }
 }
 
-/// The settled tree state for an age-gate skip, mirroring [`report_removed`]'s
+/// The settled tree state for an age-gate skip, mirroring [`removed_row`]'s
 /// glyph and colour with a concise reason as the detail.
 fn skip_state(reg: &Registry, now: u64, reason: SkipReason) -> DepState {
     let age_days = reg.age_secs(now).unwrap_or(0) / SECS_PER_DAY;
@@ -416,13 +450,13 @@ pub fn report_registry(reg: &Registry, progress: bool) {
     }
 }
 
-/// Render one fetched reference to stderr, distinguishing a live network fetch
-/// from a cache hit and naming the actual URL that was (or would be) retrieved.
-/// Only the interactive terminal path passes `progress`; JSON/server callers
-/// stay silent.
-pub(super) fn report_fetch(rec: &FetchRecord) {
+/// One fetched reference as its stderr rows (whole lines; empty when the row
+/// is not shown), distinguishing a live network fetch from a cache hit and
+/// naming the actual URL that was (or would be) retrieved. Only the
+/// interactive terminal path prints them; JSON/server callers stay silent.
+pub(super) fn fetch_rows(rec: &FetchRecord) -> String {
     if !terminal_fetch_row_visible(rec) {
-        return;
+        return String::new();
     }
     let row = fetch_row(rec);
     // A redirect lands the payload elsewhere — name the host, dimmed. Only the
@@ -444,15 +478,18 @@ pub(super) fn report_fetch(rec: &FetchRecord) {
     let column = row
         .detail
         .unwrap_or_else(|| rec.size.map_or(String::new(), crate::output::human_size));
-    eprintln!(
-        "    {} {}  {}{redirect}",
+    let mut rows = format!(
+        "    {} {}  {}{redirect}\n",
         Ink::stderr().fg(row.color, &format!("{} {:<6}", row.glyph, row.label)),
         Ink::stderr().fg(DETAIL, &format!("{column:>10}")),
         crate::output::tty_text(fetch_target(rec))
     );
     if analysis_unavailable(rec) {
-        eprintln!("      {}", crate::output::tty_text(&coverage_text(rec)));
+        rows.push_str("      ");
+        rows.push_str(&crate::output::tty_text(&coverage_text(rec)));
+        rows.push('\n');
     }
+    rows
 }
 
 /// Whether one fetch outcome deserves a terminal row. An unresolved locator
@@ -479,6 +516,57 @@ pub(super) fn analysis_unavailable(rec: &FetchRecord) -> bool {
     rec.coverage
         .iter()
         .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
+}
+
+/// Whether `rec` is a coverage gap rather than a fetch that went wrong: the
+/// reference was retrieved, or deliberately left alone, and what is missing
+/// is an analysis of it.
+fn coverage_gap(rec: &FetchRecord) -> bool {
+    analysis_unavailable(rec)
+        && matches!(
+            rec.outcome,
+            Outcome::Ok | Outcome::Skipped | Outcome::Unresolved(_)
+        )
+}
+
+/// The coverage gaps among `records`, grouped by reason in first-seen order,
+/// each with the distinct references it covers: what a result card shows in
+/// place of one row per reference. `source_path` names the file a declaring
+/// sha belongs to, so a gap reads as a place in the artifact, not a digest.
+pub(crate) fn coverage_gaps(
+    records: &[FetchRecord],
+    source_path: impl Fn(&str) -> Option<String>,
+) -> Vec<(&str, Vec<String>)> {
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut seen = HashSet::new();
+    for rec in records.iter().filter(|rec| coverage_gap(rec)) {
+        let reason = rec
+            .coverage
+            .iter()
+            .find_map(|fact| match fact {
+                Coverage::Unavailable { reason } => reason.as_deref(),
+                _ => None,
+            })
+            .unwrap_or("not analyzed");
+        let target = fetch_target(rec);
+        let label = if rec.locator.starts_with("pkg:") {
+            purl_display(&rec.locator)
+        } else if let Some(sha) = rec.source_sha256.as_deref()
+            && let Some(path) = source_path(sha)
+        {
+            target.replace(sha, &path)
+        } else {
+            target.to_owned()
+        };
+        if !seen.insert((reason, label.clone())) {
+            continue;
+        }
+        match groups.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, labels)) => labels.push(label),
+            None => groups.push((reason, vec![label])),
+        }
+    }
+    groups
 }
 
 /// Attention counts survive dropping the full report for terminal output.
@@ -511,6 +599,34 @@ pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::De
         }
     }
     attention
+}
+
+/// Whether every fetch reached an answer that asking again would not change.
+/// A transport failure, a registry reply that could not be read, an exhausted
+/// budget and a reference the run stopped short of are all accidents of this
+/// run: a result built on one must not stand in for the next run's.
+pub(crate) fn settled(records: &[FetchRecord]) -> bool {
+    let unsettled = |record: &&FetchRecord| {
+        match &record.outcome {
+        Outcome::BudgetExceeded | Outcome::Unresolved(Unresolved::InvalidResponse) => true,
+        Outcome::Failed(_) => !artifact_absent(record),
+        _ => record.coverage.iter().any(|fact| {
+            matches!(fact, Coverage::Pending { reason, .. } if reason == super::session::FETCH_TIMEOUT)
+        }),
+    }
+    };
+    let mut all = true;
+    for record in records.iter().filter(unsettled) {
+        tracing::debug!(
+            locator = %record.locator,
+            outcome = ?record.outcome,
+            status = ?record.status,
+            coverage = ?record.coverage,
+            "fetch not settled: a later run may answer differently"
+        );
+        all = false;
+    }
+    all
 }
 
 /// Whether a failed fetch failed because the artifact is simply not there:
@@ -558,16 +674,11 @@ impl FetchRow {
 }
 
 /// The display row for a fetch outcome. Shared by the streamed log
-/// ([`report_fetch`]) and the live tree, so a dependency reads the same either
+/// ([`fetch_rows`]) and the live tree, so a dependency reads the same either
 /// way: a *fetched* dep the local bloom filters vouch for (or flag) is relabeled
 /// `known` instead of `live`/`cache`; `skip`/`fail` rows are left as-is.
 pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
-    if analysis_unavailable(rec)
-        && matches!(
-            rec.outcome,
-            Outcome::Ok | Outcome::Skipped | Outcome::Unresolved(_)
-        )
-    {
+    if coverage_gap(rec) {
         let flagged = rec
             .coverage
             .iter()
@@ -620,7 +731,7 @@ pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
     }
 }
 
-/// A bloom verdict for a fetched artifact, as a `report_fetch` row override:
+/// A bloom verdict for a fetched artifact, as a [`fetch_rows`] row override:
 /// every known state renders as the `known` label, distinguished by glyph —
 /// 🚩 known-bad, 🏴 conflicted, 👁 sighted by somebody else (all still scanned;
 /// the flag also rides the result header), green ✓ known-good (fetched here
@@ -677,7 +788,7 @@ pub(super) fn failure_detail(why: &FetchError) -> String {
 /// fetch progress block: the package, its age in days, and the strongest
 /// reputation signal the registry gave (downloads, else votes/rating). The
 /// other skips never reach the stream: aged-out and known-good stay at debug.
-fn report_removed(r: &Reference, reg: &Registry, now: u64) {
+fn removed_row(r: &Reference, reg: &Registry, now: u64) -> String {
     let age_days = reg.age_secs(now).unwrap_or(0) / SECS_PER_DAY;
     let signal = reg
         .downloads_recent
@@ -687,12 +798,12 @@ fn report_removed(r: &Reference, reg: &Registry, now: u64) {
     let detail = signal.map_or_else(String::new, |signal| {
         format!("  {}", Ink::stderr().fg(MUTED, &signal))
     });
-    eprintln!(
-        "    {} {}  {}{detail}",
+    format!(
+        "    {} {}  {}{detail}\n",
         Ink::stderr().fg(MUTED, &format!("\u{00b7} {:<10}", "removed")),
         Ink::stderr().fg(DETAIL, &format!("{:>10}", format!("{age_days}d old"))),
         crate::output::tty_text(locator(r))
-    );
+    )
 }
 
 pub(super) fn summary_line(records: &[FetchRecord]) -> String {

@@ -335,6 +335,67 @@ traits:
     }
 }
 
+/// Scanning one named file again, unchanged and the same way, prints what
+/// the first scan printed without analyzing it; a changed file or a changed
+/// option is scanned.
+#[test]
+fn a_repeat_scan_of_an_unchanged_file_is_replayed() {
+    const REPLAYED: &str = "scan replayed";
+    let f = Fixture::new();
+    let rule_dir = f.traits.join("objectives/test");
+    fs::create_dir_all(&rule_dir).unwrap();
+    fs::write(
+        rule_dir.join("replay-fixture.yaml"),
+        r"
+defaults:
+  platforms: [unix, windows]
+  for: [javascript]
+traits:
+  - id: replay-fixture-marker
+    desc: Synthetic replay test marker
+    crit: hostile
+    conf: 0.99
+    if: {type: string_literal, exact: atomscan-replay-test}
+",
+    )
+    .unwrap();
+    let sample = f.root.path().join("sample.js");
+    fs::write(&sample, "const marker = 'atomscan-replay-test';\n").unwrap();
+    let scan = |format: &str| {
+        let mut cmd = f.command(&[
+            "--analyze",
+            "local",
+            "-f",
+            format,
+            "path",
+            sample.to_str().unwrap(),
+        ]);
+        cmd.env("ATOMDRIFT_UPLINK", "0")
+            .env("RUST_LOG", "scan::engine::run=info");
+        let output = f.run(&mut cmd, 0, Duration::from_secs(60));
+        let replayed = String::from_utf8_lossy(&output.stderr).contains(REPLAYED);
+        (String::from_utf8(output.stdout).unwrap(), replayed)
+    };
+
+    let (first, replayed) = scan("json");
+    assert!(!replayed, "nothing to replay yet");
+    assert!(first.contains("replay-fixture-marker"), "{first}");
+    assert_eq!(scan("json"), (first.clone(), true));
+
+    // Another format is another scan, and is then replayed in its own right.
+    let (tiny, replayed) = scan("tiny");
+    assert!(!replayed, "a format never scanned");
+    assert_ne!(tiny, first);
+    assert_eq!(scan("tiny"), (tiny, true));
+
+    // The path is the same and the bytes are not: nothing is replayed, and
+    // the answer is the new file's.
+    fs::write(&sample, "const marker = 'nothing of note';\n").unwrap();
+    let (changed, replayed) = scan("json");
+    assert!(!replayed, "changed bytes");
+    assert!(!changed.contains("replay-fixture-marker"), "{changed}");
+}
+
 #[test]
 #[ignore = "downloads the published rules over the network; CI's release builds run it"]
 fn update_rules_installs_models_and_traits() {

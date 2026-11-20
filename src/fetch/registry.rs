@@ -13,9 +13,10 @@ use fletch::{RefKind, RefLocator, Reference, Registry};
 use crate::output::fg;
 
 use super::age_gate::Lookup;
+use super::imports::is_package_import;
 use super::merge::{Graft, apply_package_composites, merge_registry, payload_name, sub_findings};
 use super::render::{
-    LABEL, LIVE, delivered_bytes, failure_detail, fetch_target, gone_status, report_fetch,
+    LABEL, LIVE, delivered_bytes, failure_detail, fetch_rows, fetch_target, gone_status,
 };
 use super::{Resources, SECS_PER_DAY, locator, shared_resources};
 
@@ -161,7 +162,7 @@ pub fn fetch_one(
     let rec = fetch_one_record(&reference, &*res.net, &res.cache);
     if progress {
         eprintln!("\n  {}  {}", fg(LIVE, "\u{2b07}"), fg(LABEL, "fetching"));
-        report_fetch(&rec);
+        eprint!("{}", fetch_rows(&rec));
     }
     if !delivered_bytes(&rec) {
         return Err(Unretrievable {
@@ -321,9 +322,10 @@ const REGISTRY_MEMO_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUs
 /// Release-cadence window `Registry::with_age` looks back over: two days.
 const RELEASE_CADENCE_WINDOW_SECS: u64 = 2 * SECS_PER_DAY;
 
-/// Look up each declared dependency's registry record, returning one slot per
-/// input ref in `selected` order. A non-dependency ref, or one whose record
-/// can't be resolved, yields `None`.
+/// Look up the registry record of each declared dependency and each imported
+/// package (see [`is_package_import`]), returning one slot per input ref in
+/// `selected` order. Any other ref, or one whose record can't be resolved,
+/// yields `None`.
 ///
 /// Fresh misses use `registry_with_sources` once, so the normalized record and
 /// provenance come from one lookup. The process memo deliberately retains only
@@ -337,7 +339,7 @@ pub(super) fn lookup_registries(
 ) -> Vec<Option<Lookup>> {
     let mut found: Vec<Option<Lookup>> = selected.iter().map(|_| None).collect();
 
-    // Split dependency refs into memo hits — served from memory, no disk or
+    // Split the gated refs into memo hits — served from memory, no disk or
     // network — and misses that still need a lookup.
     let mut misses: Vec<usize> = Vec::new();
     {
@@ -347,7 +349,7 @@ pub(super) fn lookup_registries(
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         for (i, r) in selected.iter().enumerate() {
-            if r.kind != RefKind::Dependency {
+            if r.kind != RefKind::Dependency && !is_package_import(r) {
                 continue;
             }
             match memo

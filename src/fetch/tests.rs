@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use cleave::{AnalysisOptions, AnalysisReport, Finding};
 use fletch::fetch::{
     BlobCache, CandidateSource, Coverage, FetchError, FetchRecord, Outcome, RecordedSource, Served,
+    Unresolved,
 };
 use fletch::{RefKind, RefLocator, Reference, Registry, find};
 use reqwest::Url;
@@ -311,6 +312,53 @@ fn fetched_record() -> FetchRecord {
     }
 }
 
+/// A result is settled when asking again would change no fetch: a missing
+/// artifact, a policy skip and a depth-limit deferral are answers, while a
+/// transport failure, an unreadable registry reply, a spent budget and a
+/// reference the run stopped short of are accidents.
+#[test]
+fn only_accidents_of_the_run_leave_fetches_unsettled() {
+    let with = |outcome, status, coverage: Option<Coverage>| {
+        let mut record = fetched_record();
+        record.outcome = outcome;
+        record.status = status;
+        record.coverage.extend(coverage);
+        record
+    };
+    let pending = |reason: &str| Coverage::Pending {
+        reason: reason.to_owned(),
+        hop: 2,
+    };
+    let failed = || Outcome::Failed(FetchError::Transport("connection reset".to_owned()));
+    for answered in [
+        with(Outcome::Ok, Some(200), None),
+        with(failed(), Some(404), None),
+        with(failed(), Some(410), None),
+        with(Outcome::PinMismatch, Some(200), None),
+        with(Outcome::Unresolved(Unresolved::NoRelease), None, None),
+        with(Outcome::Skipped, None, Some(Coverage::DevelopmentExcluded)),
+        with(Outcome::Skipped, None, Some(pending("depth limit"))),
+    ] {
+        assert!(settled(std::slice::from_ref(&answered)), "{answered:?}");
+    }
+    for accident in [
+        with(failed(), None, None),
+        with(failed(), Some(503), None),
+        with(Outcome::BudgetExceeded, None, None),
+        with(Outcome::Unresolved(Unresolved::InvalidResponse), None, None),
+        with(
+            Outcome::Skipped,
+            None,
+            Some(pending(session::FETCH_TIMEOUT)),
+        ),
+    ] {
+        assert!(!settled(std::slice::from_ref(&accident)), "{accident:?}");
+        // One accident unsettles the whole run.
+        assert!(!settled(&[fetched_record(), accident]));
+    }
+    assert!(settled(&[]));
+}
+
 #[test]
 fn unresolved_extension_count_only_counts_a_registry_without_the_release() {
     let mut records = Vec::new();
@@ -357,7 +405,7 @@ fn unresolved_extension_count_only_counts_a_registry_without_the_release() {
     );
 }
 
-/// Registry/package composites must be grafted before `capture_dependency`
+/// Registry/package composites must be grafted before [`Captured::new`]
 /// consumes its snapshot; otherwise Hopper grades the dependency as clean and
 /// the parent never receives a dependency-verdict back-reference.
 #[test]
@@ -396,7 +444,9 @@ fn registry_composite_reaches_standalone_capture_and_merged_dependency() {
     );
 
     let rec = fetched_record();
-    let captured = capture_dependency(&rec, &payload).expect("standalone capture");
+    let captured = Captured::new(&rec, &payload)
+        .and_then(Captured::write)
+        .expect("standalone capture");
     let captured: cleave::types::CompactReport =
         serde_json::from_str(&captured.raw).expect("captured report parses");
     assert!(
@@ -451,7 +501,9 @@ fn missing_registry_does_not_mutate_fetched_dependency() {
         },
     );
 
-    let captured = capture_dependency(&fetched_record(), &payload).expect("capture");
+    let captured = Captured::new(&fetched_record(), &payload)
+        .and_then(Captured::write)
+        .expect("capture");
     let captured: cleave::types::CompactReport =
         serde_json::from_str(&captured.raw).expect("captured report parses");
     assert_eq!(captured.files[0].findings.len(), 1);
@@ -843,6 +895,7 @@ fn the_streamed_log_states_each_distinct_row_once() {
         external_urls: AtomicU32::new(0),
         budget_notice: AtomicBool::new(false),
         printed: std::sync::Mutex::new(HashSet::new()),
+        shown: std::sync::Mutex::default(),
     };
 
     let mut rec = fetched_record();

@@ -8,8 +8,7 @@ fn grade(raw: &str, label: &str, model: &Model) -> Option<(Decision, MemberEvals
 
 fn grade_fully(raw: &str, label: &str, model: &Model) -> Option<DependencyGrade> {
     let report: CompactReport = serde_json::from_str(raw).expect("dependency report parses");
-    let req = ClassifyRequest::new(label, std::path::Path::new(label), model);
-    classify_dependency(&report, label, &req).expect("not cancelled")
+    classify_dependency(&report, label, model, None).expect("not cancelled")
 }
 
 /// The former production cutoff. Tests deliberately put evidence beyond it
@@ -122,7 +121,7 @@ fn security_held_dependency_at_high_index_elevates_parent() {
     let entries: Vec<&cleave::types::CompactFile> = embedded_entries(&report).collect();
     let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
     let evals: MemberEvals =
-        score_embedded_files(&entries, "parent.tgz", needs, &ctx, &model, None)
+        score_embedded_files(&entries, "", "parent.tgz", needs, &ctx, &model, None)
             .expect("not cancelled")
             .into_iter()
             .map(|member| (member.id, member))
@@ -157,8 +156,7 @@ fn declines_to_grade_an_unparseable_report() {
         size: 1,
         raw: "{not json".to_string(),
     };
-    let req = ClassifyRequest::new("x", std::path::Path::new("x"), &model);
-    let graded = grade_dependencies(vec![dep], &[], &req).expect("not cancelled");
+    let graded = grade_dependencies(vec![dep], &[], &model, None, false).expect("not cancelled");
     assert!(
         graded[0].verdict.is_none(),
         "an unparseable report must yield no verdict",
@@ -184,8 +182,49 @@ fn cancellation_is_an_error_not_a_clean_member_table() {
     let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
     let cancelled = AtomicBool::new(true);
     assert!(
-        score_embedded_files(&entries, "d.tgz", needs, &ctx, &model, Some(&cancelled)).is_err()
+        score_embedded_files(&entries, "", "d.tgz", needs, &ctx, &model, Some(&cancelled)).is_err()
     );
+}
+
+/// A repeat scan reuses each unchanged member's score and reports exactly what
+/// the first scan did; a member whose findings changed is scored again.
+#[test]
+fn unchanged_members_reuse_their_scores_and_changed_ones_do_not() {
+    let Some(dir) = model_bundle() else {
+        eprintln!("skipping: no model bundle (set SCAN_MODELS_DIR)");
+        return;
+    };
+    let model = Model::load(&dir, None, None).expect("load model bundle");
+    let ctx = ExtractContext::new(model.spec());
+    let hostile = r#"[{"id":"objectives/command-and-control/backdoor/rat::beacon","crit":5,"conf":0.95,"desc":"Beacons to a controller"}]"#;
+    let mut report: CompactReport = serde_json::from_str(&dep_report(4, hostile)).unwrap();
+    let root_sha = "5c".repeat(32);
+    let needs = model.raw_needs(report.files.iter().map(|f| f.file_type.as_str()));
+    let score = |report: &CompactReport| {
+        let entries: Vec<&CompactFile> = embedded_entries(report).collect();
+        score_embedded_files(&entries, &root_sha, "d.tgz", needs, &ctx, &model, None)
+            .expect("not cancelled")
+    };
+
+    let first = score(&report);
+    let table = ScoreTable::open(&root_sha, &model, needs).expect("analysis cache is on");
+    for file in embedded_entries(&report) {
+        let key = table.key(file).expect("a compact file serializes");
+        assert!(table.get(key).is_some(), "{} was not remembered", file.path);
+    }
+    assert_eq!(format!("{first:?}"), format!("{:?}", score(&report)));
+
+    let changed = report.files.last_mut().expect("the report has members");
+    changed.findings.clear();
+    let changed = report.files.last().expect("the report has members");
+    let key = table.key(changed).expect("a compact file serializes");
+    assert!(
+        table.get(key).is_none(),
+        "a member whose findings changed must be scored again"
+    );
+    let rescored = score(&report);
+    assert_eq!(rescored.len(), first.len());
+    assert!(rescored.last().expect("scored").top_findings.is_empty());
 }
 
 /// Members elevate their container: a dependency whose members carry confident

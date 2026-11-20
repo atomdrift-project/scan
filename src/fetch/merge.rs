@@ -191,12 +191,22 @@ impl Payloads<'_> {
             next_from_bytes.push((content_sha.clone(), payload_refs));
         }
 
+        let size_bytes = bytes.len();
+        let started = std::time::Instant::now();
         let sub = match cleave::analyze_bytes_owned(bytes, &name, self.opts) {
             Ok(mut sub) => {
                 // finalize() collapses the sub-analysis into its files[]; without
                 // it the payload's data stays in top-level fields and files[] is
                 // empty.
                 sub.finalize();
+                tracing::debug!(
+                    locator = %rec.locator,
+                    name,
+                    size_bytes,
+                    files = sub.files.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "fetched payload analyzed"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -250,31 +260,56 @@ pub(super) fn corpus_hit_record(r: &Reference, source_sha: &str, sha: &str) -> F
     }
 }
 
-/// Capture a fetched payload's standalone report for upload as its own hopper
-/// sample. The report is the pristine one cleave produced for the dependency's
-/// own bytes (container at depth 0, correct member structure) — so it needs no
-/// rerooting, unlike reconstructing a subtree out of the merged parent report.
-/// Compacted from a borrow: no clone of the report, and no strip pass (the raw is
-/// never fed to a model here, and a single dependency never nears the body
-/// limit). Returns `None` when there is nothing to upload.
-pub(super) fn capture_dependency(
-    rec: &FetchRecord,
-    analyzed: &Analyzed,
-) -> Option<FetchedDependency> {
-    let sub = analyzed.sub.as_ref()?;
-    let compact =
-        cleave::types::compact::compact_from_files(&sub.files, cleave::types::Facts::Full);
-    let raw = serde_json::to_string(&compact)
-        .map_err(|e| tracing::warn!(locator = %rec.locator, error = %e, "dependency report could not be serialized for upload"))
-        .ok()?;
-    let url = fetched_url(rec).unwrap_or_default().to_owned();
-    Some(FetchedDependency {
-        locator: rec.locator.clone(),
-        url,
-        content_sha: analyzed.content_sha.clone(),
-        size: rec.size.unwrap_or(0),
-        raw,
-    })
+/// A fetched payload's standalone report captured for upload as its own hopper
+/// sample, compacted but not yet written as the JSON text a
+/// [`FetchedDependency`] carries. The report is the pristine one cleave
+/// produced for the dependency's own bytes (container at depth 0, correct
+/// member structure) — so it needs no rerooting, unlike reconstructing a
+/// subtree out of the merged parent report.
+///
+/// Two steps because only the first is tied to the merge: compaction reads the
+/// sub-report before the merge consumes it, while the write reads nothing
+/// else, so a batch's reports are written concurrently.
+pub(super) struct Captured {
+    locator: String,
+    url: String,
+    content_sha: String,
+    size: u64,
+    report: cleave::types::CompactReport,
+}
+
+impl Captured {
+    /// Compacted from a borrow: no clone of the report, and no strip pass (the
+    /// raw is never fed to a model here, and a single dependency never nears
+    /// the body limit). `None` when there is nothing to upload.
+    pub(super) fn new(rec: &FetchRecord, analyzed: &Analyzed) -> Option<Self> {
+        let sub = analyzed.sub.as_ref()?;
+        Some(Self {
+            locator: rec.locator.clone(),
+            url: fetched_url(rec).unwrap_or_default().to_owned(),
+            content_sha: analyzed.content_sha.clone(),
+            size: rec.size.unwrap_or(0),
+            report: cleave::types::compact::compact_from_files(
+                &sub.files,
+                cleave::types::Facts::Full,
+            ),
+        })
+    }
+
+    /// The dependency with its report as JSON text. `None`, logged, when the
+    /// report cannot be serialized.
+    pub(super) fn write(self) -> Option<FetchedDependency> {
+        let raw = serde_json::to_string(&self.report)
+            .map_err(|e| tracing::warn!(locator = %self.locator, error = %e, "dependency report could not be serialized for upload"))
+            .ok()?;
+        Some(FetchedDependency {
+            locator: self.locator,
+            url: self.url,
+            content_sha: self.content_sha,
+            size: self.size,
+            raw,
+        })
+    }
 }
 
 /// Where grafted nodes attach: the next free file id, and the first node of

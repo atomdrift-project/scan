@@ -273,6 +273,87 @@ fn unresolved_maven_declarations_survive_empty_worklists_and_deduplicate() {
 }
 
 #[test]
+fn a_python_import_settled_at_the_gate_grafts_nothing_but_keeps_severe_claims() {
+    // The gate skipped the fetch, so no bytes land: `clean` is the registry
+    // node of an ordinary old release, `held` one the registry flags.
+    let registry_report = |findings: serde_json::Value| -> AnalysisReport {
+        serde_json::from_value(serde_json::json!({"version":"3","files":[
+            {"id":0,"path":"candidate.registry.json","depth":0,"file_type":"registry","sha256":"d".repeat(64),"size":100,
+             "findings":findings}
+        ]}))
+        .unwrap()
+    };
+    let clean = registry_report(serde_json::json!([]));
+    let held = registry_report(
+        serde_json::json!([{"id":"objectives/test::hostile-registry","crit":"hostile"}]),
+    );
+    for (sub, flagged) in [(clean, false), (held, true)] {
+        let mut importer: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
+            {"id":0,"path":"entry.py","depth":0,"file_type":"python","sha256":"a".repeat(64),"size":30}
+        ]})).unwrap();
+        let group = GroupFetch {
+            source_sha: "a".repeat(64),
+            registries: vec![Gated {
+                reference: Reference::new(
+                    RefLocator::Purl("pkg:pypi/scapy".into()),
+                    RefKind::Command,
+                    "ast-python-import-candidate",
+                    "scapy.tools.UTscapy",
+                ),
+                record: crate::test_registry("pypi", "scapy", "1.0"),
+                sources: None,
+                provenance: None,
+                skip: Some(SkipReason::AgedOut),
+            }],
+            landed: Vec::new(),
+        };
+        let analysis = GroupAnalysis {
+            registries: vec![Some(sub)],
+            payloads: Vec::new(),
+        };
+        let mut pass = session(&importer, FetchPolicy::parse_follow("references").unwrap());
+        let mut next = Vec::new();
+        pass.merge_group(&mut importer, group, analysis, &mut next);
+        assert_eq!(
+            importer.files.len(),
+            1,
+            "a same-named project's registry record is not a fact about this importer"
+        );
+        assert!(pass.out.registries.is_empty());
+        assert!(next.is_empty());
+        if !flagged {
+            assert!(
+                pass.out.records.is_empty(),
+                "an old release nobody flags leaves nothing to review"
+            );
+            continue;
+        }
+        let [record] = pass.out.records.as_slice() else {
+            panic!("one reviewable edge: {:?}", pass.out.records);
+        };
+        assert_eq!(record.outcome, Outcome::Skipped, "nothing was fetched");
+        assert!(record.content_sha256.is_none());
+        assert_eq!(
+            record.source_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert!(record.coverage.iter().any(|fact| matches!(
+            fact,
+            Coverage::CandidateFlagged { findings }
+                if findings == &["hostile:objectives/test::hostile-registry".to_owned()]
+        )));
+        assert_eq!(
+            fetch_row(record).detail.as_deref(),
+            Some("candidate flagged")
+        );
+        assert_eq!(
+            dependency_attention(std::slice::from_ref(record)).flagged_candidates,
+            1
+        );
+    }
+}
+
+#[test]
 fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
     let mut importer: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
             {"id":0,"path":"entry.py","depth":0,"file_type":"python","sha256":"a".repeat(64),"size":30}

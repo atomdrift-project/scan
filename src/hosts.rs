@@ -910,6 +910,9 @@ const PUBLISHER: &[&str] = &[
     "cloud.google.com",
     "cloudflare.com",
     "datadoghq.com",
+    // GitHub's own page scripts and styles. User content is served from
+    // github.com and githubusercontent.com, which stay off this list.
+    "githubassets.com",
     "jetbrains.com",
     "jfrog.com",
     "newrelic.com",

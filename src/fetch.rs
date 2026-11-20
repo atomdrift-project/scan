@@ -62,7 +62,7 @@ pub use self::registry::{
     Unretrievable, fetch_one, graft_root_registry, registry_document, registry_summary,
     registry_with_sources,
 };
-pub(crate) use self::render::dependency_attention;
+pub(crate) use self::render::{coverage_gaps, dependency_attention, settled};
 pub use self::render::{fetch_target, report_registry};
 
 use self::discover::{CiRefs, collect_references_from_input};
@@ -348,6 +348,8 @@ pub struct FetchOutcome {
     pub registries: Vec<DependencyRegistry>,
     /// Existing corpus verdicts adopted instead of analyzing these bytes.
     pub adopted: HashMap<String, crate::corpus_precheck::Verdict>,
+    /// What the phase left on stderr: its fetch rows or its dependency tree.
+    pub(crate) shown: String,
 }
 
 /// References to fetch, grouped by the sha256 of the file that declared them.

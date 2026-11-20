@@ -875,7 +875,7 @@ fn init_logging(global: &GlobalArgs, daemon: bool) {
     });
     let layer = tracing_subscriber::fmt::layer()
         .with_thread_names(true)
-        .with_writer(std::io::stderr);
+        .with_writer(|| scan::engine::LogWriter);
     if daemon {
         tracing_subscriber::registry()
             .with(filter)

@@ -4,6 +4,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use cleave::{AnalysisOptions, AnalysisReport};
 use filefacts::FileType;
@@ -11,7 +12,6 @@ use fletch::fetch::{CandidateSource, Coverage, FetchRecord};
 use fletch::{RefKind, RefLocator, Reference, find};
 
 use super::discover::{PYPROJECT_LOCKS, ancestors, npm_import_name, virtual_parent};
-use super::render::delivered_bytes;
 use super::{Group, report_file_type};
 
 /// Turn parser-observed static ES module edges into the same package
@@ -114,6 +114,20 @@ pub(super) fn is_python_import_candidate(reference: &Reference) -> bool {
     reference.source == "ast-python-import-candidate"
 }
 
+/// Whether `reference` names a package because code imports it: a Python
+/// import candidate, or an npm `require`/`import`. An import is a dependency
+/// the manifest left out, so it meets the same registry gate a declared one
+/// does (see [`age_gate`](super::age_gate::age_gate)) before any bytes are
+/// fetched. A package an install command names is not one: that is an
+/// acquisition the code performs, whatever the release's age.
+pub(super) fn is_package_import(reference: &Reference) -> bool {
+    reference.kind == RefKind::Command
+        && matches!(
+            reference.source.as_str(),
+            "ast-python-import-candidate" | "ast-call" | "ast-import"
+        )
+}
+
 /// A wheel's root namespace is evidence for a possible provider, not proof
 /// of the imported runtime's distribution, version, or import reachability.
 pub(super) fn python_candidate_provides_namespace(
@@ -126,22 +140,50 @@ pub(super) fn python_candidate_provides_namespace(
     if report_file_type(&root.file_type) != FileType::Whl {
         return false;
     }
-    let module = reference.evidence.split('.').next().unwrap_or_default();
     let prefix = format!("{}!!", root.path);
-    report.files.iter().any(|file| {
-        let Some(member) = file.path.strip_prefix(&prefix) else {
-            return false;
-        };
-        if member.contains("!!") || member.contains("##") || !python_runtime_module_file(member) {
-            return false;
-        }
-        member.split('/').next().is_some_and(|first| {
-            if member.contains('/') {
-                first == module
-            } else {
-                first.split('.').next() == Some(module)
-            }
-        })
+    let members = report
+        .files
+        .iter()
+        .filter_map(|file| file.path.strip_prefix(&prefix))
+        .filter(|member| !member.contains("!!") && !member.contains("##"));
+    wheel_provides_module(members, &reference.evidence)
+}
+
+/// The same check against a wheel's archive index, for one cleave never
+/// opened: bytes the known-good filters vouch for come back as a target-only
+/// report (see [`dep_skip_predicate`](super::age_gate::dep_skip_predicate)),
+/// which names no members to read a namespace from.
+pub(super) fn python_wheel_provides_namespace(
+    reference: &Reference,
+    name: &str,
+    bytes: &[u8],
+) -> bool {
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new(name))
+        .open(bytes);
+    parsed.fileid().file_type() == FileType::Whl
+        && wheel_provides_module(
+            parsed
+                .archive_members()
+                .iter()
+                .map(|member| member.path.as_str()),
+            &reference.evidence,
+        )
+}
+
+/// Whether a wheel holding `members` at its import root supplies `module`'s
+/// top-level name as a runtime module: a package directory, or a single file.
+fn wheel_provides_module<'a>(mut members: impl Iterator<Item = &'a str>, module: &str) -> bool {
+    let module = module.split('.').next().unwrap_or_default();
+    members.any(|member| {
+        python_runtime_module_file(member)
+            && member.split('/').next().is_some_and(|first| {
+                if member.contains('/') {
+                    first == module
+                } else {
+                    first.split('.').next() == Some(module)
+                }
+            })
     })
 }
 
@@ -170,37 +212,34 @@ pub(super) fn candidate_static_issues(
 
 /// Do not graft an unrelated same-named PyPI project onto the importer.
 /// A namespace check still leaves the installed distribution/version unknown.
+/// `verified` is whether the candidate's bytes provide the imported namespace;
+/// `report` is its analysis, when there is one.
 pub(super) fn annotate_python_import_candidate(
     record: &mut FetchRecord,
-    reference: &Reference,
+    verified: bool,
     report: Option<&AnalysisReport>,
     registry_issues: Option<&std::collections::BTreeSet<String>>,
-) -> bool {
-    let verified = delivered_bytes(record)
-        && report.is_some_and(|report| python_candidate_provides_namespace(reference, report));
+) {
     if verified {
         record.coverage.push(Coverage::Candidate {
             source: CandidateSource::PythonImport,
         });
-    } else {
-        record.coverage.push(Coverage::Unavailable {
-            reason: Some(
-                "Python import provider unresolved; no candidate namespace verified".into(),
-            ),
-        });
-        // Keep severe observations about the rejected *candidate* reviewable
-        // without turning them into findings about the importing artifact.
-        let mut issues = report.map(candidate_static_issues).unwrap_or_default();
-        if let Some(registry_issues) = registry_issues {
-            issues.extend(registry_issues.iter().cloned());
-        }
-        if !issues.is_empty() {
-            record.coverage.push(Coverage::CandidateFlagged {
-                findings: issues.into_iter().collect(),
-            });
-        }
+        return;
     }
-    verified
+    record.coverage.push(Coverage::Unavailable {
+        reason: Some("Python import provider unresolved; no candidate namespace verified".into()),
+    });
+    // Keep severe observations about the rejected *candidate* reviewable
+    // without turning them into findings about the importing artifact.
+    let mut issues = report.map(candidate_static_issues).unwrap_or_default();
+    if let Some(registry_issues) = registry_issues {
+        issues.extend(registry_issues.iter().cloned());
+    }
+    if !issues.is_empty() {
+        record.coverage.push(Coverage::CandidateFlagged {
+            findings: issues.into_iter().collect(),
+        });
+    }
 }
 
 /// The package a `package.json` directory belongs to, for the imports it

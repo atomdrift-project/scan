@@ -55,6 +55,19 @@ impl serde::Serialize for Classification {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Classification {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match <u8 as serde::Deserialize>::deserialize(deserializer)? {
+            0 => Ok(Self::Benign),
+            1 => Ok(Self::Suspicious),
+            2 => Ok(Self::Hostile),
+            other => Err(serde::de::Error::custom(format_args!(
+                "unknown classification {other}"
+            ))),
+        }
+    }
+}
+
 impl std::fmt::Display for Classification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -94,6 +107,15 @@ pub struct SkippedRoute {
     /// Short reason the route was not used.
     #[serde(rename = "why")]
     pub reason: &'static str,
+}
+
+impl SkippedRoute {
+    /// The route has no calibrated thresholds.
+    pub(crate) const UNCALIBRATED: &'static str = "uncalibrated";
+    /// A policy names the route and its model is not installed.
+    pub(crate) const UNAVAILABLE: &'static str = "unavailable";
+    /// Every reason a route is skipped for.
+    pub(crate) const REASONS: [&'static str; 2] = [Self::UNCALIBRATED, Self::UNAVAILABLE];
 }
 
 /// Probability cutoffs used to map model output into a [`Classification`].
