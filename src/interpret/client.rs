@@ -741,7 +741,7 @@ pub(super) fn prompt_hash(system: &str, model: &str, user: &str) -> String {
     h.update(system.as_bytes());
     h.update(b"\0");
     h.update(user.as_bytes());
-    format!("{:x}", h.finalize())
+    crate::digest::hex(&h.finalize())
 }
 
 /// Root of the interpret verdict cache (`…/atomdrift/scan/interpret`), or `None`

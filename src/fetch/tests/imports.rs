@@ -286,6 +286,54 @@ fn supplied_python_namespaces_respect_archive_and_runtime_boundaries() {
     assert!(local.resolves("bundle.zip!!nested.whl!!entry.py", "requests"));
 }
 
+/// A source distribution's modules are found under its wrapping directory,
+/// beside the manifest or under `src/`, so its own tests importing the
+/// package it ships are not sent to the registry for the newest release of
+/// it. A plain tarball of the same shape makes no such promise.
+#[test]
+fn a_source_distribution_supplies_the_modules_under_its_wrapping_directory() {
+    let source = b"import litellm\nfrom inner.core import run\nimport requests\n";
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new("test_api.py"))
+        .open(source);
+    let files = |archive_type: &str| {
+        report_of(&serde_json::json!([
+            {"id":0,"path":"litellm-1.0.tar.gz","depth":0,"file_type":archive_type,"sha256":"a".repeat(64),"size":500},
+            {"id":1,"path":"litellm-1.0.tar.gz!!litellm-1.0/litellm/__init__.py","depth":1,"file_type":"python","sha256":"b".repeat(64),"size":20},
+            {"id":2,"path":"litellm-1.0.tar.gz!!litellm-1.0/src/inner/core.py","depth":1,"file_type":"python","sha256":"c".repeat(64),"size":20},
+            {"id":3,"path":"litellm-1.0.tar.gz!!litellm-1.0/setup.py","depth":1,"file_type":"python","sha256":"d".repeat(64),"size":20},
+            {"id":4,"path":"litellm-1.0.tar.gz!!litellm-1.0/tests/test_api.py","depth":1,"file_type":"python","sha256":"e".repeat(64),"size":source.len(),"filefacts":{"symbols":parsed.symbols()}}
+        ]))
+    };
+    let importer = "litellm-1.0.tar.gz!!litellm-1.0/tests/test_api.py";
+    let sdist = files("python_sdist");
+    let local = PythonNamespaces::from_report(&sdist);
+    for module in ["litellm.utils", "inner.core", "src.inner", "setup", "tests"] {
+        assert!(local.resolves(importer, module), "{module} is in the tree");
+    }
+    for module in ["requests", "litellm-1.0", "core"] {
+        assert!(!local.resolves(importer, module), "{module} is not a root");
+    }
+    let candidates = |report: &AnalysisReport| -> Vec<String> {
+        collect_references_from_input(report, Path::new("not-on-disk"), None, CiRefs::Skip)
+            .iter()
+            .flat_map(|(_, refs)| refs)
+            .filter(|r| is_python_import_candidate(r))
+            .map(|r| locator(r).to_owned())
+            .collect()
+    };
+    assert_eq!(candidates(&sdist), ["pkg:pypi/requests"]);
+
+    let tarball = files("tar");
+    assert!(!PythonNamespaces::from_report(&tarball).resolves(importer, "litellm"));
+    let mut named = candidates(&tarball);
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        ["pkg:pypi/inner", "pkg:pypi/litellm", "pkg:pypi/requests"]
+    );
+}
+
 #[test]
 fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() {
     let reference = Reference::new(

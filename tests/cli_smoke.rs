@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -278,13 +278,17 @@ traits:
         cmd
     };
 
-    for (target, remote, blocked) in [
-        (loader.to_str().unwrap(), false, true),
-        (image.to_str().unwrap(), false, false),
-        (ENTRY, true, true),
-        (CLEAN, true, false),
+    // `entry.js` imports the module that imports the child: the child is two
+    // levels down, past the default depth of one and within an explicit two.
+    for (target, remote, depth, blocked) in [
+        (loader.to_str().unwrap(), false, None, true),
+        (image.to_str().unwrap(), false, None, false),
+        (ENTRY, true, None, false),
+        (ENTRY, true, Some("--follow-depth=2"), true),
+        (CLEAN, true, Some("--follow-depth=2"), false),
     ] {
         let mut args = vec!["--analyze", "local", "-f", "json"];
+        args.extend(depth);
         if remote {
             args.push("url");
         }
@@ -302,7 +306,7 @@ traits:
                         .as_str()
                         .is_some_and(|desc| desc.contains(CHILD))
             });
-        assert_eq!(child_verdict, blocked, "{target}: {report}");
+        assert_eq!(child_verdict, blocked, "{target} {depth:?}: {report}");
     }
 
     for (target, follow, expected) in [
@@ -394,6 +398,87 @@ traits:
     let (changed, replayed) = scan("json");
     assert!(!replayed, "changed bytes");
     assert!(!changed.contains("replay-fixture-marker"), "{changed}");
+}
+
+/// Scanning a directory again replays every file that has not changed,
+/// each under its own path, and analyzes only the one that has. A file found
+/// in a walk and the same file named alone are different scans.
+#[test]
+fn a_repeat_scan_of_a_directory_replays_each_unchanged_file() {
+    const REPLAYED: &str = "scan replayed";
+    const MARKED: &str = "const marker = 'atomscan-replay-test';\n";
+    let f = Fixture::new();
+    let rule_dir = f.traits.join("objectives/test");
+    fs::create_dir_all(&rule_dir).unwrap();
+    fs::write(
+        rule_dir.join("replay-fixture.yaml"),
+        r"
+defaults:
+  platforms: [unix, windows]
+  for: [javascript]
+traits:
+  - id: replay-fixture-marker
+    desc: Synthetic replay test marker
+    crit: hostile
+    conf: 0.99
+    if: {type: string_literal, exact: atomscan-replay-test}
+",
+    )
+    .unwrap();
+    let dir = f.root.path().join("batch");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    // Two files of the same bytes are two results, one per path.
+    fs::write(dir.join("first.js"), MARKED).unwrap();
+    fs::write(dir.join("nested/copy.js"), MARKED).unwrap();
+    fs::write(dir.join("plain.js"), "const marker = 'nothing of note';\n").unwrap();
+    let scan = |target: &Path| {
+        let mut cmd = f.command(&[
+            "--analyze",
+            "local",
+            "-f",
+            "json",
+            "path",
+            target.to_str().unwrap(),
+        ]);
+        cmd.env("ATOMDRIFT_UPLINK", "0")
+            .env("RUST_LOG", "scan::engine::run=info");
+        let output = f.run(&mut cmd, 0, Duration::from_secs(60));
+        let replayed = String::from_utf8_lossy(&output.stderr)
+            .matches(REPLAYED)
+            .count();
+        // Results arrive as they finish, so compare them in a fixed order.
+        let mut results: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        results.sort_unstable();
+        (results, replayed)
+    };
+    let marked = |results: &[String]| {
+        results
+            .iter()
+            .filter(|line| line.contains("replay-fixture-marker"))
+            .count()
+    };
+
+    let (first, replayed) = scan(&dir);
+    assert_eq!(replayed, 0, "nothing to replay yet");
+    assert_eq!((first.len(), marked(&first)), (3, 2), "{first:?}");
+    assert_eq!(scan(&dir), (first.clone(), 3));
+
+    // One file changes: it alone is analyzed, and the answer is its own.
+    fs::write(dir.join("plain.js"), MARKED).unwrap();
+    let (changed, replayed) = scan(&dir);
+    assert_eq!(replayed, 2, "the two files left alone");
+    assert_eq!((changed.len(), marked(&changed)), (3, 3), "{changed:?}");
+    assert_eq!(scan(&dir), (changed, 3));
+
+    // Named alone, a file the walk scanned is scanned again: nothing a walk
+    // kept answers for it.
+    let (alone, replayed) = scan(&dir.join("first.js"));
+    assert_eq!((alone.len(), replayed), (1, 0));
+    assert_eq!(scan(&dir.join("first.js")), (alone, 1));
 }
 
 #[test]

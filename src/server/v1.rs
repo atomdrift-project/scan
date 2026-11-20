@@ -513,7 +513,7 @@ async fn read_body(
         digest.update(&chunk);
         buf.extend_from_slice(&chunk);
     }
-    Ok((buf.freeze(), format!("{:x}", digest.finalize())))
+    Ok((buf.freeze(), crate::digest::hex(&digest.finalize())))
 }
 
 /// Analyze the bytes a caller sent, rather than a package they named.

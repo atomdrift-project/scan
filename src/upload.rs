@@ -1300,7 +1300,7 @@ fn refetch_artifact(locator: &str, sha256: &str) -> Option<Vec<u8>> {
 /// that ever treats a mismatch as acceptable would corrupt the corpus silently.
 fn bytes_match_digest(bytes: &[u8], sha256: &str, locator: &str) -> bool {
     use sha2::{Digest as _, Sha256};
-    let got = format!("{:x}", Sha256::digest(bytes));
+    let got = crate::digest::hex(&Sha256::digest(bytes));
     if got != sha256 {
         tracing::warn!(
             %locator, expected = %sha256, got = %got,

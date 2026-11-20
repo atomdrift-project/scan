@@ -335,7 +335,7 @@ mod tests {
                     bytes[4096..].fill(0);
                 }
                 let stem = format!("{kind}-{tier}");
-                let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                let sha256 = crate::digest::hex(&Sha256::digest(&bytes));
                 let file = format!("{stem}-{sha256}.adbl");
                 std::fs::write(dir.path().join(&file), bytes).unwrap();
                 let entry = manifest.filter.get_mut(&stem).unwrap();

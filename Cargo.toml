@@ -112,7 +112,7 @@ dirs = "6.0"
 # with onnxmltools.
 tract-onnx = { version = "0.21", default-features = false }
 tract-linalg = "0.21"
-sha2 = "0.10"
+sha2 = "0.11"
 # Encodes non-JSON raw registry documents in an upload's provenance sidecar.
 # Already present transitively (reqwest/rustls), so this only promotes it to a
 # direct dependency.

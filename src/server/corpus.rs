@@ -286,7 +286,7 @@ impl Corpus {
                 self.note_at(base, true, Instant::now());
                 return Ok(Sample {
                     bytes: body.freeze(),
-                    sha256: format!("{:x}", digest.finalize()),
+                    sha256: crate::digest::hex(&digest.finalize()),
                 });
             }
         }

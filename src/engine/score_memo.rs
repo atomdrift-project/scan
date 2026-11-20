@@ -146,7 +146,7 @@ impl ScoreTable {
     /// remembered.
     pub(super) fn key(&self, file: &CompactFile) -> Option<Key> {
         let mut digest = self.seed.clone();
-        serde_json::to_writer(&mut digest, file).ok()?;
+        serde_json::to_writer(crate::digest::Hashing(&mut digest), file).ok()?;
         let digest = digest.finalize();
         let half = |at: usize| digest[at..at + 8].try_into().ok().map(u64::from_be_bytes);
         Some((half(0)?, half(8)?))

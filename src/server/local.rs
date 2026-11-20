@@ -99,7 +99,7 @@ pub(super) fn read(path: &Path, allowed: &[PathBuf], limit: usize) -> Result<Loc
         .map(|name| sanitize_upload_filename(&name.to_string_lossy()))
         .unwrap_or_default();
     Ok(LocalFile {
-        sha256: format!("{:x}", Sha256::digest(&buf)),
+        sha256: crate::digest::hex(&Sha256::digest(&buf)),
         bytes: buf.into(),
         filename,
     })
@@ -144,7 +144,7 @@ mod tests {
         let file = read(&path, &allowed(&dir), 1024).expect("allowed");
         assert_eq!(&file.bytes[..], b"bytes");
         assert_eq!(file.filename, "left-pad-1.3.0.tgz");
-        assert_eq!(file.sha256, format!("{:x}", Sha256::digest(b"bytes")));
+        assert_eq!(file.sha256, crate::digest::hex(&Sha256::digest(b"bytes")));
     }
 
     /// A missing file, a file outside the allowed directories, and something

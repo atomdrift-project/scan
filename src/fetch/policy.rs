@@ -7,12 +7,18 @@ use std::time::Duration;
 use fletch::{RefKind, RefLocator, Reference};
 
 use super::Coordinate;
-use super::imports::is_package_import;
 
-/// Default fetch recursion depth — the number of hops followed from the root.
-/// `2` reaches a stage-3 payload (root → stage-2 → stage-3), since multi-stage
-/// `curl | bash` droppers are the common case.
-pub const DEFAULT_FETCH_DEPTH: u8 = 2;
+/// Default fetch depth: the levels of references followed from the scanned
+/// artifact. `1` fetches what the artifact itself references — its declared
+/// dependencies, the packages its code imports, the URLs and packages its
+/// commands fetch — and none of what those reference in turn.
+pub const DEFAULT_FETCH_DEPTH: u8 = 1;
+
+/// Default fetch depth for a scanner that answers for other hosts (`serve`,
+/// postdoc's workers and server). It populates a shared corpus rather than
+/// answering one question fast, so it also takes the level below: a
+/// dependency's own dependencies and a downloaded script's next stage.
+pub const DEFAULT_SERVICE_FETCH_DEPTH: u8 = 2;
 
 /// Default age ceiling for fetching a declared dependency, in days. A version
 /// older than this has had a long window for community discovery, so only its
@@ -129,8 +135,10 @@ pub struct FetchPolicy {
     /// off by default (a routine `deps` fetch skips them) and enabled only when
     /// auditing CI itself: `--follow=all`, `--follow=ci-actions`, or isomer `ci`.
     pub ci: bool,
-    /// How many hops to follow: `1` fetches the references found in the root,
-    /// `2` also follows references found *inside* those payloads, and so on.
+    /// How many levels of references to follow, alike for every kind: `0`
+    /// follows nothing, `1` fetches the references found in the scanned
+    /// artifact, `2` also follows references found *inside* those payloads (a
+    /// dependency's dependencies, a downloaded script's stage-2), and so on.
     pub depth: u8,
     /// Skip fetching a declared dependency older than this many days, judged by
     /// the registry's publish date (looked up cheaply before the artifact is
@@ -156,21 +164,6 @@ pub struct FetchPolicy {
     /// Ceiling on total bytes fetched on behalf of a single scanned file. The
     /// sweep stops once retrieved bytes cross it.
     pub max_file_bytes: u64,
-    /// Follow declared dependencies past the **first** hop — the dependencies
-    /// of a fetched dependency, and so on to `depth`.
-    ///
-    /// Off for an interactive scan. Hop 1 is the artifact's own declared supply
-    /// chain, which is the thing being judged; hop 2+ is a transitive closure
-    /// that multiplies per hop and is dominated by the long tail of ordinary,
-    /// old releases. Each of those costs a registry round trip *before* the age
-    /// gate can rule it out, because the publish date is what the lookup is
-    /// for, so nearly all of that work ends in an age-out rather than a fetch.
-    ///
-    /// The dropper chain `--follow-depth 2` exists for runs through URLs and
-    /// install-command packages, and those are followed at every hop regardless.
-    /// `serve` sets this because it is a cache-population role, where
-    /// the transitive tail is the point rather than an overhead.
-    pub transitive_deps: bool,
     /// Skip fetching a *dependency* whose name pins it to a platform other than
     /// the host — the `@scope/pkg-<os>-<arch>` native-binary packages (biome,
     /// esbuild, swc, rollup, sharp…) that ship one prebuilt per platform. On a
@@ -195,17 +188,17 @@ impl Default for FetchPolicy {
             max_url_fetches: DEFAULT_MAX_URL_FETCHES,
             max_file_bytes: DEFAULT_MAX_FILE_SIZE,
             max_duration: DEFAULT_FETCH_TIMEOUT,
-            transitive_deps: false,
             host_platform_only: true,
         }
     }
 }
 
 impl FetchPolicy {
-    /// True when at least one kind is selected — the master switch.
+    /// True when at least one kind is selected and at least one level may be
+    /// followed — the master switch. A depth of `0` follows nothing.
     #[must_use]
     pub const fn enabled(&self) -> bool {
-        self.urls || self.packages || self.deps || self.ci
+        self.depth > 0 && (self.urls || self.packages || self.deps || self.ci)
     }
 
     /// This operator-configured policy, following only the reference kinds
@@ -346,26 +339,6 @@ impl FetchPolicy {
             RefKind::Dependency => self.deps,
             _ => false,
         }
-    }
-
-    /// Whether `kind` is selected on hop `hop` (0-based). Identical to
-    /// [`Self::wants`] except that declared dependencies stop at the first hop
-    /// unless [`Self::transitive_deps`] is set — see that field for why.
-    #[must_use]
-    pub(super) fn wants_at(&self, kind: RefKind, hop: u8) -> bool {
-        self.wants(kind) && (self.transitive_deps || hop == 0 || kind != RefKind::Dependency)
-    }
-
-    /// Whether `reference` is followed on hop `hop`: [`Self::wants_at`], with
-    /// a package the code imports held to the rule for one the manifest
-    /// declares. An import is a dependency the manifest left out, so past the
-    /// first hop it is the same transitive tail: a fetched dependency's own
-    /// imports, each a registry round trip and a download for a release the
-    /// scanned artifact never named.
-    #[must_use]
-    pub(super) fn follows_at(&self, reference: &Reference, hop: u8) -> bool {
-        self.wants_at(reference.kind, hop)
-            && (self.transitive_deps || hop == 0 || !is_package_import(reference))
     }
 }
 

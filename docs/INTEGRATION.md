@@ -191,13 +191,21 @@ analyzes them, and folds their results back into its verdict. Choose declared
 manifest/lockfile dependencies (`dependencies`), packages and URLs named by
 install/download commands (`references`), or third-party CI actions
 (`ci-actions`, which also implies dependencies). A bare `--follow` and the
-default select `dependencies,references`; `all` also includes CI actions. With
-`--follow-depth` it follows hops: a script that pulls a loader that runs a
-`curl | bash` dropper is caught as one chain.
+default select `dependencies,references`; `all` also includes CI actions.
+
+`--follow-depth N` sets how many levels are followed, the same for every kind
+of reference. `0` follows nothing; `1`, the default for a scan, fetches what
+the scanned artifact references (its declared dependencies, the packages its code imports,
+the URLs and packages its commands fetch) but nothing those payloads reference
+in turn. Each further level follows one more step: `2` reaches a dependency's
+own dependencies and a downloaded script's second stage, and a script that
+pulls a loader that runs a `curl | bash` dropper needs `3` to be caught as one
+chain. Each level multiplies the registry lookups and downloads. A service that
+answers for other hosts (`atomscan serve`, postdoc) defaults to `2`.
 
 ```bash
 atomscan --follow=dependencies ./pkg/             # manifests and lockfiles only
-atomscan --follow --follow-depth 3 ./pkg/          # dependencies and references
+atomscan --follow --follow-depth 3 ./pkg/          # dependencies and references, 3 levels
 atomscan --follow=all --follow-depth 3 ./pkg/      # include CI actions too
 ```
 

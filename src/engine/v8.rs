@@ -667,7 +667,7 @@ impl UploadDoc {
             .collect();
         let count = reports.len();
         for (line, text) in reports {
-            let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let digest = crate::digest::hex(&Sha256::digest(text.as_bytes()));
             self.files[line].report = Some(Report { digest, text });
         }
         tracing::debug!(

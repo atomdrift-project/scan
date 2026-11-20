@@ -14,7 +14,8 @@ use super::hopper::{Origin, renew};
 use super::pipeline::{ClassifyRequest, classify_report};
 use super::progress::{Progress, Spinner};
 use super::render_cards::write_tiny;
-use super::replay::Replay;
+use super::replay::{Hashed, Replay, Role};
+use super::turns::{Turns, first_of_each_content, release};
 use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources_for,
@@ -56,7 +57,17 @@ pub(crate) fn run_with(
     if !path.is_file() && !path.is_dir() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
-    run_paths_with(model, shap, &[path.to_path_buf()], config, None, None)
+    let paths = [path.to_path_buf()];
+    let targets = Targets::of(&paths);
+    run_paths_with(
+        model,
+        shap,
+        &paths,
+        targets,
+        config,
+        None,
+        Replays::default(),
+    )
 }
 
 /// The model and SHAP table `config` names.
@@ -86,42 +97,153 @@ pub fn run_paths(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
 ) -> Result<ScanSummary> {
-    // The model and cleave's rules load independently, so load the model on
-    // a thread of its own while this one prefetches the rules: one after the
-    // other, the model's ~60 ms was added to every one-shot scan's startup.
-    // The prefetch stays on the calling thread, which is not a rayon worker
-    // (see `prefetch_cleave_resources`).
-    let replay = match paths {
-        [path] if replays_apply(config, registry_map) && path.is_file() => {
-            Replay::load(path, config)
+    let targets = Targets::of(paths);
+    let alone = targets.alone();
+    let load_replays = || {
+        if replays_apply(config, registry_map) {
+            targets.replays(config)
+        } else {
+            Replays::default()
         }
-        _ => None,
     };
-    let loaded = std::thread::scope(|scope| {
+    // The model, cleave's rules and the files' earlier scans load
+    // independently, so the model and the scans get a thread each while this
+    // one prefetches the rules: one after the other, the model's ~60 ms and
+    // the hashing of every file were added to the scan's startup. The
+    // prefetch stays on the calling thread, which is not a rayon worker (see
+    // `prefetch_cleave_resources`).
+    let (loaded, replays) = std::thread::scope(|scope| {
         let model = std::thread::Builder::new()
             .name("model-load".into())
             .spawn_scoped(scope, || load_model(config));
-        // Nothing is analyzed in a replay, so no rule is needed.
-        if replay.is_none() {
+        let replays = std::thread::Builder::new()
+            .name("replay-load".into())
+            .spawn_scoped(scope, load_replays);
+        // A batch names its rule count in the banner whatever is replayed.
+        // The one file named has no banner, and no rule is needed to replay
+        // it, so its rules wait to hear that it has to be analyzed.
+        if !alone {
             prefetch_cleave_resources_for(paths);
         }
-        match model {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            // No thread to spare: load it here instead.
-            Err(_) => load_model(config),
+        let replays = joined(replays, load_replays);
+        if alone && !replays.answer_all() {
+            prefetch_cleave_resources_for(paths);
         }
+        (joined(model, || load_model(config)), replays)
     });
     let (model, shap) = loaded?;
-    run_paths_with(&model, shap.as_ref(), paths, config, registry_map, replay)
+    run_paths_with(
+        &model,
+        shap.as_ref(),
+        paths,
+        targets,
+        config,
+        registry_map,
+        replays,
+    )
+}
+
+/// What `work` returned on the thread started for it, or what it returns
+/// here when there was no thread to spare.
+fn joined<T>(
+    thread: io::Result<std::thread::ScopedJoinHandle<'_, T>>,
+    work: impl FnOnce() -> T,
+) -> T {
+    match thread {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(_) => work(),
+    }
+}
+
+/// What a scan of some paths covers.
+struct Targets {
+    /// The files named: each is analyzed whatever the bloom filters say.
+    files: Vec<PathBuf>,
+    /// The files found under the directories named.
+    dir_files: Vec<PathBuf>,
+    /// Paths that are neither, and directory entries that could not be read.
+    errors: u32,
+}
+
+impl Targets {
+    /// Partition `paths`: explicit files become one unfiltered batch (a named
+    /// file is always analyzed), each directory is walked upfront into its
+    /// file list, and anything else is an error. Walking the directories here
+    /// — rather than letting cleave stream them — tells the progress bar its
+    /// denominator before analysis starts.
+    fn of(paths: &[PathBuf]) -> Self {
+        let errors = AtomicU32::new(0);
+        let mut files = Vec::new();
+        let mut dir_files = Vec::new();
+        for path in paths {
+            if path.is_file() {
+                files.push(path.clone());
+            } else if path.is_dir() {
+                dir_files.extend(discover_files(path, &errors));
+            } else {
+                tracing::error!(path = %path.display(), "path does not exist");
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Self {
+            files,
+            dir_files,
+            errors: errors.into_inner(),
+        }
+    }
+
+    /// Whether the scan is of one named file and nothing else: the scan that
+    /// draws a spinner and a dependency tree instead of a progress bar.
+    fn alone(&self) -> bool {
+        self.files.len() == 1 && self.dir_files.is_empty()
+    }
+
+    /// The earlier scan of each file, where one is kept that still answers.
+    fn replays(&self, config: &ScanConfig) -> Replays {
+        let named = if self.alone() {
+            Role::Alone
+        } else {
+            Role::Named
+        };
+        // A named file is analyzed whatever its size; a walked one only up
+        // to cleave's limit.
+        let limit = analysis_options(config).max_scan_file_size;
+        Replays {
+            files: Replay::load_each(&self.files, named, 0, config),
+            dir_files: Replay::load_each(&self.dir_files, Role::Found, limit, config),
+        }
+    }
+}
+
+/// What hashing a scan's files found: one place per file of [`Targets`], in
+/// its order, `None` where the file was not hashed. Empty when nothing is
+/// replayed.
+#[derive(Default)]
+struct Replays {
+    files: Vec<Option<Hashed>>,
+    dir_files: Vec<Option<Hashed>>,
+}
+
+impl Replays {
+    /// Whether there is a replay for every file, and at least one file.
+    fn answer_all(&self) -> bool {
+        let mut all = self.files.iter().chain(&self.dir_files).peekable();
+        all.peek().is_some()
+            && all.all(|hashed| {
+                hashed
+                    .as_ref()
+                    .is_some_and(|hashed| hashed.replay.is_some())
+            })
+    }
 }
 
 /// Whether a scan under `config` is kept for replay and replayed: only when
 /// its result is a function of the file and the config alone (no registry
 /// map supplying provenance) and printing it is all that is owed (no hopper
-/// to renew). Only the scan of one named file is: with more, a progress bar
-/// shares the terminal and what each file printed depends on the others.
+/// to renew). Each file of a batch is kept apart, under the [`Role`] it was
+/// scanned in: what a file prints does not depend on the files beside it.
 fn replays_apply(
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
@@ -137,59 +259,55 @@ fn run_paths_with(
     model: &Model,
     shap: Option<&ShapImportance>,
     paths: &[PathBuf],
+    targets: Targets,
     config: &ScanConfig,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
-    replay: Option<Replay>,
+    replays: Replays,
 ) -> Result<ScanSummary> {
     let mut session = Session::start(config, model, shap);
-    // The one named file, scanned the same way before: print what it printed.
-    if let (Some(replay), [path]) = (replay, paths) {
-        session.replay(path, &replay);
-        return session.finish();
-    }
-    prefetch_cleave_resources_for(paths);
-
-    // Partition the requested paths: explicit files become one unfiltered batch
-    // (a named file is always analyzed), each directory is walked upfront into
-    // its file list, and anything else is an error. Walking the directories here
-    // — rather than letting cleave stream them — lets us learn the total file
-    // count before analysis starts, so the progress bar has a denominator.
-    let mut files = Vec::new();
-    let mut dir_files = Vec::new();
-    for path in paths {
-        if path.is_file() {
-            files.push(path.clone());
-        } else if path.is_dir() {
-            dir_files.extend(discover_files(path, &session.tally.errors));
-        } else {
-            tracing::error!(path = %path.display(), "path does not exist");
-            session.tally.errors.fetch_add(1, Ordering::Relaxed);
-        }
+    session
+        .tally
+        .errors
+        .fetch_add(targets.errors, Ordering::Relaxed);
+    let alone = targets.alone();
+    // Nothing is analyzed when the one file named is replayed, so no rule is
+    // needed. Anything else needs them, for the banner if for nothing else.
+    if !(alone && replays.answer_all()) {
+        prefetch_cleave_resources_for(paths);
     }
     // Print the banner and start the bar, when a terminal scan covers more
     // than one file.
-    let total = files.len() + dir_files.len();
+    let total = targets.files.len() + targets.dir_files.len();
     if config.format() == OutputFormat::Terminal && total > 1 {
         crate::output::print_banner(detection_counts(config));
         session.progress = Some(Progress::new(u32::try_from(total).unwrap_or(u32::MAX)));
     }
-    // Each batch keeps its own policy, so each is offered to Uplink alone.
+    // A file scanned the same way before prints what it printed then. Each
+    // batch of the rest keeps its own policy, so each is offered to Uplink
+    // alone.
+    let mut shas = HashMap::new();
+    let files = session.replay_kept(targets.files, replays.files, &mut HashMap::new());
+    let dir_files = session.replay_kept(targets.dir_files, replays.dir_files, &mut shas);
     let files = session.judge_remotely(files);
     let dir_files = session.judge_remotely(dir_files);
-    scan_partitioned(&session, &files, dir_files, registry_map)?;
+    scan_partitioned(&session, &files, dir_files, &shas, registry_map, alone)?;
     session.finish()
 }
 
 /// Analyze the named files and the files found in named directories, and
-/// record each result as it completes.
+/// record each result as it completes. `alone` says the scan is of one named
+/// file (see [`Targets::alone`]), whatever is left of it to analyze, and
+/// `shas` names the content of each walked file that was hashed.
 fn scan_partitioned(
     session: &Session<'_>,
     files: &[PathBuf],
     dir_files: Vec<PathBuf>,
+    shas: &HashMap<PathBuf, String>,
     registry_map: Option<&HashMap<String, RegistryProvenance>>,
+    alone: bool,
 ) -> Result<()> {
-    let alone = files.len() == 1 && dir_files.is_empty();
-    let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
+    let kept = replays_apply(session.config, registry_map);
+    let record_now = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
         // Per-file provenance: match this artifact's content sha to its registry
         // record in `--registry-map`, the registry's own account of the package
         // recovered without a refetch — which for a deleted release is the only
@@ -205,12 +323,36 @@ fn scan_partitioned(
             registry: registry_map.zip(sha).and_then(|(map, sha)| map.get(sha)),
             fetch: None,
         };
+        let sidecar = !named && session.config.sidecars() && is_attached_sidecar(path);
+        let role = match (named, alone) {
+            (false, _) => Role::Found,
+            (true, true) => Role::Alone,
+            (true, false) => Role::Named,
+        };
         let target = Target {
-            sidecar: !named && session.config.sidecars() && is_attached_sidecar(path),
-            replayable: named && alone && replays_apply(session.config, registry_map),
+            sidecar,
+            // What a capture record prints depends on the file it lies
+            // beside, which is no part of a replay's key.
+            kept: (kept && !sidecar).then_some(role),
             ..Target::new(origin)
         };
         session.record(&target, analyzed, None);
+    };
+    // Files of one release follow the same references, so they take turns
+    // at it (see `Turns`); a scan that follows none has nothing to share.
+    let turns = Turns::default();
+    let follows = session.config.fetch_policy().enabled();
+    let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| match analyzed
+        .as_ref()
+        .ok()
+        .and_then(release)
+    {
+        Some(release) if follows => turns.take(
+            &release,
+            (path.to_path_buf(), analyzed, named),
+            |(path, analyzed, named)| record_now(&path, analyzed, named),
+        ),
+        _ => record_now(path, analyzed, named),
     };
 
     // A single artifact has no file-count bar, so its static analysis —
@@ -218,9 +360,10 @@ fn scan_partitioned(
     // screen for however many seconds it takes. Analyze it directly with a
     // spinner instead of through the streaming API, dropping the spinner before
     // `record` so its fetch tree and final render own the terminal cleanly.
-    if session.config.format() == OutputFormat::Terminal && files.len() == 1 && dir_files.is_empty()
-    {
-        let path = &files[0];
+    if let ([path], true) = (
+        files,
+        alone && session.config.format() == OutputFormat::Terminal,
+    ) {
         let label = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -243,12 +386,23 @@ fn scan_partitioned(
                 }
             })?;
         }
-        if !dir_files.is_empty() {
-            cleave::scan_paths(dir_files, &session.opts, |event| {
-                if let cleave::ScanEvent::File { path, result } = event {
-                    record(&path, *result, false);
-                }
-            })?;
+        // Files of the same bytes are analyzed one after another, not at
+        // once: the second finds the first's analysis and its dependencies
+        // in the caches, where at once each did all of it again. With
+        // everything it follows already kept, the second wave takes no turns.
+        let (first, again) = first_of_each_content(dir_files, shas);
+        for (wave, cached) in [(first, false), (again, true)] {
+            if !wave.is_empty() {
+                cleave::scan_paths(wave, &session.opts, |event| {
+                    if let cleave::ScanEvent::File { path, result } = event {
+                        if cached {
+                            record_now(&path, *result, false);
+                        } else {
+                            record(&path, *result, false);
+                        }
+                    }
+                })?;
+            }
         }
     }
     Ok(())
@@ -584,9 +738,39 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Replay each of `files` that has an earlier scan in `hashed` (see
+    /// [`Replays`]), and return the rest, noting in `shas` the content of
+    /// each one that was hashed.
+    fn replay_kept(
+        &self,
+        files: Vec<PathBuf>,
+        hashed: Vec<Option<Hashed>>,
+        shas: &mut HashMap<PathBuf, String>,
+    ) -> Vec<PathBuf> {
+        let mut hashed = hashed.into_iter();
+        files
+            .into_iter()
+            .filter(|path| match hashed.next().flatten() {
+                Some(Hashed {
+                    replay: Some(replay),
+                    ..
+                }) => {
+                    self.replay(path, &replay);
+                    false
+                }
+                Some(Hashed { sha256, .. }) => {
+                    shas.insert(path.clone(), sha256);
+                    true
+                }
+                None => true,
+            })
+            .collect()
+    }
+
     /// Account for a file whose earlier scan is replayed: tallied and shown
     /// exactly as [`Self::report`] did then.
     fn replay(&self, path: &Path, replay: &Replay) {
+        self.advance();
         if let Some(lookup) = self.config.bloom()
             && let Some(digest) = burton::parse_sha256_hex(&replay.sha256)
         {
@@ -609,7 +793,11 @@ impl<'a> Session<'a> {
             .fetch_add(replay.flagged_candidates, Ordering::Relaxed);
         // The cosmetic rows first, as they came first; a failed write of
         // them is as harmless now as it was then.
-        let _ = io::stderr().write_all(replay.notes.as_bytes());
+        if !replay.notes.is_empty() {
+            super::print_above_bar(|| {
+                let _ = io::stderr().write_all(replay.notes.as_bytes());
+            });
+        }
         if let Some(output) = &replay.output {
             self.write_result(|| write_stdout(output.as_bytes()));
         }
@@ -764,15 +952,21 @@ impl<'a> Session<'a> {
         let complete = self.uploader.is_none() && shown == written.is_some();
         tracing::debug!(
             path = %target.origin.path.display(),
-            replayable = target.replayable,
+            kept = ?target.kept,
             settled = settled.is_some(),
             complete,
             "whether this scan is kept for replay"
         );
-        if let Some(notes) = settled.filter(|_| target.replayable && complete) {
+        if let Some((notes, role)) = settled.zip(target.kept).filter(|_| complete) {
+            let label = target.origin.path.display().to_string();
             match written.map(String::from_utf8).transpose() {
-                Ok(output) => Replay::new(&result, notes, output, self.config)
-                    .store(&target.origin.path.display().to_string(), self.config),
+                Ok(output) => {
+                    Replay::new(&result, notes, output, self.config).store(
+                        &label,
+                        role,
+                        self.config,
+                    );
+                }
                 Err(_) => tracing::debug!("scan output is not UTF-8; not kept for replay"),
             }
         }
@@ -927,9 +1121,9 @@ struct Target<'a> {
     /// Set when the bytes are a registry-metadata document standing in for a
     /// package that could not be fetched; see [`super::HopperRoute`].
     fallback_purl: Option<&'a str>,
-    /// The one file the operator named, scanned with nothing but its bytes
-    /// and the config: the scan [`Replay`] keeps.
-    replayable: bool,
+    /// The role its scan is kept for [`Replay`] under, when it is one
+    /// scanned with nothing but its bytes and the config.
+    kept: Option<Role>,
 }
 
 impl<'a> Target<'a> {
@@ -938,7 +1132,7 @@ impl<'a> Target<'a> {
             origin,
             sidecar: false,
             fallback_purl: None,
-            replayable: false,
+            kept: None,
         }
     }
 }
@@ -1467,6 +1661,57 @@ fn file_touched_within(path: &Path, window: Duration, now: SystemTime) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Named files and walked files are kept apart, a path that is neither
+    /// is an error, and only one named file with nothing else is "alone".
+    #[test]
+    fn targets_keep_named_and_walked_files_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let named = dir.path().join("named.txt");
+        std::fs::write(&named, "x").expect("write");
+        let walked = dir.path().join("walked");
+        std::fs::create_dir_all(walked.join("deep")).expect("mkdir");
+        std::fs::write(walked.join("deep/found.txt"), "y").expect("write");
+        let absent = dir.path().join("absent");
+
+        let targets = Targets::of(&[named.clone(), walked.clone(), absent]);
+        assert_eq!(targets.files, std::slice::from_ref(&named));
+        assert_eq!(targets.dir_files, [walked.join("deep/found.txt")]);
+        assert_eq!(targets.errors, 1);
+        assert!(!targets.alone(), "a directory came with it");
+
+        assert!(Targets::of(std::slice::from_ref(&named)).alone());
+        assert!(!Targets::of(&[named.clone(), named]).alone());
+        assert!(
+            !Targets::of(&[walked]).alone(),
+            "one walked file is a batch"
+        );
+    }
+
+    /// Replaying every file is something only a scan with files can do, and
+    /// one file left to analyze is enough to need the rules.
+    #[test]
+    fn replays_answer_for_all_only_when_no_file_is_left() {
+        let hashed = |replay: Option<&str>| {
+            Some(Hashed {
+                sha256: "ab".repeat(32),
+                replay: replay.map(|json| serde_json::from_str(json).expect("a replay")),
+            })
+        };
+        let kept = || {
+            hashed(Some(
+                r#"{"at":0,"expires":false,"class":0,"severe":false,
+                    "dependency_gaps":0,"flagged_candidates":0,"notes":"","output":null}"#,
+            ))
+        };
+        let replays = |files, dir_files| Replays { files, dir_files };
+        assert!(!Replays::default().answer_all(), "no file, no answer");
+        assert!(replays(vec![kept()], vec![]).answer_all());
+        assert!(replays(vec![kept()], vec![kept(), kept()]).answer_all());
+        assert!(!replays(vec![kept()], vec![kept(), None]).answer_all());
+        assert!(!replays(vec![kept()], vec![hashed(None)]).answer_all());
+        assert!(!replays(vec![None], vec![]).answer_all());
+    }
 
     #[test]
     fn discovery_keeps_dot_git_lookalikes_and_skips_only_the_object_store() {

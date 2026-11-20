@@ -455,7 +455,7 @@ fn only_bytes_matching_the_analyzed_digest_are_uploaded() {
     let bytes = b"the exact bytes the verdict was computed over";
     let sha = {
         use sha2::{Digest as _, Sha256};
-        format!("{:x}", Sha256::digest(bytes))
+        crate::digest::hex(&Sha256::digest(bytes))
     };
     assert!(
         bytes_match_digest(bytes, &sha, "pkg:npm/x@1"),

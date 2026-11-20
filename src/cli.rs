@@ -386,17 +386,14 @@ pub struct GlobalArgs {
     )]
     pub follow: Option<crate::fetch::FetchPolicy>,
 
-    /// Experimental: how many hops of references to follow when `--follow` is on:
-    /// `1` fetches only what the scanned files reference, `2` also follows
-    /// references found inside those payloads (reaching a stage-3 `curl | bash`
-    /// dropper), and so on.
-    #[arg(
-        long = "follow-depth",
-        global = true,
-        value_name = "N",
-        default_value_t = crate::fetch::DEFAULT_FETCH_DEPTH
-    )]
-    pub follow_depth: u8,
+    /// Experimental: how many levels of references to follow when `--follow` is
+    /// on, the same for dependencies, imports, URLs and install commands: `0`
+    /// follows nothing, `1` fetches only what the scanned files reference, `2`
+    /// also follows what those payloads reference (a dependency's
+    /// dependencies, a downloaded script's next stage), and so on. Default: 1
+    /// for a scan, 2 for a service that answers for other hosts (`serve`).
+    #[arg(long = "follow-depth", global = true, value_name = "N")]
+    pub follow_depth: Option<u8>,
 }
 
 impl GlobalArgs {
@@ -515,13 +512,12 @@ impl GlobalArgs {
         }
     }
 
-    /// Apply the follow knobs to `policy`: the hop count from `--follow-depth`,
-    /// the dependency age ceiling, and the scanner's role. `serve` scans on
-    /// behalf of other hosts, so it takes every platform's native-binary
-    /// dependencies and the transitive tail; an interactive scan stays
-    /// host-only and stops declared dependencies at the first hop, since the
-    /// transitive tail costs a registry lookup each and is almost entirely old
-    /// releases the age gate then discards. An explicit selection is honored
+    /// Apply the follow knobs to `policy`: the depth from `--follow-depth`, the
+    /// dependency age ceiling, and the scanner's role. A scanner that answers
+    /// for other hosts takes every platform's native-binary dependencies and,
+    /// unless `--follow-depth` says otherwise, one more level of references
+    /// ([`DEFAULT_SERVICE_FETCH_DEPTH`](crate::fetch::DEFAULT_SERVICE_FETCH_DEPTH));
+    /// an interactive scan stays host-only. An explicit selection is honored
     /// verbatim, and the per-file ceilings are `policy`'s own.
     #[must_use]
     pub fn fetch_policy(
@@ -530,10 +526,13 @@ impl GlobalArgs {
         max_dep_age_days: u32,
         scans_for_other_hosts: bool,
     ) -> crate::fetch::FetchPolicy {
-        policy.depth = self.follow_depth;
+        policy.depth = self.follow_depth.unwrap_or(if scans_for_other_hosts {
+            crate::fetch::DEFAULT_SERVICE_FETCH_DEPTH
+        } else {
+            crate::fetch::DEFAULT_FETCH_DEPTH
+        });
         policy.max_dep_age_days = max_dep_age_days;
         policy.host_platform_only = !scans_for_other_hosts;
-        policy.transitive_deps = scans_for_other_hosts;
         policy
     }
 

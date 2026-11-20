@@ -58,7 +58,7 @@ fn compact_archive_keeps_xor_decoded_program_targets_after_serialization() {
         .collect();
     assert_eq!(refs.len(), 2);
     for (command, url, _) in cases {
-        let sha = format!("{:x}", sha2::Sha256::digest(command.as_bytes()));
+        let sha = crate::digest::hex(&sha2::Sha256::digest(command.as_bytes()));
         let (owner, reference) = refs.iter().find(|(_, r)| locator(r) == url).unwrap();
         assert_eq!(owner.as_str(), sha);
         assert_eq!(reference.kind, RefKind::Dependency);

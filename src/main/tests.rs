@@ -158,9 +158,9 @@ fn dependency_scope_follows_scanner_role() -> Result<()> {
         interactive.host_platform_only,
         "interactive scans optimize for the current host"
     );
-    assert!(
-        !interactive.transitive_deps,
-        "interactive scans stop declared dependencies at the first hop"
+    assert_eq!(
+        interactive.depth, 1,
+        "an interactive scan follows one level of references"
     );
     assert!(
         scan::fetch::FetchPolicy::default().host_platform_only,
@@ -176,7 +176,39 @@ fn dependency_scope_follows_scanner_role() -> Result<()> {
         !served.host_platform_only,
         "serve scans on behalf of other hosts"
     );
-    assert!(served.transitive_deps, "serve populates the corpus");
+    assert_eq!(
+        served.depth, 2,
+        "a scanner for other hosts follows one level further by default"
+    );
+
+    let shallow = Cli::try_parse_from(["scan", "--follow-depth=1", "serve"])
+        .context("an explicit depth should parse")?;
+    let shallow = fetch_policy(
+        &shallow.global,
+        shallow.command.as_ref().context("a command")?,
+    );
+    assert_eq!(shallow.depth, 1, "an explicit depth wins over the role");
+    Ok(())
+}
+
+#[test]
+fn follow_depth_counts_levels_and_zero_follows_nothing() -> Result<()> {
+    let policy = |args: &[&str]| -> Result<scan::fetch::FetchPolicy> {
+        let cli = Cli::try_parse_from(with_default_subcommand(args.iter().copied()))
+            .context("should parse")?;
+        Ok(fetch_policy(
+            &cli.global,
+            cli.command.as_ref().context("a command")?,
+        ))
+    };
+    for depth in [1, 2, 5] {
+        let flag = format!("--follow-depth={depth}");
+        let followed = policy(&["scan", "--follow=all", &flag, "/tmp/a"])?;
+        assert_eq!(followed.depth, depth);
+        assert!(followed.enabled(), "{flag}");
+    }
+    let none = policy(&["scan", "--follow=all", "--follow-depth=0", "/tmp/a"])?;
+    assert!(!none.enabled(), "depth 0 follows nothing");
     Ok(())
 }
 

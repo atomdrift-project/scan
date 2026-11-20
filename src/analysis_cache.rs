@@ -262,7 +262,7 @@ fn bloom_token(manifest: &burton::Manifest) -> String {
         hasher.update(entry.sha256.as_bytes());
         hasher.update(b"\n");
     }
-    let mut token = format!("b{:x}", hasher.finalize());
+    let mut token = format!("b{}", crate::digest::hex(&hasher.finalize()));
     token.truncate(13); // "b" and 12 hex digits
     token
 }

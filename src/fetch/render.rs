@@ -571,7 +571,10 @@ pub(crate) fn coverage_gaps(
 
 /// Attention counts survive dropping the full report for terminal output.
 /// Candidate issues concern the retrieved candidate, not the importing file.
+/// A reference past the follow depth is no gap: the depth is the operator's
+/// choice, and every dependency's own requirements lie past the default one.
 pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::DependencyAttention {
+    let chosen = |fact: &Coverage| matches!(fact, Coverage::Pending { reason, .. } if reason == super::session::DEPTH_LIMIT);
     let mut attention = crate::engine::DependencyAttention::default();
     for record in records {
         if record
@@ -581,7 +584,10 @@ pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::De
         {
             attention.flagged_candidates += 1;
         }
-        if record.coverage.iter().any(Coverage::is_gap)
+        if record
+            .coverage
+            .iter()
+            .any(|fact| fact.is_gap() && !chosen(fact))
             || matches!(
                 record.outcome,
                 Outcome::Failed(_)

@@ -61,11 +61,23 @@ pub(super) fn static_es_module_refs(
 /// boundaries separate: a fixture or nested wheel cannot satisfy its parent.
 /// Presence prevents an unrelated registry refetch; it does not prove a module
 /// executes successfully, or that arbitrary sys.path modifications are modeled.
+///
+/// A source distribution wraps its tree in one `<name>-<version>` directory,
+/// and its modules sit beside the manifest there or under `src/`. Read from
+/// the archive's own root, none of them was found, and every test and example
+/// that imports the package it ships with fetched the newest release of that
+/// package from the registry instead.
 #[derive(Default)]
 pub(super) struct PythonNamespaces(HashMap<String, HashSet<String>>);
 
 impl PythonNamespaces {
     pub(super) fn from_report(report: &AnalysisReport) -> Self {
+        let sdists: HashSet<&str> = report
+            .files
+            .iter()
+            .filter(|file| report_file_type(&file.file_type) == FileType::PythonSdist)
+            .map(|file| file.path.as_str())
+            .collect();
         let mut roots: HashMap<String, HashSet<String>> = HashMap::new();
         for file in &report.files {
             let Some((archive, member)) = file.path.rsplit_once("!!") else {
@@ -74,23 +86,31 @@ impl PythonNamespaces {
             if member.contains("##") || !python_runtime_module_file(member) {
                 continue;
             }
-            let first = member.split('/').next().unwrap_or_default();
-            let module = if member.contains('/') {
-                first
+            let trees = if sdists.contains(archive) {
+                let tree = member.split_once('/').map_or(member, |(_, tree)| tree);
+                [Some(tree), tree.strip_prefix("src/")]
             } else {
-                first.split('.').next().unwrap_or_default()
+                [Some(member), None]
             };
-            // A Python identifier: what an `import` could name.
-            let mut chars = module.chars();
-            let identifier = chars
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if identifier {
-                roots
-                    .entry(archive.to_owned())
-                    .or_default()
-                    .insert(module.to_owned());
+            for tree in trees.into_iter().flatten() {
+                let first = tree.split('/').next().unwrap_or_default();
+                let module = if tree.contains('/') {
+                    first
+                } else {
+                    first.split('.').next().unwrap_or_default()
+                };
+                // A Python identifier: what an `import` could name.
+                let mut chars = module.chars();
+                let identifier = chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if identifier {
+                    roots
+                        .entry(archive.to_owned())
+                        .or_default()
+                        .insert(module.to_owned());
+                }
             }
         }
         Self(roots)

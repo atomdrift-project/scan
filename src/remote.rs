@@ -253,7 +253,7 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
 /// The verdict Uplink holds for a fetched artifact's bytes, under `auto`.
 pub(crate) fn known_bytes(bytes: &[u8]) -> Option<(String, Verdict)> {
     let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
-    let sha = format!("{:x}", Sha256::digest(bytes));
+    let sha = crate::digest::hex(&Sha256::digest(bytes));
     match precheck.standing(&sha) {
         Standing::Adopt(verdict) => Some((sha, verdict)),
         _ => None,
@@ -384,7 +384,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
         .context("Uplink's analysis stream ended without an answer")?;
     let (sha, verdict) = crate::corpus_precheck::analyzed_verdict(&answer)?;
     if let Some(body) = &body {
-        let sent = format!("{:x}", Sha256::digest(body));
+        let sent = crate::digest::hex(&Sha256::digest(body));
         if sent != sha {
             anyhow::bail!("Uplink answered for {sha}, but the upload was {sent}");
         }

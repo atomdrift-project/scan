@@ -60,7 +60,7 @@ fn feature_names_digest(feature_names: &[String]) -> String {
         }
         hasher.update(name.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    crate::digest::hex(&hasher.finalize())
 }
 
 /// A reason why a file was flagged.

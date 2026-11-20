@@ -544,8 +544,10 @@ impl Index {
     /// a path component.
     fn url_alias_path(&self, url: &str) -> PathBuf {
         use sha2::{Digest, Sha256};
-        self.dir
-            .join(format!("{:x}.url", Sha256::digest(url.trim().as_bytes())))
+        self.dir.join(format!(
+            "{}.url",
+            crate::digest::hex(&Sha256::digest(url.trim().as_bytes()))
+        ))
     }
 
     /// Write via a uniquely named temp file and rename, so a reader never sees
@@ -580,7 +582,7 @@ fn normalize_sha(raw: &str) -> Option<String> {
 fn purl_key(purl: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     let identity = fletch::purl::identity(purl.trim())?;
-    Some(format!("{:x}", Sha256::digest(identity.as_bytes())))
+    Some(crate::digest::hex(&Sha256::digest(identity.as_bytes())))
 }
 
 /// Digest first, because a digest names exact bytes and a verdict filed under

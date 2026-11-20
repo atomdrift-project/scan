@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn fingerprint_is_the_sha256_prefix() {
         let rendered = fingerprint(b"x-isotope-scan").to_string();
-        let expected: String = format!("{:x}", Sha256::digest(b"x-isotope-scan"))
+        let expected: String = crate::digest::hex(&Sha256::digest(b"x-isotope-scan"))
             .chars()
             .take(8)
             .collect();

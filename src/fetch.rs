@@ -55,8 +55,9 @@ pub(crate) use self::budget::set_total_budget;
 pub use self::merge::fetched_url;
 pub use self::policy::{
     DEFAULT_FETCH_DEPTH, DEFAULT_MAX_DEP_AGE_DAYS, DEFAULT_MAX_FILE_FETCHES,
-    DEFAULT_MAX_TOTAL_FETCHES, DEFAULT_MAX_TOTAL_SIZE, DEFAULT_MAX_URL_FETCHES, FetchPolicy,
-    WORKER_MAX_DEP_AGE_DAYS, default_service_follow_policy,
+    DEFAULT_MAX_TOTAL_FETCHES, DEFAULT_MAX_TOTAL_SIZE, DEFAULT_MAX_URL_FETCHES,
+    DEFAULT_SERVICE_FETCH_DEPTH, FetchPolicy, WORKER_MAX_DEP_AGE_DAYS,
+    default_service_follow_policy,
 };
 pub use self::registry::{
     Unretrievable, fetch_one, graft_root_registry, registry_document, registry_summary,
@@ -286,6 +287,8 @@ fn shared_resources() -> Option<&'static Resources> {
         .map_err(|e| tracing::warn!(error = %e, "fetch disabled: blob cache unavailable"))
         .ok();
     let (net, cache) = net.zip(cache)?;
+    // A download host that is gone is asked once, not once a scan.
+    let net = net.remembering_unanswered(cache.clone());
     Some(RESOURCES.get_or_init(|| Resources {
         net: Box::new(net),
         cache,

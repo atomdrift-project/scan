@@ -205,7 +205,7 @@ pub(crate) fn download(http: &Http, url: &str, sha256: &str, out: &mut impl Writ
         digest: Sha256::new(),
     };
     copy_capped(http, url, MAX_FILE_BYTES, &mut hashed)?;
-    let got = format!("{:x}", hashed.digest.finalize());
+    let got = crate::digest::hex(&hashed.digest.finalize());
     if got != sha256 {
         bail!("sha256 mismatch for {url}: got {got}, manifest says {sha256}");
     }

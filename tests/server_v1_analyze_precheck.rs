@@ -209,6 +209,14 @@ async fn a_policy_wider_than_the_server_allows_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// Lowercase hex SHA-256 of `text`, as the server names an upload.
+fn sha256_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// An upload is asked about by the digest of the bytes in hand — the identity —
 /// so re-sending an artifact the corpus has already seen costs nothing either.
 #[tokio::test(flavor = "multi_thread")]
@@ -216,7 +224,7 @@ async fn an_upload_is_answered_from_a_verdict_held_for_its_digest() -> Result<()
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
     let artifact = "these exact bytes have been seen before";
-    let sha = format!("{:x}", Sha256::digest(artifact.as_bytes()));
+    let sha = sha256_hex(artifact);
 
     let (status, body) = analyze(app, "/v1/analyze", artifact).await?;
 
@@ -253,7 +261,7 @@ async fn an_uploads_purl_never_reaches_the_resolver() -> Result<()> {
     let (base, asked) = stub_corpus(Holds::Verdict).await?;
     let app = app_with_corpus(Some(&base)).await?;
     let artifact = "these bytes are not that package";
-    let sha = format!("{:x}", Sha256::digest(artifact.as_bytes()));
+    let sha = sha256_hex(artifact);
 
     let (_status, body) = analyze(app, "/v1/analyze?purl=npm%2Fchalk%405.3.0", artifact).await?;
 

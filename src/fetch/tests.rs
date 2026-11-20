@@ -280,6 +280,10 @@ fn every_candidate_counts_as_a_gap_and_policy_skips_do_not() {
         record.coverage.push(why);
         record
     };
+    let pending = |reason: &str| Coverage::Pending {
+        reason: reason.to_owned(),
+        hop: 1,
+    };
     let records = [
         candidate(CandidateSource::PeerDependency),
         candidate(CandidateSource::ArchRepository),
@@ -287,8 +291,13 @@ fn every_candidate_counts_as_a_gap_and_policy_skips_do_not() {
         skipped(Coverage::DevelopmentExcluded),
         skipped(Coverage::TransitiveNotFollowed),
         skipped(Coverage::CoveredByDeclaration),
+        // Past the depth the operator chose: a choice, not a gap. A
+        // reference the run ran out of time for is one.
+        skipped(pending(super::session::DEPTH_LIMIT)),
     ];
     assert_eq!(dependency_attention(&records).gaps, 3);
+    let unreached = [skipped(pending(super::session::FETCH_TIMEOUT))];
+    assert_eq!(dependency_attention(&unreached).gaps, 1);
 }
 
 fn fetched_record() -> FetchRecord {

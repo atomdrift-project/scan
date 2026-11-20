@@ -25,6 +25,7 @@ mod replay;
 mod retention;
 mod run;
 mod score_memo;
+mod turns;
 mod v8;
 mod verdict;
 

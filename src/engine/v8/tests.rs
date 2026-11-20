@@ -327,7 +327,7 @@ fn reports_are_placement_free_and_cite_by_digest() {
     let text = serde_json::to_string(root_report).unwrap();
     assert_eq!(
         lines[1]["report"],
-        format!("{:x}", Sha256::digest(text.as_bytes())),
+        crate::digest::hex(&Sha256::digest(text.as_bytes())),
         "the file line names its report by the report line's own digest"
     );
     assert_eq!(

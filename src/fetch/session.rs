@@ -275,6 +275,11 @@ pub(super) struct FetchSession {
     unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
 }
 
+/// Why a reference past `--follow-depth` is left pending. The operator chose
+/// the depth, so what lies past it is not a gap in this scan's coverage (see
+/// `dependency_attention`).
+pub(super) const DEPTH_LIMIT: &str = "depth limit";
+
 /// Why a reference is left pending when the run stopped before reaching it:
 /// its time ran out or it was cancelled. Unlike the depth limit, that is an
 /// accident of this run, and the next may get further.
@@ -405,8 +410,8 @@ impl FetchSession {
             if worklist.is_empty() {
                 return;
             }
-            self.settle_declared_imports(report, &mut worklist, hop);
-            self.settle_local_packages(report, &mut worklist, hop);
+            self.settle_declared_imports(report, &mut worklist);
+            self.settle_local_packages(report, &mut worklist);
             for (_, refs) in &mut worklist {
                 refs.sort_by_key(dependency_execution_priority);
             }
@@ -416,10 +421,10 @@ impl FetchSession {
                     .min()
                     .unwrap_or(Priority::Development)
             });
-            self.bid_versions(&worklist, hop);
+            self.bid_versions(&worklist);
             worklist = self.hop(report, worklist, hop);
         }
-        self.defer_groups(&worklist, end, "depth limit");
+        self.defer_groups(&worklist, end, DEPTH_LIMIT);
     }
 
     /// The groups hop `hop` may still follow: within `policy.depth`, plus any
@@ -430,20 +435,15 @@ impl FetchSession {
                 let credit = self.redirect_credit.get(sha).copied().unwrap_or(0);
                 hop < self.policy.depth.saturating_add(credit)
             });
-        self.defer_groups(&deferred, hop, "depth limit");
+        self.defer_groups(&deferred, hop, DEPTH_LIMIT);
         allowed
     }
 
     /// Reconcile imports with declarations before policy selection, so a
-    /// declared import cannot evade a transitive-dependency limit by resolving
+    /// declared import resolves to the declaration's release rather than
     /// `latest` as a command. A references-only scan keeps the declaration's
     /// constraint while following the observed import.
-    fn settle_declared_imports(
-        &mut self,
-        report: &AnalysisReport,
-        worklist: &mut [Group],
-        hop: u8,
-    ) {
+    fn settle_declared_imports(&mut self, report: &AnalysisReport, worklist: &mut [Group]) {
         let declared_imports = declared_npm_imports_in_hop(report, worklist);
         for (source, reference) in reconcile_python_imports(report, worklist, self.policy.deps) {
             self.out.records.push(skipped_record(
@@ -455,7 +455,7 @@ impl FetchSession {
         let policy = self.policy;
         for (source, refs) in worklist {
             refs.retain_mut(|reference| {
-                if !policy.follows_at(reference, hop)
+                if !policy.wants(reference.kind)
                     || reference.kind != RefKind::Command
                     || !matches!(reference.source.as_str(), "ast-call" | "ast-import")
                 {
@@ -472,14 +472,11 @@ impl FetchSession {
                     reference.context.clone_from(&declaration.context);
                     return true;
                 }
-                let coverage = if policy.wants_at(RefKind::Dependency, hop) {
-                    Coverage::CoveredByDeclaration
-                } else {
-                    Coverage::TransitiveNotFollowed
-                };
-                self.out
-                    .records
-                    .push(skipped_record(source, reference, coverage));
+                self.out.records.push(skipped_record(
+                    source,
+                    reference,
+                    Coverage::CoveredByDeclaration,
+                ));
                 false
             });
         }
@@ -489,11 +486,11 @@ impl FetchSession {
     /// a captured workspace member or a vendored `node_modules` copy — and
     /// record where. A pinned one is still fetched, so its pin can be checked
     /// against the bytes; its record notes the local copy.
-    fn settle_local_packages(&mut self, report: &AnalysisReport, worklist: &mut [Group], hop: u8) {
+    fn settle_local_packages(&mut self, report: &AnalysisReport, worklist: &mut [Group]) {
         let local = LocalNpmPackages::from_report(report);
         for (source, refs) in worklist {
             refs.retain(|reference| {
-                if !self.policy.follows_at(reference, hop) {
+                if !self.policy.wants(reference.kind) {
                     return true;
                 }
                 let workspace = local.workspace_coverage(report, source, reference);
@@ -547,9 +544,9 @@ impl FetchSession {
     /// Pre-scan a whole hop so the newest version is hop-wide, not
     /// first-group-wins: every fetchable versioned reference bids, and the
     /// running cross-hop maximum only rises.
-    fn bid_versions(&mut self, worklist: &[Group], hop: u8) {
+    fn bid_versions(&mut self, worklist: &[Group]) {
         for r in worklist.iter().flat_map(|(_, refs)| refs) {
-            if !self.policy.follows_at(r, hop) {
+            if !self.policy.wants(r.kind) {
                 continue;
             }
             let Some((key, version)) = versioned_purl(locator(r)) else {
@@ -606,7 +603,7 @@ impl FetchSession {
                         exhausted = true;
                         break;
                     };
-                    let selected = self.select(&source_sha, refs, hop, &mut dropped_old_versions);
+                    let selected = self.select(&source_sha, refs, &mut dropped_old_versions);
                     if !selected.is_empty() {
                         wanted += selected.len();
                         picked.push((source_sha, selected));
@@ -648,33 +645,25 @@ impl FetchSession {
         next
     }
 
-    /// Keep only the references this hop follows and this run has not yet
+    /// Keep only the references the policy follows and this run has not yet
     /// seen. Selection is by [`RefKind`], so a command-mentioned package
     /// (`packages`) is distinct from a declared dependency (`deps`) even though
-    /// both are PURLs.
+    /// both are PURLs. How deep a hop may go is decided before this, alike for
+    /// every kind (see [`Self::within_depth`]).
     fn select(
         &mut self,
         source_sha: &str,
         refs: Vec<Reference>,
-        hop: u8,
         dropped_old: &mut usize,
     ) -> Vec<Reference> {
         let mut selected = Vec::new();
         for r in refs {
-            if self.policy.wants(r.kind) && !self.policy.follows_at(&r, hop) {
-                self.out.records.push(skipped_record(
-                    source_sha,
-                    &r,
-                    Coverage::TransitiveNotFollowed,
-                ));
-                continue;
-            }
             // CI references only under `--follow=ci-actions`.
             let ci = r
                 .context
                 .as_ref()
                 .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci);
-            if (ci && !self.policy.ci) || !self.policy.follows_at(&r, hop) {
+            if (ci && !self.policy.ci) || !self.policy.wants(r.kind) {
                 continue;
             }
             if let Some(reason) = self.fetch_skip_reason(&r) {
