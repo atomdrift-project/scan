@@ -59,7 +59,7 @@ pub(super) fn normalize_pkg_purl(raw: &str) -> Result<String, &'static str> {
 /// them.
 ///
 /// A URL carrying credentials (`https://user:pass@host/`) is refused too: it
-/// would be logged, listed in `/_/requests` and stored in fetch provenance.
+/// would be logged and stored in fetch provenance.
 pub(super) fn valid_http_url(raw: &str) -> bool {
     !raw.chars().any(crate::output::tty_hostile)
         && reqwest::Url::parse(raw).is_ok_and(|url| {

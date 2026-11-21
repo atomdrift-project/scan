@@ -1,9 +1,12 @@
 //! Integration tests for bearer-token authentication on the HTTP API.
 //!
 //! These drive the assembled router through `oneshot`, so they exercise the
-//! real ACL middleware without binding a socket. Everything except the health
-//! body-detail test runs without model artifacts: the middleware rejects a
-//! request long before a handler needs a model.
+//! real ACL middleware without binding a socket. None needs model artifacts:
+//! the middleware decides long before a handler needs a model.
+//!
+//! A request the ACL lets through is shown by `GET /v1/analyze` answering 405:
+//! the router refused the method, so the request got past the middleware
+//! without running an analysis.
 
 mod common;
 
@@ -83,7 +86,7 @@ async fn rejects_wrong_and_malformed_credentials() -> Result<()> {
     ] {
         let response = app
             .clone()
-            .oneshot(loopback(get("/_/info", header.as_deref())?))
+            .oneshot(loopback(get("/v1/lookup", header.as_deref())?))
             .await
             .context("request failed")?;
         assert_eq!(
@@ -106,50 +109,26 @@ async fn accepts_a_valid_token() -> Result<()> {
     ] {
         let response = app
             .clone()
-            .oneshot(loopback(get("/_/info", Some(&header))?))
+            .oneshot(loopback(get("/v1/analyze", Some(&header))?))
             .await
             .context("request failed")?;
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            StatusCode::METHOD_NOT_ALLOWED,
             "valid token rejected for {header:?}",
         );
     }
     Ok(())
 }
 
-/// Health is the one route reachable without a credential, so tunnel and load
-/// balancer probes work without holding a secret. An invalid token there is
-/// ignored rather than rejected — a stale credential must not take monitoring
-/// down.
+/// No path is exempt from the token — including the retired `/_/health`
+/// probe path, which once was — and an unknown path is refused by the ACL
+/// before the router can say it does not exist.
 #[tokio::test]
-async fn health_never_requires_a_token() -> Result<()> {
+async fn no_path_is_exempt_from_the_token() -> Result<()> {
     let app = build_app(&config(true)?).await?;
 
-    for header in [None, Some("Bearer nonsense-nonsense"), Some("garbage")] {
-        let response = app
-            .clone()
-            .oneshot(loopback(get("/_/health", header)?))
-            .await
-            .context("request failed")?;
-        // The server never becomes ready (see `config`), so a probe the ACL
-        // lets through is answered 503 by the handler — never 401 by the ACL.
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "health rejected for {header:?}",
-        );
-    }
-    Ok(())
-}
-
-/// The exemption is an exact path match. A prefix or suffix match would open
-/// every route whose path starts with `/_/health`.
-#[tokio::test]
-async fn health_exemption_does_not_extend_to_similar_paths() -> Result<()> {
-    let app = build_app(&config(true)?).await?;
-
-    for uri in ["/_/healthz", "/_/health/", "/_/health/x", "/_/", "/"] {
+    for uri in ["/_/health", "/_/info", "/healthz", "/", "/v1/nope"] {
         let response = app
             .clone()
             .oneshot(loopback(get(uri, None)?))
@@ -173,7 +152,7 @@ async fn a_valid_token_does_not_bypass_the_ip_acl() -> Result<()> {
 
     let response = app
         .oneshot(with_peer(
-            get("/_/info", Some(&authorization))?,
+            get("/v1/analyze", Some(&authorization))?,
             [203, 0, 113, 7],
         ))
         .await
@@ -190,115 +169,50 @@ async fn unauthenticated_server_is_unchanged() -> Result<()> {
     let app = build_app(&config(false)?).await?;
 
     let response = app
-        .oneshot(loopback(get("/_/info", None)?))
+        .oneshot(loopback(get("/v1/analyze", None)?))
         .await
         .context("request failed")?;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     Ok(())
 }
 
-/// The admin routes reload what the server runs, so `--allow-cidr` — which
-/// grants analysis — must not grant them too. Without a token they answer
-/// loopback alone; with one, the token is their credential like any route's.
-///
-/// Asked with GET: a peer the ACL lets through reaches the router and gets 405,
-/// which tells the two outcomes apart without running a reload.
+/// Only the `/v1` API is served. The retired diagnostic and admin routes are
+/// gone rather than hidden, and `--allow-cidr` grants a peer the API alone.
 #[tokio::test]
-async fn admin_routes_need_loopback_or_a_token() -> Result<()> {
+async fn retired_routes_are_gone() -> Result<()> {
     let allowed = [203, 0, 113, 7];
-    let open = build_app(&ServerConfig {
+    let app = build_app(&ServerConfig {
         allow_cidrs: vec![Cidr::parse("203.0.113.0/24").map_err(anyhow::Error::msg)?],
         ..config(false)?
     })
     .await?;
-    for route in ["/_/reload", "/_/update"] {
-        let response = open
-            .clone()
-            .oneshot(with_peer(get(route, None)?, allowed))
-            .await?;
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "an allowed peer reached {route} on a server with no token",
-        );
-        let response = open.clone().oneshot(loopback(get(route, None)?)).await?;
-        assert_eq!(
-            response.status(),
-            StatusCode::METHOD_NOT_ALLOWED,
-            "loopback must still reach {route}",
-        );
-        // Analysis stays open to the allowed peer.
-        let response = open
-            .clone()
-            .oneshot(with_peer(get("/v1/analyze", None)?, allowed))
-            .await?;
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    let authenticated = build_app(&ServerConfig {
-        allow_cidrs: vec![Cidr::parse("203.0.113.0/24").map_err(anyhow::Error::msg)?],
-        ..config(true)?
-    })
-    .await?;
-    let authorization = format!("Bearer {TOKEN}");
-    let response = authenticated
-        .oneshot(with_peer(get("/_/reload", Some(&authorization))?, allowed))
-        .await?;
-    assert_eq!(
-        response.status(),
-        StatusCode::METHOD_NOT_ALLOWED,
-        "with a token configured, the token is the admin credential",
-    );
-    Ok(())
-}
-
-/// `/_/health` is public, so its body must not name the samples being
-/// analysed. The diagnostic keys appear only for a request that authenticated.
-///
-/// Needs a ready server — the privileged keys live in the ready-state body.
-#[tokio::test]
-#[ignore = "needs a model bundle: set SCAN_MODELS_DIR and run with --ignored"]
-async fn health_detail_requires_authentication() -> Result<()> {
-    let digest = TokenDigest::new(TOKEN).map_err(anyhow::Error::msg)?;
-    let config = ServerConfig {
-        auth_digest: Some(digest),
-        ..common::ready_config()?
-    };
-    let app = common::ready_app(&config).await?;
-
-    let body_of = async |authorization: Option<&str>| -> Result<serde_json::Value> {
-        let response = app
-            .clone()
-            .oneshot(loopback(get("/_/health", authorization)?))
-            .await
-            .context("health request failed")?;
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
-        serde_json::from_slice(&bytes).context("health body is not JSON")
-    };
-
-    let public = body_of(None).await?;
-    for key in ["status", "rss_mb", "active_tasks", "uptime_secs", "load"] {
-        assert!(public.get(key).is_some(), "monitors need {key}");
-    }
-    for key in [
-        "long_running_tasks",
-        "oldest_task",
-        "stuck_orphans",
-        "rayon_threads",
+    for route in [
+        "/_/health",
+        "/_/info",
+        "/_/stats",
+        "/_/memory",
+        "/_/requests",
+        "/_/threads",
+        "/_/reload",
+        "/_/update",
     ] {
-        assert!(
-            public.get(key).is_none(),
-            "unauthenticated health leaked {key}: {public}",
-        );
+        for (method, peer) in [("GET", allowed), ("POST", [127, 0, 0, 1])] {
+            let request = Request::builder()
+                .method(method)
+                .uri(route)
+                .body(Body::empty())?;
+            let response = app.clone().oneshot(with_peer(request, peer)).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {route} is still served",
+            );
+        }
     }
-
-    let private = body_of(Some(&format!("Bearer {TOKEN}"))).await?;
-    for key in ["long_running_tasks", "stuck_orphans", "rayon_threads"] {
-        assert!(
-            private.get(key).is_some(),
-            "authenticated health is missing {key}: {private}",
-        );
-    }
+    let response = app
+        .oneshot(with_peer(get("/v1/analyze", None)?, allowed))
+        .await?;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     Ok(())
 }

@@ -51,8 +51,7 @@ pub struct ServerConfig {
     pub workers: usize,
     /// Peer networks besides loopback allowed to connect.
     pub allow_cidrs: Vec<Cidr>,
-    /// Digest of the bearer token required on every route but `/_/health`;
-    /// `None` leaves the API open. Loopback is not exempt: behind a Cloudflare
+    /// Digest of the bearer token required on every route; `None` leaves the API open. Loopback is not exempt: behind a Cloudflare
     /// tunnel every remote request arrives over loopback.
     pub auth_digest: Option<TokenDigest>,
     /// Per-request analysis timeout in seconds. Zero disables it.

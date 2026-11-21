@@ -819,7 +819,7 @@ fn a_reason_qualifies_but_does_not_become_a_verdict() {
 }
 
 /// A streamed upload's progress names the phase of the run it rides. The
-/// upload's `/_/requests` entry is named by its filename while its subject
+/// upload's in-flight entry is named by its filename while its subject
 /// is the digest, so a search by name would report `phase: null` for
 /// every streamed upload.
 #[test]

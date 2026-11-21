@@ -16,7 +16,6 @@
 //! cost of an unreachable address is a timeout, and paying that in front of
 //! every lookup would be worse than the outage it is reacting to.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -123,59 +122,17 @@ pub(super) struct Sample {
     pub(super) sha256: String,
 }
 
-/// Where corpus lookups went, for `/_/stats`.
-#[derive(Debug, serde::Serialize)]
-pub(super) struct CorpusStats {
-    /// Every deferral, and what came back. `unreachable` is the one that
-    /// reaches a caller as a decision about us rather than the artifact.
-    found: u64,
-    nothing: u64,
-    unreachable: u64,
-    /// Non-zero `failed` on the first address with traffic on a later one is
-    /// a failover in progress, whether or not anyone has noticed.
-    preferred_resting: bool,
-    by_address: Vec<AddressStats>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AddressStats {
-    address: String,
-    asked: u64,
-    answered: u64,
-    failed: u64,
-}
-
 /// The corpus behind this server's index.
 #[derive(Debug)]
 pub(super) struct Corpus {
     /// Every address the corpus can be reached at, in preference order.
     bases: Vec<String>,
-    /// Per-address traffic, parallel to `bases`.
-    ///
-    /// Failover is otherwise invisible: servers quietly reading from the
-    /// primary because the replica stopped answering look exactly like ones
-    /// reading from the replica, and the first sign is the primary's load. This
-    /// is what turns that into a number an operator can see before it becomes a
-    /// page.
-    traffic: Vec<Address>,
     client: reqwest::Client,
     /// When the preferred address may lead again, or `None` while it leads.
     rested: Mutex<Option<Instant>>,
     /// The preferred address's data lag when last asked, and when we asked.
     /// `None` inside means it could not tell us.
     lag: Mutex<Option<(Instant, Option<Duration>)>>,
-    /// What the corpus said, across every address.
-    found: AtomicU64,
-    nothing: AtomicU64,
-    unreachable: AtomicU64,
-}
-
-/// One address's share of the traffic.
-#[derive(Debug, Default)]
-struct Address {
-    asked: AtomicU64,
-    answered: AtomicU64,
-    failed: AtomicU64,
 }
 
 impl Corpus {
@@ -196,16 +153,11 @@ impl Corpus {
                 tracing::error!(error = %e, "cannot build the corpus HTTP client; lookups answer from the local index alone");
             })
             .ok()?;
-        let traffic = bases.iter().map(|_| Address::default()).collect();
         Some(Arc::new(Self {
             bases,
-            traffic,
             client,
             rested: Mutex::new(None),
             lag: Mutex::new(None),
-            found: AtomicU64::new(0),
-            nothing: AtomicU64::new(0),
-            unreachable: AtomicU64::new(0),
         }))
     }
 
@@ -353,12 +305,6 @@ impl Corpus {
                 // where replication lag reads as absence.
                 Some((reached, source)) => {
                     self.note_at(base, true, Instant::now());
-                    self.count(base, |a| &a.answered);
-                    let outcome = match &reached {
-                        Reached::Record(_) => &self.found,
-                        _ => &self.nothing,
-                    };
-                    outcome.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
                         endpoint = %base,
                         sha256 = sha.unwrap_or(""),
@@ -379,7 +325,6 @@ impl Corpus {
                 }
                 None => {
                     self.note_at(base, false, Instant::now());
-                    self.count(base, |a| &a.failed);
                     tracing::warn!(
                         endpoint = %base,
                         sha256 = sha.unwrap_or(""),
@@ -399,7 +344,6 @@ impl Corpus {
             purl = purl.unwrap_or(""),
             "corpus unreachable at every address; answering unavailable",
         );
-        self.unreachable.fetch_add(1, Ordering::Relaxed);
         (Reached::Unreachable, None)
     }
 
@@ -464,38 +408,9 @@ impl Corpus {
             .map(Duration::from_secs)
     }
 
-    /// Bump one of an address's counters.
-    fn count(&self, base: &str, pick: impl Fn(&Address) -> &AtomicU64) {
-        if let Some(i) = self.bases.iter().position(|b| b == base) {
-            pick(&self.traffic[i]).fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// A snapshot for `/_/stats`.
-    pub(super) fn stats(&self) -> CorpusStats {
-        CorpusStats {
-            found: self.found.load(Ordering::Relaxed),
-            nothing: self.nothing.load(Ordering::Relaxed),
-            unreachable: self.unreachable.load(Ordering::Relaxed),
-            preferred_resting: lock(&self.rested).is_some_and(|until| Instant::now() < until),
-            by_address: self
-                .bases
-                .iter()
-                .zip(&self.traffic)
-                .map(|(base, a)| AddressStats {
-                    address: base.clone(),
-                    asked: a.asked.load(Ordering::Relaxed),
-                    answered: a.answered.load(Ordering::Relaxed),
-                    failed: a.failed.load(Ordering::Relaxed),
-                })
-                .collect(),
-        }
-    }
-
     /// One endpoint's answer, or `None` when it could not give one.
     async fn ask(&self, base: &str, path: &str) -> Option<(Reached, Option<CorpusSource>)> {
         for attempt in 0..=READ_RETRIES {
-            self.count(base, |a| &a.asked);
             let mut request = self.client.get(format!("{base}{path}"));
             if let Some(token) = crate::hopper::token() {
                 request = request.bearer_auth(token);

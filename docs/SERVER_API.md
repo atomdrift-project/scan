@@ -2,7 +2,7 @@
 
 `atomscan serve` is an HTTP daemon that takes an artifact and answers whether
 to let it through. It binds to loopback by default. Pass `--token-file` to
-require a bearer token on every route but `/_/health`.
+require a bearer token on every route.
 
 ## Running the server
 
@@ -24,17 +24,17 @@ Global flags (`--follow`, `--llm`, `--level`, …) apply as they do to a scan;
 `atomscan --help` lists them. Environment variables are listed in
 [ENVIRONMENT.md](ENVIRONMENT.md).
 
-The listener binds before the model loads. Until it has, analysis routes
-answer `503` with code `starting`; poll `/_/health` until `status` is `ok`.
-Models and traits are refreshed once at startup (`-u` forces it, `--no-update`
-skips it). If the traits cannot be resolved the server never reports ready:
-`/_/health` answers `503` with `{"status":"failed","reason":"initialization_failed"}`
-and the log names the path.
+The listener binds before the model loads. Until it has, analyses answer
+`503` with code `starting`; retry until they stop. Models and traits are
+refreshed once at startup (`-u` forces it, `--no-update` skips it), so picking
+up new ones means a restart. If the traits cannot be resolved the server never
+becomes ready: every analysis answers `503` with code `init_failed`, and the
+log names the path.
 
 ## Authentication
 
 `--token-file PATH` reads the token from the first non-empty line of `PATH`
-and requires it on every route except `/_/health`:
+and requires it on every route:
 
     curl -H "Authorization: Bearer $(cat ~/.tok/scan)" …
 
@@ -52,8 +52,6 @@ The examples below abbreviate that header as `$AUTH`.
 - **Rotation needs a restart.** The token is read once.
 
 A missing and a wrong token get the same `401` with `WWW-Authenticate: Bearer`.
-Without a token, `/_/reload` and `/_/update` answer loopback only, so
-`--allow-cidr` grants analysis and never administration.
 
 ## Endpoints
 
@@ -196,41 +194,13 @@ directories, or is not a regular file gets the same `403 path_not_allowed`,
 so the route does not reveal which paths exist. The answer is the decision an
 upload of the same bytes would get.
 
-### `GET /_/health`
-
-Liveness and load: `200` when ready, `503` while starting or failed. The only
-route that needs no token. `status` is `ok`, `starting`, `failed`,
-`degraded` or `saturated`. A request with a valid token (or any request to a
-server without one) also gets the names of the samples being analyzed.
-
-### `GET /_/info`, `GET /_/stats`
-
-`/_/info` is static: version, slots, CPUs, limits, model and traits commits.
-`/_/stats` is what a router reads to choose a server: free slots, CPU busy,
-recent latency by type and size, upload backlog.
-
-### `POST /_/reload`, `POST /_/update`
-
-`/_/reload` reloads the model bundle and traits from disk and swaps them in;
-on failure the previous model stays. `/_/update` first pulls the latest
-traits, models, bloom and NSRL filters; its `update_errors` names each source
-that failed to update, and is empty when none did. Why a source or a reload
-failed is logged, never returned: those errors carry install paths. One at a time; a
-concurrent call gets `409`.
-
-### `GET /_/memory`, `GET /_/requests`, `GET /_/threads`
-
-Diagnostics: allocator counters, in-flight analyses with their phase, and
-per-thread state where the platform reports it.
-
 ## Status codes
 
 | Code | Cause |
 | ---- | ----- |
 | 400  | Malformed request: a bad locator or budget, a `follow` wider than the server's, or more than one artifact named. |
 | 401  | Missing or wrong bearer token. |
-| 403  | Peer not allowed, admin route without a token, or a `?path=` refused. |
-| 409  | A reload or update is already running. |
+| 403  | Peer not allowed, or a `?path=` refused. |
 | 413  | Artifact larger than `--max-size-mb`. |
 | 415  | Unsupported file, archive or compression format. |
 | 422  | The artifact is corrupt, truncated, encrypted, or past a depth or count limit, or could not be retrieved. |
@@ -254,7 +224,7 @@ response is ready, and every other line about it repeats its `id`:
 | `dur_ms`    | Wall time from arrival to response. |
 | `peer`      | Socket peer. Behind a tunnel, always loopback. |
 | `fwd`       | Client address a proxy reported. Logged, never trusted. |
-| `auth`      | `token`, `open`, `anon`, or the reason a request was refused. |
+| `auth`      | `token`, `open`, or the reason a request was refused. |
 | `shared`    | `true` when the request rode an analysis already in flight. |
 | `streamed`  | `true` when the answer was streamed. |
 | `sha256`, `purl`, `url`, `path` | The artifact, as validated. Caller text is control-stripped and bounded, so it cannot forge a line. |
@@ -283,8 +253,6 @@ response is ready, and every other line about it repeats its `id`:
 
     $ atomscan serve --token-file ~/.tok/scan &
     $ AUTH="Authorization: Bearer $(cat ~/.tok/scan)"
-    $ curl -s http://127.0.0.1:49999/_/health | jq -r .status
-    ok
     $ curl -s -H "$AUTH" -X POST \
         'http://127.0.0.1:49999/v1/analyze?purl=pkg:npm/left-pad@1.3.0' | jq .decision
     "allow"

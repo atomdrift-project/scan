@@ -564,9 +564,8 @@ struct ServeArgs {
     #[arg(long)]
     allow_cidr: Option<String>,
 
-    /// Require `Authorization: Bearer <token>` on every route except
-    /// `/_/health`, reading the token from the first non-empty line of
-    /// PATH. Loopback is not exempt: behind a tunnel or reverse proxy every
+    /// Require `Authorization: Bearer <token>` on every route, reading the
+    /// token from the first non-empty line of PATH. Loopback is not exempt: behind a tunnel or reverse proxy every
     /// request arrives from loopback. A missing, empty, or unreadable
     /// file is a startup error — never a silent drop to unauthenticated.
     #[arg(long, value_name = "PATH")]

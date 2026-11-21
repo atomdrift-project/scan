@@ -339,7 +339,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// The right to replace one install directory, held across processes.
 ///
 /// Several updaters can target one directory at once (a scan's auto-update,
-/// `update-rules`, a server's `/_/update`, an embedding daemon). The lock, a
+/// `update-rules`, an embedding daemon). The lock, a
 /// `.<name>.lock` file beside the target, serializes their staging and swap.
 /// Readers don't take it; see [`settle`].
 #[derive(Debug)]

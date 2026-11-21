@@ -144,14 +144,10 @@ pub(super) enum Auth {
     Token,
     /// Trusted because no `--token-file` is configured: the API is open.
     Open,
-    /// No valid credential, on the one route that does not require one.
-    Anonymous,
     /// Refused: peer address unavailable. A wiring bug, not a client error.
     NoPeerInfo,
     /// Refused: peer IP matched no `--allow-cidr` network.
     PeerDenied,
-    /// Refused: a non-loopback peer asked for a loopback-only route.
-    LoopbackOnly,
     /// Refused: no `Authorization` header at all.
     NoCredential,
     /// Refused: an `Authorization` header that is not a usable `Bearer`
@@ -168,10 +164,8 @@ impl Auth {
         match self {
             Self::Token => "token",
             Self::Open => "open",
-            Self::Anonymous => "anon",
             Self::NoPeerInfo => "no-peer-info",
             Self::PeerDenied => "peer-denied",
-            Self::LoopbackOnly => "loopback-only",
             Self::NoCredential => "no-credential",
             Self::MalformedCredential => "malformed-credential",
             Self::BadToken { .. } => "bad-token",
@@ -181,7 +175,7 @@ impl Auth {
     /// Whether this outcome refused the request. Denials are the security
     /// record, so they are logged a level above ordinary traffic.
     fn denied(self) -> bool {
-        !matches!(self, Self::Token | Self::Open | Self::Anonymous)
+        !matches!(self, Self::Token | Self::Open)
     }
 }
 
@@ -305,16 +299,13 @@ pub(super) async fn access_log(
     let auth = response.extensions().get::<Auth>().copied();
     let dur_ms = crate::duration_ms(started.elapsed());
 
-    // A healthy liveness probe every few seconds is not a record worth keeping;
-    // anything else about /_/health is. Server faults are warnings — they are
-    // the lines an operator greps for first — and a missing peer address is an
-    // error because it means the ConnectInfo wiring is broken, not the client.
+    // Server faults are warnings — they are the lines an operator greps for
+    // first — and a missing peer address is an error because it means the
+    // ConnectInfo wiring is broken, not the client.
     let level = if auth == Some(Auth::NoPeerInfo) {
         tracing::Level::ERROR
     } else if status.is_server_error() || auth.is_some_and(Auth::denied) {
         tracing::Level::WARN
-    } else if path == super::acl::HEALTH_ROUTE {
-        tracing::Level::DEBUG
     } else {
         tracing::Level::INFO
     };

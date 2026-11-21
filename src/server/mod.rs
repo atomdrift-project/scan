@@ -5,12 +5,6 @@
 //! a decision.
 //!
 //! Routes:
-//!   GET  /_/health      — liveness (public; detail only when trusted)
-//!   GET  /_/info        — build and capacity, for sizing a client
-//!   GET  /_/stats       — live routing signals
-//!   GET  /_/memory, /_/requests, /_/threads — diagnostics
-//!   POST /_/reload      — reload the model bundle from disk (admin)
-//!   POST /_/update      — pull models and traits, then reload (admin)
 //!   GET  /v1/lookup     — decisions for one or many artifacts (no slot)
 //!   POST /v1/analyze    — a decision, streamed if the analysis is slow
 //!
@@ -19,18 +13,13 @@
 
 mod access;
 mod acl;
-mod admin;
 mod analyze;
 mod config;
 mod corpus;
-mod cpu_busy;
 pub(crate) mod decision;
-mod diag;
 mod error;
 mod flight;
 mod input;
-mod jobs;
-mod latency;
 mod local;
 mod tasks;
 mod v1;
@@ -52,38 +41,29 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{Semaphore, watch};
 
-use cpu_busy::CpuBusy;
 use error::ApiError;
-use jobs::Jobs;
 use tasks::Tasks;
 
 use crate::explain::ShapImportance;
 use crate::model::Model;
 
-/// One admitted analysis, as `/_/requests` and the watchdog report it.
+/// One admitted analysis, as the watchdog reports it.
 struct InFlightRequest {
     name: String,
-    size_bytes: u64,
     started_at: Instant,
     /// Shared with the blocking task; set to true to request cooperative cancellation.
     cancellation: Arc<AtomicBool>,
     /// Tracks the current analysis phase inside cleave and scan. Updated at each
-    /// major stage so `/_/requests` can report what a stuck request is doing.
+    /// major stage so the watchdog can report what a stuck request is doing.
     phase: RequestPhase,
     /// OS thread ID of the blocking thread servicing this request (0 until started).
     thread_id: AtomicU64,
 }
 
 impl InFlightRequest {
-    fn new(
-        name: &str,
-        size_bytes: u64,
-        cancellation: Arc<AtomicBool>,
-        phase: RequestPhase,
-    ) -> Self {
+    fn new(name: &str, cancellation: Arc<AtomicBool>, phase: RequestPhase) -> Self {
         Self {
             name: name.to_owned(),
-            size_bytes,
             started_at: Instant::now(),
             cancellation,
             phase,
@@ -119,7 +99,7 @@ pub(super) struct RequestGuard {
 }
 
 impl RequestGuard {
-    /// Register an admitted analysis on `/_/requests` and hold its capacity
+    /// Register an admitted analysis with the watchdog and hold its capacity
     /// until the guard drops.
     fn new(
         state: &Arc<AppState>,
@@ -129,7 +109,6 @@ impl RequestGuard {
     ) -> Self {
         let cancellation = Arc::clone(&entry.cancellation);
         state.in_flight.insert(request_id, entry);
-        state.jobs.started.fetch_add(1, Ordering::Relaxed);
         Self {
             request_id,
             state: Arc::clone(state),
@@ -241,8 +220,7 @@ enum Readiness {
 /// `--max-size-mb`, and nothing else bounds them.
 const MAX_BUFFERED: usize = 4;
 
-/// How long an analysis runs before the watchdog and `/_/health` call it
-/// long-running.
+/// How long an analysis runs before the watchdog calls it long-running.
 const LONG_RUNNING_SECS: u64 = 120;
 
 /// How often the watchdog looks for long-running analyses.
@@ -261,9 +239,6 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct AppState {
     config: ServerConfig,
-    /// Process uptime anchor — captured when the app is built, very close to
-    /// process start. `/_/health` reports `now - started_at` as `uptime_secs`.
-    started_at: Instant,
     readiness: RwLock<Readiness>,
     next_request_id: AtomicU64,
     /// One permit per `--workers` slot. Each analysis holds one for its whole
@@ -276,22 +251,14 @@ struct AppState {
     /// Tasks stuck past the timeout — still occupying a slot until the
     /// blocking thread finally returns. Tracked for observability only.
     stuck_orphans: AtomicUsize,
-    /// Serializes `/_/reload` and `/_/update`. The guard is moved into the
-    /// blocking work, so it is held for as long as that work runs.
-    reload_lock: Arc<tokio::sync::Mutex<()>>,
     overloaded_since: Mutex<Option<Instant>>,
-    /// The status `/_/health` last answered, so a probe logs only a change.
-    health: Mutex<&'static str>,
     in_flight: dashmap::DashMap<u64, InFlightRequest>,
-    /// Machine-wide cores busy between consecutive `/_/stats` reads.
-    cpu_busy: CpuBusy,
     /// Raised when the server stops, so background tasks wind down with it.
     /// Dropping the state drops the sender, which they read the same way.
     shutdown: watch::Sender<bool>,
     /// Work no request is waiting on — analyses whose callers hung up, their
     /// index and upload tails — counted so shutdown can drain it.
     tasks: Arc<Tasks>,
-    jobs: Jobs,
     /// Analyses in progress, so concurrent requests for the same artifact
     /// share one run instead of each taking a slot. See [`flight`].
     flights: Arc<flight::Flights>,
@@ -311,13 +278,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl AppState {
-    /// Analyses this server can start right now: a slot and a core for each.
-    pub(super) fn available_analysis_permits(&self) -> usize {
-        self.slots
-            .available_permits()
-            .min(self.cpu.available_permits())
-    }
-
     /// Analyses running now. Every analysis holds a slot for its whole run;
     /// the CPU gate is narrower than the slots, so it cannot count them.
     pub(super) fn active_tasks(&self) -> usize {
@@ -351,16 +311,6 @@ impl AppState {
         }
     }
 
-    pub(super) fn is_ready(&self) -> bool {
-        matches!(
-            *self
-                .readiness
-                .read()
-                .unwrap_or_else(PoisonError::into_inner),
-            Readiness::Ready(_)
-        )
-    }
-
     /// Wrap a loaded model in the request-independent settings every analysis
     /// runs with. The one place a bundle is assembled.
     fn bundle(&self, model: Model, shap: Option<ShapImportance>) -> ModelResources {
@@ -371,18 +321,6 @@ impl AppState {
             fetch: self.config.fetch,
             zip_passwords: self.config.zip_passwords.clone(),
         }
-    }
-
-    /// Serve `resources` from now on. Returns whether a bundle was already
-    /// being served.
-    fn install(&self, resources: ModelResources) -> bool {
-        let mut readiness = self
-            .readiness
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let was_ready = matches!(*readiness, Readiness::Ready(_));
-        *readiness = Readiness::Ready(Arc::new(resources));
-        was_ready
     }
 
     fn fail_startup(&self, message: String) {
@@ -493,8 +431,8 @@ impl AppState {
 
 /// Build the axum [`Router`] and start loading resources in the background.
 ///
-/// The router answers immediately; until the model bundle loads, the health
-/// endpoint and the analyze endpoints answer 503. Useful for integration tests
+/// The router answers immediately; until the model bundle loads, analyses
+/// answer 503. Useful for integration tests
 /// that need the app without binding a port. Background tasks stop when the
 /// router is dropped.
 ///
@@ -542,21 +480,16 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
     }
 
     let state = Arc::new(AppState {
-        started_at: Instant::now(),
         readiness: RwLock::new(Readiness::Starting),
         next_request_id: AtomicU64::new(1),
         slots: Arc::new(Semaphore::new(max_concurrent)),
         cpu: Arc::new(Semaphore::new(cores)),
-        cpu_busy: CpuBusy::default(),
         stuck_orphans: AtomicUsize::new(0),
-        reload_lock: Arc::new(tokio::sync::Mutex::new(())),
         overloaded_since: Mutex::new(None),
-        health: Mutex::new("starting"),
         flights: Arc::new(flight::Flights::default()),
         in_flight: dashmap::DashMap::new(),
         shutdown,
         tasks: Arc::new(Tasks::default()),
-        jobs: Jobs::default(),
         buffered: Arc::new(Semaphore::new(MAX_BUFFERED)),
         uploader,
         corpus,
@@ -571,14 +504,6 @@ fn assemble(config: ServerConfig) -> anyhow::Result<(Router, Arc<AppState>)> {
     // `.layer()` runs first per request; the ACL runs before the body limit so
     // a rejected peer never gets to upload bytes.
     let app = Router::new()
-        .route("/_/health", get(diag::health))
-        .route("/_/info", get(diag::info))
-        .route("/_/stats", get(diag::stats))
-        .route("/_/reload", post(admin::reload))
-        .route("/_/update", post(admin::update))
-        .route("/_/memory", get(diag::memory_stats))
-        .route("/_/requests", get(diag::requests))
-        .route("/_/threads", get(diag::threads))
         .route("/v1/lookup", get(v1::v1_lookup))
         .route("/v1/analyze", post(v1::v1_analyze))
         .layer(DefaultBodyLimit::max(state.config.max_body_size))
@@ -635,9 +560,9 @@ async fn load_resources(state: Arc<AppState>) {
         let t = Instant::now();
         tracing::info!(queue_ms, "YARA warmup started");
         // The traits tree is the rule set every analysis runs against. Resolve
-        // it before reporting ready: a server that answers `/_/health` with
-        // "ok" while failing every analysis on a missing traits directory is
-        // worse than one that never starts.
+        // it before reporting ready: a server that reports ready while failing
+        // every analysis on a missing traits directory is worse than one that
+        // never starts.
         let traits = cleave::traits_repo::try_resolve().map_err(|e| format!("{e:#}"))?;
         tracing::info!(dir = %traits.display(), "cleave traits resolved");
         let opts = cleave::AnalysisOptions {
@@ -662,7 +587,11 @@ async fn load_resources(state: Arc<AppState>) {
             let spec_version = model.spec().version();
             let features = model.spec().total_features();
             let shap_loaded = shap.is_some();
-            state.install(state.bundle(model, shap));
+            let resources = Arc::new(state.bundle(model, shap));
+            *state
+                .readiness
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Readiness::Ready(resources);
             tracing::info!(
                 total_ms = init_start.elapsed().as_millis(),
                 spec_version,

@@ -386,7 +386,7 @@ pub struct Uploader {
     tally: Arc<Tally>,
 }
 
-/// A point-in-time view of the uploader, for `/_/stats`.
+/// A point-in-time view of the uploader.
 #[derive(Debug, Clone, Copy)]
 pub struct UploadStats {
     /// Jobs accepted but not yet handled.

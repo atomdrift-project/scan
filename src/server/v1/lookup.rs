@@ -6,7 +6,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::V1Query;
 use crate::lookup::pick_verdict;
@@ -40,16 +39,10 @@ pub(in crate::server) async fn v1_lookup(
     raw: axum::extract::RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    let started = Instant::now();
     let q = V1Query::parse(raw.0.as_deref()).with_fresh_header(&headers);
-    let response = v1_lookup_inner(&state, &q)
+    v1_lookup_inner(&state, &q)
         .await
-        .unwrap_or_else(|refusal| refusal.response());
-    state
-        .jobs
-        .lookups
-        .record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-    response
+        .unwrap_or_else(|refusal| refusal.response())
 }
 
 /// The values given, trimmed, with blanks dropped.

@@ -196,8 +196,8 @@ fn finish(
 #[derive(Debug)]
 /// A request's phase marker plus the timeline it leaves behind.
 ///
-/// Wraps the [`cleave::PhaseTracker`] that `/_/requests` and the watchdog
-/// read, and records when each phase began so the completion log can say
+/// Wraps the [`cleave::PhaseTracker`] that streamed progress and the
+/// watchdog read, and records when each phase began so the completion log can say
 /// where a request's wall time went (`phases="purl:fetch=812 cleave:init=1930 …"`,
 /// milliseconds per phase, repeats summed). That is what turns a latency
 /// percentile into an attribution: fetch-bound, registry-bound or
@@ -473,7 +473,7 @@ impl WhaleSlot {
             .map_err(|_full| WhaleSlotBusy { slots })
     }
 
-    /// Slots in use right now, for `/_/stats`.
+    #[cfg(test)]
     fn in_use() -> usize {
         WHALE_SLOTS_IN_USE.load(Ordering::Acquire)
     }
@@ -511,12 +511,6 @@ struct WhaleLane {
     pool: rayon::ThreadPool,
     /// Held for the pool's life when the payload is a big whale.
     _slot: Option<WhaleSlot>,
-}
-
-/// Big-whale slots in use and available, for `/_/stats`.
-#[must_use]
-pub fn whale_slot_usage() -> (usize, usize) {
-    (WhaleSlot::in_use(), whale_config().slots)
 }
 
 /// The lane a payload of `bytes` analyzes on: a private pool sized to it —

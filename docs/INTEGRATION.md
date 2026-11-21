@@ -102,8 +102,8 @@ Choose by where a mistake hurts. A hard upload gate wants a strict level
 queue feeding human reviewers can run a high level like `-l 25000` and let
 people sort it out.
 
-Whichever you pick is fixed when the process starts. A running server picks
-up a new setting with `POST /_/reload` — no restart.
+Whichever you pick is fixed when the process starts; changing it means a
+restart.
 
 ## Output formats
 

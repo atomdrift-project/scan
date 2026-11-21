@@ -9,13 +9,11 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::Router;
-use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use scan::server::{ServerConfig, build_app};
-use tower::ServiceExt;
 
 /// Inject a peer address, as `into_make_service_with_connect_info` does in
 /// production. Without it the ACL fails closed and every request 403s.
@@ -77,49 +75,6 @@ pub(crate) fn encoded_purl(purl: &str) -> String {
             other => format!("%{:02X}", other as u32),
         })
         .collect()
-}
-
-/// The model bundle under `SCAN_MODELS_DIR`. A test that calls this is
-/// ignored by default and run on purpose, so a missing bundle fails it rather
-/// than letting it pass without testing anything.
-pub(crate) fn model_dir() -> Result<std::path::PathBuf> {
-    scan::env::path(scan::env::SCAN_MODELS_DIR)
-        .context("set SCAN_MODELS_DIR to run integration tests against real model artifacts")
-}
-
-/// A config over the real model bundle.
-pub(crate) fn ready_config() -> Result<ServerConfig> {
-    Ok(ServerConfig {
-        model_dir: model_dir()?,
-        ..unready_config()
-    })
-}
-
-/// Build the app for `config` and wait until it reports ready. YARA warmup
-/// can take ~15s in release and longer in debug builds.
-pub(crate) async fn ready_app(config: &ServerConfig) -> Result<Router> {
-    let app = build_app(config).await.context("failed to build app")?;
-    let polls: u32 = if cfg!(debug_assertions) { 1800 } else { 600 };
-    for _ in 0..polls {
-        let response = app
-            .clone()
-            .oneshot(loopback(
-                Request::builder().uri("/_/health").body(Body::empty())?,
-            ))
-            .await
-            .context("health request failed")?;
-        let (status, body) = status_and_json(response).await?;
-        if status == StatusCode::OK {
-            return Ok(app);
-        }
-        // A startup that failed will not recover by waiting; the reason is in
-        // the server log above.
-        if body["status"] == "failed" {
-            anyhow::bail!("server failed to start: {body}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    anyhow::bail!("server did not become ready within {}s", polls / 10)
 }
 
 /// The status and JSON body of a response. A body that is not one JSON

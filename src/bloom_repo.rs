@@ -64,16 +64,6 @@ pub fn global() -> Option<Arc<Lookup>> {
         .clone()
 }
 
-/// Reload the installed bundle, if one was published: a long-lived process
-/// picks up refreshed filters without a restart. A probe already holding the
-/// old bundle finishes with it.
-pub(crate) fn reload() {
-    if global().is_some() {
-        set_global(Arc::new(Lookup::load()));
-        tracing::info!("bloom filters reloaded");
-    }
-}
-
 /// Scan's view of a [`burton::Lookup`]: the bundle, plus the optional NSRL
 /// digest filter that may vouch for a file the bundle does not know.
 #[derive(Debug)]

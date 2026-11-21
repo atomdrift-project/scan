@@ -188,15 +188,7 @@ impl Flight {
 /// Registry of analyses currently in progress.
 #[derive(Debug, Default)]
 pub(super) struct Flights {
-    /// Attachment counts live inside the map, under the same lock as the
-    /// flights they count.
-    live: Mutex<HashMap<FlightKey, Live>>,
-}
-
-#[derive(Debug)]
-struct Live {
-    flight: Arc<Flight>,
-    attached: usize,
+    live: Mutex<HashMap<FlightKey, Arc<Flight>>>,
 }
 
 impl Flights {
@@ -204,29 +196,16 @@ impl Flights {
     /// running. The returned [`Attachment`] detaches on drop.
     pub(super) fn join(self: &Arc<Self>, key: FlightKey) -> Attachment {
         let mut live = lock(&self.live);
-        let (flight, leader) = match live.get_mut(&key) {
-            Some(entry) => {
-                entry.attached += 1;
-                (Arc::clone(&entry.flight), false)
-            }
+        let (flight, leader) = match live.get(&key) {
+            Some(flight) => (Arc::clone(flight), false),
             None => {
                 let flight = Arc::new(Flight::new(key.clone()));
-                live.insert(
-                    key,
-                    Live {
-                        flight: Arc::clone(&flight),
-                        attached: 1,
-                    },
-                );
+                live.insert(key, Arc::clone(&flight));
                 (flight, true)
             }
         };
         drop(live);
-        Attachment {
-            flights: Arc::clone(self),
-            flight,
-            leader,
-        }
+        Attachment { flight, leader }
     }
 
     /// Hand the leader the sole right to publish this flight's outcome.
@@ -238,13 +217,10 @@ impl Flights {
         }
     }
 
-    /// Snapshot how much work de-duplication is saving right now.
-    pub(super) fn census(&self) -> Census {
-        let live = lock(&self.live);
-        Census {
-            analyses: live.len(),
-            attached: live.values().map(|entry| entry.attached).sum(),
-        }
+    /// Distinct analyses in progress.
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        lock(&self.live).len()
     }
 
     /// Retire `flight` and wake everyone waiting on it.
@@ -254,7 +230,7 @@ impl Flights {
         // request may have started a fresh one under the same key.
         if live
             .get(flight.key())
-            .is_some_and(|entry| Arc::ptr_eq(&entry.flight, flight))
+            .is_some_and(|live| Arc::ptr_eq(live, flight))
         {
             live.remove(flight.key());
         }
@@ -265,21 +241,20 @@ impl Flights {
     }
 }
 
-/// How many analyses are running and how many requests are riding them. The
-/// gap between the two is work that is not being repeated.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Census {
-    /// Distinct analyses in progress.
-    pub(super) analyses: usize,
-    /// Requests attached to them — at least one apiece.
-    pub(super) attached: usize,
-}
-
-/// One request's claim on a flight. Dropping it detaches; the analysis runs on
-/// regardless, so a caller who reconnects can rejoin it.
+/// One request's claim on a flight.
+///
+/// Dropping it neither cancels nor retires the flight. An analysis is worth
+/// finishing with nobody waiting: its verdict is indexed locally and renewed
+/// on hopper, so a caller that hung up — or a proxy that timed out at two
+/// minutes on a twenty-minute run — finds the answer waiting rather than
+/// starting again from nothing. The watchdog's `--analysis-timeout` is what
+/// bounds a runaway. Keeping the flight registered means the caller who
+/// reconnects rides the run already minutes in rather than keying a second
+/// one. Only [`Flights::finish`] retires a flight, and every flight reaches
+/// it: the leader publishes, and a leader that dies without publishing has its
+/// outcome published by the [`Publisher`] it dropped.
 #[derive(Debug)]
 pub(super) struct Attachment {
-    flights: Arc<Flights>,
     flight: Arc<Flight>,
     leader: bool,
 }
@@ -293,32 +268,6 @@ impl Attachment {
     /// The shared analysis this request is attached to.
     pub(super) const fn flight(&self) -> &Arc<Flight> {
         &self.flight
-    }
-}
-
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        // A later request may have started a fresh flight under this key
-        // after ours retired; its count is none of our business.
-        if let Some(entry) = lock(&self.flights.live).get_mut(self.flight.key())
-            && Arc::ptr_eq(&entry.flight, &self.flight)
-        {
-            entry.attached -= 1;
-        }
-        // Deliberately *not* cancelled when the last request leaves. An
-        // analysis is worth finishing with nobody waiting: its verdict is
-        // indexed locally and renewed on hopper, so a caller that hung up — or
-        // a proxy that timed out at two minutes on a twenty-minute run — finds
-        // the answer waiting rather than starting again from nothing. The
-        // watchdog's `--analysis-timeout` is what bounds a runaway.
-        //
-        // The flight is left registered for the same reason. Retiring it here
-        // would leave the analysis running but unreachable, so the caller who
-        // reconnected — the one this is all for — would key a second flight and
-        // pay for a run already minutes in. Only [`Flights::finish`] retires a
-        // flight, and every flight reaches it: the leader publishes, and a
-        // leader that dies without publishing has its outcome published by the
-        // [`Publisher`] it dropped.
     }
 }
 
@@ -380,7 +329,7 @@ mod tests {
         assert!(leader.leads());
         assert!(!follower.leads());
         assert!(Arc::ptr_eq(leader.flight(), follower.flight()));
-        assert_eq!(flights.census().analyses, 1);
+        assert_eq!(flights.running(), 1);
     }
 
     /// The same bytes are one analysis however they were named: the digest is
@@ -393,7 +342,7 @@ mod tests {
         let txt = flights.join(FlightKey::new(Artifact::Sha("a".repeat(64)), 0, 0));
         assert!(zip.leads());
         assert!(!txt.leads(), "the same bytes follow the run already going");
-        assert_eq!(flights.census().analyses, 1);
+        assert_eq!(flights.running(), 1);
     }
 
     #[test]
@@ -407,7 +356,7 @@ mod tests {
         ));
         assert!(a.leads());
         assert!(b.leads());
-        assert_eq!(flights.census().analyses, 2);
+        assert_eq!(flights.running(), 2);
     }
 
     #[test]
@@ -424,7 +373,7 @@ mod tests {
         });
         assert!(dependencies.leads());
         assert!(none.leads());
-        assert_eq!(flights.census().analyses, 2);
+        assert_eq!(flights.running(), 2);
     }
 
     #[test]
@@ -438,7 +387,7 @@ mod tests {
         // The leader hanging up must not stop work the follower still wants.
         drop(leader);
         assert!(!cancellation.load(Ordering::Acquire));
-        assert_eq!(flights.census().analyses, 1);
+        assert_eq!(flights.running(), 1);
 
         // Nor does the last one leaving: the verdict is indexed locally and
         // renewed on hopper, so the work is not the connection's to lose. Only
@@ -449,7 +398,7 @@ mod tests {
             "a departed caller must not cancel work that still has somewhere to go",
         );
         assert_eq!(
-            flights.census().analyses,
+            flights.running(),
             1,
             "the flight stays reachable, so a caller who comes back rejoins it",
         );
@@ -471,12 +420,11 @@ mod tests {
         let back = flights.join(key());
         assert!(!back.leads(), "the reconnect started a second analysis");
         assert!(Arc::ptr_eq(&flight, back.flight()));
-        assert_eq!(flights.census().attached, 1);
 
         // And it still ends: publishing retires the flight exactly as before,
         // so a flight nobody rejoins cannot linger past its own outcome.
         flights.publisher(&flight).publish(rendered(StatusCode::OK));
-        assert_eq!(flights.census().analyses, 0);
+        assert_eq!(flights.running(), 0);
         assert!(
             flights.join(key()).leads(),
             "a finished flight was rejoined"
@@ -506,7 +454,7 @@ mod tests {
         flights
             .publisher(first.flight())
             .publish(rendered(StatusCode::OK));
-        assert_eq!(flights.census().analyses, 0);
+        assert_eq!(flights.running(), 0);
 
         // The next request starts fresh rather than attaching to a finished run.
         let second = flights.join(key());
@@ -515,7 +463,7 @@ mod tests {
 
         // Dropping the retired attachment must not disturb the new flight.
         drop(first);
-        assert_eq!(flights.census().analyses, 1);
+        assert_eq!(flights.running(), 1);
         assert!(!second.flight().cancellation().load(Ordering::Acquire));
     }
 
@@ -552,7 +500,7 @@ mod tests {
     }
 
     /// A follower streaming progress reads the leader's phase through the
-    /// flight, not by searching `/_/requests` for an entry named like the
+    /// flight, not by searching the in-flight entries for one named like the
     /// flight's subject: an upload's entry is named by its filename and its
     /// subject is the digest, so that search finds nothing for an upload.
     #[test]

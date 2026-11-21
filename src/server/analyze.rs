@@ -1,9 +1,8 @@
 //! One analysis on behalf of a request: claiming capacity, running it on a
 //! blocking thread, and filing what it found.
 //!
-//! Every analyze route goes through [`lead`], so admission, the `/_/requests`
-//! entry, the timeout, the completion log and the `/_/stats` figures are one
-//! code path.
+//! Every analyze route goes through [`lead`], so admission, the watchdog's
+//! in-flight entry, the timeout and the completion log are one code path.
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -68,7 +67,7 @@ pub(super) enum Job {
 }
 
 impl Job {
-    /// How `/_/requests` and the phase tracker name the run.
+    /// How the watchdog and the phase tracker name the run.
     fn name(&self) -> &str {
         match self {
             Self::Bytes { filename, .. } => filename,
@@ -176,16 +175,7 @@ impl Leader {
     ) -> Outcome {
         let phase = RequestPhase::with_label(format!("req#{} {}", self.request_id, job.name()));
         self.flight.set_phase(phase.clone());
-        let entry = InFlightRequest::new(
-            job.name(),
-            // The payload size, when it is known before the fetch.
-            match &job {
-                Job::Bytes { bytes, .. } => bytes.len() as u64,
-                Job::Purl(_) | Job::Url(_) => 0,
-            },
-            self.flight.cancellation(),
-            phase.clone(),
-        );
+        let entry = InFlightRequest::new(job.name(), self.flight.cancellation(), phase.clone());
         let cancellation = Arc::clone(&entry.cancellation);
         let started = Instant::now();
 
@@ -286,9 +276,8 @@ impl Leader {
     }
 }
 
-/// Log a finished analysis and count it in the routing figures; turn a failure
-/// into its answer. Every analyze route reports here, so none of them can
-/// drift out of `/_/stats`. `phases` is [`RequestPhase::timeline`].
+/// Log a finished analysis; turn a failure into its answer. Every analyze
+/// route reports here. `phases` is [`RequestPhase::timeline`].
 fn record(
     state: &AppState,
     request_id: u64,
@@ -326,7 +315,6 @@ fn record(
                 },
                 "<-- 200 OK",
             );
-            state.jobs.finished(&result, elapsed_ms, key.purl());
             Ok(result)
         }
         AnalysisOutcome::Ok(Err(e)) => {

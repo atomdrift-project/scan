@@ -66,7 +66,7 @@ pub(crate) struct ClassifyRequest<'a> {
     pub root_fetch: Option<&'a FetchRecord>,
     /// Bloom flag (🚩 known-bad / 🏴 conflicted) for the terminal header.
     pub bloom_mark: Option<crate::output::BloomMark>,
-    /// Stage tracker for the in-flight census (`/_/requests`, the watchdog), so
+    /// Stage tracker for the in-flight census (streamed progress, the watchdog), so
     /// dependency fetch and analysis are not misattributed to featurization.
     pub phase: Option<&'a cleave::PhaseTracker>,
     /// Called once everything the artifact follows is fetched and analyzed,

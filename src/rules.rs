@@ -143,14 +143,6 @@ impl Refreshed {
         self.0.iter().any(|(_, result)| matches!(result, Ok(true)))
     }
 
-    /// Whether `source` installed something new.
-    #[must_use]
-    pub(crate) fn changed_source(&self, source: Source) -> bool {
-        self.0
-            .iter()
-            .any(|(s, result)| *s == source && matches!(result, Ok(true)))
-    }
-
     /// The sources that failed to update, with why.
     pub fn failures(&self) -> impl Iterator<Item = (Source, &anyhow::Error)> {
         self.0

@@ -135,7 +135,7 @@ colored = "3.1"
 unicode-width = "0.2"
 tempfile = "3"
 dashmap = "6"
-# Bounded LRU for the GET /_/bloom decision memos. Already in the lock graph
+# Bounded LRU for the verdict index's decision memos. Already in the lock graph
 # (via other crates); this only promotes it so we can name the type.
 lru = "0.18"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "multipart"], default-features = false }

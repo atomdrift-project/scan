@@ -5,19 +5,12 @@
 //!
 //! 1. **Peer IP.** Loopback connections pass. Every other peer must match one
 //!    of the configured `--allow-cidr` networks.
-//! 2. **Bearer token.** When a token is configured, every route except
-//!    [`HEALTH_ROUTE`] requires `Authorization: Bearer <token>`. Loopback is
+//! 2. **Bearer token.** When a token is configured, every route requires
+//!    `Authorization: Bearer <token>`. Loopback is
 //!    deliberately *not* exempt: the server is meant to sit behind a
 //!    Cloudflare tunnel, where `cloudflared` runs on the host and dials the
 //!    service over loopback, so every remote request arrives with a loopback
 //!    peer address. Exempting loopback would exempt the entire internet.
-//!
-//! The admin routes ([`ADMIN_ROUTES`]) change what the server runs. With a
-//! token configured they need it like every other route; without one they are
-//! loopback-only, so `--allow-cidr` grants analysis and never administration.
-//!
-//! Requests clearing both gates carry a [`Trusted`] marker, which handlers use
-//! to decide whether a response may include privileged diagnostic detail.
 //!
 //! Every response — pass or reject — is tagged with the [`Auth`] decision that
 //! produced it, which [`access_log`](super::access::access_log) turns into the
@@ -331,24 +324,6 @@ fn fingerprint(credential: &[u8]) -> Fingerprint {
     Fingerprint(fp)
 }
 
-/// Marker attached to requests allowed to see privileged diagnostic detail:
-/// in-flight sample names, thread counts, orphan counts. Present when the
-/// request carried a valid bearer token — or when authentication is disabled,
-/// which leaves those responses exactly as they were before tokens existed.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Trusted;
-
-/// Routes that reload or update the models and rules the server runs. The
-/// bearer token is their credential; on a server without one, only loopback
-/// may call them.
-const ADMIN_ROUTES: &[&str] = &["/_/reload", "/_/update"];
-
-/// The one route reachable without a bearer token, so that load balancers,
-/// tunnel health checks, and monitoring can probe liveness without holding a
-/// credential. A valid token still upgrades the response to the full
-/// diagnostic body; see [`Trusted`].
-pub(super) const HEALTH_ROUTE: &str = "/_/health";
-
 fn forbidden(message: &'static str, auth: Auth) -> Response {
     tag(
         ApiError::new(StatusCode::FORBIDDEN, "forbidden", message).response(),
@@ -384,13 +359,9 @@ fn unauthorized() -> Response {
 /// gets to upload bytes.
 pub(super) async fn acl(
     State(state): State<Arc<AppState>>,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> Response {
-    let path = req.uri().path();
-    let loopback_only = ADMIN_ROUTES.contains(&path) && state.config.auth_digest.is_none();
-    let auth_exempt = path == HEALTH_ROUTE;
-
     let peer = req
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
@@ -404,17 +375,9 @@ pub(super) async fn acl(
     };
 
     // Gate 1: peer IP. Loopback passes; anything else needs an --allow-cidr
-    // match and can never reach a loopback-only route.
-    if !ip.is_loopback() {
-        if loopback_only {
-            return forbidden(
-                "this route requires a loopback connection",
-                Auth::LoopbackOnly,
-            );
-        }
-        if !state.config.allow_cidrs.iter().any(|c| c.contains(ip)) {
-            return forbidden("peer address not in any allow-cidr", Auth::PeerDenied);
-        }
+    // match.
+    if !ip.is_loopback() && !state.config.allow_cidrs.iter().any(|c| c.contains(ip)) {
+        return forbidden("peer address not in any allow-cidr", Auth::PeerDenied);
     }
 
     // Gate 2: bearer token. Loopback is not exempt — see the module docs.
@@ -422,7 +385,6 @@ pub(super) async fn acl(
         None => Auth::Open,
         Some(digest) => match bearer_credential(req.headers()) {
             Presented::Bearer(credential) if digest.matches(credential) => Auth::Token,
-            _ if auth_exempt => Auth::Anonymous,
             // The response is identical in all three cases — only the log
             // distinguishes them, so the endpoint stays useless as an oracle.
             Presented::None => return tag(unauthorized(), Auth::NoCredential),
@@ -438,10 +400,6 @@ pub(super) async fn acl(
             }
         },
     };
-    if auth != Auth::Anonymous {
-        req.extensions_mut().insert(Trusted);
-    }
-
     tag(next.run(req).await, auth)
 }
 
