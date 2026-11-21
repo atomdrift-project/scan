@@ -69,6 +69,9 @@ pub(crate) struct ClassifyRequest<'a> {
     /// Stage tracker for the in-flight census (`/_/requests`, the watchdog), so
     /// dependency fetch and analysis are not misattributed to featurization.
     pub phase: Option<&'a cleave::PhaseTracker>,
+    /// Called once everything the artifact follows is fetched and analyzed,
+    /// and so kept for another scan that follows the same things.
+    pub fetched: Option<&'a (dyn Fn() + Sync)>,
     pub cpu_lease: Option<CpuLease>,
 }
 
@@ -92,6 +95,7 @@ impl<'a> ClassifyRequest<'a> {
             root_fetch: None,
             bloom_mark: None,
             phase: None,
+            fetched: None,
             cpu_lease: None,
         }
     }
@@ -462,6 +466,9 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
         },
     );
     let fetch_time = fetch_started.elapsed();
+    if let Some(fetched) = req.fetched {
+        fetched();
+    }
     if let Some(p) = req.phase {
         p.set("features+model");
     }

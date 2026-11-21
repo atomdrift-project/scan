@@ -20,7 +20,7 @@ use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources_for,
 };
-use crate::bloom_repo::Decision as BloomDecision;
+use crate::bloom_repo::{Decision as BloomDecision, Gate, KNOWN_GOOD_FRESH};
 use crate::corpus_precheck::Verdict;
 use crate::explain::ShapImportance;
 use crate::model::{Classification, Model};
@@ -307,7 +307,10 @@ fn scan_partitioned(
     alone: bool,
 ) -> Result<()> {
     let kept = replays_apply(session.config, registry_map);
-    let record_now = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
+    let record_now = |path: &Path,
+                      analyzed: Result<AnalysisReport>,
+                      named: bool,
+                      fetched: &(dyn Fn() + Sync)| {
         // Per-file provenance: match this artifact's content sha to its registry
         // record in `--registry-map`, the registry's own account of the package
         // recovered without a refetch — which for a deleted release is the only
@@ -334,6 +337,7 @@ fn scan_partitioned(
             // What a capture record prints depends on the file it lies
             // beside, which is no part of a replay's key.
             kept: (kept && !sidecar).then_some(role),
+            fetched: Some(fetched),
             ..Target::new(origin)
         };
         session.record(&target, analyzed, None);
@@ -342,38 +346,68 @@ fn scan_partitioned(
     // at it (see `Turns`); a scan that follows none has nothing to share.
     let turns = Turns::default();
     let follows = session.config.fetch_policy().enabled();
-    let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| match analyzed
-        .as_ref()
-        .ok()
-        .and_then(release)
-    {
-        Some(release) if follows => turns.take(
-            &release,
-            (path.to_path_buf(), analyzed, named),
-            |(path, analyzed, named)| record_now(&path, analyzed, named),
-        ),
-        _ => record_now(path, analyzed, named),
-    };
+    // The scope is what the files left for a turn are recorded in: a job of
+    // the pool like any other, which nothing waits for but the end of the
+    // scan.
+    rayon::in_place_scope(|scope| {
+        let release_of = |analyzed: &Result<AnalysisReport>| {
+            analyzed.as_ref().ok().and_then(release).filter(|_| follows)
+        };
+        let record = |path: &Path, analyzed: Result<AnalysisReport>, named: bool| {
+            let Some(release) = release_of(&analyzed) else {
+                return record_now(path, analyzed, named, &|| ());
+            };
+            let Some((path, analyzed, named)) =
+                turns.take(&release, (path.to_path_buf(), analyzed, named))
+            else {
+                return;
+            };
+            // Once this file has fetched what it follows, the files left for
+            // its turn find all of that kept. They are recorded one after
+            // another, beside the rest of this one.
+            let passed = std::sync::Once::new();
+            let pass = || {
+                passed.call_once(|| {
+                    let Some(next) = turns.pass(&release) else {
+                        return;
+                    };
+                    let (turns, release) = (&turns, release.clone());
+                    scope.spawn(move |_| {
+                        let mut next = Some(next);
+                        while let Some((path, analyzed, named)) = next {
+                            record_now(&path, analyzed, named, &|| ());
+                            next = turns.pass(&release);
+                        }
+                    });
+                });
+            };
+            record_now(&path, analyzed, named, &pass);
+            // A file that fetched nothing has the turn to pass on all the
+            // same: one that was skipped, or whose analysis failed.
+            pass();
+        };
 
-    // A single artifact has no file-count bar, so its static analysis —
-    // extraction, disassembly, per-member scoring — would run with nothing on
-    // screen for however many seconds it takes. Analyze it directly with a
-    // spinner instead of through the streaming API, dropping the spinner before
-    // `record` so its fetch tree and final render own the terminal cleanly.
-    if let ([path], true) = (
-        files,
-        alone && session.config.format() == OutputFormat::Terminal,
-    ) {
-        let label = path.file_name().map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let spinner = Spinner::start(&label);
-        let analyzed = cleave::analyze_file(path, &named_target_opts(&session.opts))
-            .with_context(|| format!("cleave analysis of {}", path.display()));
-        drop(spinner);
-        record(path, analyzed, true);
-    } else {
+        // A single artifact has no file-count bar, so its static analysis —
+        // extraction, disassembly, per-member scoring — would run with nothing
+        // on screen for however many seconds it takes. Analyze it directly
+        // with a spinner instead of through the streaming API, dropping the
+        // spinner before `record` so its fetch tree and final render own the
+        // terminal cleanly.
+        if let ([path], true) = (
+            files,
+            alone && session.config.format() == OutputFormat::Terminal,
+        ) {
+            let label = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let spinner = Spinner::start(&label);
+            let analyzed = cleave::analyze_file(path, &named_target_opts(&session.opts))
+                .with_context(|| format!("cleave analysis of {}", path.display()));
+            drop(spinner);
+            record(path, analyzed, true);
+            return Ok(());
+        }
         // The two batches differ in exactly one way: a file the operator
         // named is analyzed unconditionally, while a file found by walking a
         // directory they named is eligible for the known-good shortcut. That
@@ -387,25 +421,35 @@ fn scan_partitioned(
             })?;
         }
         // Files of the same bytes are analyzed one after another, not at
-        // once: the second finds the first's analysis and its dependencies
-        // in the caches, where at once each did all of it again. With
-        // everything it follows already kept, the second wave takes no turns.
+        // once: the second finds the first's analysis in the cache, where at
+        // once each did all of it again.
         let (first, again) = first_of_each_content(dir_files, shas);
-        for (wave, cached) in [(first, false), (again, true)] {
-            if !wave.is_empty() {
-                cleave::scan_paths(wave, &session.opts, |event| {
-                    if let cleave::ScanEvent::File { path, result } = event {
-                        if cached {
-                            record_now(&path, *result, false);
-                        } else {
-                            record(&path, *result, false);
-                        }
-                    }
-                })?;
-            }
+        if !first.is_empty() {
+            cleave::scan_paths(first, &session.opts, |event| {
+                if let cleave::ScanEvent::File { path, result } = event {
+                    record(&path, *result, false);
+                }
+            })?;
         }
-    }
-    Ok(())
+        // What the second follows is kept once every file of its release
+        // that took a turn has passed it on, and then it takes none: it is
+        // left for the turn only while one of them still has it.
+        if !again.is_empty() {
+            cleave::scan_paths(again, &session.opts, |event| {
+                if let cleave::ScanEvent::File { path, result } = event {
+                    let Some(release) = release_of(&result) else {
+                        return record_now(&path, *result, false, &|| ());
+                    };
+                    if let Some((path, analyzed, named)) =
+                        turns.follow(&release, (path, *result, false))
+                    {
+                        record_now(&path, analyzed, named, &|| ());
+                    }
+                }
+            })?;
+        }
+        Ok(())
+    })
 }
 
 /// Bytes fetched for `scan url` or `scan purl`, and where they came from.
@@ -560,6 +604,7 @@ pub(crate) fn scan_bytes(
         model,
         shap,
         cancel: None,
+        fetched: None,
     };
     let (result, _) = classifier.classify(
         report,
@@ -599,6 +644,7 @@ pub(crate) fn scan_file(
         model,
         shap,
         cancel: None,
+        fetched: None,
     };
     let (result, _) = classifier.classify(
         report,
@@ -722,6 +768,7 @@ impl<'a> Session<'a> {
                 model: self.model,
                 shap: self.shap,
                 cancel: Some(&self.cancel),
+                fetched: target.fetched,
             }
             .classify(
                 report,
@@ -1040,6 +1087,7 @@ impl<'a> Session<'a> {
         // Engine-internal attribution (per-phase thread time, regex store
         // churn) for slow-scan diagnosis: cumulative, so logged once a scan.
         cleave::log_scan_stats();
+        crate::bloom_repo::log_gates();
         let summary = self.tally.summary(self.started);
         if self.broken_pipe.load(Ordering::Relaxed) {
             // The reader went away (`atomscan … | head`), so nothing more is
@@ -1124,6 +1172,9 @@ struct Target<'a> {
     /// The role its scan is kept for [`Replay`] under, when it is one
     /// scanned with nothing but its bytes and the config.
     kept: Option<Role>,
+    /// Called once what the file follows is fetched (see
+    /// `ClassifyRequest::fetched`).
+    fetched: Option<&'a (dyn Fn() + Sync)>,
 }
 
 impl<'a> Target<'a> {
@@ -1133,6 +1184,7 @@ impl<'a> Target<'a> {
             sidecar: false,
             fallback_purl: None,
             kept: None,
+            fetched: None,
         }
     }
 }
@@ -1145,6 +1197,7 @@ struct Classifier<'a> {
     model: &'a Model,
     shap: Option<&'a ShapImportance>,
     cancel: Option<&'a Arc<AtomicBool>>,
+    fetched: Option<&'a (dyn Fn() + Sync)>,
 }
 
 impl Classifier<'_> {
@@ -1170,6 +1223,7 @@ impl Classifier<'_> {
                 root_bytes,
                 shap: self.shap,
                 cancellation: self.cancel,
+                fetched: self.fetched,
                 tiny_opts: tiny_opts_for(config),
                 interpret: config.interpret(),
                 fetch: config.fetch_policy(),
@@ -1394,8 +1448,8 @@ impl SkippedByBloom {
 
 /// The bloom short-circuit for a scan target, honoring the local known-good
 /// freshness override: a known-good file created, status-changed, or modified
-/// within the last 48h is scanned on its own merits rather than skipped on its
-/// bloom vouch. Returns the benign count (see [`bloom_gate`]) when the target
+/// within the last hour ([`KNOWN_GOOD_FRESH`]) is scanned on its own merits
+/// rather than skipped on its bloom vouch. Returns the benign count (see [`bloom_gate`]) when the target
 /// is short-circuited (counted, not scanned) and `None` when it must be scanned.
 pub(crate) fn bloom_gate_fresh(
     config: &ScanConfig,
@@ -1404,7 +1458,7 @@ pub(crate) fn bloom_gate_fresh(
     emit: impl FnOnce(&str, BloomVerdict),
 ) -> Option<u32> {
     if decision == BloomDecision::Skip
-        && file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now())
+        && file_touched_within(path, KNOWN_GOOD_FRESH, SystemTime::now())
     {
         return None;
     }
@@ -1445,7 +1499,7 @@ fn bloom_skip_predicate(
             };
             let decision = lookup.decide(&burton::Artifact::sha256(&digest));
             // Known-good is trusted and skipped, unless the file was created,
-            // status-changed, or modified within the last 48h — a fresh
+            // status-changed, or modified within the last hour — a fresh
             // known-good is analyzed on its own merits (recent activity, and a
             // guard against a bloom false positive on a freshly planted file),
             // so cleave analyzes it once here rather than skipping and then
@@ -1454,8 +1508,21 @@ fn bloom_skip_predicate(
             // Every other decision is analyzed, adverse or not: in fast mode an
             // unknown is skipped as well, which is what fast mode means.
             let skip = if decision.may_skip() {
-                !file_touched_within(path, KNOWN_GOOD_RESCAN, SystemTime::now())
+                let fresh = file_touched_within(path, KNOWN_GOOD_FRESH, SystemTime::now());
+                crate::bloom_repo::met(if fresh {
+                    Gate::FileFresh
+                } else {
+                    Gate::FileKnownGood
+                });
+                tracing::debug!(
+                    path = %path.display(),
+                    sha256 = sha_hex,
+                    fresh,
+                    "walked file is known-good by content; analyzed only if fresh"
+                );
+                !fresh
             } else {
+                crate::bloom_repo::met(Gate::FileUnvouched);
                 fast && decision == BloomDecision::Unknown
             };
             if skip {
@@ -1614,19 +1681,6 @@ impl Tally {
         }
     }
 }
-
-/// Freshness window for the local known-good re-scan: a known-good file created,
-/// changed, or modified this recently is scanned on its own merits rather than
-/// skipped.
-///
-/// Deliberately its own value rather than the dependency window in
-/// [`crate::fetch`]. The two answer different questions: that one asks how long
-/// a *registry release* stays too new to trust a vouch for, and is sized in
-/// hours because a published version is immutable; this one asks how recently a
-/// *local file* was written, and is the guard against a bloom false-positive
-/// shielding something a live intrusion just planted. Shrinking it to match the
-/// dependency window would narrow that guard for no reason connected to it.
-const KNOWN_GOOD_RESCAN: Duration = Duration::from_hours(48);
 
 /// Whether the file at `path` was created (btime), status-changed (ctime), or
 /// modified (mtime) within the last `window` (in whole seconds). A known-good file this
@@ -1821,23 +1875,29 @@ mod tests {
         assert!(findings_match_filter(hostile_only, &[], &members));
     }
 
+    /// A file written inside the known-good freshness window is analyzed
+    /// whatever vouches for it; one written more than an hour ago is not held
+    /// back, and neither is one whose metadata cannot be read.
     #[test]
     fn file_touched_within_flags_fresh_and_ignores_old_and_missing() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x.txt");
         std::fs::write(&f, b"hi").unwrap();
         let now = SystemTime::now();
-        // Just-written file is within the window.
-        assert!(file_touched_within(&f, KNOWN_GOOD_RESCAN, now));
-        // Evaluated from a clock 10 days ahead, every timestamp is well outside
-        // the 48h window — the not-recent (skip-eligible) case.
-        let later = now + Duration::from_secs(10 * 86_400);
-        assert!(!file_touched_within(&f, KNOWN_GOOD_RESCAN, later));
+        assert_eq!(KNOWN_GOOD_FRESH, Duration::from_hours(1));
+        // Just-written file is within the window, and still is half an hour on.
+        assert!(file_touched_within(&f, KNOWN_GOOD_FRESH, now));
+        let soon = now + Duration::from_mins(30);
+        assert!(file_touched_within(&f, KNOWN_GOOD_FRESH, soon));
+        // Evaluated from a clock two hours ahead, every timestamp is outside
+        // the window — the not-recent (skip-eligible) case.
+        let later = now + Duration::from_hours(2);
+        assert!(!file_touched_within(&f, KNOWN_GOOD_FRESH, later));
         // Unreadable metadata (e.g. a fetched artifact's synthetic path) is treated
         // as not-recent, so the normal known-good skip still applies.
         assert!(!file_touched_within(
             &dir.path().join("does-not-exist"),
-            KNOWN_GOOD_RESCAN,
+            KNOWN_GOOD_FRESH,
             now
         ));
     }

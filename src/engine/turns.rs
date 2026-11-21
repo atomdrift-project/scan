@@ -6,14 +6,14 @@ use std::sync::{Mutex, PoisonError};
 
 use cleave::AnalysisReport;
 
-/// Work that belongs together, done a turn at a time.
+/// Work that belongs together, begun a turn at a time.
 ///
 /// The files of one release — a wheel and its sdist, a download kept twice —
 /// resolve to the same dependencies. Recorded at once, each analyzed every
 /// one of them for itself, because none had finished for the others to find
-/// in the cache. Here the first to arrive goes ahead and the rest are left
-/// with it: when it is done it does theirs, one after another, on its own
-/// thread.
+/// in the cache. Here the first to arrive has the turn and the rest are left
+/// for it: once it has fetched what it follows it passes the turn on, and
+/// whoever passes a turn on does the work of the one it is passed to.
 ///
 /// Nobody waits. A rayon worker blocked on another's work can be holding the
 /// very job that work needs, and then neither finishes.
@@ -26,27 +26,42 @@ impl<T> Default for Turns<T> {
 }
 
 impl<T> Turns<T> {
-    /// Do `work` on `item` now, or leave `item` with whoever has the turn for
-    /// `key`. Whoever has it does every item left with it before giving it up.
-    pub(super) fn take(&self, key: &str, mut item: T, work: impl Fn(T)) {
-        {
-            let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(left) = turns.get_mut(key) {
+    /// Take the turn for `key`: `item` back when it is free, to be worked
+    /// on now. Otherwise `item` is left for whoever has the turn.
+    pub(super) fn take(&self, key: &str, item: T) -> Option<T> {
+        let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(left) = turns.get_mut(key) {
+            left.push_back(item);
+            return None;
+        }
+        turns.insert(key.to_string(), VecDeque::new());
+        drop(turns);
+        Some(item)
+    }
+
+    /// Leave `item` for whoever has the turn for `key`, or get it back when
+    /// nobody has: everything that took that turn is done with it, so `item`
+    /// needs none.
+    pub(super) fn follow(&self, key: &str, item: T) -> Option<T> {
+        let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match turns.get_mut(key) {
+            Some(left) => {
                 left.push_back(item);
-                return;
+                None
             }
-            turns.insert(key.to_string(), VecDeque::new());
+            None => Some(item),
         }
-        loop {
-            work(item);
-            let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(next) = turns.get_mut(key).and_then(VecDeque::pop_front) else {
-                turns.remove(key);
-                return;
-            };
-            drop(turns);
-            item = next;
+    }
+
+    /// Give up the turn for `key`: to the first item left for it, which the
+    /// caller starts, or to nobody.
+    pub(super) fn pass(&self, key: &str) -> Option<T> {
+        let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = turns.get_mut(key).and_then(VecDeque::pop_front);
+        if next.is_none() {
+            turns.remove(key);
         }
+        next
     }
 }
 
@@ -125,9 +140,31 @@ mod tests {
         assert_eq!(release(&anonymous), None);
     }
 
-    /// Items under one key are never worked on at once, each is worked on
-    /// exactly once, and nobody waits: an item that arrives while its key is
-    /// taken is done by whoever took it. Other keys go ahead meanwhile.
+    /// What follows a turn is left for whoever has it, and goes ahead at
+    /// once, taking no turn, when nobody has.
+    #[test]
+    fn a_follower_is_left_for_the_turn_only_while_it_is_taken() {
+        let turns = Turns::default();
+        assert_eq!(turns.follow("release", "copy"), Some("copy"));
+        assert_eq!(
+            turns.follow("release", "again"),
+            Some("again"),
+            "no turn taken"
+        );
+        assert_eq!(turns.take("release", "first"), Some("first"));
+        assert_eq!(turns.take("release", "second"), None);
+        assert_eq!(turns.follow("release", "copy"), None);
+        assert_eq!(turns.follow("other", "theirs"), Some("theirs"));
+        assert_eq!(turns.pass("release"), Some("second"));
+        assert_eq!(turns.pass("release"), Some("copy"));
+        assert_eq!(turns.pass("release"), None);
+        assert_eq!(turns.follow("release", "late"), Some("late"));
+        assert!(turns.0.lock().unwrap().is_empty());
+    }
+
+    /// Only one item under a key has the turn at a time, each has it exactly
+    /// once, and nobody waits: an item that arrives while its key is taken is
+    /// started by whoever passes the turn on. Other keys go ahead meanwhile.
     #[test]
     fn work_under_one_key_takes_turns_and_none_is_lost() {
         const THREADS: usize = 8;
@@ -141,20 +178,14 @@ mod tests {
                 scope.spawn(move || {
                     for item in 0..ITEMS {
                         let key = (thread + item) % 2;
-                        turns.take(
-                            &key.to_string(),
-                            (key, thread, item),
-                            |(key, thread, item)| {
-                                assert_eq!(
-                                    busy[key].fetch_add(1, Ordering::SeqCst),
-                                    0,
-                                    "two at once"
-                                );
-                                std::thread::yield_now();
-                                done.lock().unwrap().push((thread, item));
-                                busy[key].fetch_sub(1, Ordering::SeqCst);
-                            },
-                        );
+                        let mut turn = turns.take(&key.to_string(), (thread, item));
+                        while let Some(mine) = turn {
+                            assert_eq!(busy[key].fetch_add(1, Ordering::SeqCst), 0, "two at once");
+                            std::thread::yield_now();
+                            done.lock().unwrap().push(mine);
+                            busy[key].fetch_sub(1, Ordering::SeqCst);
+                            turn = turns.pass(&key.to_string());
+                        }
                     }
                 });
             }

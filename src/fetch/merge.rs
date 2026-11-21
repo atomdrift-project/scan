@@ -132,6 +132,7 @@ impl Payloads<'_> {
         // detector produced for this input — a rules/engine change misses and
         // re-scans.
         if let Some(hit) = self.acache.and_then(|ac| ac.get(&cache_key)) {
+            crate::bloom_repo::met(crate::bloom_repo::Gate::PayloadCached);
             tracing::debug!(
                 locator = %rec.locator,
                 content_sha = %content_sha,
@@ -199,11 +200,24 @@ impl Payloads<'_> {
                 // it the payload's data stays in top-level fields and files[] is
                 // empty.
                 sub.finalize();
+                // The skip predicate answers for registry documents too, so
+                // a payload it spared is told here, by asking again as it did
+                // (see `dep_skip_predicate`).
+                let known_good = crate::bloom_repo::global().is_some_and(|lookup| {
+                    burton::parse_sha256_hex(&content_sha)
+                        .is_some_and(|d| lookup.may_skip(&burton::Artifact::sha256(&d)))
+                });
+                crate::bloom_repo::met(if known_good {
+                    crate::bloom_repo::Gate::PayloadKnownGood
+                } else {
+                    crate::bloom_repo::Gate::PayloadAnalyzed
+                });
                 tracing::debug!(
                     locator = %rec.locator,
                     name,
                     size_bytes,
                     files = sub.files.len(),
+                    known_good,
                     elapsed_ms = started.elapsed().as_millis(),
                     "fetched payload analyzed"
                 );

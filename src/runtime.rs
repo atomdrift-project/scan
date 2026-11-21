@@ -207,7 +207,7 @@ pub fn install_rayon_pool() {
         crate::env::number::<usize>(crate::env::CLEAVE_RAYON_THREADS).filter(|&n| n > 0);
     let physical = cleave::memory_tracker::physical_cpu_count();
     let logical = cleave::memory_tracker::cpu_count();
-    let detected_cores = pool_cores(physical, logical, smt_pool_vendor());
+    let detected_cores = pool_cores(physical, logical, extra_cpus());
     let threads = override_threads.unwrap_or_else(|| {
         detected_cores.unwrap_or_else(|| {
             tracing::warn!(
@@ -317,45 +317,69 @@ const SMALL_HOST_CORES: usize = 8;
 ///
 /// On a small SMT host the pool is the only parallelism there is, and it
 /// idles whenever the one admitted archive is in a serial phase (tar/gzip
-/// read), so it takes every logical CPU. Either wider pool is taken only
-/// where that class of sibling exists (see [`smt_pool_vendor`]);
-/// `CLEAVE_RAYON_THREADS` overrides both.
-fn pool_cores(physical: Option<usize>, logical: Option<usize>, smt_vendor: bool) -> Option<usize> {
-    match (physical, logical) {
-        (Some(p), Some(l)) if l > p && smt_vendor => Some(if p < SMALL_HOST_CORES {
+/// read), so it takes every logical CPU.
+///
+/// Efficiency cores are whole cores, only slower, so the pool takes all of
+/// them: on a 12P+4E Apple host a cold scan of a folder of archives took
+/// 151 s on 16 threads against 162-167 s on the 12 performance cores, for 9%
+/// more CPU time and the same peak RSS.
+///
+/// A wider pool is taken only where that class of CPU exists (see
+/// [`extra_cpus`]); `CLEAVE_RAYON_THREADS` overrides all of it.
+fn pool_cores(physical: Option<usize>, logical: Option<usize>, extra: ExtraCpus) -> Option<usize> {
+    match (physical, logical, extra) {
+        (Some(p), Some(l), ExtraCpus::Efficiency) => Some(l.max(p)),
+        (Some(p), Some(l), ExtraCpus::Smt) if l > p => Some(if p < SMALL_HOST_CORES {
             l
         } else {
             (p + p / 2).min(l)
         }),
-        (Some(p), _) => Some(p),
-        (None, l) => l,
+        (Some(p), _, _) => Some(p),
+        (None, l, _) => l,
     }
 }
 
-/// Whether this host's SMT siblings are the kind the small-host pool policy
-/// holds for: x86 hyperthreads from AMD or Intel (the same design). Apple
-/// silicon never qualifies — its extra "logical" capacity is efficiency cores,
-/// which do not help this workload — and neither does an unknown vendor.
-fn smt_pool_vendor() -> bool {
+/// What a host's logical CPUs beyond its physical (performance) cores are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtraCpus {
+    /// x86 hyperthreads from AMD or Intel (the same design).
+    Smt,
+    /// Apple silicon's efficiency cores.
+    Efficiency,
+    /// Not known, so not counted on.
+    Unknown,
+}
+
+/// The class of this host's logical CPUs beyond its physical cores.
+fn extra_cpus() -> ExtraCpus {
+    if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        return ExtraCpus::Efficiency;
+    }
+    // An Intel Mac's hyperthreads were never counted on, and still are not.
     if cfg!(target_vendor = "apple") || !cfg!(target_arch = "x86_64") {
-        return false;
+        return ExtraCpus::Unknown;
     }
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/cpuinfo")
+        if std::fs::read_to_string("/proc/cpuinfo")
             .is_ok_and(|info| info.contains("AuthenticAMD") || info.contains("GenuineIntel"))
+        {
+            ExtraCpus::Smt
+        } else {
+            ExtraCpus::Unknown
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         // x86_64 FreeBSD/Windows/illumos hosts: AMD/Intel is the only x86 SMT
         // there is; the arch check above already excludes everything else.
-        true
+        ExtraCpus::Smt
     }
 }
 
 #[cfg(test)]
 mod pool_tests {
-    use super::{cleave_concurrency_from, pool_cores};
+    use super::{ExtraCpus, cleave_concurrency_from, pool_cores};
 
     #[test]
     fn cleave_concurrency_scales_with_pool_and_respects_slot_cap() {
@@ -368,15 +392,26 @@ mod pool_tests {
 
     #[test]
     fn small_smt_hosts_take_every_sibling_and_wide_hosts_half_of_them() {
-        assert_eq!(pool_cores(Some(4), Some(8), true), Some(8));
-        assert_eq!(pool_cores(Some(4), Some(8), false), Some(4));
-        assert_eq!(pool_cores(Some(16), Some(32), true), Some(24));
-        assert_eq!(pool_cores(Some(16), Some(32), false), Some(16));
-        assert_eq!(pool_cores(Some(16), Some(20), true), Some(20));
-        assert_eq!(pool_cores(Some(8), Some(16), true), Some(12));
-        assert_eq!(pool_cores(Some(4), Some(4), true), Some(4));
-        assert_eq!(pool_cores(None, Some(6), true), Some(6));
-        assert_eq!(pool_cores(None, None, true), None);
+        use ExtraCpus::{Smt, Unknown};
+        assert_eq!(pool_cores(Some(4), Some(8), Smt), Some(8));
+        assert_eq!(pool_cores(Some(4), Some(8), Unknown), Some(4));
+        assert_eq!(pool_cores(Some(16), Some(32), Smt), Some(24));
+        assert_eq!(pool_cores(Some(16), Some(32), Unknown), Some(16));
+        assert_eq!(pool_cores(Some(16), Some(20), Smt), Some(20));
+        assert_eq!(pool_cores(Some(8), Some(16), Smt), Some(12));
+        assert_eq!(pool_cores(Some(4), Some(4), Smt), Some(4));
+        assert_eq!(pool_cores(None, Some(6), Smt), Some(6));
+        assert_eq!(pool_cores(None, None, Smt), None);
+    }
+
+    #[test]
+    fn efficiency_cores_are_all_taken() {
+        use ExtraCpus::Efficiency;
+        assert_eq!(pool_cores(Some(12), Some(16), Efficiency), Some(16));
+        assert_eq!(pool_cores(Some(4), Some(8), Efficiency), Some(8));
+        assert_eq!(pool_cores(Some(8), Some(8), Efficiency), Some(8));
+        assert_eq!(pool_cores(Some(12), None, Efficiency), Some(12));
+        assert_eq!(pool_cores(None, Some(16), Efficiency), Some(16));
     }
 }
 

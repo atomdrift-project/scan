@@ -39,8 +39,10 @@ use crate::model::Classification;
 
 /// How long a scan that followed references, or deferred to a remote first,
 /// answers from its replay: the time a resolved release set is trusted before
-/// the registries are asked again.
-const RESOLUTION_TTL: Duration = Duration::from_secs(60 * 60);
+/// the registries are asked again. The same two hours fletch keeps a
+/// versionless registry document, so a replay never outlives what a fresh
+/// scan would read, nor expires before it could read anything newer.
+const RESOLUTION_TTL: Duration = Duration::from_hours(2);
 
 /// Environment variables whose names start with one of these can change an
 /// analysis or its output, so all of them are part of the key.
@@ -237,15 +239,15 @@ mod tests {
         }
     }
 
-    /// A scan that followed references answers for an hour and no longer; one
+    /// A scan that followed references answers for two hours and no longer; one
     /// that read only the file answers for as long as its namespace lives. A
     /// stamp ahead of the clock answers for neither.
     #[test]
     fn a_replay_expires_only_when_its_scan_followed_references() {
-        let hour = RESOLUTION_TTL.as_secs();
-        assert!(replay(true, 1_000).fresh(1_000 + hour));
-        assert!(!replay(true, 1_000).fresh(1_001 + hour));
-        assert!(replay(false, 1_000).fresh(1_000 + 1_000 * hour));
+        let ttl = RESOLUTION_TTL.as_secs();
+        assert!(replay(true, 1_000).fresh(1_000 + ttl));
+        assert!(!replay(true, 1_000).fresh(1_001 + ttl));
+        assert!(replay(false, 1_000).fresh(1_000 + 1_000 * ttl));
         assert!(!replay(true, 1_000).fresh(999));
         assert!(!replay(false, 1_000).fresh(999));
     }

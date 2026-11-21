@@ -13,8 +13,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 pub use burton::{Artifact, Decision};
+
+/// How long anything stays too new for a known-good vouch: a registry release
+/// since it was published, a local file since it was last written. Inside the
+/// window it is analyzed on its own merits, whatever the filters say; past it
+/// a vouch by PURL or by SHA-256 stands.
+///
+/// One window for both. It covers the hour right after a release or a write,
+/// where a compromise is freshest and the filters are most likely to be wrong
+/// about it, and no more: a longer wait re-analyzed every release of the last
+/// week and every file downloaded in the last two days, known-good or not.
+pub const KNOWN_GOOD_FRESH: Duration = Duration::from_hours(1);
 
 /// The PURL canonicalization scan's keys are in.
 ///
@@ -318,6 +330,67 @@ pub(crate) fn counts() -> BloomCounts {
         unscanned: STATS.unscanned.load(Ordering::Relaxed),
         unavailable: STATS.unavailable.load(Ordering::Relaxed),
     }
+}
+
+/// What an artifact met on its way to being analyzed or not.
+///
+/// Counted once per decision, process-wide, and logged once a scan by
+/// [`log_gates`]: the answer to "which filter fired, and how often". A file
+/// the operator named is not counted, because nothing gates it; nor is an
+/// archive member, because no filter is consulted for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// A walked file skipped on its SHA-256 vouch.
+    FileKnownGood,
+    /// A walked file vouched for but analyzed: written inside
+    /// [`KNOWN_GOOD_FRESH`].
+    FileFresh,
+    /// A walked file nothing vouches for.
+    FileUnvouched,
+    /// A release not fetched: older than the dependency age limit.
+    ReleaseAgedOut,
+    /// A release not fetched: its registry withdrew it.
+    ReleaseRemoved,
+    /// A release not fetched: vouched for by PURL.
+    ReleaseKnownGood,
+    /// A release kept for fetching: unvouched, or published inside
+    /// [`KNOWN_GOOD_FRESH`].
+    ReleaseKept,
+    /// A fetched payload skipped on its SHA-256 vouch.
+    PayloadKnownGood,
+    /// A fetched payload answered from the analysis cache.
+    PayloadCached,
+    /// A fetched payload analyzed.
+    PayloadAnalyzed,
+}
+
+static GATES: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
+
+/// Count one artifact at `gate`.
+pub(crate) fn met(gate: Gate) {
+    GATES[gate as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many artifacts have met `gate` in this process.
+pub(crate) fn met_count(gate: Gate) -> u32 {
+    GATES[gate as usize].load(Ordering::Relaxed)
+}
+
+/// Log the [`Gate`] tally. Cumulative, so once a scan.
+pub(crate) fn log_gates() {
+    tracing::info!(
+        files_known_good = met_count(Gate::FileKnownGood),
+        files_fresh = met_count(Gate::FileFresh),
+        files_unvouched = met_count(Gate::FileUnvouched),
+        releases_aged_out = met_count(Gate::ReleaseAgedOut),
+        releases_removed = met_count(Gate::ReleaseRemoved),
+        releases_known_good = met_count(Gate::ReleaseKnownGood),
+        releases_kept = met_count(Gate::ReleaseKept),
+        payloads_known_good = met_count(Gate::PayloadKnownGood),
+        payloads_cached = met_count(Gate::PayloadCached),
+        payloads_analyzed = met_count(Gate::PayloadAnalyzed),
+        "what each artifact met on its way to analysis"
+    );
 }
 
 /// The installed manifest — its `built` date, schema, and per-filter key

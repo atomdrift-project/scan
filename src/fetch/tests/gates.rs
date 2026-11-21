@@ -158,9 +158,11 @@ fn freshly_published_and_must_rescan_track_publish_age() {
         record.published_at = Some(at);
         record
     };
-    let fresh = published(now - 3_600); // 1h ago
-    // 30h ago: outside the 4h window, and the case that separates it from
-    // the local-file window in `engine`, which is still measured in days.
+    let fresh = published(now - 1_800); // half an hour ago
+    // The window is one hour, the same one a local file's vouch waits out,
+    // and it closes the second after.
+    assert!(freshly_published(&published(now - 3_600), now));
+    assert!(!freshly_published(&published(now - 3_601), now));
     let day_and_a_half = published(now - 30 * 3_600);
     let stale = published(now - 300_000); // ~3.5d ago
     assert!(freshly_published(&fresh, now));
@@ -738,6 +740,83 @@ fn imported_packages_meet_the_known_good_check_at_their_resolved_version() {
         assert_eq!(keep.len(), 2, "{path}");
         assert!(gated.iter().all(|gate| gate.skip.is_none()), "{path}");
     }
+}
+
+/// A vouch stands for any exact release more than an hour old, in every
+/// ecosystem: a PyPI release a day old is skipped on it under the default
+/// age ceiling, where before only one past fifteen days could be and the
+/// ceiling had already dropped those. Inside the hour, from another index, or
+/// of unknown age, the release is fetched.
+#[test]
+fn a_vouch_stands_for_any_release_more_than_an_hour_old() {
+    let now = 2_000_000_000;
+    let policy = FetchPolicy::parse_follow("references").unwrap();
+    assert_eq!(policy.max_dep_age_days, DEFAULT_MAX_DEP_AGE_DAYS);
+    let res = offline_resources();
+    for (path, file_type, ecosystem, source) in import_forms("vouchedyoung", "unvouchedyoung") {
+        let refs = discovered(path, file_type, source.as_bytes());
+        assert_eq!(refs.len(), 2, "{path}: {refs:?}");
+        let vouched = format!("{}@1.2.3", locator(&refs[0]));
+        let (_filters, bloom) = known_good(&[&vouched]);
+        let skips = |age: u64| {
+            remember_release(&refs[0], ecosystem, "1.2.3", now, age);
+            remember_release(&refs[1], ecosystem, "1.2.3", now, age);
+            let (keep, gated) = age_gate(refs.clone(), &policy, &res, now, Some(&bloom));
+            (keep.len(), gated[0].skip, gated[1].skip)
+        };
+        let met = || {
+            use crate::bloom_repo::{Gate, met_count};
+            (
+                met_count(Gate::ReleaseKnownGood),
+                met_count(Gate::ReleaseKept),
+            )
+        };
+        let before = met();
+        assert_eq!(
+            skips(DAY),
+            (1, Some(SkipReason::KnownGood), None),
+            "{path}: a day-old release is skipped on its vouch, and only on a vouch"
+        );
+        // Each decision is tallied for the end-of-scan log. Other tests count
+        // in the same process, so the tally only ever has at least these.
+        let after = met();
+        assert!(
+            after.0 > before.0 && after.1 > before.1,
+            "{path}: a vouched release and a kept one are both counted: {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            skips(3_601),
+            (1, Some(SkipReason::KnownGood), None),
+            "{path}: the window closes after an hour"
+        );
+        assert_eq!(skips(3_600), (2, None, None), "{path}: inside the hour");
+    }
+
+    // What the vouch does not cover: another index's release of the same
+    // name, and a PyPI release whose age nobody knows.
+    let young = Some(DAY);
+    let mut record = crate::test_registry("pypi", "fixture", "1.2.3");
+    let vouched = "pkg:pypi/vouchedyoung@1.2.3";
+    let (_filters, bloom) = known_good(&[vouched]);
+    let reason = |purl: &str, record: &Registry| {
+        let reference = Reference::new(
+            RefLocator::Purl(purl.into()),
+            RefKind::Dependency,
+            "manifest",
+            "vouchedyoung",
+        );
+        skip_reason(&reference, record, None, now, Some(&bloom))
+    };
+    record.published_at = young.map(|age| now - age);
+    assert!(
+        !immutable_coordinate(vouched, young),
+        "still open to new files"
+    );
+    assert_eq!(reason(vouched, &record), Some(SkipReason::KnownGood));
+    let elsewhere = "pkg:pypi/vouchedyoung@1.2.3?repository_url=https://pypi.example.test/simple";
+    assert_eq!(reason(elsewhere, &record), None);
+    record.published_at = None;
+    assert_eq!(reason(vouched, &record), None);
 }
 
 #[test]

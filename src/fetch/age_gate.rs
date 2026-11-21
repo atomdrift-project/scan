@@ -9,6 +9,7 @@ use fletch::fetch::RecordedSource;
 use fletch::{RefKind, RefLocator, Reference, Registry};
 use rayon::prelude::*;
 
+use crate::bloom_repo::Gate;
 use crate::provenance::RegistryProvenance;
 
 use super::policy::FetchPolicy;
@@ -73,22 +74,12 @@ pub(super) fn dep_pulled(reg: &Registry) -> bool {
         })
 }
 
-/// Number of seconds in the freshness window: a version published this recently
-/// is re-scanned rather than trusted on a known-good vouch.
-///
-/// A published registry version is immutable — npm, crates.io and PyPI all
-/// refuse to re-publish `name@version` with different bytes — so a vouch for a
-/// pinned coordinate cannot go stale the way a mutable one can, and age is
-/// otherwise no reason to distrust it. What this window buys is narrower: cover
-/// for the hours right after a release, where a compromise is freshest and
-/// least-vetted, and insurance against the bloom itself being wrong about a
-/// brand-new package. Hours, not days, is the right size for that.
-pub(super) const FRESH_WINDOW_SECS: u64 = 4 * 3_600;
-
-/// Whether this version was published inside [`FRESH_WINDOW_SECS`].
+/// Whether this version was published inside the known-good freshness window
+/// ([`KNOWN_GOOD_FRESH`](crate::bloom_repo::KNOWN_GOOD_FRESH)): a version this
+/// new is re-scanned rather than trusted on a known-good vouch.
 pub(super) fn freshly_published(reg: &Registry, now: u64) -> bool {
     reg.age_secs(now)
-        .is_some_and(|age| age <= FRESH_WINDOW_SECS)
+        .is_some_and(|age| age <= crate::bloom_repo::KNOWN_GOOD_FRESH.as_secs())
 }
 
 /// A known-good dependency is normally skipped; re-scan it anyway when its trust
@@ -412,6 +403,12 @@ pub(super) fn age_gate(
         if skip.is_none() {
             keep.push(r.clone());
         }
+        crate::bloom_repo::met(match skip {
+            Some(SkipReason::AgedOut) => Gate::ReleaseAgedOut,
+            Some(SkipReason::Removed) => Gate::ReleaseRemoved,
+            Some(SkipReason::KnownGood) => Gate::ReleaseKnownGood,
+            None => Gate::ReleaseKept,
+        });
         registries.push(Gated {
             reference: r,
             record,
@@ -506,6 +503,7 @@ fn settle_locally(
                 && bloom.is_some_and(|lk| lk.decide_purl(purl).may_skip()));
         if vouched {
             crate::bloom_repo::record(crate::bloom_repo::Decision::Skip, false);
+            crate::bloom_repo::met(Gate::ReleaseKnownGood);
             tracing::debug!(
                 package = %locator(&r),
                 "known-good coordinate (bloom); registry lookup and fetch both skipped"
@@ -518,6 +516,7 @@ fn settle_locally(
             _ => false,
         };
         if self_dated {
+            crate::bloom_repo::met(Gate::ReleaseAgedOut);
             tracing::debug!(
                 package = %locator(&r),
                 "go pseudo-version dates itself past the dependency age limit; registry lookup skipped"
@@ -538,19 +537,32 @@ fn settle_locally(
 /// [`settle_locally`]'s bloom probe: it costs nothing extra (the record is in
 /// hand) and catches the range-declared references the pre-lookup probe
 /// cannot, and with the record in hand [`must_rescan`] still catches a yanked
-/// version. Only for a coordinate whose bytes cannot change
-/// ([`immutable_coordinate`]): a vouch for a git tag or a young PyPI release
-/// says nothing about what it names now.
-fn skip_reason(
+/// version.
+///
+/// A vouch stands for an exact version from its ecosystem's default source
+/// once the release is known to be past the freshness window, whichever
+/// registry it is from. Before this, PyPI's vouch waited fifteen days for the
+/// release to close to new files, which the age ceiling made unreachable: the
+/// only PyPI releases still fetched were the ones too young to be vouched for.
+/// A release of unknown age is vouched for only where its bytes can never
+/// change ([`immutable_coordinate`]).
+pub(super) fn skip_reason(
     r: &Reference,
     record: &Registry,
     max_age: Option<u64>,
     now: u64,
     bloom: Option<&crate::bloom_repo::Lookup>,
 ) -> Option<SkipReason> {
+    let age = record.age_secs(now);
     let vouched = || {
         resolved_purl(r, record)
-            .filter(|purl| immutable_coordinate(purl, record.age_secs(now)))
+            .filter(|purl| {
+                immutable_coordinate(purl, age)
+                    || (age.is_some()
+                        && pins_exact_version(purl)
+                        && fletch::purl::Purl::parse(purl)
+                            .is_ok_and(|parsed| super::default_source(&parsed)))
+            })
             .is_some_and(|purl| bloom.is_some_and(|lk| lk.decide_purl(&purl).may_skip()))
     };
     if record.version_removed == Some(true) {

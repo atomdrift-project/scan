@@ -441,11 +441,17 @@ traits:
             target.to_str().unwrap(),
         ]);
         cmd.env("ATOMDRIFT_UPLINK", "0")
-            .env("RUST_LOG", "scan::engine::run=info");
+            .env("RUST_LOG", "scan::engine::run=info,scan::bloom_repo=info");
         let output = f.run(&mut cmd, 0, Duration::from_secs(60));
-        let replayed = String::from_utf8_lossy(&output.stderr)
-            .matches(REPLAYED)
-            .count();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Every scan says once what its artifacts met on the way to analysis.
+        assert_eq!(
+            stderr.matches("what each artifact met").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(stderr.contains("payloads_known_good="), "{stderr}");
+        let replayed = stderr.matches(REPLAYED).count();
         // Results arrive as they finish, so compare them in a fixed order.
         let mut results: Vec<String> = String::from_utf8(output.stdout)
             .unwrap()
