@@ -341,7 +341,8 @@ traits:
 
 /// Scanning one named file again, unchanged and the same way, prints what
 /// the first scan printed without analyzing it; a changed file or a changed
-/// option is scanned.
+/// option is scanned. A copy under another name is the same file: its scan
+/// is the first one's, shown under its own path.
 #[test]
 fn a_repeat_scan_of_an_unchanged_file_is_replayed() {
     const REPLAYED: &str = "scan replayed";
@@ -365,21 +366,25 @@ traits:
     .unwrap();
     let sample = f.root.path().join("sample.js");
     fs::write(&sample, "const marker = 'atomscan-replay-test';\n").unwrap();
-    let scan = |format: &str| {
+    let scan_as = |path: &Path, format: &str, cached: bool| {
         let mut cmd = f.command(&[
             "--analyze",
             "local",
             "-f",
             format,
             "path",
-            sample.to_str().unwrap(),
+            path.to_str().unwrap(),
         ]);
         cmd.env("ATOMDRIFT_UPLINK", "0")
             .env("RUST_LOG", "scan::engine::run=info");
+        if !cached {
+            cmd.env("SCAN_NO_ANALYSIS_CACHE", "1");
+        }
         let output = f.run(&mut cmd, 0, Duration::from_secs(60));
         let replayed = String::from_utf8_lossy(&output.stderr).contains(REPLAYED);
         (String::from_utf8(output.stdout).unwrap(), replayed)
     };
+    let scan = |format: &str| scan_as(&sample, format, true);
 
     let (first, replayed) = scan("json");
     assert!(!replayed, "nothing to replay yet");
@@ -392,6 +397,31 @@ traits:
     assert_ne!(tiny, first);
     assert_eq!(scan("tiny"), (tiny, true));
 
+    // A copy is not analyzed: it prints the first scan with its own path,
+    // which is what an analysis of the copy alone prints. The time of the
+    // analysis is the only thing that tells the two apart.
+    let copy = f.root.path().join("renamed copy.js");
+    fs::copy(&sample, &copy).unwrap();
+    let path_of = |path: &Path| serde_json::to_string(path.to_str().unwrap()).unwrap();
+    let undated = |decision: &str| {
+        let (decision, at) = decision.split_once("\"analyzed_at\"").expect(decision);
+        assert!(!at.contains("renamed") && !at.contains("sample"), "{at}");
+        decision.to_string()
+    };
+    let (copied, replayed) = scan_as(&copy, "json", true);
+    assert!(replayed, "the same bytes under another name");
+    assert_eq!(copied, first.replace(&path_of(&sample), &path_of(&copy)));
+    // In its `path` and with the finding that fired on it.
+    assert_eq!(copied.matches(&path_of(&copy)).count(), 2, "{copied}");
+    let (alone, replayed) = scan_as(&copy, "json", false);
+    assert!(!replayed, "nothing is kept without the cache");
+    assert_eq!(undated(&copied), undated(&alone));
+    // The text format is right for a copy as well, whether its output could
+    // be shown under another name or the copy was scanned for itself.
+    let (copied, _) = scan_as(&copy, "tiny", true);
+    assert_eq!(copied, scan_as(&copy, "tiny", false).0);
+    assert_eq!(scan_as(&copy, "tiny", true), (copied, true));
+
     // The path is the same and the bytes are not: nothing is replayed, and
     // the answer is the new file's.
     fs::write(&sample, "const marker = 'nothing of note';\n").unwrap();
@@ -401,8 +431,9 @@ traits:
 }
 
 /// Scanning a directory again replays every file that has not changed,
-/// each under its own path, and analyzes only the one that has. A file found
-/// in a walk and the same file named alone are different scans.
+/// each under its own path, and analyzes only bytes it has not scanned: a
+/// copy of a scanned file is that file's scan, shown under its own path. A
+/// file found in a walk and the same file named alone are different scans.
 #[test]
 fn a_repeat_scan_of_a_directory_replays_each_unchanged_file() {
     const REPLAYED: &str = "scan replayed";
@@ -468,17 +499,42 @@ traits:
             .count()
     };
 
+    // Each result names its own file, whichever scan it came from.
+    let named = |results: &[String], name: &str| {
+        let path = serde_json::to_string(dir.join(name).to_str().unwrap()).unwrap();
+        results
+            .iter()
+            .filter(|line| line.contains(&format!("\"path\":{path}")))
+            .count()
+    };
+    let each_named_once = |results: &[String]| {
+        ["first.js", "nested/copy.js", "plain.js"]
+            .iter()
+            .all(|name| named(results, name) == 1)
+    };
+
+    // The copy is not analyzed: it is the first file's scan under its path.
     let (first, replayed) = scan(&dir);
-    assert_eq!(replayed, 0, "nothing to replay yet");
+    assert_eq!(replayed, 1, "the second of the two files of the same bytes");
     assert_eq!((first.len(), marked(&first)), (3, 2), "{first:?}");
+    assert!(each_named_once(&first), "{first:?}");
     assert_eq!(scan(&dir), (first.clone(), 3));
 
-    // One file changes: it alone is analyzed, and the answer is its own.
+    // One file changes into bytes already scanned: nothing is analyzed, and
+    // its answer is the one those bytes have, under its own path.
     fs::write(dir.join("plain.js"), MARKED).unwrap();
     let (changed, replayed) = scan(&dir);
-    assert_eq!(replayed, 2, "the two files left alone");
+    assert_eq!(replayed, 3, "bytes scanned before");
     assert_eq!((changed.len(), marked(&changed)), (3, 3), "{changed:?}");
+    assert!(each_named_once(&changed), "{changed:?}");
     assert_eq!(scan(&dir), (changed, 3));
+
+    // And into bytes never scanned: it alone is analyzed.
+    fs::write(dir.join("plain.js"), "const marker = 'something new';\n").unwrap();
+    let (fresh, replayed) = scan(&dir);
+    assert_eq!(replayed, 2, "the two files left alone");
+    assert_eq!((fresh.len(), marked(&fresh)), (3, 2), "{fresh:?}");
+    assert!(each_named_once(&fresh), "{fresh:?}");
 
     // Named alone, a file the walk scanned is scanned again: nothing a walk
     // kept answers for it.

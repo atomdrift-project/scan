@@ -307,6 +307,27 @@ fn scan_partitioned(
     alone: bool,
 ) -> Result<()> {
     let kept = replays_apply(session.config, registry_map);
+    let sidecar_of =
+        |path: &Path, named: bool| !named && session.config.sidecars() && is_attached_sidecar(path);
+    let role_of = |named: bool| match (named, alone) {
+        (false, _) => Role::Found,
+        (true, true) => Role::Alone,
+        (true, false) => Role::Named,
+    };
+    // Whether `path`, whose bytes are `sha`, was replayed from a scan of the
+    // same bytes that finished since this one began: a copy of a file is
+    // that file's scan, shown under its own name.
+    let replayed = |path: &Path, sha: &str, named: bool| {
+        if !kept || sidecar_of(path, named) {
+            return false;
+        }
+        let label = path.display().to_string();
+        let Some(replay) = Replay::find(sha, &label, role_of(named), session.config) else {
+            return false;
+        };
+        session.replay(path, &replay);
+        true
+    };
     let record_now = |path: &Path,
                       analyzed: Result<AnalysisReport>,
                       named: bool,
@@ -321,22 +342,20 @@ fn scan_partitioned(
             .as_ref()
             .ok()
             .map(|report| report.target.sha256.as_str());
+        if sha.is_some_and(|sha| replayed(path, sha, named)) {
+            return;
+        }
         let origin = Origin {
             path,
             registry: registry_map.zip(sha).and_then(|(map, sha)| map.get(sha)),
             fetch: None,
         };
-        let sidecar = !named && session.config.sidecars() && is_attached_sidecar(path);
-        let role = match (named, alone) {
-            (false, _) => Role::Found,
-            (true, true) => Role::Alone,
-            (true, false) => Role::Named,
-        };
+        let sidecar = sidecar_of(path, named);
         let target = Target {
             sidecar,
             // What a capture record prints depends on the file it lies
             // beside, which is no part of a replay's key.
-            kept: (kept && !sidecar).then_some(role),
+            kept: (kept && !sidecar).then_some(role_of(named)),
             fetched: Some(fetched),
             ..Target::new(origin)
         };
@@ -431,6 +450,11 @@ fn scan_partitioned(
                 }
             })?;
         }
+        // A copy of a file whose scan is kept by now is not read again.
+        let again: Vec<PathBuf> = again
+            .into_iter()
+            .filter(|path| !shas.get(path).is_some_and(|sha| replayed(path, sha, false)))
+            .collect();
         // What the second follows is kept once every file of its release
         // that took a turn has passed it on, and then it takes none: it is
         // left for the turn only while one of them still has it.
@@ -1008,11 +1032,8 @@ impl<'a> Session<'a> {
             let label = target.origin.path.display().to_string();
             match written.map(String::from_utf8).transpose() {
                 Ok(output) => {
-                    Replay::new(&result, notes, output, self.config).store(
-                        &label,
-                        role,
-                        self.config,
-                    );
+                    Replay::new(&result, &label, notes, output, self.config)
+                        .store(role, self.config);
                 }
                 Err(_) => tracing::debug!("scan output is not UTF-8; not kept for replay"),
             }
@@ -1754,7 +1775,7 @@ mod tests {
         };
         let kept = || {
             hashed(Some(
-                r#"{"at":0,"expires":false,"class":0,"severe":false,
+                r#"{"at":0,"expires":false,"label":"a.bin","class":0,"severe":false,
                     "dependency_gaps":0,"flagged_candidates":0,"notes":"","output":null}"#,
             ))
         };
