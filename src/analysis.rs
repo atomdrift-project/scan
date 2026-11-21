@@ -473,7 +473,7 @@ impl WhaleSlot {
             .map_err(|_full| WhaleSlotBusy { slots })
     }
 
-    #[cfg(test)]
+    /// Slots in use right now, for a host's stats endpoint.
     fn in_use() -> usize {
         WHALE_SLOTS_IN_USE.load(Ordering::Acquire)
     }
@@ -511,6 +511,13 @@ struct WhaleLane {
     pool: rayon::ThreadPool,
     /// Held for the pool's life when the payload is a big whale.
     _slot: Option<WhaleSlot>,
+}
+
+/// Big-whale slots in use and available, for a host's stats endpoint: a
+/// router reads them to keep a big payload off a host that would refuse it.
+#[must_use]
+pub fn whale_slot_usage() -> (usize, usize) {
+    (WhaleSlot::in_use(), whale_config().slots)
 }
 
 /// The lane a payload of `bytes` analyzes on: a private pool sized to it —
