@@ -2,12 +2,17 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 3.0.0 (2026-11-19)
+## 3.0.0-rc.1 (2026-11-22)
 
 ### Features
 
 - `atomscan feed` lists and switches rule feeds: oss-delayed, supporter, or zero-day.
-- breaking: --uplink and ATOMDRIFT_UPLINK are gone, so use `--feed` or ATOMDRIFT_FEED instead.
+- breaking: the rule feed moved from --uplink to `--feed`, and from ATOMDRIFT_UPLINK to ATOMDRIFT_FEED.
+- breaking: --analyze is now `--uplink` (true, false or always), and hash lookups no longer need an account.
+- breaking: the /_/health, /_/info, /_/stats, /_/reload and /_/update server routes are gone.
+- `--offline` makes no network connection at all, whatever other flags and environment variables say.
+- Rescanning the same bytes replays the earlier answer instead of analyzing again, even under another file name.
+- Experimental `--follow-depth` sets how many levels of references to follow; scans default to one, serve to two.
 - A few reviewed traits now convict hostile on their own, without waiting for the model to agree.
 - VS Code extensions whose hard dependencies or VSIX downloads vanished from the gallery now count as evidence.
 - Uplink verdicts get a full terminal card marked ⚡, so nobody mistakes them for local analysis.
@@ -28,6 +33,9 @@ All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions foll
 - The model now loads alongside the rules, cutting roughly 60 ms from every one-shot scan.
 - Scans of a few named files build regex indexes lazily, saving about half a second of CPU.
 - Specialist models share the general model's feature tables instead of each building a private copy.
+- Import scans stop at the first hop, and unchanged archive members reuse the model's earlier scores.
+- Dependencies are graded alongside the root file instead of after it.
+- Known-good files and releases are re-analyzed only within an hour of being written or published, not for days.
 
 ## 3.0.0-beta.2 (2026-11-13)
 
