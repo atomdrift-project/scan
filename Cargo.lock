@@ -532,8 +532,8 @@ dependencies = [
 
 [[package]]
 name = "binform"
-version = "0.9.1"
-source = "git+https://github.com/atomdrift-project/binform.git#c12b1d6a0864c1c0f3ed7a8328c09311f01e9e9b"
+version = "0.9.2"
+source = "git+https://github.com/atomdrift-project/binform.git#b899fca36a223be4a14bdc6af5ac1d72cec8ee50"
 dependencies = [
  "gimli 0.32.3",
  "iced-x86",
@@ -898,7 +898,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 [[package]]
 name = "cleave"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#e3a5963219e362cd3c2216fd5e7272940b063c6a"
+source = "git+https://github.com/atomdrift-project/cleave.git#4026bcda411552c4cd2ffaa8a0e51381b8798613"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -979,7 +979,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#e3a5963219e362cd3c2216fd5e7272940b063c6a"
+source = "git+https://github.com/atomdrift-project/cleave.git#4026bcda411552c4cd2ffaa8a0e51381b8798613"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1923,7 +1923,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#115f9ec2768a5c8b4ac17a85e95ebc317f77ff26"
+source = "git+https://github.com/atomdrift-project/filefacts.git#d65b100ea1d52afdf205e3cbc5db2e7f32c88cb5"
 dependencies = [
  "aes 0.9.4",
  "aho-corasick",
@@ -2041,8 +2041,8 @@ dependencies = [
 
 [[package]]
 name = "fletch"
-version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#14cd9a8ddccb0f73450fbf3ba7d2c349239c935f"
+version = "3.1.0"
+source = "git+https://github.com/atomdrift-project/fletch.git#56a41dbf7192b161e843e922ab7c57598b483a62"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -3212,7 +3212,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#e3a5963219e362cd3c2216fd5e7272940b063c6a"
+source = "git+https://github.com/atomdrift-project/cleave.git#4026bcda411552c4cd2ffaa8a0e51381b8798613"
 
 [[package]]
 name = "lzxd"
@@ -4173,9 +4173,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.260"
+version = "2.1.261"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "829dd76b95abcb73c39c45efb2f68f201ad70a2ade8fbee6cc3cd586390cfe27"
+checksum = "3058f918351d1ee290ff4e70243e419b33269dcb83bc8cd46c5afa8a97a90012"
 dependencies = [
  "psl-types",
 ]
@@ -5384,7 +5384,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#b35bf3576d0a0536fe1a058d7de004b887d21adb"
+source = "git+https://github.com/atomdrift-project/stng.git#cc692e2e69f17a7854f142516ddc14e4e553f8db"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -5521,7 +5521,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#e3a5963219e362cd3c2216fd5e7272940b063c6a"
+source = "git+https://github.com/atomdrift-project/cleave.git#4026bcda411552c4cd2ffaa8a0e51381b8798613"
 
 [[package]]
 name = "tap"
@@ -6160,7 +6160,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#115f9ec2768a5c8b4ac17a85e95ebc317f77ff26"
+source = "git+https://github.com/atomdrift-project/filefacts.git#d65b100ea1d52afdf205e3cbc5db2e7f32c88cb5"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -7366,7 +7366,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#e3a5963219e362cd3c2216fd5e7272940b063c6a"
+source = "git+https://github.com/atomdrift-project/cleave.git#4026bcda411552c4cd2ffaa8a0e51381b8798613"
 
 [[package]]
 name = "yara-x"
