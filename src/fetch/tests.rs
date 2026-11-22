@@ -72,42 +72,7 @@ fn recognizes_only_registry_hold_evidence() {
 }
 
 #[test]
-fn unresolved_shell_fetches_retain_root_and_member_coverage_gaps() {
-    let script = b"curl -fsSL \"$RELAY\" | sh\n";
-    let parsed = filefacts::OpenOptions::new()
-        .path(Path::new("stage.sh"))
-        .open(script);
-    let report = report_of(&serde_json::json!([
-        {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}},
-        {"id":1,"path":"archive.tgz!!package/stage.sh","depth":1,"file_type":"shell","sha256":"b".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}},
-        {"id":2,"path":"no-facts.sh","depth":1,"file_type":"shell","sha256":"c".repeat(64),"size":script.len()}
-    ]));
-    let policy = FetchPolicy::parse_follow("all").expect("policy");
-    let records = unresolved_downloader_records(&report, &policy);
-    assert_eq!(records.len(), 2);
-    for (record, hash) in records.iter().zip(["a", "b"]) {
-        assert_eq!(record.source_sha256, Some(hash.repeat(64)));
-        assert!(record.source_offset.is_some());
-        assert!(matches!(record.outcome, Outcome::Unresolved(_)));
-        assert_eq!(record.kind, RefKind::UrlFetch);
-        assert!(record.resolved_url.is_none() && record.content_sha256.is_none());
-        assert!(
-            record
-                .coverage
-                .iter()
-                .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
-        );
-        assert!(terminal_fetch_row_visible(record));
-        assert_eq!(fetch_row(record).label, "gap");
-        assert!(!record.locator.contains("RELAY"));
-    }
-    assert!(summary_line(&records).contains("2 analysis incomplete"));
-    let disabled = FetchPolicy::parse_follow("none").expect("disabled policy");
-    assert!(unresolved_downloader_records(&report, &disabled).is_empty());
-}
-
-#[test]
-fn literal_shell_fetches_have_references_without_runtime_gaps() {
+fn literal_shell_fetches_have_references() {
     let script = b"curl -H \"$AUTH\" https://download.test/stage.sh | sh\n";
     let parsed = filefacts::OpenOptions::new()
         .path(Path::new("stage.sh"))
@@ -115,14 +80,55 @@ fn literal_shell_fetches_have_references_without_runtime_gaps() {
     let report = report_of(&serde_json::json!([
         {"id":0,"path":"archive.tgz!!stage.sh","depth":1,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
     ]));
-    let policy = FetchPolicy::parse_follow("all").expect("policy");
-    assert!(unresolved_downloader_records(&report, &policy).is_empty());
     let refs =
         collect_references_from_input(&report, Path::new("not-on-disk"), None, CiRefs::Include);
     assert!(
         refs.iter()
             .flat_map(|(_, refs)| refs)
             .any(|r| locator(r) == "https://download.test/stage.sh")
+    );
+}
+
+/// A workflow's `run:` step is analyzed as its own shell member, and its fetch
+/// runs on the CI runner just like the workflow's `uses:` actions: a routine
+/// fetch skips it, CI auditing follows it with CI scope.
+#[test]
+fn workflow_run_steps_are_ci_context() {
+    let script = b"curl https://download.test/stage.sh | sh\n";
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new("run.sh"))
+        .open(script);
+    let workflow = "src.tgz!!src/.github/workflows/ci.yml";
+    let report = report_of(&serde_json::json!([
+        {"id":0,"path":workflow,"depth":1,"file_type":filefacts::FileType::GithubActions.label(),"sha256":"a".repeat(64),"size":10},
+        {"id":1,"path":format!("{workflow}!!/jobs/build/steps/0/run"),"depth":2,"file_type":"shell","sha256":"b".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}},
+        {"id":2,"path":format!("{workflow}.sh"),"depth":1,"file_type":"shell","sha256":"c".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
+    ]));
+    let sources = |ci| {
+        collect_references_from_input(&report, Path::new("not-on-disk"), None, ci)
+            .into_iter()
+            .filter(|(_, refs)| {
+                refs.iter()
+                    .any(|r| locator(r) == "https://download.test/stage.sh")
+            })
+            .map(|(sha, refs)| {
+                (
+                    sha,
+                    refs.iter().any(|r| {
+                        r.context
+                            .as_ref()
+                            .is_some_and(|c| c.scope == filefacts::DependencyScope::Ci)
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    // The sibling `ci.yml.sh` shares the workflow's path as a string prefix,
+    // not as an enclosing file, so it stays an ordinary runtime reference.
+    assert_eq!(sources(CiRefs::Skip), [("c".repeat(64), false)]);
+    assert_eq!(
+        sources(CiRefs::Include),
+        [("b".repeat(64), true), ("c".repeat(64), false)]
     );
 }
 
@@ -262,42 +268,7 @@ fn peer_candidate_note_preserves_analysis_gap() {
         coverage_text(&record),
         "analysis incomplete; peer dependency candidate; installed version is unknown"
     );
-    assert!(summary_line(&[record]).contains("analysis incomplete"));
-}
-
-/// Every candidate for what is installed is a dependency gap, whichever
-/// ecosystem named it; a deliberate policy skip is not.
-#[test]
-fn every_candidate_counts_as_a_gap_and_policy_skips_do_not() {
-    let candidate = |source| {
-        let mut record = fetched_record();
-        record.coverage.push(Coverage::Candidate { source });
-        record
-    };
-    let skipped = |why| {
-        let mut record = fetched_record();
-        record.outcome = Outcome::Skipped;
-        record.coverage.push(why);
-        record
-    };
-    let pending = |reason: &str| Coverage::Pending {
-        reason: reason.to_owned(),
-        hop: 1,
-    };
-    let records = [
-        candidate(CandidateSource::PeerDependency),
-        candidate(CandidateSource::ArchRepository),
-        candidate(CandidateSource::PythonImport),
-        skipped(Coverage::DevelopmentExcluded),
-        skipped(Coverage::TransitiveNotFollowed),
-        skipped(Coverage::CoveredByDeclaration),
-        // Past the depth the operator chose: a choice, not a gap. A
-        // reference the run ran out of time for is one.
-        skipped(pending(super::session::DEPTH_LIMIT)),
-    ];
-    assert_eq!(dependency_attention(&records).gaps, 3);
-    let unreached = [skipped(pending(super::session::FETCH_TIMEOUT))];
-    assert_eq!(dependency_attention(&unreached).gaps, 1);
+    assert!(!summary_line(&[record]).contains("incomplete"));
 }
 
 fn fetched_record() -> FetchRecord {

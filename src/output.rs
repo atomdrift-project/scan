@@ -527,6 +527,14 @@ pub(crate) fn terminal_interpretation(
     })
 }
 
+/// Uplink's reason for its verdict, in the LLM interpretation's slot when no
+/// interpretation was asked for: `⚡ <reason>`, the bolt marking it as
+/// Uplink's word rather than this run's.
+pub(crate) fn terminal_uplink_reason(reason: &str) -> String {
+    let lead = rail(1, "\u{26a1}", " \u{26a1} ");
+    format!("{lead}{}", fg_bold(palette().path_name, &tty_text(reason)))
+}
+
 /// One concise identity claim beneath the artifact name. The ID-card glyph
 /// gives this optional line the same visual gutter as artifact and hash lines.
 pub(crate) fn terminal_identity_line(identity: &str) -> Option<String> {
@@ -1074,6 +1082,12 @@ impl BloomMark {
         !matches!(self, Self::KnownGood)
     }
 
+    /// Whether this mark convicts: our own corpus holds the bytes as bad
+    /// (known-bad, or conflicted, which answers as known-bad).
+    pub(crate) const fn is_known_bad(self) -> bool {
+        matches!(self, Self::KnownBad | Self::Conflicted)
+    }
+
     /// The glyph identifying this status: ✓ known-good, 🚩 known-bad,
     /// 📡 sighted by outside intelligence, 🏴 conflicted.
     const fn glyph(self) -> &'static str {
@@ -1157,6 +1171,20 @@ pub(crate) fn print_bloom_verdict(
     )
 }
 
+/// One artifact Atomdrift Uplink judged, as it is written.
+#[derive(Clone, Copy)]
+pub(crate) struct Remote<'a> {
+    /// The name it is shown under.
+    pub(crate) label: &'a str,
+    pub(crate) sha256: &'a str,
+    pub(crate) purl: Option<&'a str>,
+    pub(crate) verdict: &'a crate::corpus_precheck::Verdict,
+    /// The verdict graded at this run's level.
+    pub(crate) class: Classification,
+    /// The file's bloom mark, which a known-bad file keeps.
+    pub(crate) bloom_mark: Option<BloomMark>,
+}
+
 /// Write one artifact Atomdrift Uplink judged, in place of a local
 /// result.
 ///
@@ -1170,13 +1198,17 @@ pub(crate) fn print_bloom_verdict(
 /// Writing to `out` failed.
 pub(crate) fn write_remote_verdict(
     out: &mut impl std::io::Write,
-    label: &str,
-    sha256: &str,
-    purl: Option<&str>,
-    verdict: &crate::corpus_precheck::Verdict,
-    class: Classification,
+    remote: Remote<'_>,
     format: OutputFormat,
 ) -> std::io::Result<()> {
+    let Remote {
+        label,
+        sha256,
+        purl,
+        verdict,
+        class,
+        bloom_mark,
+    } = remote;
     // Both JSON formats: a file with no analysis has no full result, only
     // its decision.
     if format.is_json() {
@@ -1186,7 +1218,7 @@ pub(crate) fn write_remote_verdict(
         return out.write_all(b"\n");
     }
     if format == OutputFormat::Terminal {
-        return out.write_all(remote_card(label, sha256, purl, verdict, class).as_bytes());
+        return out.write_all(remote_card(remote).as_bytes());
     }
     let name = class.to_string();
     let p = palette();
@@ -1206,12 +1238,15 @@ pub(crate) fn write_remote_verdict(
         .first()
         .map(|f| format!(" \u{b7} {}", tty_text(&f.id)))
         .unwrap_or_default();
+    let mark = bloom_mark
+        .map(|mark| format!(" \u{b7} {}", mark.tiny_str()))
+        .unwrap_or_default();
     writeln!(
         out,
         " {}  {} {}  {}",
         fg(color, icon),
         fg(color, &name),
-        fg(p.very_dim, &format!("Uplink{when}{why}")),
+        fg(p.very_dim, &format!("Uplink{when}{why}{mark}")),
         fg(p.header_path, &tty_text(label)),
     )
 }
@@ -1223,13 +1258,15 @@ pub(crate) fn write_remote_verdict(
 /// size is the file's on disk (absent for a coordinate), and findings show
 /// their trait ids. The hash line carries ⚡ where a local result carries
 /// 🧬 or 🚩, with the analysis date, so the verdict's origin is never in doubt.
-fn remote_card(
-    label: &str,
-    sha256: &str,
-    purl: Option<&str>,
-    verdict: &crate::corpus_precheck::Verdict,
-    class: Classification,
-) -> String {
+fn remote_card(remote: Remote<'_>) -> String {
+    let Remote {
+        label,
+        sha256,
+        purl,
+        verdict,
+        class,
+        bloom_mark,
+    } = remote;
     let path = std::path::Path::new(label);
     let declared = filefacts::fileid::declared_file_type(path);
     let file_type = if declared == filefacts::FileType::Unknown {
@@ -1272,9 +1309,13 @@ fn remote_card(
         .as_deref()
         .filter(|r| !r.trim().is_empty())
         .map(|r| reason_line(&tty_text(r)));
-    for row in [identity, uplink_hash_line(sha256, verdict), reason]
-        .into_iter()
-        .flatten()
+    for row in [
+        identity,
+        uplink_hash_line(sha256, verdict, bloom_mark),
+        reason,
+    ]
+    .into_iter()
+    .flatten()
     {
         out.push_str(&row);
         out.push('\n');
@@ -1305,7 +1346,11 @@ fn remote_card(
 /// An Uplink verdict's hash line: ⚡, the SHA-256, then `Uplink · analyzed
 /// <day>`. Plain mode keeps the marker as text after the hash, as a bloom
 /// mark does. `None` when the hash is absent.
-fn uplink_hash_line(sha256: &str, verdict: &crate::corpus_precheck::Verdict) -> Option<String> {
+fn uplink_hash_line(
+    sha256: &str,
+    verdict: &crate::corpus_precheck::Verdict,
+    bloom_mark: Option<BloomMark>,
+) -> Option<String> {
     if sha256.is_empty() {
         return None;
     }
@@ -1316,12 +1361,13 @@ fn uplink_hash_line(sha256: &str, verdict: &crate::corpus_precheck::Verdict) -> 
         .map(|day| format!(" \u{b7} analyzed {}", tty_text(day)))
         .unwrap_or_default();
     let sha256 = tty_text(sha256);
+    let mark = bloom_mark.map(BloomMark::marker).unwrap_or_default();
     if !color_enabled() {
-        return Some(format!("{sha256}  \u{26a1} uplink{when}"));
+        return Some(format!("{sha256}  \u{26a1} uplink{when}{mark}"));
     }
     let p = palette();
     Some(format!(
-        "{}{}  {}",
+        "{}{}  {}{mark}",
         terminal_marker_prefix(1, "\u{26a1}"), // ⚡
         fg(p.very_dim, &sha256),
         fg(p.dim, &format!("Uplink{when}")),
@@ -1408,17 +1454,35 @@ pub(crate) fn summary_status_line(summary: &ScanSummary) -> String {
         );
     }
 
+    // A clean verdict leads the line whatever else the scan has to report. A
+    // flagged dependency candidate swaps the ✓ for a warning mark but still
+    // states the grade.
     if summary.hostile == 0
         && summary.suspicious == 0
         && summary.errors == 0
-        && summary.dependency_attention.gaps == 0
-        && summary.dependency_attention.flagged_candidates == 0
         && summary.static_flags == 0
     {
+        let flagged = summary.dependency_attention.flagged_candidates;
+        let verdict = match summary.total_files {
+            1 => "1 file scanned, graded benign".to_string(),
+            n => format!("{n} files scanned, all graded benign"),
+        };
+        if flagged == 0 {
+            return format!(
+                "{}  {verdict}  {}",
+                ink.fg(p.benign, "\u{2713}"),
+                ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)),
+            );
+        }
+        let candidates = format!(
+            "{flagged} flagged candidate{}",
+            if flagged == 1 { "" } else { "s" }
+        );
         return format!(
-            "{}  {} files scanned, all graded benign  {}",
-            ink.fg(p.benign, "\u{2713}"),
-            summary.total_files,
+            "{}  {verdict}  {}  {}  {}",
+            ink.fg(p.warning, "!"),
+            ink.fg(p.dot_sep, "\u{00b7}"),
+            ink.fg(p.warning, &candidates),
             ink.fg(p.very_dim, &format_elapsed(summary.duration_ms)),
         );
     }
@@ -1444,11 +1508,7 @@ fn summary_counts(summary: &ScanSummary, p: &Palette, ink: Ink) -> Vec<(String, 
         benign,
         errors,
         static_flags,
-        dependency_attention:
-            crate::engine::DependencyAttention {
-                gaps,
-                flagged_candidates,
-            },
+        dependency_attention: crate::engine::DependencyAttention { flagged_candidates },
         ..
     } = *summary;
     let files = format!("{total_files} file{}", plural(total_files));
@@ -1457,11 +1517,6 @@ fn summary_counts(summary: &ScanSummary, p: &Palette, ink: Ink) -> Vec<(String, 
         (hostile, p.hostile, format!("{hostile} hostile")),
         (suspicious, p.suspicious, format!("{suspicious} suspicious")),
         (errors, p.header_path, format!("{errors} errors")),
-        (
-            gaps,
-            p.warning,
-            format!("{gaps} dependency gap{}", plural(gaps)),
-        ),
         (
             static_flags,
             p.warning,

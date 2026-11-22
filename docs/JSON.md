@@ -90,14 +90,18 @@ specified in `JSON_PLAN.md` at the repository root; in short:
 - **File lines:** the scanned artifact first, then up to 256 of its members,
   the gravest first, and the containers on the way to them. Each carries
   `sha256`, `size`, `type`, its `verdict`, one object per juror (`ml`,
-  `floor`, and on the artifact `llm`), `ident` when the file claims an
+  `floor`, and on the artifact `llm`, and `uplink` when Uplink held a
+  verdict that did not replace the local one: `class`, `fires_at`,
+  `reason`, `analyzed_at`, `engine`), `ident` when the file claims an
   identity, `contents` for a container, `refs` on the artifact, and `report`,
   the sha256 of its report line.
 - **Report lines:** each file's cleave findings and facts, with nothing that
   says where the file sat; a source in another file is cited by its sha256.
 
 A file with no analysis has no full result: a bloom, Uplink or failed file
-gets its decision line instead, as in `--format json`. A reader tells the two
+gets its decision line instead, as in `--format json`. So does a file whose
+Uplink verdict replaced its analysis. The `uplink` juror is never
+uploaded: hopper is Uplink's source. A reader tells the two
 apart by the header's `"v":8` against a decision's `decision` key.
 
 `--all-members` (hidden, for coverage tools) gives every member cleave listed

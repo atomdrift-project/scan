@@ -456,21 +456,18 @@ impl ScanConfig {
     }
 }
 
-/// Dependency coverage warnings, independent of the model's file grades.
+/// Dependency warnings, independent of the model's file grades. Coverage
+/// gaps — references that could not be fetched or analyzed — are not counted:
+/// they stay on the fetch records for machine output, but say nothing about
+/// whether the file is safe, so the terminal does not report them.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct DependencyAttention {
-    /// Dependency edges whose analysis or installed provider remains
-    /// unresolved: a coverage fact that is a gap (see
-    /// [`fletch::fetch::Coverage::is_gap`]), or a fetch that failed, ran out
-    /// of budget, or could not be verified or resolved.
-    pub gaps: u32,
     /// Unverified provider candidates with suspicious or hostile static findings.
     pub flagged_candidates: u32,
 }
 
 impl DependencyAttention {
     pub(crate) fn add(&mut self, other: Self) {
-        self.gaps = self.gaps.saturating_add(other.gaps);
         self.flagged_candidates = self
             .flagged_candidates
             .saturating_add(other.flagged_candidates);

@@ -27,7 +27,7 @@ use super::budget::{
 };
 use super::discover::{
     CiRefs, LocalNpmPackages, TRAIT_SECURITY_HOLD_RECORD, collect_references_from_input,
-    image_carrier_urls, inherit_dependency_context, is_ci_context, npm_import_name, skipped_record,
+    image_carrier_urls, inherit_dependency_context, npm_import_name, skipped_record,
 };
 use super::imports::{
     annotate_python_import_candidate, attribute_undeclared_npm_imports, candidate_static_issues,
@@ -42,8 +42,7 @@ use super::merge::{
 use super::policy::{FetchPolicy, Platform, host_platform, off_host_platform};
 use super::registry::{mark_peer_candidate, registry_node};
 use super::render::{
-    Reporter, artifact_absent, delivered_bytes, dep_display_name, gone_status, landed_state,
-    manifest_relpath,
+    Reporter, artifact_absent, delivered_bytes, dep_display_name, gone_status, manifest_relpath,
 };
 use super::urls::{
     AsClient, MAX_REDIRECT_HOPS, client_user_agent, has_unexpanded_url_placeholder,
@@ -96,93 +95,6 @@ pub(super) struct Landed {
     pub(super) reference: Reference,
     pub(super) record: FetchRecord,
     pub(super) standing: Standing,
-}
-
-/// Analysis gaps are per observed call, not guessed URL references. The same
-/// retained facts are available for roots and extracted/fetched members.
-pub(super) fn unresolved_downloader_records(
-    report: &AnalysisReport,
-    policy: &FetchPolicy,
-) -> Vec<FetchRecord> {
-    if !policy.wants(RefKind::UrlFetch) {
-        return Vec::new();
-    }
-    let mut records = Vec::new();
-    for file in &report.files {
-        if !policy.ci && is_ci_context(file) {
-            continue;
-        }
-        let Some(view) = &file.filefacts else {
-            continue;
-        };
-        let file_type = report_file_type(&file.file_type);
-        let values = filefacts::Values::from(view.values.clone());
-        for call in find::references_from_facts(file_type, &values, &view.symbols, &[]).unresolved {
-            let location = call
-                .offset
-                .map_or_else(String::new, |offset| format!(" at byte {offset}"));
-            let mut record = FetchRecord::terminal(
-                format!(
-                    "{} (unresolved downloader arguments){location} in {}",
-                    call.command, file.sha256
-                ),
-                Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
-            );
-            record.source_sha256 = Some(file.sha256.clone());
-            record.source_offset = call.offset;
-            record.kind = RefKind::UrlFetch;
-            record.coverage.push(Coverage::Unavailable {
-                reason: Some(
-                    "downloader arguments require runtime evaluation; no URL inferred".into(),
-                ),
-            });
-            records.push(record);
-        }
-    }
-    records
-}
-
-/// POM declarations that need an effective Maven model are coverage gaps,
-/// never silently substituted with a latest version or Maven Central artifact.
-pub(super) fn unresolved_maven_records(
-    report: &AnalysisReport,
-    policy: &FetchPolicy,
-) -> Vec<FetchRecord> {
-    if !policy.wants(RefKind::Dependency) {
-        return Vec::new();
-    }
-    let mut records = Vec::new();
-    for file in &report.files {
-        let Some(view) = &file.filefacts else {
-            continue;
-        };
-        let Some(gaps) = view
-            .values
-            .pointer("/jar/pom/dependency_gaps")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for gap in gaps {
-            let (Some(member), Some(reason)) = (
-                gap.get("member").and_then(serde_json::Value::as_str),
-                gap.get("reason").and_then(serde_json::Value::as_str),
-            ) else {
-                continue;
-            };
-            let mut record = FetchRecord::terminal(
-                format!("Maven POM {member} in {}: {reason}", file.sha256),
-                Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
-            );
-            record.source_sha256 = Some(file.sha256.clone());
-            record.kind = RefKind::Dependency;
-            record.coverage.push(Coverage::Unavailable {
-                reason: Some(format!("Maven POM dependency: {reason}")),
-            });
-            records.push(record);
-        }
-    }
-    records
 }
 
 /// How many registry records were materialized for one declaring file, and
@@ -270,9 +182,6 @@ pub(super) struct FetchSession {
     registry_outcomes: BTreeMap<String, RegistryTally>,
     /// Locally supplied copies: source sha → locator → path.
     local_coverage: HashMap<String, HashMap<String, String>>,
-    /// Unresolved downloader calls and Maven gaps already recorded, by
-    /// declaring sha, offset and locator, so a file seen twice records once.
-    unresolved_fetch_calls: HashSet<(String, Option<u64>, String)>,
 }
 
 /// Why a reference past `--follow-depth` is left pending. The operator chose
@@ -284,6 +193,14 @@ pub(super) const DEPTH_LIMIT: &str = "depth limit";
 /// its time ran out or it was cancelled. Unlike the depth limit, that is an
 /// accident of this run, and the next may get further.
 pub(super) const FETCH_TIMEOUT: &str = "fetch timeout";
+
+/// [`FetchSession::fetch_skip_reason`] for a URL with no usable host.
+const INVALID_URL: &str = "invalid or local URL host";
+/// [`FetchSession::fetch_skip_reason`] for a URL still holding a `${VAR}`.
+const URL_TEMPLATE: &str = "unexpanded URL template";
+/// [`FetchSession::fetch_skip_reason`] for a documentation stand-in such as
+/// `github.com/username/repo.git` (see [`hosts::placeholder`]).
+const PLACEHOLDER_URL: &str = "placeholder URL";
 
 impl FetchSession {
     /// A session for `report`, whose hop-0 work is `worklist`. `precheck` is
@@ -362,30 +279,6 @@ impl FetchSession {
             captured: Vec::new(),
             registry_outcomes: BTreeMap::new(),
             local_coverage: HashMap::new(),
-            unresolved_fetch_calls: HashSet::new(),
-        }
-    }
-
-    /// Keep unresolved downloader calls and Maven declarations visible without
-    /// inventing URLs, artifact coordinates, or effective-model defaults.
-    pub(super) fn record_unresolved_fetch_calls(&mut self, report: &AnalysisReport) {
-        for record in unresolved_downloader_records(report, &self.policy)
-            .into_iter()
-            .chain(unresolved_maven_records(report, &self.policy))
-        {
-            let key = (
-                record.source_sha256.clone().unwrap_or_default(),
-                record.source_offset,
-                record.locator.clone(),
-            );
-            if self.unresolved_fetch_calls.insert(key) {
-                self.reporter.report(&record, "");
-                if let Reporter::Tree { tree, .. } = &self.reporter {
-                    tree.add(&record.locator, &record.locator, "");
-                    tree.set(&record.locator, landed_state(&record));
-                }
-                self.out.records.push(record);
-            }
         }
     }
 
@@ -650,7 +543,7 @@ impl FetchSession {
     /// (`packages`) is distinct from a declared dependency (`deps`) even though
     /// both are PURLs. How deep a hop may go is decided before this, alike for
     /// every kind (see [`Self::within_depth`]).
-    fn select(
+    pub(super) fn select(
         &mut self,
         source_sha: &str,
         refs: Vec<Reference>,
@@ -668,8 +561,14 @@ impl FetchSession {
             }
             if let Some(reason) = self.fetch_skip_reason(&r) {
                 // A downloader the code calls is evidence, so its exclusion is
-                // recorded; any other unfetchable reference only logs.
-                if is_explicit_url_fetch(&r) {
+                // recorded; any other unfetchable reference only logs. So does
+                // a downloader whose argument is no real URL (`curl
+                // http://file-with-sudo`, `wget https://${HOST}/x`, `curl
+                // http://website.com/x`): nothing could ever be fetched, so
+                // there is nothing missing to report.
+                if is_explicit_url_fetch(&r)
+                    && !matches!(reason, INVALID_URL | URL_TEMPLATE | PLACEHOLDER_URL)
+                {
                     self.out.records.push(skipped_record(
                         source_sha,
                         &r,
@@ -711,13 +610,16 @@ impl FetchSession {
             _ => return Some("unsupported locator"),
         };
         let Ok(url) = Url::parse(raw) else {
-            return Some("invalid or local URL host");
+            return Some(INVALID_URL);
         };
         if !valid_discovered_url_host(&url) {
-            return Some("invalid or local URL host");
+            return Some(INVALID_URL);
         }
         if has_unexpanded_url_placeholder(raw) {
-            return Some("unexpanded URL template");
+            return Some(URL_TEMPLATE);
+        }
+        if hosts::placeholder(&url) {
+            return Some(PLACEHOLDER_URL);
         }
         if hosts::publisher_controlled(&url) || hosts::discovery_exception(raw, &url) {
             return Some("publisher-controlled or boilerplate URL");
@@ -1506,9 +1408,6 @@ impl FetchSession {
             &self.opts,
             apply_package_composites,
         );
-        if let Some(sub) = &payload.sub {
-            self.record_unresolved_fetch_calls(sub);
-        }
         // Check each fetched npm package in its own manifest context before
         // it is captured or merged into its parent's report. Only with its
         // bytes in hand: the root's path is a download name, not a file, and

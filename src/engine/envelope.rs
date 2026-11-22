@@ -90,6 +90,15 @@ pub struct ScanResult {
     /// tiny` line. `None` for unremarkable files; a terminal-UI concern only, so
     /// it is never serialized into the JSON envelope.
     pub bloom_mark: Option<crate::output::BloomMark>,
+    /// What Atomdrift Uplink said of this flagged file, when it held a
+    /// verdict: reported in place of this result when it stands, and
+    /// otherwise shown beside it as the `uplink` juror of the full result.
+    /// Never uploaded: hopper is where Uplink's verdicts come from.
+    pub(crate) uplink: Option<crate::remote::Opinion>,
+    /// Uplink's reason for an older verdict on this flagged file, shown in
+    /// place of an LLM interpretation this run did not ask for. Not
+    /// serialized; the JSON decision carries it as its `reason`.
+    pub uplink_reason: Option<String>,
     /// Where this result's verdict should land on hopper, when that differs
     /// from the ordinary "post under `sha256`" rule. Not serialized — like
     /// [`analysis_cached`](Self::analysis_cached), it describes how this
@@ -338,7 +347,8 @@ impl EmbeddedFile {
 
 impl ScanResult {
     /// The full result: the version 8 body as it is uploaded, but naming no
-    /// worker. With `every`, it names every member the document holds
+    /// worker, and with Uplink's opinion as the `uplink` juror when it was
+    /// asked. With `every`, it names every member the document holds
     /// (`--all-members`). `None` when the result was not classified for upload
     /// or its body cannot be written.
     #[must_use]
@@ -352,11 +362,7 @@ impl ScanResult {
             ms: None,
         };
         let llm = self.interpretation.as_ref();
-        if every {
-            doc.encode_every(&self.sha256, llm, &stamp)
-        } else {
-            doc.encode(&self.sha256, llm, &stamp)
-        }
+        doc.encode_shown(&self.sha256, llm, self.uplink.as_ref(), &stamp, every)
     }
 
     /// Static findings remain attention-worthy when the model grades benign.
@@ -418,6 +424,8 @@ pub(super) mod tests {
             pending_llm: None,
             dependency_results: Vec::new(),
             bloom_mark: None,
+            uplink: None,
+            uplink_reason: None,
             hopper_route: HopperRoute::Normal,
             upload: None,
         }

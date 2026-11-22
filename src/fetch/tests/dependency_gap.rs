@@ -219,60 +219,6 @@ fn session_follow(report: &AnalysisReport, follow: Follow<'_>) -> FetchSession {
     FetchSession::new(report, &[], resources, follow, None)
 }
 #[test]
-fn unresolved_downloader_records_survive_an_empty_worklist_and_deduplicate() {
-    let script = b"curl \"$REMOTE\" | sh\n";
-    let parsed = filefacts::OpenOptions::new()
-        .path(Path::new("stage.sh"))
-        .open(script);
-    let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
-            {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":script.len(),"filefacts":{"symbols":parsed.symbols()}}
-        ]})).unwrap();
-    let mut session = session(&report, FetchPolicy::parse_follow("references").unwrap());
-    session.record_unresolved_fetch_calls(&report);
-    session.record_unresolved_fetch_calls(&report);
-    session.run(&mut report, Vec::new());
-    assert_eq!(session.out.records.len(), 1);
-    assert!(session.out.records[0].content_sha256.is_none());
-
-    // A fetched report uses this same method before its files are merged.
-    let mut fetched = report.clone();
-    fetched.files[0].sha256 = "b".repeat(64);
-    fetched.files[0].depth = 1;
-    session.record_unresolved_fetch_calls(&fetched);
-    session.record_unresolved_fetch_calls(&fetched);
-    assert_eq!(session.out.records.len(), 2);
-    assert_eq!(session.out.records[1].source_sha256, Some("b".repeat(64)));
-}
-
-#[test]
-fn unresolved_maven_declarations_survive_empty_worklists_and_deduplicate() {
-    let mut report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
-            {"id":0,"path":"app.jar","depth":0,"file_type":"jar","sha256":"a".repeat(64),"size":200,
-             "filefacts":{"values":{"jar":{"pom":{"dependency_gaps":[{"member":"META-INF/maven/g/a/pom.xml","reason":"g:library: version requires unresolved property/parent/dependencyManagement/BOM"}]}}}}}
-        ]})).unwrap();
-    let policy = FetchPolicy::parse_follow("dependencies").unwrap();
-    let mut session = session(&report, policy);
-    session.record_unresolved_fetch_calls(&report);
-    session.record_unresolved_fetch_calls(&report);
-    session.run(&mut report, Vec::new());
-    assert_eq!(session.out.records.len(), 1);
-    let record = &session.out.records[0];
-    assert_eq!(
-        record.source_sha256.as_deref(),
-        Some("a".repeat(64).as_str())
-    );
-    assert_eq!(record.kind, RefKind::Dependency);
-    assert!(
-        record
-            .coverage
-            .iter()
-            .any(|fact| matches!(fact, Coverage::Unavailable { reason: Some(r) } if r.starts_with("Maven POM")))
-    );
-    let disabled = FetchPolicy::parse_follow("none").unwrap();
-    assert!(unresolved_maven_records(&report, &disabled).is_empty());
-}
-
-#[test]
 fn a_python_import_settled_at_the_gate_grafts_nothing_but_keeps_severe_claims() {
     // The gate skipped the fetch, so no bytes land: `clean` is the registry
     // node of an ordinary old release, `held` one the registry flags.
@@ -412,7 +358,6 @@ fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
     assert!(next.is_empty());
     assert!(pass.out.registries.is_empty());
     assert_eq!(pass.out.records.len(), 1);
-    assert!(analysis_unavailable(&pass.out.records[0]));
     assert!(terminal_fetch_row_visible(&pass.out.records[0]));
     assert!(
         pass.out.records[0]
@@ -433,9 +378,10 @@ fn unverified_python_candidate_and_registry_do_not_poison_the_importer() {
         fetch_row(&pass.out.records[0]).detail.as_deref(),
         Some("candidate flagged")
     );
-    let attention = dependency_attention(&pass.out.records);
-    assert_eq!(attention.gaps, 1);
-    assert_eq!(attention.flagged_candidates, 1);
+    assert_eq!(
+        dependency_attention(&pass.out.records).flagged_candidates,
+        1
+    );
 }
 
 #[test]
@@ -853,4 +799,43 @@ fn parent_cancellation_stops_reference_work_and_reaches_nested_analysis() {
             .unwrap()
             .load(Ordering::Acquire)
     );
+}
+
+/// A downloader call whose argument is no fetchable URL — no real host, or a
+/// `${VAR}` template — is skipped without a record. One aimed at a real but
+/// boilerplate host is a deliberate exclusion and stays on the record.
+#[test]
+fn downloader_calls_without_a_valid_url_are_skipped_silently() {
+    let report: AnalysisReport = serde_json::from_value(serde_json::json!({"version":"3","files":[
+        {"id":0,"path":"root.sh","depth":0,"file_type":"shell","sha256":"a".repeat(64),"size":1}
+    ]}))
+    .unwrap();
+    let mut session = session(&report, FetchPolicy::parse_follow("all").unwrap());
+    let fetch = |url: &str| {
+        Reference::new(
+            RefLocator::Url(url.into()),
+            RefKind::UrlFetch,
+            "ast-fetch-call",
+            "curl",
+        )
+    };
+    let mut dropped = 0;
+    let selected = session.select(
+        &"a".repeat(64),
+        vec![
+            fetch("http://file-with-sudo"),
+            fetch("https://${HOST}/stage.sh"),
+            fetch("not a url"),
+            fetch("https://dot.net/v1/dotnet-install.sh"),
+        ],
+        &mut dropped,
+    );
+    assert!(selected.is_empty(), "{selected:?}");
+    let recorded: Vec<&str> = session
+        .out
+        .records
+        .iter()
+        .map(|r| r.locator.as_str())
+        .collect();
+    assert_eq!(recorded, ["https://dot.net/v1/dotnet-install.sh"]);
 }

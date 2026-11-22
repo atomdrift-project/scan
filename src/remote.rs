@@ -19,6 +19,8 @@
 //! - the SHA-256 of a local file of at least
 //!   [`crate::analysis::SMALL_JOB_MAX_BYTES`] (1 MiB) — below that, analyzing
 //!   is cheaper than asking, and such files are mostly source nobody else has;
+//! - the SHA-256 of a local file of any size that the bloom filters mark
+//!   known-bad or sighted, or that this run grades suspicious or hostile;
 //! - the SHA-256 of a fetched artifact;
 //! - a PURL only when `public_purl` says it names a package on a mainstream
 //!   public registry.
@@ -27,11 +29,19 @@
 //! under `always`. A remote verdict replaces local analysis and is reported
 //! as a `"source": "remote"` record, the way a bloom decision is reported as
 //! `"source": "bloom"`.
+//!
+//! A verdict on a large file stands however old it is. On a sighted file the
+//! worse of Uplink's verdict and the local one stands. On any other flagged
+//! file Uplink's stands only when it is current: reached no earlier than the
+//! installed traits were committed. Otherwise the local result stands, and
+//! Uplink's reason is shown only when no `--llm` interpretation was asked
+//! for.
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -85,6 +95,15 @@ pub enum Uplink {
 /// handed it.
 static RESOLVED: OnceLock<(Uplink, Option<cleave::feed::Token>)> = OnceLock::new();
 
+/// When the traits this run analyzes with were committed, Unix seconds; set by
+/// [`resolve`]. `None` for a git checkout, whose working tree may be newer than
+/// any commit, so no remote verdict is [`current`] for it.
+static TRAITS_COMMITTED: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The verdicts Uplink answered with in this process, by digest, so a file
+/// asked about before analysis is not asked again after it.
+static ANSWERED: Mutex<Option<HashMap<String, Verdict>>> = Mutex::new(None);
+
 /// What a run that did not say means by `--uplink`, given the rules
 /// directory it analyzes with: ask, unless the rules are a git checkout (or a
 /// link to one). The service judged under published rules, so its verdicts
@@ -121,11 +140,14 @@ pub fn resolve(said: Option<Uplink>, paid: bool, rules: Option<&Path>) -> Result
     if uplink == Uplink::Ask {
         crate::corpus_precheck::configure_uplink(token.clone());
     }
+    let committed = rules.and_then(cleave::rule_update::committed_at);
+    let _ = TRAITS_COMMITTED.set(committed);
     tracing::info!(
         event = "remote.mode",
         ?uplink,
         said = said.is_some(),
         paid,
+        traits_committed = committed,
         rules = %rules.map(Path::display).map(|d| d.to_string()).unwrap_or_default(),
     );
     // Once per process. A second resolve keeps the first answer, which every
@@ -143,6 +165,87 @@ pub fn resolve(said: Option<Uplink>, paid: bool, rules: Option<&Path>) -> Result
 /// The resolved mode; [`Uplink::Off`] until [`resolve`] runs.
 pub(crate) fn mode() -> Uplink {
     RESOLVED.get().map_or(Uplink::Off, |(mode, _)| *mode)
+}
+
+/// What Uplink said of a file this run analyzed, and whether its verdict
+/// stands in for the local one.
+#[derive(Debug, Clone)]
+pub(crate) struct Opinion {
+    pub(crate) verdict: Verdict,
+    pub(crate) stands: bool,
+}
+
+/// Whether Uplink reached `verdict` under traits at least as new as this
+/// run's: analyzed no earlier than they were committed. Never for a verdict
+/// with no date, or for traits with no commit time (a git checkout).
+#[must_use]
+pub(crate) fn current(verdict: &Verdict) -> bool {
+    let traits = TRAITS_COMMITTED.get().copied().flatten();
+    let analyzed = verdict
+        .analyzed_at
+        .as_deref()
+        .and_then(crate::corpus_precheck::parse_rfc3339_epoch);
+    is_current(analyzed, traits)
+}
+
+fn is_current(analyzed: Option<u64>, traits: Option<u64>) -> bool {
+    analyzed
+        .zip(traits)
+        .is_some_and(|(at, traits)| at >= traits)
+}
+
+/// Remember that Uplink answered `sha` with `verdict`.
+fn remember(sha: &str, verdict: &Verdict) {
+    ANSWERED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(sha.to_owned(), verdict.clone());
+}
+
+/// What Uplink answered about `sha` earlier in this process.
+fn remembered(sha: &str) -> Option<Verdict> {
+    ANSWERED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()?
+        .get(sha)
+        .cloned()
+}
+
+/// Whether Uplink, asked about `sha` within [`UNKNOWN_TTL_SECS`], knew
+/// nothing of it.
+fn recently_unknown(cache: Option<&crate::analysis_cache::AnalysisCache>, sha: &str) -> bool {
+    cache
+        .and_then(|cache| cache.read::<Unknown>(&unknown_key(sha)))
+        .is_some_and(|unknown| unknown.fresh(crate::civil::now_secs()))
+}
+
+/// Uplink's verdict on a local file this run flagged (known-bad or sighted by
+/// the bloom filters, or graded suspicious or hostile), when asking and it holds one.
+/// Any size: a flagged file is worth the question.
+pub(crate) fn second_opinion(sha: &str) -> Option<Verdict> {
+    let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
+    if let Some(verdict) = remembered(sha) {
+        return Some(verdict);
+    }
+    let cache = crate::analysis_cache::AnalysisCache::shared();
+    if recently_unknown(cache, sha) {
+        return None;
+    }
+    match precheck.standing(sha) {
+        Standing::Adopt(verdict) => {
+            remember(sha, &verdict);
+            Some(verdict)
+        }
+        _ => {
+            if let Some(cache) = cache {
+                let at = crate::civil::now_secs();
+                cache.write(&unknown_key(sha), &Unknown { at });
+            }
+            None
+        }
+    }
 }
 
 /// The subscription token, asking for one (and saving it, once the rules
@@ -241,10 +344,13 @@ pub(crate) fn classification(fires_at: Level, level: Option<u16>) -> Option<Clas
 /// The local files Uplink already judges, by path, and the files left to
 /// analyze here, in their original order.
 ///
-/// Only files of at least [`crate::analysis::SMALL_JOB_MAX_BYTES`] are asked
-/// about, and, when `limit` is not zero, of at most `limit` bytes: a file the
-/// scan will not analyze is not worth a question, and neither is one
-/// `passed_over` says this machine already vouches for (by path and digest).
+/// Only files of at least [`crate::analysis::SMALL_JOB_MAX_BYTES`], or that
+/// `known_bad` says the bloom filters convict (by digest), are asked about,
+/// and, when `limit` is not zero, of at most `limit` bytes: a file the scan
+/// will not analyze is not worth a question, and neither is one `passed_over`
+/// says this machine already vouches for (by path and digest). A known-bad
+/// file is answered only by a [`current`] verdict; an older one leaves it to
+/// local analysis.
 /// A digest in `known` is used as it is; any other is hashed by streaming the
 /// file — bounded memory, never a second resident copy — and the digests go
 /// out in batches. A file
@@ -256,12 +362,12 @@ pub(crate) fn answer_known(
     known: &std::collections::HashMap<PathBuf, String>,
     limit: u64,
     passed_over: impl Fn(&Path, &str) -> bool + Sync,
+    known_bad: impl Fn(&str) -> bool + Sync,
 ) -> (Vec<(PathBuf, String, Verdict)>, Vec<PathBuf>) {
     let Some(precheck) = crate::corpus_precheck::armed().filter(|p| p.is_uplink()) else {
         return (Vec::new(), paths);
     };
     let floor = crate::analysis::SMALL_JOB_MAX_BYTES;
-    let asked = |len: u64| len >= floor && (limit == 0 || len <= limit);
     let digests: Vec<Option<String>> = paths
         .par_iter()
         .map(|path| {
@@ -269,13 +375,18 @@ pub(crate) fn answer_known(
                 .ok()
                 .filter(std::fs::Metadata::is_file)?
                 .len();
-            if !asked(size) {
+            if limit != 0 && size > limit {
                 return None;
             }
-            known
-                .get(path)
-                .cloned()
-                .or_else(|| crate::digest::sha256_file(path).ok())
+            // A small file is worth hashing only when its digest is already
+            // in hand, to learn whether the bloom filters convict it.
+            let sha = known.get(path).cloned().or_else(|| {
+                (size >= floor)
+                    .then(|| crate::digest::sha256_file(path).ok())
+                    .flatten()
+            })?;
+            (size >= floor || known_bad(&sha))
+                .then_some(sha)
                 .filter(|sha| !passed_over(path, sha))
         })
         .collect();
@@ -288,12 +399,7 @@ pub(crate) fn answer_known(
     // What Uplink did not know a little while ago it is not asked again: a
     // scan whose every file is saved, judged or unknown makes no request.
     let cache = crate::analysis_cache::AnalysisCache::shared();
-    let recently_unknown = |sha: &str| {
-        cache
-            .and_then(|cache| cache.read::<Unknown>(&unknown_key(sha)))
-            .is_some_and(|unknown| unknown.fresh(crate::civil::now_secs()))
-    };
-    asked.retain(|sha| !recently_unknown(sha));
+    asked.retain(|sha| !recently_unknown(cache, sha));
     let (known, unknown) = if asked.is_empty() {
         Default::default()
     } else {
@@ -312,7 +418,18 @@ pub(crate) fn answer_known(
         if let Some(sha) = digest
             && let Some(Standing::Adopt(verdict)) = known.get(&sha)
         {
-            answered.push((path, sha, verdict.clone()));
+            remember(&sha, verdict);
+            if known_bad(&sha) && !current(verdict) {
+                tracing::debug!(
+                    path = %path.display(),
+                    sha,
+                    analyzed_at = verdict.analyzed_at.as_deref().unwrap_or_default(),
+                    "known-bad file's Uplink verdict predates the traits; analyzing here"
+                );
+                rest.push(path);
+            } else {
+                answered.push((path, sha, verdict.clone()));
+            }
         } else {
             rest.push(path);
         }
@@ -632,13 +749,29 @@ mod tests {
         );
     }
 
+    /// A verdict is current when reached no earlier than the traits were
+    /// committed; with either time unknown, it is not.
+    #[test]
+    fn a_verdict_is_current_only_when_no_older_than_the_traits() {
+        assert!(is_current(Some(200), Some(100)));
+        assert!(is_current(Some(100), Some(100)));
+        assert!(!is_current(Some(99), Some(100)));
+        assert!(!is_current(None, Some(100)), "an undated verdict");
+        assert!(!is_current(Some(200), None), "a git checkout");
+    }
+
     #[test]
     fn nothing_is_asked_when_lookups_are_off() {
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("big.bin");
         std::fs::write(&path, vec![0u8; 2 << 20]).expect("write");
-        let (answered, rest) =
-            answer_known(vec![path.clone()], &Default::default(), 0, |_, _| false);
+        let (answered, rest) = answer_known(
+            vec![path.clone()],
+            &Default::default(),
+            0,
+            |_, _| false,
+            |_| false,
+        );
         assert!(answered.is_empty());
         assert_eq!(rest, vec![path]);
     }

@@ -198,7 +198,7 @@ fn ruby_process_downloads_are_discovered_from_retained_and_fetched_member_facts(
 }
 
 #[test]
-fn ruby_dynamic_downloader_arguments_produce_a_visible_gap_without_a_guessed_url() {
+fn ruby_dynamic_downloader_arguments_produce_no_guessed_url() {
     let source = b"system('curl', options, 'https://ruby.fixturetests.net/after-unknown')\n";
     let parsed = filefacts::OpenOptions::new()
         .path(Path::new("runtime.rb"))
@@ -213,17 +213,6 @@ fn ruby_dynamic_downloader_arguments_produce_a_visible_gap_without_a_guessed_url
             .iter()
             .all(|(_, refs)| refs.iter().all(|r| r.source != "ast-fetch-call"))
     );
-    let records =
-        unresolved_downloader_records(&report, &FetchPolicy::parse_follow("references").unwrap());
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0].source_sha256.as_deref(),
-        Some("a".repeat(64).as_str())
-    );
-    assert!(records[0].content_sha256.is_none());
-    assert!(terminal_fetch_row_visible(&records[0]));
-    assert_eq!(fetch_row(&records[0]).label, "gap");
-    assert!(!records[0].locator.contains("after-unknown"));
 }
 
 #[test]
@@ -350,9 +339,15 @@ fn python_candidate_provider_requires_runtime_namespace_and_keeps_uncertainty() 
     record.content_sha256 = Some("candidate-hash".into());
     assert!(!python_candidate_provides_namespace(&reference, &report));
     annotate_python_import_candidate(&mut record, false, Some(&report), None);
-    assert!(analysis_unavailable(&record));
-    assert!(terminal_fetch_row_visible(&record));
-    assert_eq!(fetch_row(&record).label, "gap");
+    // The uncertainty stays on the record; the terminal shows the fetch as
+    // the fetch it was, with no gap row.
+    assert!(
+        record
+            .coverage
+            .iter()
+            .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
+    );
+    assert_ne!(fetch_row(&record).label, "gap");
     assert_eq!(
         record.outcome,
         Outcome::Ok,
@@ -453,57 +448,6 @@ fn known_good_wheel_namespace_is_read_from_its_archive_index() {
     assert!(
         !python_wheel_provides_namespace(&import("redis"), name, b"not an archive"),
         "bytes with no archive index verify nothing"
-    );
-}
-
-#[test]
-fn coverage_gaps_group_by_reason_and_name_the_declaring_file() {
-    let unverified = |locator: &str| {
-        let mut record = FetchRecord::terminal(locator.into(), Outcome::Ok);
-        annotate_python_import_candidate(&mut record, false, None, None);
-        record
-    };
-    let mut verified = FetchRecord::terminal("pkg:pypi/redis@8.1.0".into(), Outcome::Ok);
-    annotate_python_import_candidate(&mut verified, true, None, None);
-    let mut downloader = FetchRecord::terminal(
-        "wget (unresolved downloader arguments) at byte 17 in declaring-sha".into(),
-        Outcome::Unresolved(fletch::fetch::Unresolved::Unsupported),
-    );
-    downloader.source_sha256 = Some("declaring-sha".into());
-    downloader.coverage.push(Coverage::Unavailable {
-        reason: Some("downloader arguments require runtime evaluation; no URL inferred".into()),
-    });
-    let failed = FetchRecord::terminal(
-        "pkg:pypi/gone@1.0".into(),
-        Outcome::Failed(FetchError::Status(500)),
-    );
-    let records = [
-        unverified("pkg:pypi/dotenv@0.9.9"),
-        downloader,
-        verified,
-        unverified("pkg:pypi/azure@5.0.0"),
-        // One dependency named by two files is one fact.
-        unverified("pkg:pypi/dotenv@0.9.9"),
-        failed,
-    ];
-    let groups = coverage_gaps(&records, |sha| {
-        (sha == "declaring-sha").then(|| "scripts/install.sh".to_owned())
-    });
-    assert_eq!(
-        groups,
-        [
-            (
-                "Python import provider unresolved; no candidate namespace verified",
-                vec!["dotenv 0.9.9".to_owned(), "azure 5.0.0".to_owned()]
-            ),
-            (
-                "downloader arguments require runtime evaluation; no URL inferred",
-                vec![
-                    "wget (unresolved downloader arguments) at byte 17 in scripts/install.sh"
-                        .to_owned()
-                ]
-            ),
-        ]
     );
 }
 

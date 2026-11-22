@@ -810,7 +810,19 @@ impl<'a> Session<'a> {
         });
         self.advance();
         match classified {
-            Ok((result, settled)) => self.report(target, result, settled),
+            // Uplink's verdict on a flagged file, reached under traits at
+            // least as new as ours, stands in for this one.
+            Ok((result, settled)) => match result.uplink.as_ref().filter(|o| o.stands) {
+                Some(opinion) => self.account_remote(
+                    &target.origin.path.display().to_string(),
+                    &result.sha256,
+                    None,
+                    &opinion.verdict,
+                    target.kept,
+                    result.bloom_mark,
+                ),
+                None => self.report(target, result, settled),
+            },
             Err(error) => self.report_error(target.origin.path, &error),
         }
     }
@@ -863,9 +875,6 @@ impl<'a> Session<'a> {
             .static_flags
             .fetch_add(u32::from(replay.severe), Ordering::Relaxed);
         self.tally
-            .dependency_gaps
-            .fetch_add(replay.dependency_gaps, Ordering::Relaxed);
-        self.tally
             .flagged_candidates
             .fetch_add(replay.flagged_candidates, Ordering::Relaxed);
         // The cosmetic rows first, as they came first; a failed write of
@@ -903,9 +912,20 @@ impl<'a> Session<'a> {
                 let passed_over = |path: &Path, sha: &str| {
                     lookup.is_some_and(|lookup| bloom_passes_over(lookup, fast, sha, path).2)
                 };
-                let (answered, rest) = crate::remote::answer_known(files, shas, limit, passed_over);
+                let mark = |sha: &str| {
+                    let lookup = self.config.bloom()?;
+                    let digest = burton::parse_sha256_hex(sha)?;
+                    BloomMark::from_decision(lookup.decide_sha256(&digest))
+                };
+                let known_bad = |sha: &str| mark(sha).is_some_and(BloomMark::is_known_bad);
+                let (answered, rest) =
+                    crate::remote::answer_known(files, shas, limit, passed_over, known_bad);
                 for (path, sha, verdict) in &answered {
-                    self.record_remote(&path.display().to_string(), sha, None, verdict, Some(role));
+                    // A known-bad file keeps its mark, and is shown, whatever
+                    // Uplink says.
+                    self.advance();
+                    let label = path.display().to_string();
+                    self.account_remote(&label, sha, None, verdict, Some(role), mark(sha));
                 }
                 rest
             }
@@ -949,6 +969,21 @@ impl<'a> Session<'a> {
         kept: Option<Role>,
     ) {
         self.advance();
+        self.account_remote(label, sha, purl, verdict, kept, None);
+    }
+
+    /// [`Self::record_remote`] for an artifact already counted on the
+    /// progress bar. `bloom_mark` is the file's mark, which a known-bad file
+    /// keeps: it is shown, and marked, whatever Uplink says.
+    fn account_remote(
+        &self,
+        label: &str,
+        sha: &str,
+        purl: Option<&str>,
+        verdict: &Verdict,
+        kept: Option<Role>,
+        bloom_mark: Option<BloomMark>,
+    ) {
         let Some(class) = crate::remote::classification(verdict.fires_at, self.config.level())
         else {
             // Already taken out of local analysis, so it is answered by nothing:
@@ -962,20 +997,22 @@ impl<'a> Session<'a> {
             return;
         };
         self.tally.count(class);
-        let shown = self.config.format().emits_every_result() || self.config.filter().shows(class);
+        let shown = self.config.format().emits_every_result()
+            || bloom_mark.is_some_and(BloomMark::forces_terminal_display)
+            || self.config.filter().shows(class);
         let mut written = None;
         if shown {
             self.write_result(|| {
                 let mut bytes = Vec::new();
-                crate::output::write_remote_verdict(
-                    &mut bytes,
+                let remote = crate::output::Remote {
                     label,
-                    sha,
+                    sha256: sha,
                     purl,
                     verdict,
                     class,
-                    self.config.format(),
-                )?;
+                    bloom_mark,
+                };
+                crate::output::write_remote_verdict(&mut bytes, remote, self.config.format())?;
                 write_stdout(&bytes)?;
                 written = Some(bytes);
                 Ok(())
@@ -1022,9 +1059,6 @@ impl<'a> Session<'a> {
         self.tally
             .static_flags
             .fetch_add(u32::from(result.has_severe_findings()), Ordering::Relaxed);
-        self.tally
-            .dependency_gaps
-            .fetch_add(result.dependency_attention.gaps, Ordering::Relaxed);
         self.tally.flagged_candidates.fetch_add(
             result.dependency_attention.flagged_candidates,
             Ordering::Relaxed,
@@ -1725,7 +1759,6 @@ struct Tally {
     suspicious: AtomicU32,
     benign: AtomicU32,
     errors: AtomicU32,
-    dependency_gaps: AtomicU32,
     static_flags: AtomicU32,
     flagged_candidates: AtomicU32,
 }
@@ -1759,7 +1792,6 @@ impl Tally {
             benign,
             errors,
             dependency_attention: super::DependencyAttention {
-                gaps: self.dependency_gaps.load(Ordering::Relaxed),
                 flagged_candidates: self.flagged_candidates.load(Ordering::Relaxed),
             },
             static_flags: self.static_flags.load(Ordering::Relaxed),
@@ -1841,7 +1873,7 @@ mod tests {
         let kept = || {
             hashed(Some(
                 r#"{"at":0,"expires":false,"label":"a.bin","class":0,"severe":false,
-                    "dependency_gaps":0,"flagged_candidates":0,"notes":"","output":null}"#,
+                    "flagged_candidates":0,"notes":"","output":null}"#,
             ))
         };
         let replays = |files, dir_files| Replays { files, dir_files };

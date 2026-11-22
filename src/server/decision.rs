@@ -358,7 +358,7 @@ impl V1Decision {
             sha256: Some(verdict.sha256),
             severity: Some(severity),
             fires_at: verdict.lvl,
-            reason: verdict.why,
+            reason: verdict.why.or_else(|| result.uplink_reason.clone()),
             findings: V1Finding::worth_reporting(verdict.hits.iter().map(V1Finding::from_hit)),
             engine_version: Some(verdict.eng),
             analyzed_at: Some(verdict.at),

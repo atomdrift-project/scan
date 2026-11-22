@@ -93,7 +93,6 @@ pub(super) struct Replay {
     pub(super) class: Classification,
     /// Whether it carried suspicious or hostile static findings.
     pub(super) severe: bool,
-    pub(super) dependency_gaps: u32,
     pub(super) flagged_candidates: u32,
     /// What its fetch phase left on stderr: fetch rows or the dependency tree.
     pub(super) notes: String,
@@ -119,7 +118,6 @@ impl Replay {
             label: label.to_string(),
             class: result.classification,
             severe: result.has_severe_findings(),
-            dependency_gaps: result.dependency_attention.gaps,
             flagged_candidates: result.dependency_attention.flagged_candidates,
             notes,
             output,
@@ -142,7 +140,6 @@ impl Replay {
             label: label.to_string(),
             class,
             severe: false,
-            dependency_gaps: 0,
             flagged_candidates: 0,
             notes: String::new(),
             output,
@@ -362,9 +359,8 @@ mod tests {
             label: String::new(),
             class: Classification::Hostile,
             severe: true,
-            dependency_gaps: 3,
             flagged_candidates: 1,
-            notes: "    \u{26a0} gap\n".to_string(),
+            notes: "    \u{2716} fail\n".to_string(),
             output: Some("card\n".to_string()),
         }
     }
@@ -407,7 +403,7 @@ mod tests {
         assert_eq!(found.sha256, sha256);
         assert_eq!(found.class, Classification::Hostile);
         assert!(found.severe);
-        assert_eq!((found.dependency_gaps, found.flagged_candidates), (3, 1));
+        assert_eq!(found.flagged_candidates, 1);
         assert_eq!(found.notes, kept.notes);
         assert_eq!(found.output, kept.output);
 

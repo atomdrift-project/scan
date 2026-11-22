@@ -15,7 +15,7 @@ use crate::output::{Ink, Rgb};
 
 use super::age_gate::SkipReason;
 use super::registry::registry_summary;
-use super::{Coordinate, SECS_PER_DAY, coverage_text, is_analysis_gap, locator};
+use super::{Coordinate, SECS_PER_DAY, coverage_text, locator};
 
 /// Where the fetch phase's progress is surfaced.
 ///
@@ -164,22 +164,10 @@ impl Reporter {
         }
         if let Self::Stream { .. } = self {
             // The streamed log is the attention channel: successes are carried
-            // by the aggregate header and the final summary, and only failures
-            // and pin trouble earn a line. A coverage gap is neither — a
-            // package with hundreds of optional imports has hundreds of them,
-            // and a line above a bar shared by every file being scanned names
-            // no owner — so the file's own card summarizes them (see
-            // [`coverage_gaps`]). A flagged candidate is the exception: that
-            // one is a finding about something this artifact may load.
-            let flagged = rec
-                .coverage
-                .iter()
-                .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }));
-            if coverage_gap(rec) {
-                if !flagged {
-                    return;
-                }
-            } else if matches!(rec.outcome, Outcome::Ok) {
+            // by the aggregate header and the final summary, and only failures,
+            // pin trouble and flagged candidates — a finding about something
+            // this artifact may load — earn a line.
+            if matches!(rec.outcome, Outcome::Ok) && !candidate_flagged(rec) {
                 return;
             }
             if !self.claim_row(rec) {
@@ -484,7 +472,7 @@ pub(super) fn fetch_rows(rec: &FetchRecord) -> String {
         Ink::stderr().fg(DETAIL, &format!("{column:>10}")),
         crate::output::tty_text(fetch_target(rec))
     );
-    if analysis_unavailable(rec) {
+    if candidate_flagged(rec) {
         rows.push_str("      ");
         rows.push_str(&crate::output::tty_text(&coverage_text(rec)));
         rows.push('\n');
@@ -492,17 +480,17 @@ pub(super) fn fetch_rows(rec: &FetchRecord) -> String {
     rows
 }
 
-/// Whether one fetch outcome deserves a terminal row. An unresolved locator
-/// is quiet unless it explicitly records an analysis gap. A non-target
-/// reference (a source repo, an unclassified string) was never going to be
-/// fetched at all — a row for either says nothing about the artifact being
-/// scanned. Retain their [`FetchRecord`]s for machine output and diagnostics,
-/// but keep the default human view quiet.
+/// Whether one fetch outcome deserves a terminal row. An unresolved locator,
+/// a non-target reference (a source repo, an unclassified string) and a
+/// coverage gap (a reference that could not be fetched or analyzed) say
+/// nothing about whether the artifact being scanned is safe, so they get no
+/// row; their [`FetchRecord`]s stay for machine output and diagnostics. A
+/// flagged candidate is a finding, and always shows.
 ///
 /// A corpus hit (see [`corpus_hit_record`](super::merge::corpus_hit_record)) is quiet for the same reason: the
 /// corpus already judged those bytes, so there is nothing here to look at.
 pub(super) fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
-    if analysis_unavailable(rec) {
+    if candidate_flagged(rec) {
         return true;
     }
     match rec.outcome {
@@ -512,99 +500,29 @@ pub(super) fn terminal_fetch_row_visible(rec: &FetchRecord) -> bool {
     }
 }
 
-pub(super) fn analysis_unavailable(rec: &FetchRecord) -> bool {
+/// Whether an unverified provider candidate for `rec` carried suspicious or
+/// hostile static findings.
+fn candidate_flagged(rec: &FetchRecord) -> bool {
     rec.coverage
         .iter()
-        .any(|fact| matches!(fact, Coverage::Unavailable { .. }))
-}
-
-/// Whether `rec` is a coverage gap rather than a fetch that went wrong: the
-/// reference was retrieved, or deliberately left alone, and what is missing
-/// is an analysis of it.
-fn coverage_gap(rec: &FetchRecord) -> bool {
-    analysis_unavailable(rec)
-        && matches!(
-            rec.outcome,
-            Outcome::Ok | Outcome::Skipped | Outcome::Unresolved(_)
-        )
-}
-
-/// The coverage gaps among `records`, grouped by reason in first-seen order,
-/// each with the distinct references it covers: what a result card shows in
-/// place of one row per reference. `source_path` names the file a declaring
-/// sha belongs to, so a gap reads as a place in the artifact, not a digest.
-pub(crate) fn coverage_gaps(
-    records: &[FetchRecord],
-    source_path: impl Fn(&str) -> Option<String>,
-) -> Vec<(&str, Vec<String>)> {
-    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
-    let mut seen = HashSet::new();
-    for rec in records.iter().filter(|rec| coverage_gap(rec)) {
-        let reason = rec
-            .coverage
-            .iter()
-            .find_map(|fact| match fact {
-                Coverage::Unavailable { reason } => reason.as_deref(),
-                _ => None,
-            })
-            .unwrap_or("not analyzed");
-        let target = fetch_target(rec);
-        let label = if rec.locator.starts_with("pkg:") {
-            purl_display(&rec.locator)
-        } else if let Some(sha) = rec.source_sha256.as_deref()
-            && let Some(path) = source_path(sha)
-        {
-            target.replace(sha, &path)
-        } else {
-            target.to_owned()
-        };
-        if !seen.insert((reason, label.clone())) {
-            continue;
-        }
-        match groups.iter_mut().find(|(known, _)| *known == reason) {
-            Some((_, labels)) => labels.push(label),
-            None => groups.push((reason, vec![label])),
-        }
-    }
-    groups
+        .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }))
 }
 
 /// Attention counts survive dropping the full report for terminal output.
 /// Candidate issues concern the retrieved candidate, not the importing file.
-/// A reference past the follow depth is no gap: the depth is the operator's
-/// choice, and every dependency's own requirements lie past the default one.
 pub(crate) fn dependency_attention(records: &[FetchRecord]) -> crate::engine::DependencyAttention {
-    let chosen = |fact: &Coverage| matches!(fact, Coverage::Pending { reason, .. } if reason == super::session::DEPTH_LIMIT);
-    let mut attention = crate::engine::DependencyAttention::default();
-    for record in records {
-        if record
-            .coverage
-            .iter()
-            .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }))
-        {
-            attention.flagged_candidates += 1;
-        }
-        if record
-            .coverage
-            .iter()
-            .any(|fact| fact.is_gap() && !chosen(fact))
-            || matches!(
-                record.outcome,
-                Outcome::Failed(_)
-                    | Outcome::BudgetExceeded
-                    | Outcome::PinMismatch
-                    | Outcome::UnverifiablePin
-            )
-            || (matches!(record.outcome, Outcome::Unresolved(_))
-                && matches!(
-                    record.kind,
-                    RefKind::Dependency | RefKind::Command | RefKind::UrlFetch
-                ))
-        {
-            attention.gaps += 1;
-        }
+    let flagged = records
+        .iter()
+        .filter(|record| {
+            record
+                .coverage
+                .iter()
+                .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }))
+        })
+        .count();
+    crate::engine::DependencyAttention {
+        flagged_candidates: u32::try_from(flagged).unwrap_or(u32::MAX),
     }
-    attention
 }
 
 /// Whether every fetch reached an answer that asking again would not change.
@@ -684,19 +602,8 @@ impl FetchRow {
 /// way: a *fetched* dep the local bloom filters vouch for (or flag) is relabeled
 /// `known` instead of `live`/`cache`; `skip`/`fail` rows are left as-is.
 pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
-    if coverage_gap(rec) {
-        let flagged = rec
-            .coverage
-            .iter()
-            .any(|fact| matches!(fact, Coverage::CandidateFlagged { .. }));
-        return FetchRow::new('\u{26a0}', "gap", CAUTION).detail(
-            if flagged {
-                "candidate flagged"
-            } else {
-                "not verified"
-            }
-            .into(),
-        );
+    if candidate_flagged(rec) {
+        return FetchRow::new('\u{26a0}', "flag", CAUTION).detail("candidate flagged".into());
     }
     match &rec.outcome {
         Outcome::PinMismatch => {
@@ -717,9 +624,6 @@ pub(super) fn fetch_row(rec: &FetchRecord) -> FetchRow {
         }),
         Outcome::BudgetExceeded => {
             FetchRow::new('\u{25cb}', "budget", CAUTION).detail("over fetch budget".to_string())
-        }
-        Outcome::Unresolved(_) if terminal_fetch_row_visible(rec) => {
-            FetchRow::new('\u{26a0}', "gap", CAUTION).detail("not analyzed".to_string())
         }
         Outcome::Unresolved(_) => {
             FetchRow::new('\u{00b7}', "skip", MUTED).detail("unresolved".to_string())
@@ -819,22 +723,16 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     let mut bytes = 0u64;
     let mut pending = 0u32;
     let mut local = 0u32;
-    let mut incomplete = 0u32;
     for rec in records {
         bytes += rec.size.unwrap_or(0);
         let has = |pick: fn(&Coverage) -> bool| rec.coverage.iter().any(pick);
-        if matches!(
-            rec.outcome,
-            Outcome::BudgetExceeded | Outcome::Unresolved(_)
-        ) || has(|fact| matches!(fact, Coverage::Pending { .. }))
+        if matches!(rec.outcome, Outcome::BudgetExceeded)
+            || has(|fact| matches!(fact, Coverage::Pending { .. }))
         {
             pending += 1;
         }
         if has(|fact| matches!(fact, Coverage::Supplied { .. })) {
             local += 1;
-        }
-        if has(is_analysis_gap) {
-            incomplete += 1;
         }
         match &rec.outcome {
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin if rec.is_cached() => {
@@ -856,7 +754,6 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
         (failed, "failed"),
         (pending, "pending"),
         (local, "supplied locally"),
-        (incomplete, "analysis incomplete"),
     ] {
         if count > 0 {
             parts.push(format!("{count} {label}"));
@@ -865,7 +762,7 @@ pub(super) fn summary_line(records: &[FetchRecord]) -> String {
     parts.push(crate::output::human_size(bytes));
     format!(
         "  {}  {}",
-        if failed + pending + incomplete > 0 {
+        if failed + pending > 0 {
             Ink::stderr().fg(Rgb(220, 160, 80), "!")
         } else {
             Ink::stderr().fg(Rgb(80, 220, 80), "\u{2713}")

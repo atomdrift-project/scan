@@ -13,7 +13,7 @@ use crate::corpus_precheck::{Precheck, Standing, Verdict};
 
 use super::budget::PAYLOADS_ANALYZED_TOTAL;
 use super::discover::{
-    LocalModules, is_ci_context, is_vendored_node_module, mark_scope, npm_import_name,
+    CiFiles, LocalModules, is_vendored_node_module, mark_scope, npm_import_name,
 };
 use super::imports::{is_python_import_candidate, static_es_module_refs};
 use super::render::{delivered_bytes, fetch_target};
@@ -489,6 +489,7 @@ pub(super) fn merge_payload(
     // If the payload was an archive, its members' facts (declared deps, npm
     // hooks) are the next hop too — the bytes hunt only saw the container.
     // The payload's own node is skipped; the bytes hunt already covered it.
+    let ci_files = CiFiles::of(&report.files[first_new..]);
     for file in &report.files[first_new..] {
         if file.sha256 == analyzed.content_sha {
             continue;
@@ -507,7 +508,7 @@ pub(super) fn merge_payload(
             &file.path,
         );
         mark_published_npm_development_refs(&rec.locator, &file.path, &mut refs);
-        if is_ci_context(file) {
+        if ci_files.contains(file) {
             mark_scope(&mut refs, filefacts::DependencyScope::Ci);
         }
         if !refs.is_empty() {

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn unresolved_dependencies_preclude_a_clean_summary() {
+fn benign_verdict_leads_the_summary() {
     let mut summary = ScanSummary {
         total_files: 1,
         hostile: 0,
@@ -11,19 +11,24 @@ fn unresolved_dependencies_preclude_a_clean_summary() {
         duration_ms: 1,
         static_flags: 0,
         dependency_attention: crate::engine::DependencyAttention {
-            gaps: 2,
             flagged_candidates: 1,
         },
     };
+    // A flagged candidate keeps the grade but loses the ✓.
     let line = summary_status_line(&summary);
-    assert!(line.contains("2 dependency gaps") && line.contains("1 flagged candidate"));
-    assert!(!line.contains("all graded benign") && !line.contains('\u{2713}'));
+    assert!(line.contains("1 file scanned, graded benign"), "{line}");
+    assert!(line.contains("1 flagged candidate"), "{line}");
+    assert!(!line.contains('\u{2713}'), "{line}");
     summary.dependency_attention = Default::default();
-    assert!(summary_status_line(&summary).contains("all graded benign"));
+    let line = summary_status_line(&summary);
+    assert!(line.contains('\u{2713}') && line.contains("1 file scanned, graded benign"));
+    summary.total_files = 3;
+    summary.benign = 3;
+    assert!(summary_status_line(&summary).contains("3 files scanned, all graded benign"));
     summary.static_flags = 1;
     let line = summary_status_line(&summary);
     assert!(line.contains("1 with severe static findings"));
-    assert!(!line.contains("all graded benign"));
+    assert!(!line.contains("scanned") && !line.contains('\u{2713}'));
 }
 
 #[test]
@@ -93,11 +98,14 @@ fn uplink_verdict_renders_as_a_card() {
     let mut out = Vec::new();
     write_remote_verdict(
         &mut out,
-        "/nonexistent/litellm-1.107.0-py3-none-any.whl",
-        "2befe2a7",
-        None,
-        &verdict,
-        Classification::Hostile,
+        Remote {
+            label: "/nonexistent/litellm-1.107.0-py3-none-any.whl",
+            sha256: "2befe2a7",
+            purl: None,
+            verdict: &verdict,
+            class: Classification::Hostile,
+            bloom_mark: None,
+        },
         OutputFormat::Terminal,
     )
     .expect("write");

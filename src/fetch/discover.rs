@@ -17,12 +17,40 @@ use super::imports::{
 };
 use super::{Coordinate, Group, found, hex_len, locator, report_file_type};
 
-/// A file whose references execute only in CI, never in an installed artifact
-/// — a GitHub Actions workflow or composite `action.yml`. Its `uses:` actions
-/// and `run:` fetches are third-party code, but they run on the CI runner, so a
-/// routine dependency fetch skips them; `--follow=all`/`--follow=ci-actions` opts in.
-pub(super) fn is_ci_context(file: &cleave::types::FileAnalysis) -> bool {
-    file.file_type == filefacts::FileType::GithubActions.label()
+/// The files in a report whose references execute only in CI, never in an
+/// installed artifact — a GitHub Actions workflow or composite `action.yml`,
+/// and every layer decoded out of one. Its `uses:` actions and `run:` fetches
+/// are third-party code, but they run on the CI runner, so a routine
+/// dependency fetch skips them; `--follow=all`/`--follow=ci-actions` opts in.
+///
+/// A workflow's `run:` steps are analyzed as their own members
+/// (`ci.yml!!/jobs/build/steps/0/run`) and detected as shell, so the type
+/// alone would let each step's `curl` escape the workflow that holds it: a
+/// member is CI when it or any file enclosing it is a workflow.
+pub(super) struct CiFiles<'a>(HashSet<&'a str>);
+
+impl<'a> CiFiles<'a> {
+    pub(super) fn of(files: &'a [cleave::types::FileAnalysis]) -> Self {
+        Self(
+            files
+                .iter()
+                .filter(|f| f.file_type == FileType::GithubActions.label())
+                .map(|f| f.path.as_str())
+                .collect(),
+        )
+    }
+
+    pub(super) fn contains(&self, file: &cleave::types::FileAnalysis) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        let path = file.path.as_str();
+        self.0.contains(path)
+            || path
+                .match_indices("!!")
+                .chain(path.match_indices("##"))
+                .any(|(at, _)| path.get(..at).is_some_and(|outer| self.0.contains(outer)))
+    }
 }
 
 /// Whether [`collect_references_from_input`] follows references that only ever execute in
@@ -171,6 +199,7 @@ fn declared_references(report: &AnalysisReport, ci: CiRefs) -> Vec<Group> {
     for file in &report.files {
         by_path.entry(file.path.as_str()).or_insert(file);
     }
+    let ci_files = CiFiles::of(&report.files);
     let mut skips = ImportSkips::default();
     let mut groups: Vec<Group> = Vec::new();
     for file in &report.files {
@@ -179,7 +208,8 @@ fn declared_references(report: &AnalysisReport, ci: CiRefs) -> Vec<Group> {
         // unless CI auditing was requested (`--follow=all`, `--follow=ci-actions`). The
         // root of a single-file workflow scan is a member here like any other,
         // so this one gate covers it too.
-        if ci == CiRefs::Skip && is_ci_context(file) {
+        let in_ci = ci_files.contains(file);
+        if ci == CiRefs::Skip && in_ci {
             continue;
         }
         let Some(view) = &file.filefacts else {
@@ -202,7 +232,7 @@ fn declared_references(report: &AnalysisReport, ci: CiRefs) -> Vec<Group> {
         if refs.is_empty() {
             continue;
         }
-        if is_ci_context(file) {
+        if in_ci {
             mark_scope(&mut refs, filefacts::DependencyScope::Ci);
         }
         groups.push((file.sha256.clone(), refs));
@@ -289,7 +319,8 @@ fn hunt_root(
     let Some(root) = report.files.first() else {
         return;
     };
-    if (ci == CiRefs::Skip && is_ci_context(root)) || root.size > ROOT_HUNT_MAX_BYTES {
+    let root_in_ci = root.file_type == FileType::GithubActions.label();
+    if (ci == CiRefs::Skip && root_in_ci) || root.size > ROOT_HUNT_MAX_BYTES {
         return;
     }
     let Some(bytes) = root_bytes
@@ -318,7 +349,7 @@ fn hunt_root(
         Some(subject) => vec![subject],
         None => found(find::references_in_bytes(&bytes, &*name), &root.path),
     };
-    if is_ci_context(root) {
+    if root_in_ci {
         mark_scope(&mut hunted, filefacts::DependencyScope::Ci);
     }
     if !hunted.is_empty() {
@@ -475,12 +506,13 @@ fn hunt_download_members(
         return;
     };
     let prefix = format!("{}!!", root.path);
+    let ci_files = CiFiles::of(&report.files);
     let mut hunted_members = 0usize;
     // Cleave extracts from a path; materialize in-memory input only if a member
     // actually needs a text hunt, and reuse the temporary file for all members.
     let mut staged: Option<tempfile::NamedTempFile> = None;
     for file in members {
-        if ci == CiRefs::Skip && is_ci_context(file) {
+        if ci == CiRefs::Skip && ci_files.contains(file) {
             continue;
         }
         let Some(trigger) = download_intent(&file.findings) else {

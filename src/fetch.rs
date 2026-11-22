@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use cleave::AnalysisReport;
-use fletch::fetch::{BlobCache, Coverage, Fetch, FetchRecord, HttpFetch, Outcome};
+use fletch::fetch::{BlobCache, Fetch, FetchRecord, HttpFetch, Outcome};
 use fletch::{RefLocator, Reference, find};
 
 mod age_gate;
@@ -63,7 +63,7 @@ pub use self::registry::{
     Unretrievable, fetch_one, graft_root_registry, registry_document, registry_summary,
     registry_with_sources,
 };
-pub(crate) use self::render::{coverage_gaps, dependency_attention, settled};
+pub(crate) use self::render::{dependency_attention, settled};
 pub use self::render::{fetch_target, report_registry};
 
 use self::discover::{CiRefs, collect_references_from_input};
@@ -422,15 +422,8 @@ pub(crate) fn orchestrate(
     attribute_undeclared_npm_imports(report, &worklist);
     let precheck = crate::corpus_precheck::armed();
     let mut session = FetchSession::new(report, &worklist, res, follow, precheck);
-    session.record_unresolved_fetch_calls(report);
     session.run(report, worklist);
     session.finish(report)
-}
-
-/// Whether `fact` says a reference's analysis is missing or has gaps: what a
-/// later run retries, and what a summary counts as incomplete.
-fn is_analysis_gap(fact: &Coverage) -> bool {
-    matches!(fact, Coverage::Unavailable { .. } | Coverage::Incomplete)
 }
 
 /// `rec`'s coverage facts as one line for people.

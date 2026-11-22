@@ -654,7 +654,7 @@ fn listed_members_get_lines_only_when_every_member_is_asked_for() {
     };
     let body = |every: bool| {
         let bytes = if every {
-            doc.encode_every(&sha('a'), None, &stamp)
+            doc.encode_shown(&sha('a'), None, None, &stamp, true)
         } else {
             doc.encode(&sha('a'), None, &stamp)
         };
@@ -827,4 +827,51 @@ fn scanners_reach_the_artifacts_line_and_leave_the_verdict_alone() {
         doc.set_scanner(Scanner::Clamav, serde_json::json!({"outcome": "skipped"})),
         Err(OpinionError::Outcome)
     );
+}
+
+/// Uplink's opinion is the shown result's `uplink` juror, on the scanned
+/// artifact's line only, and never part of an upload: hopper is where
+/// Uplink's verdicts come from.
+#[test]
+fn uplink_is_a_juror_in_shown_output_only() {
+    let doc = build_kept(&package(), &package_members(), &HashSet::from([2, 3]), &[]);
+    let opinion = crate::remote::Opinion {
+        verdict: crate::corpus_precheck::Verdict {
+            fires_at: Level::At(25),
+            reason: Some("packed coinminer\0 with C2".into()),
+            findings: Vec::new(),
+            analyzed_at: Some("2026-08-23T17:23:02Z".into()),
+            engine_version: Some("2.8.0-beta.2".into()),
+        },
+        stands: false,
+    };
+    let stamp = Stamp {
+        at: "2026-11-12T15:00:00Z",
+        model: "v20.20",
+        worker: None,
+        ms: None,
+    };
+    let parse = |body: Vec<u8>| {
+        body.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice::<serde_json::Value>(l).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let shown = parse(
+        doc.encode_shown(&sha('a'), None, Some(&opinion), &stamp, false)
+            .unwrap(),
+    );
+    assert_eq!(
+        shown[1]["uplink"],
+        serde_json::json!({
+            "class": "hostile",
+            "fires_at": 25,
+            "reason": "packed coinminer with C2",
+            "analyzed_at": "2026-08-23T17:23:02Z",
+            "engine": "2.8.0-beta.2",
+        })
+    );
+    assert!(shown[2..].iter().all(|line| line.get("uplink").is_none()));
+    let upload = parse(doc.encode(&sha('a'), None, &stamp).unwrap());
+    assert!(upload.iter().all(|line| line.get("uplink").is_none()));
 }

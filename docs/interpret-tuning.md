@@ -127,8 +127,22 @@ the grader for no gain.
 
 ## Validating a change
 
-Run this for any change to the system prompt, the render, the gate or the
-blend, and when the serving model changes.
+The target is the grade an expert security engineer would give the file if
+they found it on an endpoint they defend. A hostile sample graded suspicious is
+a failure, not a near miss; dual-use tooling and malware emulation grade
+suspicious; adware that hijacks the browser grades hostile.
+
+First run `tests/llm_fixtures.rs` (`cargo test --test llm_fixtures --
+--nocapture`). It grades `testdata/llm/` — at least 20 hostile and 20 benign
+small samples across the formats gauntlet sees, labelled in
+`testdata/llm/MANIFEST.tsv` — through the live render and endpoint, and prints
+each sample's grades and prompt bytes. It needs `~/.tok/llm` and skips without
+it. `SCAN_LLM_SYSTEM_PROMPT_FILE` grades with a candidate prompt and
+`SCAN_LLM_FIXTURES_DIR` grades a held-out set in the same layout; tune on the
+fixtures, then confirm on a held-out set, and run each arm twice, since a
+borderline sample can be stably wrong in one direction under one prompt.
+
+For a larger change, also run the corpus procedure below.
 
 1. **Assemble labelled sets.** At least one set of known-bad samples and one
    of known-clean ones, including clean files that look alarming (signed

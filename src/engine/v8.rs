@@ -753,29 +753,34 @@ impl UploadDoc {
         llm: Option<&Interpretation>,
         stamp: &Stamp<'_>,
     ) -> Option<Vec<u8>> {
-        self.encode_with(sha256, llm, stamp, false)
+        self.encode_with(sha256, (llm, None), stamp, false)
     }
 
-    /// [`Self::encode`], naming every member the document holds, kept or not
-    /// (`--all-members`). For output only; an upload is [`Self::encode`].
+    /// [`Self::encode`] as it is shown rather than uploaded: with `uplink`
+    /// as the artifact's Uplink juror, and, with `every`, naming every member
+    /// the document holds, kept or not (`--all-members`). Never uploaded:
+    /// hopper is where Uplink's verdicts come from.
     #[must_use]
-    pub fn encode_every(
+    pub(crate) fn encode_shown(
         &self,
         sha256: &str,
         llm: Option<&Interpretation>,
+        uplink: Option<&crate::remote::Opinion>,
         stamp: &Stamp<'_>,
+        every: bool,
     ) -> Option<Vec<u8>> {
-        self.encode_with(sha256, llm, stamp, true)
+        let uplink = uplink.and_then(|opinion| uplink_object(opinion, self.level));
+        self.encode_with(sha256, (llm, uplink.as_deref()), stamp, every)
     }
 
     fn encode_with(
         &self,
         sha256: &str,
-        llm: Option<&Interpretation>,
+        opinions: (Option<&Interpretation>, Option<&RawValue>),
         stamp: &Stamp<'_>,
         every: bool,
     ) -> Option<Vec<u8>> {
-        let body = self.write(sha256, llm, stamp, every, true)?;
+        let body = self.write(sha256, opinions, stamp, every, true)?;
         if body.len() <= MAX_BODY {
             return Some(body);
         }
@@ -786,13 +791,14 @@ impl UploadDoc {
             "upload: result body too large; sending it without reports",
         );
         drop(body);
-        self.write(sha256, llm, stamp, every, false)
+        self.write(sha256, opinions, stamp, every, false)
     }
 
+    /// `opinions` are the artifact's LLM and Uplink jurors.
     fn write(
         &self,
         sha256: &str,
-        llm: Option<&Interpretation>,
+        (llm, uplink): (Option<&Interpretation>, Option<&RawValue>),
         stamp: &Stamp<'_>,
         every: bool,
         with_reports: bool,
@@ -831,6 +837,7 @@ impl UploadDoc {
             let key = if i == 0 { sha256 } else { file.sha256.as_str() };
             let mut line =
                 self.file_line(i, key, llm.filter(|_| i == 0), stamp.model, with_reports);
+            line.uplink = uplink.filter(|_| i == 0 && line.verdict.is_some());
             line.contents = self.contents(i, &at);
             if line.report.is_some()
                 && let Some(report) = &file.report
@@ -894,6 +901,7 @@ impl UploadDoc {
             llm: None,
             drift_heuristic: None,
             drift_llm: None,
+            uplink: None,
             scanners: None,
             report: None,
             ident: file.ident.as_deref(),
@@ -1456,6 +1464,34 @@ fn floor_object(f: &FloorDecision, within: Option<&str>) -> Option<Box<RawValue>
 }
 
 #[derive(Serialize)]
+struct UplinkObject<'a> {
+    class: &'static str,
+    fires_at: Level,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analyzed_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<&'a str>,
+}
+
+/// Uplink's opinion as the `uplink` juror, graded at the run's `level`: one
+/// that did not stand in for the local verdict, which a standing one never
+/// reaches a full result to be. `None` for a verdict with no level.
+fn uplink_object(opinion: &crate::remote::Opinion, level: Option<u16>) -> Option<Box<RawValue>> {
+    let verdict = &opinion.verdict;
+    let class = crate::remote::classification(verdict.fires_at, level)?;
+    let reason = without_nul(verdict.reason.as_deref().unwrap_or_default());
+    fit(&reason, |reason| UplinkObject {
+        class: class_word(class),
+        fires_at: verdict.fires_at,
+        reason,
+        analyzed_at: verdict.analyzed_at.as_deref(),
+        engine: verdict.engine_version.as_deref(),
+    })
+}
+
+#[derive(Serialize)]
 struct LlmGraded<'a> {
     class: &'static str,
     conf: f32,
@@ -1533,6 +1569,9 @@ struct FileLine<'a> {
     drift_heuristic: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drift_llm: Option<&'a RawValue>,
+    /// Atomdrift Uplink's opinion: in shown output only, never uploaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uplink: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scanners: Option<BTreeMap<Scanner, &'a RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]

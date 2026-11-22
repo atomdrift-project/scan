@@ -975,7 +975,7 @@ pub fn purl_counters() -> (u64, u64) {
 /// fractional seconds, which are ignored — to a Unix epoch. Offsets other than
 /// `Z` are rejected: hopper emits UTC, and a wrong-but-plausible parse here
 /// would silently misjudge freshness.
-fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
     let s = s.strip_suffix('Z')?;
     let (whole, fraction) = s.split_once('.').unwrap_or((s, "0"));
     if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {

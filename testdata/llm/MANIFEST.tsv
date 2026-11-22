@@ -1,0 +1,58 @@
+# LLM grading fixtures for tests/llm_fixtures.rs.
+#
+# Each file is xz-compressed (`xz -dc` restores the original bytes and name)
+# so that live malware never sits in the tree in runnable form. NEVER run,
+# install or import a decompressed sample.
+#
+# Columns: fixture <TAB> expected grade <TAB> format <TAB> source <TAB> evidence
+#   expected: hostile | suspicious | benign: the grade an expert security
+#             engineer would give the file if they found it on an endpoint,
+#             which is the grade the LLM must return.
+#   source:   gauntlet = gauntlet triage 2026-11-20..22, labelled by static
+#             reverse engineering; traits-dev = traits-dev/samples (curated);
+#             upstream = fetched from the project's official URL 2026-11-22;
+#             downloads = supplied by the maintainer.
+# Labels were assigned by reading each sample; none was executed.
+hostile/event-bus-lite-testmetest-0.0.1.tgz.xz	hostile	npm	downloads	binding.gyp runs index.js at install; a ROT-1 char-code eval layer AES-GCM-decrypts lib_native.dat, writes it to a temp dir and spawns it with Bun.
+hostile/action-slack-message-root-1.0.1.tgz.xz	hostile	npm	traits-dev	Curated hostile npm sample.
+hostile/get-power-1.0.3.tgz.xz	hostile	npm	traits-dev	Curated hostile npm sample.
+hostile/blender_headless-9.99.9-py3-none-any.whl.xz	hostile	whl	gauntlet	On import, resolves import-<id>.blender-headless-<hostname>.finaltests99.dssldrf[.]net: a dependency-confusion DNS beacon.
+hostile/my_signature-1.0.0-py3-none-any.whl.xz	hostile	whl	gauntlet	On import, connects to a pinggy-free[.]link tunnel, dup2s fds 0-2 onto the socket and pty.spawn("/bin/sh"): a reverse shell.
+hostile/doctreelstm-1.0.0.tar.gz.xz	hostile	sdist	gauntlet	setup.py GETs user, hostname and cwd to hxxp://38.242.235[.]206/depconf/ at install.
+hostile/hckckfcmmebhhdmmijemjopbpabgcjbn.crx.xz	hostile	crx	traits-dev	"Fast Search" browser hijacker: forces a generic-named default search on manualsearch-svc[.]org and redirects queries through a GUID-tagged affiliate URL.
+hostile/lwd-uri-util-0.1.5.crate.xz	hostile	crate	gauntlet	build.rs POSTs every env var, hostname and user to a base64-hidden webhook[.]site URL at compile time, skipping sandbox-looking hosts.
+hostile/xmastree-0.0.2.gem.xz	hostile	gem	gauntlet	Rakefile extension runs at gem install and POSTs `whoami` to a base64-hidden herokuapp[.]com URL.
+hostile/w002yardprobe-0.0.3.gem.xz	hostile	gem	gauntlet	.yardopts loads script.rb during doc generation, which POSTs hostname, pwd, uid and Ruby version to webhook[.]site.
+hostile/Atom.Domain.1.0.0.nupkg.xz	hostile	nupkg	gauntlet	build/Atom.Domain.targets runs after Build, dumps env vars, flags secrets and POSTs them to a pipedream[.]net endpoint.
+hostile/lanarllc.prism-boards.vsix.xz	hostile	vsix	gauntlet	Activates on startup, polls doublecounter-web[.]com and runs server-supplied JS via ELECTRON_RUN_AS_NODE even when its signature check fails.
+hostile/update.ps1.xz	hostile	ps1	gauntlet	Downloads update.zip from wovplaying[.]help into %TEMP%, extracts it and runs the first .exe.
+hostile/FIYAT_TEKLIFI_SAT_35167519.js.xz	hostile	wsh-js	gauntlet	Price-quote lure; MSXML2.XMLHTTP fetches a .ps1 from moolsap[.]com and runs it with hidden `powershell -nop -ep bypass`.
+hostile/stage04.applescript.xz	hostile	applescript	gauntlet	Char+8-shifted strings; reads its C2 from a Polygon contract, POSTs to it and pipes the reply to osascript.
+hostile/router.sh.xz	hostile	sh	gauntlet	IoT dropper: fetches mips/mipsel/arm bots from hxxp://13.140.181[.]222, runs them, then deletes them and itself.
+hostile/benign-session-writer.py.xz	hostile	py	gauntlet	Despite its name, writes a forged user turn into ~/.copilot session state telling the agent to run /bin/sh /tmp/dev-test.sh before every reply.
+hostile/deathstar.mipsel.xz	hostile	elf-mipsel	gauntlet	Mirai-family bot: watchdog path list, XOR-0x26 string table decoding to a C2 host and flood payloads.
+hostile/0d19ab356db462c3c81421e8b57a1e2c.exe.xz	hostile	pe32	gauntlet	Metasploit-style stager: ror13 API hashing, connects to 192.210.193[.]156:28090, reads into RWX memory, XOR-0x99 decrypts and jumps.
+hostile/who-r-u0000.bin.xz	hostile	7z-pytorch	gauntlet	7z of a PyTorch model whose data.pkl opens with GLOBAL builtins.exec: a reverse shell to 107.173.7[.]141:4242.
+benign/@reause-math-0.1.7.tgz.xz	benign	npm	traits-dev	Curated benign npm sample.
+benign/@the-brotherhood-of-scu-scu-cli-0.5.1.tgz.xz	benign	npm	traits-dev	Curated benign npm sample.
+benign/pointer-feedback-0.2.1.tgz.xz	benign	npm	traits-dev	Curated benign npm sample.
+hostile/hafjjpdeoiaipmfgchhjkgbnhgbjjlam.crx.xz	hostile	crx	traits-dev	Searcheira browser hijacker: forces searcheira.com as default search and startup page with a sticky tracking token. Adware grades hostile (maintainer decision 2026-11-22; traits-dev still files it as benign).
+benign/yandex_monlib-66.0.3.tar.gz.xz	benign	sdist	traits-dev	Namespace-reservation placeholder; no behavior.
+benign/esbuild-0.25.0.tgz.xz	benign	npm	upstream	Official esbuild package: postinstall install.js fetches the platform binary. Alarming shape, legitimate.
+benign/rustup-init.sh.xz	benign	sh	upstream	Official rustup installer (sh.rustup.rs): downloads and runs rustup-init. Curl-to-shell shape, legitimate.
+benign/install.ps1.xz	benign	ps1	upstream	Official Chocolatey installer: downloads a nupkg, extracts and runs it. Download-and-execute shape, legitimate.
+benign/@stefanosala-vc-cli-linux-x64-0.1.0.tgz.xz	benign	npm	gauntlet	Platform-binary stub: package.json only, the declared binary is absent, no install scripts.
+benign/stdid_nyxprobe-0.0.1-py3-none-any.whl.xz	benign	whl	gauntlet	Empty placeholder: __init__.py holds a comment and __version__.
+benign/perl-orlite-2.00-1.src.tar.gz.xz	benign	aur-src	gauntlet	Ordinary AUR PKGBUILD building ORLite 2.00 from cpan.metacpan.org, sha256-pinned.
+benign/HoverSwitch.zip.xz	benign	zip-ps1	gauntlet	Tray app toggling a Windows hover-activation setting via SystemParametersInfo; documented hidden launch, no network.
+benign/bit-flags-0.1.2.crate.xz	benign	crate	gauntlet	no_std bitflag trait; no build.rs, no I/O.
+benign/happyone.winui3controls.1.1.0.nupkg.xz	benign	nupkg	gauntlet	WinUI FileButton/TreeView control DLL; opens a developer-set path on click; no network or install scripts.
+suspicious/vapt-oracle.py.xz	suspicious	py	gauntlet	Offensive tooling (maintainer decision 2026-11-22). Pentest check that sends an echo/id probe to a target URL parameter to confirm command injection; a scanner check.
+suspicious/gitdoor_behave.py.xz	suspicious	py	gauntlet	Attack emulation (maintainer decision 2026-11-22). Detection-test stub: appends a marker line to a file under %APPDATA% and prints; no network, no payload.
+benign/貨物追跡ウィジェット.js.xz	benign	js	gauntlet	Scriptable iOS shipment-tracking widget calling FedEx and OCS tracking APIs; keys in the Keychain.
+benign/36febbaaee18944359bad74a574204089838cc3642ab410d6a237da2fd4ccc2c.xz	benign	zip	gauntlet	Fan-made QQPet LAN bridge over public MQTT with AES-GCM and an honest readme; reads only the pet's own save files.
+benign/EqualizerAPO-XT-Setup.exe.xz	benign	pe32	gauntlet	Download-and-verify bootstrapper: fetches the CPU-matched build from GitHub releases, checks SHA-256, hands off to Velopack.
+benign/virussign.com_84a15af3dd065f5ce6683c78a6287f00.vir.xz	benign	pyc	gauntlet	Stock Ren'Py renpy/test/testfocus.py compiled to bytecode; focus/position helpers only.
+benign/six-1.17.0-py2.py3-none-any.whl.xz	benign	whl	upstream	Official six 1.17.0 wheel (Python 2/3 compatibility library) from files.pythonhosted.org.
+benign/cfg-if-1.0.0.crate.xz	benign	crate	upstream	Official cfg-if 1.0.0 from static.crates.io: a single cfg_if! macro, no build.rs.
+benign/rainbow-3.1.1.gem.xz	benign	gem	upstream	Official rainbow 3.1.1 from rubygems.org: terminal color string helpers, no extensions.

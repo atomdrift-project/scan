@@ -128,6 +128,8 @@ pub(super) struct CardHead<'a> {
     pub(super) decision: &'a Decision,
     pub(super) reasons: &'a [Reason],
     pub(super) interpretation: Option<&'a Interpretation>,
+    /// Uplink's reason, when no LLM interpretation was asked for.
+    pub(super) uplink_reason: Option<&'a str>,
     pub(super) sha256: &'a str,
     pub(super) label: &'a str,
     pub(super) bloom_mark: Option<BloomMark>,
@@ -430,7 +432,9 @@ pub(super) fn render_terminal_context(
     }
 
     let mut out = card_head(files, head, is_container);
-    if let Some(interp) = output::terminal_interpretation(head.interpretation) {
+    if let Some(interp) = output::terminal_interpretation(head.interpretation)
+        .or_else(|| head.uplink_reason.map(output::terminal_uplink_reason))
+    {
         out.push_str(&interp);
         out.push('\n');
     } else if let Some(trailer) = output::terminal_trailer(head.reasons) {
@@ -551,7 +555,9 @@ fn render_archive_cards(
 
     // ── Banner: verdict rule → 📦 name · TYPE · size → hash ──
     let mut out = card_head(files, head, true);
-    if let Some(interp) = output::terminal_interpretation(head.interpretation) {
+    if let Some(interp) = output::terminal_interpretation(head.interpretation)
+        .or_else(|| head.uplink_reason.map(output::terminal_uplink_reason))
+    {
         out.push_str(&interp);
         out.push('\n');
     }
@@ -949,81 +955,12 @@ pub(super) fn render_terminal_fetch_context(
         }
     }
 
-    write_terminal_coverage_gaps(&mut out, fetched, index);
-
     // Nothing is footnoted for the artifacts that stayed quiet. Their count
     // says nothing at the decision point — the streamed fetch summary already
     // reports how many were retrieved — and a section that ends by naming what
     // it declined to show reads as withheld evidence rather than a clean pass.
     (!out.is_empty()).then_some(out)
 }
-
-/// What the fetch phase could not analyze, one line per reason with as many
-/// of its references as fit. Stated on the card because that is the only
-/// place a gap has an owner; a row per reference would bury the verdict of
-/// any package with a few hundred optional imports.
-fn write_terminal_coverage_gaps(out: &mut String, fetched: Fetched<'_>, index: &ReportIndex<'_>) {
-    let groups = crate::fetch::coverage_gaps(fetched.edges, |sha| {
-        let file = index.by_sha.get(sha)?;
-        Some(if file.depth == 0 {
-            "this file".to_owned()
-        } else {
-            terminal_finding_path(&file.path)
-        })
-    });
-    if groups.is_empty() {
-        return;
-    }
-    let p = output::palette();
-    let total: usize = groups.iter().map(|(_, labels)| labels.len()).sum();
-    let _ = writeln!(
-        out,
-        "\n {}  {}",
-        output::fg(p.warning, "\u{26a0}"),
-        output::fg(
-            p.label,
-            &format!(
-                "{total} reference{} not analyzed",
-                if total == 1 { "" } else { "s" }
-            )
-        ),
-    );
-    let width = terminal_width().saturating_sub(GAP_INDENT.len());
-    for (reason, labels) in &groups {
-        let _ = writeln!(
-            out,
-            "    {}  {}",
-            output::fg(p.warning, &format!("{:>4} \u{00d7}", labels.len())),
-            output::fg(p.dim, &output::tty_text(reason)),
-        );
-        // As many references as fit one line, then how many were left out.
-        let mut line = String::new();
-        let mut shown = 0;
-        for label in labels {
-            let more = format!("  +{} more", labels.len() - shown - 1);
-            let next = if shown == 0 { 0 } else { 3 } + label.chars().count();
-            if shown > 0 && line.chars().count() + next + more.chars().count() > width {
-                break;
-            }
-            if shown > 0 {
-                line.push_str(" \u{00b7} ");
-            }
-            line.push_str(label);
-            shown += 1;
-        }
-        if shown < labels.len() {
-            let _ = write!(line, "  +{} more", labels.len() - shown);
-        }
-        let _ = writeln!(
-            out,
-            "{GAP_INDENT}{}",
-            output::fg(p.very_dim, &output::tty_text(&line))
-        );
-    }
-}
-
-/// Indent of a coverage gap's reference line, under its reason.
-const GAP_INDENT: &str = "            ";
 
 fn terminal_fetch_source(rec: &FetchRecord, index: &ReportIndex<'_>) -> String {
     rec.source_sha256

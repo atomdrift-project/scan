@@ -254,12 +254,15 @@ pub(crate) fn classify_report(
         );
     }
 
+    let (uplink, uplink_reason) = uplink_opinion(&sha256, decision.class, &req);
+
     let render_started = Instant::now();
     let rendered_context = if needs.render_context {
         let card = CardHead {
             decision: &decision,
             reasons: &scored.reasons,
             interpretation: llm.interpretation.as_ref(),
+            uplink_reason: uplink_reason.as_deref(),
             sha256: &sha256,
             label: req.label,
             bloom_mark: req.bloom_mark,
@@ -316,20 +319,11 @@ pub(crate) fn classify_report(
         blend_upload(doc, req.model, graded);
     }
     // Read before retention drops the files it does not keep.
-    let fetches_settled = crate::fetch::settled(&prepared.fetch.records);
-    let unfinished_files = compact
-        .files
-        .iter()
-        .filter(|file| crate::analysis_cache::unfinished(&file.analysis_gaps))
-        .count();
-    let settled = fetches_settled && llm.pending.is_none() && unfinished_files == 0;
-    tracing::debug!(
-        path = req.label,
-        settled,
-        fetches_settled,
-        unfinished_files,
-        llm_pending = llm.pending.is_some(),
-        "whether another run would reach this result"
+    let settled = is_settled(
+        req.label,
+        &prepared.fetch.records,
+        &compact,
+        llm.pending.is_some(),
     );
     apply_report_retention(&mut compact, &kept);
     // The model has read every fact it featurizes from; what is stored keeps
@@ -379,12 +373,90 @@ pub(crate) fn classify_report(
             interpret_ms: crate::duration_ms(llm.elapsed),
             dependency_results,
             bloom_mark: req.bloom_mark,
+            uplink,
+            uplink_reason,
             hopper_route: HopperRoute::Normal,
             model: scored.model,
             floor: scored.floor,
             upload,
         },
     })
+}
+
+/// Whether another run over the same bytes and the same resolved
+/// dependencies would reach this result: every fetch settled, every file
+/// analyzed in full, and no LLM opinion still owed.
+fn is_settled(
+    label: &str,
+    records: &[FetchRecord],
+    compact: &CompactReport,
+    llm_pending: bool,
+) -> bool {
+    let fetches_settled = crate::fetch::settled(records);
+    let unfinished_files = compact
+        .files
+        .iter()
+        .filter(|file| crate::analysis_cache::unfinished(&file.analysis_gaps))
+        .count();
+    let settled = fetches_settled && !llm_pending && unfinished_files == 0;
+    tracing::debug!(
+        path = label,
+        settled,
+        fetches_settled,
+        unfinished_files,
+        llm_pending,
+        "whether another run would reach this result"
+    );
+    settled
+}
+
+/// What Atomdrift Uplink says of a file this run flags: graded suspicious or
+/// hostile at the run's level, or marked by the bloom filters as known-bad or
+/// sighted. When Uplink's verdict stands it is reported in place of this
+/// result; otherwise the result stands and Uplink lends its reason, when no
+/// LLM interpretation was asked for. Either way the opinion is kept for the
+/// full result's `uplink` juror.
+///
+/// Which verdict stands depends on who flagged the file. A sighted file
+/// (somebody else's claim) takes the worse of the two verdicts, however old
+/// Uplink's is. Any other takes Uplink's when it is current, reached under
+/// traits at least as new as ours.
+fn uplink_opinion(
+    sha256: &str,
+    class: Classification,
+    req: &ClassifyRequest<'_>,
+) -> (Option<crate::remote::Opinion>, Option<String>) {
+    use crate::output::BloomMark;
+    let mark = req.bloom_mark;
+    let sighted = mark == Some(BloomMark::Sighted);
+    let marked = sighted || mark.is_some_and(BloomMark::is_known_bad);
+    if sha256.is_empty() || (class == Classification::Benign && !marked) {
+        return (None, None);
+    }
+    let Some(verdict) = crate::remote::second_opinion(sha256) else {
+        return (None, None);
+    };
+    let remote = crate::remote::classification(verdict.fires_at, req.model.active_level());
+    let stands = if sighted {
+        remote.is_some_and(|remote| remote > class)
+    } else {
+        crate::remote::current(&verdict)
+    };
+    tracing::info!(
+        path = req.label,
+        sha256,
+        local = ?class,
+        remote = ?remote,
+        ?mark,
+        analyzed_at = verdict.analyzed_at.as_deref().unwrap_or_default(),
+        stands,
+        "Uplink asked about a flagged file"
+    );
+    let reason = verdict
+        .reason
+        .clone()
+        .filter(|reason| !stands && req.interpret.is_none() && !reason.trim().is_empty());
+    (Some(crate::remote::Opinion { verdict, stands }), reason)
 }
 
 /// The report after cleave's finalize, reference fetching and grafting: what

@@ -1046,13 +1046,57 @@ const PUBLISHER: &[&str] = &[
     // ---- Documentation and reference --------------------------------------
     "devdocs.io",
     "linux.die.net",
-    // ---- Reserved names that never resolve (RFC 2606, RFC 6761) -----------
+];
+
+/// Domains that stand in for "your site" in documentation, READMEs and test
+/// fixtures: the names reserved never to resolve (RFC 2606, RFC 6761) and the
+/// stock spellings people write instead. A URL on one names nothing anybody
+/// published, so it is dropped before any request, without a record.
+const PLACEHOLDER_DOMAINS: &[&str] = &[
+    // Reserved names that never resolve (RFC 2606, RFC 6761).
     "example.com",
     "example.edu",
     "example.net",
     "example.org",
     "invalid",
     "localhost",
+    // Stock placeholders.
+    "domain.com",
+    "mydomain.com",
+    "mysite.com",
+    "website.com",
+    "your-domain.com",
+    "yourdomain.com",
+    "yoursite.com",
+    "yourwebsite.com",
+];
+
+/// Code hosts whose first path segment is an owner, where documentation
+/// writes a stand-in owner (`github.com/username/repo.git`).
+const OWNER_HOSTS: &[&str] = &[
+    "bitbucket.org",
+    "github.com",
+    "gitlab.com",
+    "raw.githubusercontent.com",
+];
+
+/// Stand-in owners, compared case-insensitively against the first path
+/// segment on an [`OWNER_HOSTS`] URL.
+const PLACEHOLDER_OWNERS: &[&str] = &[
+    "my-org",
+    "my-username",
+    "myorg",
+    "myusername",
+    "org",
+    "owner",
+    "user",
+    "username",
+    "your-org",
+    "your-user",
+    "your-username",
+    "yourname",
+    "yourorg",
+    "yourusername",
 ];
 
 /// A parsed URL's host, typed.
@@ -1109,6 +1153,28 @@ pub(crate) fn publisher_controlled(url: &Url) -> bool {
         return false;
     }
     PUBLISHER.iter().any(|domain| under(host, domain))
+}
+
+/// Whether `url` is a documentation placeholder rather than an address
+/// anybody published: a reserved or stock "your site" domain, or a code-host
+/// URL whose owner is a stand-in (`github.com/username/repo.git`). Fetching
+/// one can only fail or reach a stranger's parked page.
+pub(crate) fn placeholder(url: &Url) -> bool {
+    let Some(host) = domain(url) else {
+        return false;
+    };
+    if PLACEHOLDER_DOMAINS.iter().any(|domain| under(host, domain)) {
+        return true;
+    }
+    OWNER_HOSTS.contains(&host)
+        && url
+            .path_segments()
+            .and_then(|mut segments| segments.next())
+            .is_some_and(|owner| {
+                PLACEHOLDER_OWNERS
+                    .iter()
+                    .any(|stand_in| owner.eq_ignore_ascii_case(stand_in))
+            })
 }
 
 /// Whether a URL — `raw` as discovered, `url` as parsed — was observed in /bin
@@ -1375,11 +1441,36 @@ mod tests {
     }
 
     #[test]
+    fn documentation_placeholders_are_recognized() {
+        for url in [
+            "http://website.com/my-script.sh",
+            "https://www.example.com/install.sh",
+            "https://api.yourdomain.com/v1",
+            "https://github.com/username/repo.git",
+            "https://github.com/Your-Username/repo.git@v1.0#egg=package",
+            "https://raw.githubusercontent.com/OWNER/repo/main/install.sh",
+        ] {
+            assert!(placeholder(&parse(url)), "{url}");
+        }
+        for url in [
+            "https://github.com/ossf/scorecard",
+            "https://github.com/usernamespace/tool",
+            "https://gitlab.com/groups/username",
+            "https://notwebsite.com/x",
+            "https://username.github.io/repo",
+            "https://dot.net/v1/dotnet-install.sh",
+        ] {
+            assert!(!placeholder(&parse(url)), "{url}");
+        }
+    }
+
+    #[test]
     fn no_duplicate_entries() {
         for (label, list) in [
             ("PUBLISHER", PUBLISHER),
             ("THIRD_PARTY", THIRD_PARTY),
             ("DISCOVERY_DOMAINS", DISCOVERY_DOMAINS),
+            ("PLACEHOLDER_DOMAINS", PLACEHOLDER_DOMAINS),
         ] {
             let mut seen = HashSet::new();
             for domain in list {
@@ -1390,7 +1481,12 @@ mod tests {
 
     #[test]
     fn entries_are_bare_lowercase_domains() {
-        for domain in PUBLISHER.iter().chain(THIRD_PARTY).chain(DISCOVERY_DOMAINS) {
+        for domain in PUBLISHER
+            .iter()
+            .chain(THIRD_PARTY)
+            .chain(DISCOVERY_DOMAINS)
+            .chain(PLACEHOLDER_DOMAINS)
+        {
             assert_eq!(
                 *domain,
                 domain.to_ascii_lowercase(),

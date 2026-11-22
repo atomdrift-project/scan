@@ -94,7 +94,6 @@ struct Tally {
     suspicious: AtomicU32,
     benign: AtomicU32,
     errors: AtomicU32,
-    dependency_gaps: AtomicU32,
     static_flags: AtomicU32,
     flagged_candidates: AtomicU32,
 }
@@ -112,7 +111,6 @@ impl Tally {
             Classification::Benign => &self.benign,
         };
         Self::add(class, 1);
-        Self::add(&self.dependency_gaps, result.dependency_attention.gaps);
         Self::add(&self.static_flags, u32::from(result.has_severe_findings()));
         Self::add(
             &self.flagged_candidates,
@@ -129,7 +127,6 @@ impl Tally {
             benign: load(&self.benign),
             errors: load(&self.errors),
             dependency_attention: crate::engine::DependencyAttention {
-                gaps: load(&self.dependency_gaps),
                 flagged_candidates: load(&self.flagged_candidates),
             },
             static_flags: load(&self.static_flags),
