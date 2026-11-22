@@ -43,6 +43,12 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
         return Ok(data_dir);
     }
 
+    if crate::settings::get().offline {
+        anyhow::bail!(
+            "no models are installed at {}, and --offline forbids downloading them: run `atomscan update-rules` once while online",
+            data_dir.display()
+        );
+    }
     eprintln!("First run: downloading Atomdrift Scan models...");
     crate::model_update::update(&data_dir, false, false)
         .with_context(|| format!("failed to install models to {}", data_dir.display()))?;

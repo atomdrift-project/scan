@@ -259,6 +259,14 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_update: bool,
 
+    /// Make no network connection at all: no rule, model or release check, no
+    /// Atomdrift Uplink, no following of references, no hopper and no LLM,
+    /// whatever other flags and environment variables say. The rules and
+    /// models must already be installed. `url`, `purl`, `update-rules`,
+    /// `serve` and switching feeds need the network, and refuse to run.
+    #[arg(long, global = true, conflicts_with = "update")]
+    pub offline: bool,
+
     /// Rule feed for this run: zero-day, supporter, or oss-delayed. Overrides
     /// the feed saved by `atomscan feed <name>` (shared with cleave). A paid
     /// feed with no token held connects this computer on a terminal — a code
@@ -267,16 +275,19 @@ pub struct GlobalArgs {
     #[arg(long, global = true, value_enum, env = "ATOMDRIFT_FEED")]
     pub feed: Option<cleave::feed::Feed>,
 
-    /// Where artifacts are judged. `auto` (the default) asks Atomdrift Uplink
-    /// for a verdict it already holds — sending only the SHA-256 of local
-    /// files of 1 MiB or more, and the PURLs of packages on mainstream public
-    /// registries — and analyzes locally whatever it does not know; it needs
-    /// a paid isotope13 plan (a paid feed in use), and without one is the same
-    /// as `local`. `local` never asks, and is the reproducible mode. `remote`
+    /// Whether to ask Atomdrift Uplink before analyzing. `true` asks for a
+    /// verdict it already holds — sending only the SHA-256 of local files of
+    /// 1 MiB or more and of fetched artifacts, and the PURLs of packages on
+    /// mainstream public registries — and analyzes locally whatever it does
+    /// not know. No account is needed; a paid plan's token is sent when one
+    /// is held. `false` never asks, and is the reproducible mode. `always`
     /// sends everything to Uplink for analysis, uploading local files'
-    /// contents, and connects this computer if it holds no token.
-    #[arg(long, global = true, value_enum, default_value = "auto")]
-    pub analyze: crate::remote::Analyze,
+    /// contents; it needs a paid plan, and connects this computer if it holds
+    /// no token. Default: `true`, or `false` when the rules in use are a git
+    /// checkout, whose local edits Uplink's verdicts would not reflect. Also
+    /// settable via `ATOMDRIFT_UPLINK`.
+    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_UPLINK")]
+    pub uplink: Option<crate::remote::Uplink>,
 
     /// Force light-background color theme
     #[arg(long, global = true, conflicts_with = "dark")]
@@ -435,7 +446,9 @@ impl GlobalArgs {
         // turns the pass on. `local` maps to the local endpoint, `openrouter`
         // to the public API, anything else is an OpenAI-compatible base URL;
         // a comma-separated target is a failover chain, tried in order.
-        let Some(target) = flag_or(self.llm.as_deref(), env.target.as_deref()) else {
+        let Some(target) =
+            flag_or(self.llm.as_deref(), env.target.as_deref()).filter(|_| !self.offline)
+        else {
             return Ok(None);
         };
         let targets = llm_targets(target);
@@ -503,7 +516,7 @@ impl GlobalArgs {
     /// The `-u`/`--update` and `--no-update` flags as one value.
     #[must_use]
     pub fn refresh(&self) -> Refresh {
-        if self.no_update {
+        if self.no_update || self.offline {
             Refresh::Skip
         } else if self.update {
             Refresh::Force

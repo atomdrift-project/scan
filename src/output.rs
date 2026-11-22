@@ -1157,7 +1157,7 @@ pub(crate) fn print_bloom_verdict(
     )
 }
 
-/// Write one artifact Atomdrift Uplink judged (a paid plan), in place of a local
+/// Write one artifact Atomdrift Uplink judged, in place of a local
 /// result.
 ///
 /// Either JSON format gets a decision, as for an analysis, carrying what the

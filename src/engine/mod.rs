@@ -51,7 +51,7 @@ pub use self::pipeline::{CpuLease, apply_pending_interpretation};
 pub use self::progress::LogWriter;
 pub(crate) use self::progress::{
     PROGRESS_TICK, Progress, SPINNER, bar_active, external_fetch_finished, external_fetch_started,
-    print_above_bar,
+    format_eta, print_above_bar,
 };
 pub(crate) use self::render_context::{interpret_user_message, split_annotation};
 pub(crate) use self::run::{

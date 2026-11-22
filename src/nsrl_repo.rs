@@ -248,21 +248,40 @@ mod tests {
         assert_eq!(source_release(&unreleased), None);
     }
 
+    /// Every filter the server hands out is corrupt, so staging fails on a
+    /// checksum, however many of them it fetches and in whatever order.
     #[test]
     fn a_corrupt_filter_download_fails_staging() {
         use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let serving = std::sync::Arc::clone(&done);
         let server = std::thread::spawn(move || {
-            let (mut connection, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(&mut connection);
-            let mut request = String::new();
-            while !request.ends_with("\r\n\r\n") {
-                assert!(reader.read_line(&mut request).unwrap() > 0);
+            while !serving.load(Ordering::Relaxed) {
+                let mut connection = match listener.accept() {
+                    Ok((connection, _)) => connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                connection.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut connection);
+                let mut request = String::new();
+                while !request.ends_with("\r\n\r\n") {
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+                // A download abandoned after another failed may have hung up.
+                let _ = connection.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad",
+                );
             }
-            connection
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")
-                .unwrap();
         });
         let staging = tempfile::tempdir().unwrap();
         let err = stage(
@@ -272,8 +291,9 @@ mod tests {
             &release("2026-09-01", "2026.09.1"),
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("sha256 mismatch"), "{err:#}");
+        done.store(true, Ordering::Relaxed);
         server.join().unwrap();
+        assert!(format!("{err:#}").contains("sha256 mismatch"), "{err:#}");
     }
 
     #[test]

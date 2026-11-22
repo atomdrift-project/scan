@@ -1,12 +1,18 @@
-//! Where an artifact is judged on a paid plan: here, or via Atomdrift Uplink.
+//! Atomdrift Uplink: the service a scan may ask before analyzing.
 //!
-//! `--analyze=auto` asks Uplink for verdicts it already holds and analyzes
-//! locally whatever it does not know. The asking goes through
+//! `--uplink=true` asks Uplink for verdicts it already holds and analyzes
+//! locally whatever it does not know. It is the default, except for a run
+//! whose rules are a git checkout: a rule author's edits are not in the
+//! service's verdicts, so that run asks only when told to. The asking goes through
 //! [`crate::corpus_precheck`] — the same batched `/v1/lookup` negotiation, the
-//! same circuit breaker, the same fail-open rule hopper lookups use —
-//! armed against Uplink with the subscription token. `local` never asks,
-//! and is the reproducible mode. `remote` sends every artifact to
-//! `/v1/analyze`, uploading local files' contents.
+//! same circuit breaker, the same fail-open rule hopper lookups use — armed
+//! against Uplink. `false` never asks, and is the reproducible mode. `always`
+//! sends every artifact to `/v1/analyze`, uploading local files' contents,
+//! and needs a subscription.
+//!
+//! A scan with no subscription asks `api.atomdrift.org` and sends no
+//! credential. A subscriber's scan asks `api.atomdrift.com`, the one host its
+//! token is sent to.
 //!
 //! What may leave the machine is decided here and nowhere else:
 //!
@@ -17,9 +23,10 @@
 //! - a PURL only when `public_purl` says it names a package on a mainstream
 //!   public registry.
 //!
-//! Never a URL, and never a file's contents except under `remote`. A remote
-//! verdict replaces local analysis and is reported as a `"source": "remote"`
-//! record, the way a bloom decision is reported as `"source": "bloom"`.
+//! Never a URL, a path or a file name, and never a file's contents except
+//! under `always`. A remote verdict replaces local analysis and is reported
+//! as a `"source": "remote"` record, the way a bloom decision is reported as
+//! `"source": "bloom"`.
 
 use std::io::Read as _;
 use std::io::{BufRead, BufReader};
@@ -34,9 +41,13 @@ use sha2::{Digest, Sha256};
 use crate::corpus_precheck::{Standing, Verdict};
 use crate::model::{Classification, Level};
 
-/// Uplink's API. Fixed: an override would let any step of a CI job send the
-/// subscription token, and every file it is shown, somewhere else.
-pub(crate) const API_URL: &str = "https://api.isotope13.ai";
+/// Uplink's API for a subscriber. Fixed: an override would let any step of a
+/// CI job send the subscription token, and every file it is shown, somewhere
+/// else.
+pub(crate) const API_URL: &str = "https://api.atomdrift.com";
+
+/// Uplink's API for everyone else: lookups, with no credential.
+pub(crate) const OPEN_API_URL: &str = "https://api.atomdrift.org";
 
 /// The largest body Uplink's `/v1/analyze` accepts.
 const MAX_UPLOAD_BYTES: u64 = 16 * 1024 * 1024;
@@ -48,71 +59,90 @@ pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Whole-request ceiling for a remote analysis, which streams progress.
 const ANALYZE_TIMEOUT: Duration = Duration::from_mins(30);
 /// How long a remote analysis keeps retrying transient failures before the
-/// artifact is reported as failed. Under `remote` there is no local analysis
+/// artifact is reported as failed. Under `always` there is no local analysis
 /// to fall back to, so it is the longest any call waits.
 const ANALYZE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
-/// `--analyze`.
+/// `--uplink`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum Analyze {
-    /// Ask Atomdrift Uplink first on a paid plan; otherwise the same as `local`.
+pub enum Uplink {
+    /// Ask Atomdrift Uplink about large files and dependencies it may already
+    /// have judged; analyze the rest here.
     #[default]
-    Auto,
-    /// Analyze everything here.
-    Local,
+    #[value(name = "true", alias = "1")]
+    Ask,
+    /// Never ask: analyze everything here.
+    #[value(name = "false", alias = "0")]
+    Off,
     /// Send everything to Atomdrift Uplink for analysis.
-    Remote,
+    Always,
 }
 
-/// The mode this run resolved to, and the token `remote` uploads with.
+/// The mode this run resolved to, and the subscriber's token when it has one.
 ///
 /// Process-wide: [`resolve`] sets it once, before any scan starts, and the
 /// scan paths read it through [`mode`] and [`analyze`] rather than being
 /// handed it.
-static RESOLVED: OnceLock<(Analyze, Option<cleave::feed::Token>)> = OnceLock::new();
+static RESOLVED: OnceLock<(Uplink, Option<cleave::feed::Token>)> = OnceLock::new();
 
-/// Resolve `--analyze` against whether this run is on a paid plan — a paid
-/// rule feed in use, which a refused token has already fallen back from —
-/// once, before any scan starts.
-///
-/// `auto` on an open-source run is `local`: no new traffic for anyone who did
-/// not ask for the service. On a paid run, `auto` arms the Uplink lookups and
-/// `remote` holds the token for uploads. A missing token is asked for here,
-/// on a terminal, and checked against the rules service before it is used.
-///
-/// # Errors
-/// `remote` on an open-source run, or a paid run with no usable token.
-pub fn resolve(analyze: Analyze, paid: bool) -> Result<Analyze> {
-    let resolved = match (analyze, paid) {
-        (Analyze::Remote, false) => anyhow::bail!(
-            "--analyze=remote requires Atomdrift Uplink on a paid plan: switch to a paid rule feed (`atomscan feed supporter`), which connects this computer"
-        ),
-        (Analyze::Local, _) | (Analyze::Auto, false) => (Analyze::Local, None),
-        (mode, true) => {
-            let token = token()?;
-            if mode == Analyze::Auto {
-                crate::corpus_precheck::configure_uplink(token.clone());
-            }
-            (mode, Some(token))
-        }
-    };
-    tracing::info!(event = "remote.mode", analyze = ?resolved.0, paid);
-    let mode = resolved.0;
-    // Once per process. A second resolve keeps the first answer, which every
-    // scan already started has acted on.
-    if let Err((ignored, _)) = RESOLVED.set(resolved) {
-        tracing::warn!(
-            kept = ?self::mode(),
-            ignored = ?ignored,
-            "--analyze resolved twice in one process; keeping the first"
-        );
+/// What a run that did not say means by `--uplink`, given the rules
+/// directory it analyzes with: ask, unless the rules are a git checkout (or a
+/// link to one). The service judged under published rules, so its verdicts
+/// would hide whatever the checkout changes.
+fn unsaid(rules: Option<&Path>) -> Uplink {
+    if rules.is_some_and(|dir| dir.join(".git").exists()) {
+        Uplink::Off
+    } else {
+        Uplink::Ask
     }
-    Ok(mode)
 }
 
-/// The resolved mode; `local` until [`resolve`] runs.
-pub(crate) fn mode() -> Analyze {
-    RESOLVED.get().map_or(Analyze::Local, |(mode, _)| *mode)
+/// Resolve `--uplink` against the rules in use and whether this run is on a
+/// paid plan — a paid rule feed in use, which a refused token has already
+/// fallen back from — once, before any scan starts.
+///
+/// `true` arms the Uplink lookups: with the subscription token on a paid run,
+/// with no credential otherwise. `always` holds the token for uploads. A
+/// missing token is asked for here, on a terminal, and checked against the
+/// rules service before it is used. A run that did not say asks unless
+/// `rules` is a git checkout.
+///
+/// # Errors
+/// `always` on an open-source run, or a paid run with no usable token.
+pub fn resolve(said: Option<Uplink>, paid: bool, rules: Option<&Path>) -> Result<Uplink> {
+    let uplink = said.unwrap_or_else(|| unsaid(rules));
+    let token = match (uplink, paid) {
+        (Uplink::Always, false) => anyhow::bail!(
+            "--uplink=always uploads to Atomdrift Uplink, which needs a paid plan: switch to a paid rule feed (`atomscan feed supporter`), which connects this computer"
+        ),
+        (Uplink::Off, _) | (Uplink::Ask, false) => None,
+        (Uplink::Ask | Uplink::Always, true) => Some(token()?),
+    };
+    if uplink == Uplink::Ask {
+        crate::corpus_precheck::configure_uplink(token.clone());
+    }
+    tracing::info!(
+        event = "remote.mode",
+        ?uplink,
+        said = said.is_some(),
+        paid,
+        rules = %rules.map(Path::display).map(|d| d.to_string()).unwrap_or_default(),
+    );
+    // Once per process. A second resolve keeps the first answer, which every
+    // scan already started has acted on.
+    if RESOLVED.set((uplink, token)).is_err() {
+        tracing::warn!(
+            kept = ?mode(),
+            ignored = ?uplink,
+            "--uplink resolved twice in one process; keeping the first"
+        );
+    }
+    Ok(uplink)
+}
+
+/// The resolved mode; [`Uplink::Off`] until [`resolve`] runs.
+pub(crate) fn mode() -> Uplink {
+    RESOLVED.get().map_or(Uplink::Off, |(mode, _)| *mode)
 }
 
 /// The subscription token, asking for one (and saving it, once the rules
@@ -127,8 +157,8 @@ fn token() -> Result<cleave::feed::Token> {
         .context("Uplink token was accepted but could not be read back")
 }
 
-/// The process's client for Uplink: TLS only, and no redirects, so the
-/// token can reach no host but [`API_URL`]'s.
+/// The process's client for Uplink: TLS only, and no redirects, so a
+/// request, and the token it may carry, reaches no host but the one named.
 pub(crate) fn http() -> Option<&'static reqwest::blocking::Client> {
     static HTTP: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
     HTTP.get_or_init(|| {
@@ -212,20 +242,41 @@ pub(crate) fn classification(fires_at: Level, level: Option<u16>) -> Option<Clas
 /// analyze here, in their original order.
 ///
 /// Only files of at least [`crate::analysis::SMALL_JOB_MAX_BYTES`] are asked
-/// about. Each is hashed by streaming it — bounded memory, never a second
-/// resident copy — and the digests go out in batches. A file whose digest
-/// comes back with a standing verdict is answered; everything else, including
-/// every file when lookups are off or the API is unreachable, is analyzed.
-pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdict)>, Vec<PathBuf>) {
+/// about, and, when `limit` is not zero, of at most `limit` bytes: a file the
+/// scan will not analyze is not worth a question, and neither is one
+/// `passed_over` says this machine already vouches for (by path and digest).
+/// A digest in `known` is used as it is; any other is hashed by streaming the
+/// file — bounded memory, never a second resident copy — and the digests go
+/// out in batches. A file
+/// whose digest comes back with a standing verdict is answered; everything
+/// else, including every file when lookups are off or the API is
+/// unreachable, is analyzed.
+pub(crate) fn answer_known(
+    paths: Vec<PathBuf>,
+    known: &std::collections::HashMap<PathBuf, String>,
+    limit: u64,
+    passed_over: impl Fn(&Path, &str) -> bool + Sync,
+) -> (Vec<(PathBuf, String, Verdict)>, Vec<PathBuf>) {
     let Some(precheck) = crate::corpus_precheck::armed().filter(|p| p.is_uplink()) else {
         return (Vec::new(), paths);
     };
     let floor = crate::analysis::SMALL_JOB_MAX_BYTES;
+    let asked = |len: u64| len >= floor && (limit == 0 || len <= limit);
     let digests: Vec<Option<String>> = paths
         .par_iter()
         .map(|path| {
-            let big = std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() >= floor);
-            big.then(|| crate::digest::sha256_file(path).ok()).flatten()
+            let size = std::fs::metadata(path)
+                .ok()
+                .filter(std::fs::Metadata::is_file)?
+                .len();
+            if !asked(size) {
+                return None;
+            }
+            known
+                .get(path)
+                .cloned()
+                .or_else(|| crate::digest::sha256_file(path).ok())
+                .filter(|sha| !passed_over(path, sha))
         })
         .collect();
     let mut asked: Vec<String> = digests.iter().flatten().cloned().collect();
@@ -234,7 +285,26 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
     if asked.is_empty() {
         return (Vec::new(), paths);
     }
-    let known = precheck.shas(&asked);
+    // What Uplink did not know a little while ago it is not asked again: a
+    // scan whose every file is saved, judged or unknown makes no request.
+    let cache = crate::analysis_cache::AnalysisCache::shared();
+    let recently_unknown = |sha: &str| {
+        cache
+            .and_then(|cache| cache.read::<Unknown>(&unknown_key(sha)))
+            .is_some_and(|unknown| unknown.fresh(crate::civil::now_secs()))
+    };
+    asked.retain(|sha| !recently_unknown(sha));
+    let (known, unknown) = if asked.is_empty() {
+        Default::default()
+    } else {
+        precheck.shas(&asked)
+    };
+    if let Some(cache) = cache {
+        let now = crate::civil::now_secs();
+        for sha in &unknown {
+            cache.write(&unknown_key(sha), &Unknown { at: now });
+        }
+    }
     let mut answered = Vec::new();
     let mut rest = Vec::with_capacity(paths.len());
     for (path, digest) in paths.into_iter().zip(digests) {
@@ -250,7 +320,32 @@ pub(crate) fn answer_known(paths: Vec<PathBuf>) -> (Vec<(PathBuf, String, Verdic
     (answered, rest)
 }
 
-/// The verdict Uplink holds for a fetched artifact's bytes, under `auto`.
+/// How long Uplink not knowing a digest is believed: as long as a saved result
+/// that rests on Uplink, so a repeat scan asks no more than it replays.
+const UNKNOWN_TTL_SECS: u64 = 2 * 3600;
+
+/// That Uplink, asked about some bytes at `at` (Unix seconds), knew nothing
+/// of them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Unknown {
+    at: u64,
+}
+
+impl Unknown {
+    /// Whether this is still believed at `now`. A stamp from the future is a
+    /// clock that moved, and is not.
+    fn fresh(&self, now: u64) -> bool {
+        now.checked_sub(self.at)
+            .is_some_and(|age| age <= UNKNOWN_TTL_SECS)
+    }
+}
+
+/// The cache entry recording that Uplink did not know `sha256`.
+fn unknown_key(sha256: &str) -> String {
+    format!("{sha256}-uplink-unknown")
+}
+
+/// The verdict Uplink holds for a fetched artifact's bytes, when asking.
 pub(crate) fn known_bytes(bytes: &[u8]) -> Option<(String, Verdict)> {
     let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
     let sha = crate::digest::hex(&Sha256::digest(bytes));
@@ -260,7 +355,7 @@ pub(crate) fn known_bytes(bytes: &[u8]) -> Option<(String, Verdict)> {
     }
 }
 
-/// The verdict Uplink holds for a package coordinate, under `auto`, without
+/// The verdict Uplink holds for a package coordinate, when asking, without
 /// fetching it.
 pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
     let precheck = crate::corpus_precheck::armed().filter(|p| p.is_uplink())?;
@@ -294,7 +389,7 @@ pub(crate) fn known_purl(purl: &str) -> Option<(String, Verdict)> {
     }
 }
 
-/// What to send `/v1/analyze` under `remote`.
+/// What to send `/v1/analyze` under `always`.
 pub(crate) enum Upload<'a> {
     /// A package Uplink fetches itself.
     Purl(&'a str),
@@ -308,14 +403,14 @@ pub(crate) enum Upload<'a> {
 ///
 /// The answer streams: progress frames, then one line carrying `status`, which
 /// is the answer. Anything but an `analyzed` answer is an error for this
-/// artifact — under `remote` there is no local analysis to fall back to — and
+/// artifact — under `always` there is no local analysis to fall back to — and
 /// so is an answer about bytes other than the ones uploaded.
 ///
 /// # Errors
-/// No `remote` mode, a file over the upload cap, a transport failure, or an
+/// Not under `always`, a file over the upload cap, a transport failure, or an
 /// answer that is not an analyzed verdict.
 pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
-    let Some((Analyze::Remote, Some(token))) = RESOLVED.get() else {
+    let Some((Uplink::Always, Some(token))) = RESOLVED.get() else {
         anyhow::bail!("remote analysis was not enabled");
     };
     let http = http().context("no Uplink HTTP client")?;
@@ -333,7 +428,7 @@ pub(crate) fn analyze(upload: Upload<'_>) -> Result<(String, Verdict)> {
                 .with_context(|| format!("reading {}", path.display()))?;
             if bytes.len() as u64 > MAX_UPLOAD_BYTES {
                 anyhow::bail!(
-                    "{} is over Uplink's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --analyze=auto or --analyze=local",
+                    "{} is over Uplink's {MAX_UPLOAD_BYTES}-byte upload cap; scan it with --uplink=true or --uplink=false",
                     path.display()
                 );
             }
@@ -435,6 +530,68 @@ mod tests {
         }
     }
 
+    /// `--uplink` and `ATOMDRIFT_UPLINK` read the same words, asking is the
+    /// default, and the modes the flag replaced are not accepted.
+    #[test]
+    fn the_flag_reads_true_false_and_always() {
+        use clap::ValueEnum as _;
+        assert_eq!(Uplink::default(), Uplink::Ask);
+        for (text, mode) in [
+            ("true", Uplink::Ask),
+            ("1", Uplink::Ask),
+            ("false", Uplink::Off),
+            ("0", Uplink::Off),
+            ("always", Uplink::Always),
+        ] {
+            assert_eq!(Uplink::from_str(text, false).ok(), Some(mode), "{text}");
+        }
+        for text in ["auto", "local", "remote", "ask", "off", ""] {
+            assert!(Uplink::from_str(text, false).is_err(), "{text}");
+        }
+    }
+
+    /// A run that did not say asks Uplink, unless its rules are a git
+    /// checkout, a worktree, or a link to one: the service's verdicts know
+    /// nothing of local rule edits.
+    #[test]
+    fn a_run_on_checked_out_rules_does_not_ask_unless_told() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let installed = tmp.path().join("installed");
+        let checkout = tmp.path().join("checkout");
+        let worktree = tmp.path().join("worktree");
+        for dir in [&installed, &worktree] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::create_dir_all(checkout.join(".git")).expect("mkdir");
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").expect("write");
+
+        assert_eq!(unsaid(None), Uplink::Ask);
+        assert_eq!(unsaid(Some(&installed)), Uplink::Ask);
+        assert_eq!(unsaid(Some(&checkout)), Uplink::Off);
+        assert_eq!(unsaid(Some(&worktree)), Uplink::Off);
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&checkout, &link).expect("symlink");
+            assert_eq!(unsaid(Some(&link)), Uplink::Off);
+        }
+    }
+
+    /// Uplink not knowing some bytes is believed for as long as a saved
+    /// result resting on it, and not from a clock that moved back.
+    #[test]
+    fn an_unknown_answer_is_believed_for_two_hours() {
+        let at = 1_000_000;
+        let unknown = Unknown { at };
+        assert!(unknown.fresh(at));
+        assert!(unknown.fresh(at + 2 * 3600));
+        assert!(!unknown.fresh(at + 2 * 3600 + 1));
+        assert!(!unknown.fresh(at - 1), "from the future");
+        let sha = "f".repeat(64);
+        assert!(unknown_key(&sha).starts_with(&sha), "{}", unknown_key(&sha));
+        assert_ne!(unknown_key(&sha), sha);
+    }
+
     #[test]
     fn a_remote_level_grades_like_a_local_one() {
         assert_eq!(classification(Level::Manual, Some(25)), None);
@@ -480,7 +637,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let path = tmp.path().join("big.bin");
         std::fs::write(&path, vec![0u8; 2 << 20]).expect("write");
-        let (answered, rest) = answer_known(vec![path.clone()]);
+        let (answered, rest) =
+            answer_known(vec![path.clone()], &Default::default(), 0, |_, _| false);
         assert!(answered.is_empty());
         assert_eq!(rest, vec![path]);
     }

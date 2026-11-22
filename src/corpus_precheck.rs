@@ -29,15 +29,20 @@
 //!
 //! # Atomdrift Uplink
 //!
-//! Scans on a paid plan arm the same precheck against Uplink's API instead
-//! (`configure_uplink`), with the subscription token. The wire is the
-//! same `/v1/lookup`; what changes is whose judgment it is. Hopper is a corpus
-//! of other runs, so only the same analyzer's verdict is ours. Uplink is the
-//! service the subscriber asked to judge for them, so an analyzed verdict
-//! stands whatever produced it — with one bound kept from rule 2: a clean
-//! verdict older than the max age is analyzed again rather than trusted. A
-//! refused token or an exhausted quota opens the breaker: the scan carries on
-//! locally, which is always a complete answer.
+//! A scan under `--uplink=true` arms the same precheck against Uplink's API
+//! instead (`configure_uplink`): with the subscription token on a paid plan,
+//! with no credential otherwise. The wire is the same `/v1/lookup`; what
+//! changes is whose judgment it is. Hopper is a corpus of other runs, so only
+//! the same analyzer's verdict is ours. Uplink is the service the scan asked
+//! to judge for it, so an analyzed verdict stands whatever produced it — with
+//! one bound kept from rule 2: a clean verdict older than the max age is
+//! analyzed again rather than trusted.
+//!
+//! Uplink not answering is never a scan's problem: local analysis is always a
+//! complete answer. An unreachable or failing service is not asked again for
+//! the rest of the run, and nothing is said of it. A spent quota (`429`) is
+//! said once, and Uplink is left alone until the `Retry-After` it gave has
+//! passed, in this run and in later ones.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -58,6 +63,10 @@ static PURL_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 const BREAKER_LIMIT: u32 = 5;
 const BREAKER_COOLDOWN_SECS: u64 = 300;
+
+/// The longest a `Retry-After` may hold Uplink lookups off: its quotas turn
+/// over on the clock hour, so nothing honest asks for longer.
+const QUOTA_HOLD_MAX_SECS: u64 = 3600;
 
 /// Per-request ceiling on a lookup. It sits on the analysis path, so a slow
 /// replica must cost seconds, not the pipeline.
@@ -105,11 +114,15 @@ impl Breaker {
                 .is_ok()
     }
 
-    /// Open the breaker now, whatever the count: the backend said no, and every
-    /// later ask before the cooldown would hear the same. Returns whether this
-    /// call opened it, so the reason is logged once.
-    fn trip(&self, now: u64) -> bool {
-        self.opened_at.store(now, Ordering::Relaxed);
+    /// Open the breaker until `until`, in Unix seconds, whatever the count:
+    /// the backend said no, or is not there, and every ask before then would
+    /// hear the same. `u64::MAX` is the rest of the run. Returns whether this
+    /// call opened it, so the reason is said once.
+    fn hold(&self, until: u64) -> bool {
+        self.opened_at.store(
+            until.saturating_sub(BREAKER_COOLDOWN_SECS),
+            Ordering::Relaxed,
+        );
         self.failures.swap(BREAKER_LIMIT, Ordering::Relaxed) < BREAKER_LIMIT
     }
 
@@ -148,6 +161,9 @@ pub(crate) struct Precheck {
     max_age: Duration,
     breaker: Breaker,
     backend: Backend,
+    /// Where a spent quota's end is remembered between runs, so the next run
+    /// does not ask only to be refused again. `None` remembers nothing.
+    quota_file: Option<std::path::PathBuf>,
 }
 
 /// Who answers, which decides how it is authenticated and whose judgment an
@@ -156,8 +172,9 @@ pub(crate) struct Precheck {
 enum Backend {
     /// The hopper this process submits to. Only a same-analyzer verdict is ours.
     Hopper,
-    /// Uplink's API on a paid plan. Its analyzed verdicts are the answer.
-    Uplink(cleave::feed::Token),
+    /// Uplink's API, with a subscriber's token or with no credential. Its
+    /// analyzed verdicts are the answer.
+    Uplink(Option<cleave::feed::Token>),
 }
 
 /// The armed precheck.
@@ -174,16 +191,22 @@ static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 const DEFAULT_MAX_AGE: Duration =
     Duration::from_secs(DEFAULT_MAX_AGE_DAYS * crate::civil::SECS_PER_DAY.unsigned_abs());
 
-/// Arm the precheck against Uplink's API, for a paid-plan scan in
-/// `--analyze=auto`. A later [`configure`] (`--hopper`) replaces it: the
-/// hopper a process submits to is still the one it asks.
-pub(crate) fn configure_uplink(token: cleave::feed::Token) {
-    let precheck = Precheck {
-        lookup_url: format!("{}/v1/lookup", crate::remote::API_URL),
-        max_age: DEFAULT_MAX_AGE,
-        breaker: Breaker::default(),
-        backend: Backend::Uplink(token),
-    };
+/// Arm the precheck against Uplink's API, for a scan under `--uplink=true`:
+/// the subscribers' host with `token`, the open one without. A later
+/// [`configure`] (`--hopper`) replaces it: the hopper a process submits to is
+/// still the one it asks.
+pub(crate) fn configure_uplink(token: Option<cleave::feed::Token>) {
+    let precheck = Precheck::uplink(token);
+    let now = crate::civil::now_secs();
+    if let Some(until) = precheck.remembered_quota_hold(now) {
+        precheck.breaker.hold(until);
+        tracing::debug!(
+            event = "remote.disabled",
+            reason = "quota",
+            until,
+            "Uplink's quota was spent by an earlier run; analyzing locally until it turns over"
+        );
+    }
     tracing::info!(
         event = "remote.armed",
         url = %precheck.lookup_url,
@@ -313,10 +336,39 @@ impl Precheck {
             max_age,
             breaker: Breaker::default(),
             backend: Backend::Hopper,
+            quota_file: None,
         })
     }
 
-    /// Whether this precheck asks Uplink (a paid plan) rather than hopper.
+    /// A precheck against Uplink: the subscribers' host with `token`, the
+    /// open one without. The host follows the credential, so a token is sent
+    /// to [`crate::remote::API_URL`] and nowhere else.
+    fn uplink(token: Option<cleave::feed::Token>) -> Self {
+        // The two are counted apart: by organization, and by address.
+        let (api, quota) = if token.is_some() {
+            (crate::remote::API_URL, "uplink-quota")
+        } else {
+            (crate::remote::OPEN_API_URL, "uplink-quota-anonymous")
+        };
+        Self {
+            lookup_url: format!("{api}/v1/lookup"),
+            max_age: DEFAULT_MAX_AGE,
+            breaker: Breaker::default(),
+            backend: Backend::Uplink(token),
+            quota_file: crate::cache_dir().map(|dir| dir.join(quota)),
+        }
+    }
+
+    /// When the quota an earlier run spent turns over, if that is still ahead
+    /// of `now`. Bounded like a fresh `Retry-After`, so a damaged or planted
+    /// file can cost an hour of lookups and no more.
+    fn remembered_quota_hold(&self, now: u64) -> Option<u64> {
+        let text = std::fs::read_to_string(self.quota_file.as_ref()?).ok()?;
+        let until: u64 = text.trim().parse().ok()?;
+        (until > now).then(|| until.min(now.saturating_add(QUOTA_HOLD_MAX_SECS)))
+    }
+
+    /// Whether this precheck asks Uplink rather than hopper.
     pub(crate) fn is_uplink(&self) -> bool {
         matches!(self.backend, Backend::Uplink(_))
     }
@@ -335,7 +387,8 @@ impl Precheck {
     fn tid(&self) -> String {
         match &self.backend {
             Backend::Hopper => String::new(),
-            Backend::Uplink(token) => token.fingerprint(),
+            Backend::Uplink(None) => "anonymous".to_string(),
+            Backend::Uplink(Some(token)) => token.fingerprint(),
         }
     }
 
@@ -358,7 +411,24 @@ impl Precheck {
                 Some(r)
             }
             Err(e) => {
-                self.breaker.failed(crate::civil::now_secs(), what, &e);
+                match self.backend {
+                    Backend::Hopper => {
+                        self.breaker.failed(crate::civil::now_secs(), what, &e);
+                    }
+                    // Not there for one ask is not there for the run, and the
+                    // scan says nothing of it.
+                    Backend::Uplink(_) => {
+                        if self.breaker.hold(u64::MAX) {
+                            tracing::debug!(
+                                event = "remote.disabled",
+                                reason = "unreachable",
+                                error = %e,
+                                what,
+                                "Uplink did not answer; analyzing locally for the rest of the run"
+                            );
+                        }
+                    }
+                }
                 None
             }
         }
@@ -370,36 +440,85 @@ impl Precheck {
     ) -> reqwest::blocking::RequestBuilder {
         match &self.backend {
             Backend::Hopper => crate::hopper::bearer(request, crate::hopper::token()),
-            Backend::Uplink(token) => request.bearer_auth(token.secret()),
+            Backend::Uplink(None) => request,
+            Backend::Uplink(Some(token)) => request.bearer_auth(token.secret()),
         }
     }
 
-    /// Whether to read this answer at all. Every non-200 means "analyze it";
-    /// from Uplink, a refused token or an exhausted quota also means "stop
-    /// asking", because every later lookup in the run would get the same
-    /// answer.
-    fn answered(&self, status: reqwest::StatusCode, what: &str) -> bool {
+    /// Whether to read this answer at all. Every non-200 means "analyze it".
+    /// From Uplink it also means "stop asking": a spent quota until the
+    /// `retry_after` seconds it named have passed, a refusal or a failing
+    /// service for the rest of the run, because every later lookup would hear
+    /// the same.
+    fn answered(&self, status: reqwest::StatusCode, retry_after: Option<u64>, what: &str) -> bool {
         if status == reqwest::StatusCode::OK {
             return true;
         }
-        if self.is_uplink() && matches!(status.as_u16(), 401 | 403 | 429) {
-            let reason = if status.as_u16() == 429 {
-                "quota"
-            } else {
-                "token_refused"
-            };
-            if self.breaker.trip(crate::civil::now_secs()) {
+        if !self.is_uplink() {
+            return false;
+        }
+        let (status, tid) = (status.as_u16(), self.tid());
+        match status {
+            429 => {
+                let until = crate::civil::now_secs().saturating_add(
+                    retry_after
+                        .unwrap_or(BREAKER_COOLDOWN_SECS)
+                        .min(QUOTA_HOLD_MAX_SECS),
+                );
+                if self.breaker.hold(until) {
+                    tracing::info!(
+                        event = "remote.disabled",
+                        reason = "quota",
+                        until,
+                        %tid,
+                        what,
+                        "Uplink's quota is spent; analyzing locally until it turns over"
+                    );
+                    self.quota_spent(until);
+                }
+            }
+            401 | 403 if self.breaker.hold(u64::MAX) => {
                 tracing::warn!(
                     event = "remote.disabled",
-                    reason,
-                    status = status.as_u16(),
-                    tid = %self.tid(),
+                    reason = "refused",
+                    status,
+                    %tid,
                     what,
-                    "Uplink lookups paused; analyzing locally"
+                    "Uplink refused the lookup; analyzing locally"
                 );
             }
+            500..=599 if self.breaker.hold(u64::MAX) => {
+                tracing::debug!(
+                    event = "remote.disabled",
+                    reason = "unavailable",
+                    status,
+                    what,
+                    "Uplink is failing; analyzing locally for the rest of the run"
+                );
+            }
+            _ => {}
         }
         false
+    }
+
+    /// Remember that the quota is spent until `until`, and say so: once in
+    /// this process, and not again in a later run that reads the file.
+    fn quota_spent(&self, until: u64) {
+        if let Some(path) = &self.quota_file
+            && let Err(error) = std::fs::write(path, until.to_string())
+        {
+            tracing::debug!(path = %path.display(), %error, "cannot remember Uplink's quota hold");
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let notice = match self.backend {
+            Backend::Uplink(Some(_)) => {
+                "* Uplink lookup quota exceeded; falling back to offline mode."
+            }
+            _ => {
+                "* Anonymous lookup quota exceeded; falling back to offline mode. For faster scans, connect a plan with 'atomscan feed supporter'."
+            }
+        };
+        SAID.call_once(|| crate::engine::print_above_bar(|| eprintln!("{notice}")));
     }
 
     /// The policy for this backend's answers. A pending record — bytes held,
@@ -442,7 +561,7 @@ impl Precheck {
         let Some(resp) = self.send(request, "corpus precheck") else {
             return Standing::Analyze;
         };
-        if !self.answered(resp.status(), "corpus precheck") {
+        if !self.answered(resp.status(), retry_after(&resp), "corpus precheck") {
             return Standing::Analyze; // 404 unknown, 401/5xx — all "scan it".
         }
         let rec = match resp.json::<Record>() {
@@ -477,12 +596,14 @@ impl Precheck {
     /// `sha256 → standing` for every one it answers with a standing verdict,
     /// under the same policy as [`Self::standing`]. An answer is paired by its
     /// own `sha256` and must name a digest that was asked, so an answer about
-    /// other bytes can never stand in for this file. Fail-open everywhere; an
-    /// open breaker stops the batch.
-    pub(crate) fn shas(&self, shas: &[String]) -> HashMap<String, Standing> {
-        let mut out = HashMap::new();
+    /// other bytes can never stand in for this file. Also the digests the
+    /// backend did answer for, with nothing that stands: what it does not know,
+    /// as opposed to what was never asked or never answered. Fail-open
+    /// everywhere; an open breaker stops the batch.
+    pub(crate) fn shas(&self, shas: &[String]) -> (HashMap<String, Standing>, Vec<String>) {
+        let (mut out, mut unknown) = (HashMap::new(), Vec::new());
         let Some(http) = self.http() else {
-            return out;
+            return (out, unknown);
         };
         // Uplink answers a repeated `sha256` as a batch; hopper's lookup
         // reads only the first, so every further digest in a chunk would go
@@ -502,7 +623,7 @@ impl Precheck {
                 continue;
             };
             let status = resp.status();
-            if !self.answered(status, "sha precheck") {
+            if !self.answered(status, retry_after(&resp), "sha precheck") {
                 tracing::debug!(
                     keys = chunk.len(),
                     status = status.as_u16(),
@@ -511,9 +632,20 @@ impl Precheck {
                 continue;
             }
             let before = out.len();
-            match resp.bytes() {
+            let read = match resp.bytes() {
                 Ok(body) => self.collect_sha_hits(chunk, &body, &mut out),
-                Err(e) => tracing::debug!(error = %e, "sha precheck: unreadable lookup answer"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "sha precheck: unreadable lookup answer");
+                    false
+                }
+            };
+            if read {
+                unknown.extend(
+                    chunk
+                        .iter()
+                        .filter(|sha| !out.contains_key(&sha.to_ascii_lowercase()))
+                        .cloned(),
+                );
             }
             let hits = out.len() - before;
             SKIPS.fetch_add(hits as u64, Ordering::Relaxed);
@@ -527,15 +659,21 @@ impl Precheck {
                 ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
         }
-        out
+        (out, unknown)
     }
 
     /// Fold one digest batch answer into `out`, keyed by the answer's own
     /// `sha256`, which must be one that was asked.
-    fn collect_sha_hits(&self, asked: &[String], body: &[u8], out: &mut HashMap<String, Standing>) {
+    /// Returns whether the answer could be read at all.
+    fn collect_sha_hits(
+        &self,
+        asked: &[String],
+        body: &[u8],
+        out: &mut HashMap<String, Standing>,
+    ) -> bool {
         let Some(items) = answer_items(body) else {
             tracing::debug!("sha precheck: unreadable lookup answer");
-            return;
+            return false;
         };
         for item in items {
             let Ok(mut answer) = serde_json::from_str::<Record>(item.get()) else {
@@ -553,6 +691,7 @@ impl Precheck {
                 out.insert(sha, standing);
             }
         }
+        true
     }
 
     /// Batch PURL negotiation: which of these dependency PURLs does hopper hold a
@@ -585,7 +724,7 @@ impl Precheck {
             let Some(resp) = self.send(request, "purl precheck") else {
                 continue;
             };
-            if !self.answered(resp.status(), "purl precheck") {
+            if !self.answered(resp.status(), retry_after(&resp), "purl precheck") {
                 continue;
             }
             match resp.bytes() {
@@ -728,6 +867,17 @@ fn answer_items(body: &[u8]) -> Option<Vec<&serde_json::value::RawValue>> {
         Ok(batch) => Some(batch.records),
         Err(_) => Some(vec![one]),
     }
+}
+
+/// The whole seconds a refusal asks the caller to wait, when it says.
+fn retry_after(resp: &reqwest::blocking::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Uplink's policy, pure for the same reason as [`standing_of`]: an
@@ -1144,13 +1294,58 @@ mod tests {
             lookup_url: "https://unused.invalid/v1/lookup".into(),
             max_age: Duration::from_secs(30 * DAY),
             breaker: Breaker::default(),
-            backend: Backend::Uplink(
+            backend: Backend::Uplink(Some(
                 cleave::feed::Token::parse("i13_test_token").expect("a token"),
-            ),
+            )),
+            quota_file: None,
         }
     }
 
-    /// Uplink is the judge a paid scan asked for: an analyzed verdict
+    /// The host follows the credential: a token is sent to the subscribers'
+    /// host and no other, and a scan without one asks the open host and sends
+    /// nothing that identifies it.
+    #[test]
+    fn only_a_subscriber_sends_a_credential() {
+        let http = crate::remote::http().expect("a client");
+        let sent = |precheck: &Precheck| {
+            precheck
+                .authed(http.get(&precheck.lookup_url))
+                .build()
+                .expect("a request")
+        };
+        let open = Precheck::uplink(None);
+        assert!(open.is_uplink());
+        assert_eq!(open.tid(), "anonymous");
+        let request = sent(&open);
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.atomdrift.org/v1/lookup"
+        );
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
+        assert!(request.headers().get(reqwest::header::COOKIE).is_none());
+
+        let token = cleave::feed::Token::parse("i13_test_token").expect("a token");
+        let paid = Precheck::uplink(Some(token));
+        let request = sent(&paid);
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.atomdrift.com/v1/lookup"
+        );
+        assert_eq!(
+            request.headers().get(reqwest::header::AUTHORIZATION),
+            Some(&reqwest::header::HeaderValue::from_static(
+                "Bearer i13_test_token"
+            ))
+        );
+        assert_ne!(paid.tid(), "anonymous");
+    }
+
+    /// Uplink is the judge the scan asked for: an analyzed verdict
     /// stands whatever produced it, but a stale clean one, an unanalyzed one,
     /// or one with no level is analyzed here.
     #[test]
@@ -1209,31 +1404,138 @@ mod tests {
         assert!(matches!(&out[&a], Standing::Adopt(v) if v.fires_at == Level::At(3)));
     }
 
-    /// A refused token or an exhausted quota stops the asking at once; any
-    /// other failure is one batch analyzed here.
+    /// A held breaker lets nothing out before its time, one probe after it,
+    /// and nothing at all when held for the run.
     #[test]
-    fn a_refusal_from_uplink_stops_the_asking() {
-        for status in [401, 403, 429] {
+    fn a_held_breaker_stays_shut_until_its_time() {
+        let t0 = 1_000_000;
+        let breaker = Breaker::default();
+        assert!(breaker.hold(t0 + 600), "the first hold opens it");
+        assert!(!breaker.hold(t0 + 600), "and is the only one to say so");
+        assert!(!breaker.allows(t0));
+        assert!(!breaker.allows(t0 + 599));
+        assert!(breaker.allows(t0 + 600), "its time has come: one probe");
+        assert!(!breaker.allows(t0 + 600), "and only one");
+        breaker.succeeded();
+        assert!(breaker.allows(t0 + 601));
+
+        let breaker = Breaker::default();
+        assert!(breaker.hold(u64::MAX));
+        assert!(!breaker.allows(t0));
+        assert!(!breaker.allows(u64::MAX - 1), "held for the run");
+    }
+
+    /// Uplink saying no, or failing, stops the asking for the rest of the
+    /// run; an answer that is merely not a verdict does not.
+    #[test]
+    fn a_refusal_or_a_failure_from_uplink_stops_the_asking() {
+        let far = crate::civil::now_secs() + 100 * BREAKER_COOLDOWN_SECS;
+        for status in [401, 403, 500, 502, 503, 504] {
             let precheck = uplink();
             let code = reqwest::StatusCode::from_u16(status).unwrap();
-            assert!(!precheck.answered(code, "test"));
+            assert!(!precheck.answered(code, None, "test"));
             assert!(
-                !precheck.breaker.allows(crate::civil::now_secs()),
-                "{status} opens the breaker"
+                !precheck.breaker.allows(far),
+                "{status} ends the asking for the run"
             );
         }
-        let precheck = uplink();
-        assert!(!precheck.answered(reqwest::StatusCode::BAD_GATEWAY, "test"));
-        assert!(
-            precheck.breaker.allows(crate::civil::now_secs()),
-            "a 502 is one failed batch"
-        );
-        assert!(precheck.answered(reqwest::StatusCode::OK, "test"));
+        for status in [400, 404, 413] {
+            let precheck = uplink();
+            let code = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(!precheck.answered(code, None, "test"));
+            assert!(
+                precheck.breaker.allows(crate::civil::now_secs()),
+                "{status} is one unanswered batch"
+            );
+        }
+        assert!(uplink().answered(reqwest::StatusCode::OK, None, "test"));
 
         // Hopper's refusals keep their old meaning: analyze, keep asking.
         let hopper = Precheck::new("http://unused", Duration::from_secs(1)).unwrap();
-        assert!(!hopper.answered(reqwest::StatusCode::UNAUTHORIZED, "test"));
-        assert!(hopper.breaker.allows(crate::civil::now_secs()));
+        for status in [401, 429, 503] {
+            let code = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(!hopper.answered(code, Some(600), "test"));
+            assert!(hopper.breaker.allows(crate::civil::now_secs()), "{status}");
+        }
+    }
+
+    /// A spent quota holds lookups off for the `Retry-After` it came with: no
+    /// longer than an hour whatever it says, and a cooldown when it says
+    /// nothing.
+    #[test]
+    fn a_spent_quota_is_left_alone_until_retry_after() {
+        let too_many = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        for (retry_after, held, free) in [
+            (Some(600), 590, 610),
+            (
+                Some(86_400),
+                QUOTA_HOLD_MAX_SECS - 10,
+                QUOTA_HOLD_MAX_SECS + 10,
+            ),
+            (None, BREAKER_COOLDOWN_SECS - 10, BREAKER_COOLDOWN_SECS + 10),
+        ] {
+            let precheck = uplink();
+            let now = crate::civil::now_secs();
+            assert!(!precheck.answered(too_many, retry_after, "test"));
+            assert!(!precheck.breaker.allows(now), "{retry_after:?}");
+            assert!(!precheck.breaker.allows(now + held), "{retry_after:?}");
+            assert!(precheck.breaker.allows(now + free), "{retry_after:?}");
+        }
+    }
+
+    /// The end of a spent quota outlives the run that spent it, so the next
+    /// run does not ask only to be refused; a file that says more than a
+    /// quota could, or nothing readable, is not believed.
+    #[test]
+    fn a_spent_quota_is_remembered_by_the_next_run() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let quota_file = dir.path().join("uplink-quota-anonymous");
+        let fresh = || Precheck {
+            quota_file: Some(quota_file.clone()),
+            backend: Backend::Uplink(None),
+            ..uplink()
+        };
+        let now = crate::civil::now_secs();
+        assert_eq!(fresh().remembered_quota_hold(now), None, "nothing spent");
+
+        assert!(!fresh().answered(reqwest::StatusCode::TOO_MANY_REQUESTS, Some(600), "test"));
+        let until = fresh().remembered_quota_hold(now).expect("remembered");
+        assert!((now + 600..=now + 605).contains(&until), "{until} vs {now}");
+        assert_eq!(fresh().remembered_quota_hold(until), None, "turned over");
+
+        std::fs::write(&quota_file, (now + 30 * 86_400).to_string()).expect("write");
+        assert_eq!(
+            fresh().remembered_quota_hold(now),
+            Some(now + QUOTA_HOLD_MAX_SECS),
+            "no quota holds for longer than an hour"
+        );
+        for junk in ["", "soon", "-5", "18446744073709551616"] {
+            std::fs::write(&quota_file, junk).expect("write");
+            assert_eq!(fresh().remembered_quota_hold(now), None, "{junk:?}");
+        }
+    }
+
+    /// An Uplink that cannot be reached costs one failed ask: nothing more
+    /// goes out for the rest of the run, and every artifact is analyzed here.
+    #[test]
+    fn an_unreachable_uplink_is_not_asked_again() {
+        let precheck = Precheck {
+            // Nothing listens on a reserved port of this machine.
+            lookup_url: "https://127.0.0.1:1/v1/lookup".into(),
+            ..uplink()
+        };
+        let sha = "a".repeat(64);
+        assert!(matches!(precheck.standing(&sha), Standing::Analyze));
+        let far = crate::civil::now_secs() + 100 * BREAKER_COOLDOWN_SECS;
+        assert!(!precheck.breaker.allows(far), "held for the run");
+        let (standings, unknown) = precheck.shas(std::slice::from_ref(&sha));
+        assert!(standings.is_empty());
+        assert!(unknown.is_empty(), "unanswered is not unknown");
+        assert!(
+            precheck
+                .purls(&["pkg:npm/left-pad@1.3.0".to_string()])
+                .is_empty()
+        );
     }
 
     #[test]

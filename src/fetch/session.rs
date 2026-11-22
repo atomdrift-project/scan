@@ -930,7 +930,7 @@ impl FetchSession {
             })
             .collect();
         let shas: Vec<String> = resolved.iter().map(|(_, sha)| sha.clone()).collect();
-        let standings = precheck.shas(&shas);
+        let (standings, _) = precheck.shas(&shas);
         resolved
             .into_iter()
             .filter_map(|(purl, sha)| {

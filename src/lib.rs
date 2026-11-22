@@ -41,6 +41,7 @@ pub(crate) mod hosts;
 mod interrupt;
 mod retry;
 pub(crate) mod thread_priority;
+mod transfer;
 
 // Everything below is public only because the `atomscan` binary, the
 // integration tests and the Atomdrift daemons built on this crate link it.

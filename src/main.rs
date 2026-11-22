@@ -672,6 +672,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
     if let Commands::Render { args } = &command {
         return render(&global, args);
     }
+    if global.offline
+        && matches!(
+            command,
+            Commands::Url { .. }
+                | Commands::Purl { .. }
+                | Commands::Serve(_)
+                | Commands::UpdateRules
+                | Commands::Feed { name: Some(_) }
+        )
+    {
+        anyhow::bail!("this command needs the network, which --offline forbids");
+    }
     let interpret = bootstrap(&global, &command)?;
     let fetch = fetch_policy(&global, &command);
     match command {
@@ -809,14 +821,24 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
     // Interactive commands get a once-a-day, zero-telemetry update notice. The
     // long-running daemons are excluded — they refresh on restart and shouldn't
     // print transient notices into their logs — and so is `validate`.
-    if !command.is_daemon() && !matches!(command, Commands::Validate) {
+    if !command.is_daemon() && !matches!(command, Commands::Validate) && !global.offline {
         scan::update_check::maybe_notify();
     }
     // Default-on refresh: bring rules + models (+ bloom) current when the local
     // ruleset is over 24h stale — or immediately with `-u/--update` — unless
     // `--no-update` disables it. Scanning commands only: the daemons refresh on
     // restart, and `version`/`update-rules` manage updates themselves.
-    if command.is_scan() {
+    if command.is_scan() && global.offline {
+        // cleave installs a missing rules tree on first use; not here. Uplink
+        // is never resolved, which leaves it off.
+        cleave::traits_repo::try_resolve().context(
+            "--offline forbids downloading rules: run `atomscan update-rules` once while online",
+        )?;
+        tracing::info!(
+            event = "offline",
+            "no network: updates, Uplink, follows, hopper and the LLM are off"
+        );
+    } else if command.is_scan() {
         // A paid feed named with `--feed` needs a token before the refresh
         // below would ask for one mid-download; asked here, once.
         cleave::rule_update::sign_in()?;
@@ -829,7 +851,11 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
         // that needed a token has been asked for it by now, and one whose
         // token was refused has fallen back, possibly to open source, which
         // asks nothing.
-        scan::remote::resolve(global.analyze, cleave::feed::current().needs_token())?;
+        scan::remote::resolve(
+            global.uplink,
+            cleave::feed::current().needs_token(),
+            cleave::traits_repo::try_resolve().ok().as_deref(),
+        )?;
     }
     Ok(interpret)
 }
@@ -845,6 +871,7 @@ fn configure_process(global: &GlobalArgs, command: &Commands) -> Result<()> {
             bytes: scan::fetch::DEFAULT_MAX_TOTAL_SIZE,
         }),
         theme: theme(global, command),
+        offline: global.offline,
         ..Default::default()
     })?;
     // Reclaim stale/oversized caches (stng strings, scan analysis+interpret,
@@ -939,6 +966,9 @@ fn fetch_policy(global: &GlobalArgs, command: &Commands) -> scan::fetch::FetchPo
     } else {
         default_cli_follow_policy
     };
+    if global.offline {
+        return scan::fetch::FetchPolicy::default();
+    }
     global.fetch_policy(
         global.follow.unwrap_or_else(default_follow),
         scan::fetch::DEFAULT_MAX_DEP_AGE_DAYS,
@@ -964,7 +994,7 @@ fn scan_config(
         .with_interpret(interpret)
         .with_fetch(fetch)
         .with_zip_passwords(global.zip_passwords.clone())
-        .with_hopper(resolve_hopper(hopper))
+        .with_hopper(resolve_hopper(hopper).filter(|_| !global.offline))
         .with_all_members(global.all_members)
 }
 

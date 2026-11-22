@@ -98,11 +98,12 @@ Exit codes make CI integration trivial:
 
 ### Networking and privacy
 
-atomscan will never send telemetry data. It will however reach out to the Internet for 3 reasons:
+atomscan will never send telemetry data. It will however reach out to the Internet for 4 reasons:
 
 - **rule updates**: every 24h; disable with `--no-update`
 - **release check**: once a day, to say a newer atomscan exists; disable with `SCAN_NO_UPDATE_CHECK=1`
 - **following discovered references**: to detect if a benign package depends on or downloads a compromised payload. Set `--follow=none` to analyze only the requested artifact.
+- **Atomdrift Uplink lookups**: to skip analyzing what the service has already judged. A scan asks `api.atomdrift.org` about the SHA-256 of each local file of 1 MiB or more and of each downloaded dependency, and about the PURLs of packages on mainstream public registries. No account is needed and nothing identifying is sent: never a path, a file name, a URL or a file's contents. Disable with `--uplink=false` or `ATOMDRIFT_UPLINK=false`, which is also the reproducible mode. `--uplink=always` uploads files for analysis and needs a paid plan.
 
 Downloaded dependencies are analyzed under the current rules unless a local
 analysis report or a matching-analyzer corpus verdict can be reused. A recent

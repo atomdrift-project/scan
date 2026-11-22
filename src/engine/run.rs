@@ -20,13 +20,13 @@ use super::{
     DisplayFilter, ScanConfig, ScanResult, ScanSummary, add_zip_passwords,
     prefetch_cleave_resources_for,
 };
-use crate::bloom_repo::{Decision as BloomDecision, Gate, KNOWN_GOOD_FRESH};
+use crate::bloom_repo::{Decision as BloomDecision, Gate, KNOWN_GOOD_FRESH, Lookup};
 use crate::corpus_precheck::Verdict;
 use crate::explain::ShapImportance;
 use crate::model::{Classification, Model};
 use crate::output::{BloomMark, BloomVerdict};
 use crate::provenance::RegistryProvenance;
-use crate::remote::Analyze;
+use crate::remote::Uplink;
 use crate::{Mode, OutputFormat};
 
 /// Run a scan against a file or directory tree.
@@ -285,11 +285,15 @@ fn run_paths_with(
     // A file scanned the same way before prints what it printed then. Each
     // batch of the rest keeps its own policy, so each is offered to Uplink
     // alone.
-    let mut shas = HashMap::new();
-    let files = session.replay_kept(targets.files, replays.files, &mut HashMap::new());
+    // Uplink is asked only about what is left, by the digests replaying
+    // already took, and never about a walked file too large to analyze.
+    let (mut named_shas, mut shas) = (HashMap::new(), HashMap::new());
+    let files = session.replay_kept(targets.files, replays.files, &mut named_shas);
     let dir_files = session.replay_kept(targets.dir_files, replays.dir_files, &mut shas);
-    let files = session.judge_remotely(files);
-    let dir_files = session.judge_remotely(dir_files);
+    let named = if alone { Role::Alone } else { Role::Named };
+    let files = session.judge_remotely(files, &named_shas, 0, named);
+    let limit = analysis_options(config).max_scan_file_size;
+    let dir_files = session.judge_remotely(dir_files, &shas, limit, Role::Found);
     scan_partitioned(&session, &files, dir_files, &shas, registry_map, alone)?;
     session.finish()
 }
@@ -533,25 +537,27 @@ pub(crate) fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<Sca
     // to guard against. Directory paths still prefetch (they do fan out).
     let (model, shap) = load_model(config)?;
     let session = Session::start(config, &model, shap.as_ref());
-    // Atomdrift Uplink first, on a paid plan: by digest in `auto`, by upload in
-    // `remote`. A registry document standing in for an unfetchable package is
+    // Atomdrift Uplink first: by digest when asking, by upload under
+    // `always`. A registry document standing in for an unfetchable package is
     // never asked about — its bytes differ on every fetch.
     if fallback_purl.is_none() {
         match crate::remote::mode() {
-            Analyze::Auto => {
+            Uplink::Ask => {
                 if let Some((sha, verdict)) = crate::remote::known_bytes(&bytes) {
-                    session.record_remote(label, &sha, None, &verdict);
+                    session.record_remote(label, &sha, None, &verdict, None);
                     return session.finish();
                 }
             }
-            Analyze::Remote => {
+            Uplink::Always => {
                 match crate::remote::analyze(crate::remote::Upload::Bytes(bytes)) {
-                    Ok((sha, verdict)) => session.record_remote(label, &sha, None, &verdict),
+                    Ok((sha, verdict)) => {
+                        session.record_remote(label, &sha, None, &verdict, None);
+                    }
                     Err(error) => session.report_error(Path::new(label), &error),
                 }
                 return session.finish();
             }
-            Analyze::Local => {}
+            Uplink::Off => {}
         }
     }
     // No bloom short-circuit here: a `url`/`purl` scan names the one artifact
@@ -589,7 +595,7 @@ pub(crate) fn report_remote(
 ) -> Result<ScanSummary> {
     let (model, shap) = load_model(config)?;
     let session = Session::start(config, &model, shap.as_ref());
-    session.record_remote(label, sha, purl, verdict);
+    session.record_remote(label, sha, purl, verdict, None);
     session.finish()
 }
 
@@ -874,27 +880,49 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Hand files to Atomdrift Uplink on a paid plan, and return the ones left to
-    /// analyze here. `auto` answers the files it already judges; `remote` sends
-    /// every file and leaves none; `local` keeps them all.
-    fn judge_remotely(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+    /// Hand files to Atomdrift Uplink, and return the ones left to analyze
+    /// here. Asking answers the files it already judges; `always` sends every
+    /// file and leaves none; off keeps them all. `shas` holds the digests
+    /// already taken, `limit` (when not zero) the largest file asked about,
+    /// and `role` what the files are to the scan, which an answer is kept
+    /// under for the next one.
+    fn judge_remotely(
+        &self,
+        files: Vec<PathBuf>,
+        shas: &HashMap<PathBuf, String>,
+        limit: u64,
+        role: Role,
+    ) -> Vec<PathBuf> {
         match crate::remote::mode() {
-            Analyze::Local => files,
-            Analyze::Auto => {
-                let (answered, rest) = crate::remote::answer_known(files);
+            Uplink::Off => files,
+            Uplink::Ask => {
+                // A walked file the bloom filters let the walk pass over is
+                // settled here; a named one is always analyzed.
+                let lookup = self.config.bloom().filter(|_| role == Role::Found);
+                let fast = self.config.mode() == Mode::Fast;
+                let passed_over = |path: &Path, sha: &str| {
+                    lookup.is_some_and(|lookup| bloom_passes_over(lookup, fast, sha, path).2)
+                };
+                let (answered, rest) = crate::remote::answer_known(files, shas, limit, passed_over);
                 for (path, sha, verdict) in &answered {
-                    self.record_remote(&path.display().to_string(), sha, None, verdict);
+                    self.record_remote(&path.display().to_string(), sha, None, verdict, Some(role));
                 }
                 rest
             }
-            Analyze::Remote => {
+            Uplink::Always => {
                 for path in &files {
                     if self.cancel.load(Ordering::Relaxed) {
                         break;
                     }
                     match crate::remote::analyze(crate::remote::Upload::File(path)) {
                         Ok((sha, verdict)) => {
-                            self.record_remote(&path.display().to_string(), &sha, None, &verdict);
+                            self.record_remote(
+                                &path.display().to_string(),
+                                &sha,
+                                None,
+                                &verdict,
+                                Some(role),
+                            );
                         }
                         Err(error) => {
                             self.advance();
@@ -910,7 +938,16 @@ impl<'a> Session<'a> {
     /// Account for one artifact Uplink judged, as [`Self::report`] does for
     /// one analyzed here: graded at this run's level, tallied, and shown under
     /// the same rules.
-    fn record_remote(&self, label: &str, sha: &str, purl: Option<&str>, verdict: &Verdict) {
+    /// `kept` is the role a local file's answer is kept under for replay;
+    /// `None` keeps nothing (a fetched artifact, which has no file to hash).
+    fn record_remote(
+        &self,
+        label: &str,
+        sha: &str,
+        purl: Option<&str>,
+        verdict: &Verdict,
+        kept: Option<Role>,
+    ) {
         self.advance();
         let Some(class) = crate::remote::classification(verdict.fires_at, self.config.level())
         else {
@@ -926,20 +963,36 @@ impl<'a> Session<'a> {
         };
         self.tally.count(class);
         let shown = self.config.format().emits_every_result() || self.config.filter().shows(class);
+        let mut written = None;
         if shown {
             self.write_result(|| {
-                let mut out = io::stdout().lock();
+                let mut bytes = Vec::new();
                 crate::output::write_remote_verdict(
-                    &mut out,
+                    &mut bytes,
                     label,
                     sha,
                     purl,
                     verdict,
                     class,
                     self.config.format(),
-                )
-                .and_then(|()| out.flush())
+                )?;
+                write_stdout(&bytes)?;
+                written = Some(bytes);
+                Ok(())
             });
+        }
+        // Kept like a local result: when nothing else is owed for the file and
+        // what was written is all of it, so the next scan asks nobody.
+        let complete = self.uploader.is_none() && shown == written.is_some();
+        if let Some(role) = kept.filter(|_| complete) {
+            match written.map(String::from_utf8).transpose() {
+                Ok(output) => {
+                    Replay::remote(sha, label, class, output).store(role, self.config);
+                }
+                Err(_) => {
+                    tracing::debug!("remote verdict output is not UTF-8; not kept for replay")
+                }
+            }
         }
     }
 
@@ -1501,6 +1554,33 @@ fn named_target_opts(opts: &AnalysisOptions) -> AnalysisOptions {
     }
 }
 
+/// What the bloom filters say of a walked file with content `sha_hex`: the
+/// decision, whether the file is fresh, and whether the walk passes it over.
+///
+/// Known-good is trusted and passed over, unless the file was created,
+/// status-changed, or modified within the last hour — a fresh known-good is
+/// analyzed on its own merits (recent activity, and a guard against a bloom
+/// false positive on a freshly planted file). Every other decision is
+/// analyzed, adverse or not: in fast mode an unknown is passed over as well,
+/// which is what fast mode means. An unparseable digest is analyzed.
+fn bloom_passes_over(
+    lookup: &Lookup,
+    fast: bool,
+    sha_hex: &str,
+    path: &Path,
+) -> (BloomDecision, bool, bool) {
+    let Some(digest) = burton::parse_sha256_hex(sha_hex) else {
+        return (BloomDecision::Unknown, false, false);
+    };
+    let decision = lookup.decide(&burton::Artifact::sha256(&digest));
+    if decision.may_skip() {
+        let fresh = file_touched_within(path, KNOWN_GOOD_FRESH, SystemTime::now());
+        (decision, fresh, !fresh)
+    } else {
+        (decision, false, fast && decision == BloomDecision::Unknown)
+    }
+}
+
 /// Build the cleave skip predicate from the active bloom filters: a file whose
 /// sha256 is known-good (or, in fast mode, simply unknown) is skipped before
 /// analysis, and its decision noted in `skipped` for [`Session::record`].
@@ -1515,21 +1595,8 @@ fn bloom_skip_predicate(
     let skipped = skipped.clone();
     Some(cleave::SkipPredicate(Arc::new(
         move |sha_hex: &str, path: &Path| {
-            let Some(digest) = burton::parse_sha256_hex(sha_hex) else {
-                return false;
-            };
-            let decision = lookup.decide(&burton::Artifact::sha256(&digest));
-            // Known-good is trusted and skipped, unless the file was created,
-            // status-changed, or modified within the last hour — a fresh
-            // known-good is analyzed on its own merits (recent activity, and a
-            // guard against a bloom false positive on a freshly planted file),
-            // so cleave analyzes it once here rather than skipping and then
-            // re-analyzing in `Session::record`.
-            //
-            // Every other decision is analyzed, adverse or not: in fast mode an
-            // unknown is skipped as well, which is what fast mode means.
-            let skip = if decision.may_skip() {
-                let fresh = file_touched_within(path, KNOWN_GOOD_FRESH, SystemTime::now());
+            let (decision, fresh, skip) = bloom_passes_over(&lookup, fast, sha_hex, path);
+            if decision.may_skip() {
                 crate::bloom_repo::met(if fresh {
                     Gate::FileFresh
                 } else {
@@ -1541,11 +1608,9 @@ fn bloom_skip_predicate(
                     fresh,
                     "walked file is known-good by content; analyzed only if fresh"
                 );
-                !fresh
             } else {
                 crate::bloom_repo::met(Gate::FileUnvouched);
-                fast && decision == BloomDecision::Unknown
-            };
+            }
             if skip {
                 skipped.insert(path, decision);
             }

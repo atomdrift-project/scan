@@ -75,7 +75,7 @@ pub(crate) fn update<B: Bundle>(dir: &Path, force: bool, quiet: bool) -> Result<
         return Ok(false);
     }
     let installed = B::installed(dir);
-    let http = client(quiet && installed.is_some())?;
+    let http = client(quiet && installed.is_some(), B::NAME)?;
     let remote = B::fetch(&http)?;
     let current = |have: &Option<B::Installed>| {
         !force
@@ -149,6 +149,8 @@ const RETRY_BUDGET: Duration = Duration::from_secs(120);
 pub(crate) struct Http {
     client: Client,
     retry: Duration,
+    /// The bundle whose downloads [`crate::transfer`] counts, if any.
+    bundle: Option<&'static str>,
 }
 
 impl Http {
@@ -158,6 +160,7 @@ impl Http {
         Self {
             client,
             retry: Duration::ZERO,
+            bundle: None,
         }
     }
 }
@@ -166,8 +169,8 @@ impl Http {
 /// fetches. `quick` fails fast when the bucket is unreachable and never
 /// retries; a first install or an explicit update stays patient, so a slow
 /// first fetch still completes and a transient failure is retried within
-/// [`RETRY_BUDGET`].
-fn client(quick: bool) -> Result<Http> {
+/// [`RETRY_BUDGET`]. Its bundle downloads are counted under `bundle`.
+fn client(quick: bool, bundle: &'static str) -> Result<Http> {
     // The bucket is https; a redirect must not take a manifest or a bundle
     // off it onto cleartext.
     let mut builder = Client::builder().timeout(TIMEOUT).https_only(true);
@@ -178,6 +181,7 @@ fn client(quick: bool) -> Result<Http> {
     Ok(Http {
         client,
         retry: if quick { Duration::ZERO } else { RETRY_BUDGET },
+        bundle: Some(bundle),
     })
 }
 
@@ -190,7 +194,7 @@ pub(crate) fn url(path: &str) -> String {
 /// [`reqwest::Error`], so a caller can test for a 404.
 pub(crate) fn manifest(http: &Http, url: &str) -> Result<String> {
     let mut text = Vec::new();
-    copy_capped(http, url, MAX_MANIFEST_BYTES, &mut text)?;
+    copy_capped(http, url, MAX_MANIFEST_BYTES, None, &mut text)?;
     String::from_utf8(text).with_context(|| format!("{url} is not valid UTF-8"))
 }
 
@@ -204,7 +208,7 @@ pub(crate) fn download(http: &Http, url: &str, sha256: &str, out: &mut impl Writ
         out,
         digest: Sha256::new(),
     };
-    copy_capped(http, url, MAX_FILE_BYTES, &mut hashed)?;
+    copy_capped(http, url, MAX_FILE_BYTES, http.bundle, &mut hashed)?;
     let got = crate::digest::hex(&hashed.digest.finalize());
     if got != sha256 {
         bail!("sha256 mismatch for {url}: got {got}, manifest says {sha256}");
@@ -232,19 +236,40 @@ pub(crate) fn stage_filters(
     base: &str,
     manifest: &burton::Manifest,
 ) -> Result<()> {
+    // Every name must stay inside `staging`, checked before anything is fetched.
+    if let Some((stem, entry)) = manifest.filter.iter().find(|(_, entry)| {
+        Path::new(&entry.file).file_name() != Some(std::ffi::OsStr::new(&entry.file))
+    }) {
+        bail!("filter {stem} has an unsafe file name {:?}", entry.file);
+    }
+    // Fetched together: the set's size is known from the first round-trip, so
+    // progress and its ETA are honest from the start, and one large filter
+    // doesn't hold the small ones behind it.
+    std::thread::scope(|s| {
+        let downloads: Vec<_> = manifest
+            .filter
+            .values()
+            .map(|entry| {
+                s.spawn(move || {
+                    download_to(
+                        http,
+                        &format!("{base}/{}", entry.file),
+                        &entry.sha256,
+                        &staging.join(&entry.file),
+                    )
+                })
+            })
+            .collect();
+        downloads.into_iter().try_for_each(|download| {
+            download
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("filter download panicked")))
+        })
+    })?;
+    // Validated one at a time, so only one filter is ever held in memory.
     for (stem, entry) in &manifest.filter {
-        // The name must stay inside `staging`.
-        if Path::new(&entry.file).file_name() != Some(std::ffi::OsStr::new(&entry.file)) {
-            bail!("filter {stem} has an unsafe file name {:?}", entry.file);
-        }
-        let path = staging.join(&entry.file);
-        download_to(
-            http,
-            &format!("{base}/{}", entry.file),
-            &entry.sha256,
-            &path,
-        )?;
-        let bytes = fs::read(&path).with_context(|| format!("reading {}", entry.file))?;
+        let bytes = fs::read(staging.join(&entry.file))
+            .with_context(|| format!("reading {}", entry.file))?;
         let filter =
             burton::Filter::load(bytes).with_context(|| format!("validating {}", entry.file))?;
         if filter.stem() != stem || filter.len() != entry.n {
@@ -261,24 +286,60 @@ pub(crate) fn stage_filters(
     Ok(())
 }
 
-/// Stream `url` into `out`, refusing more than `max` bytes.
+/// Stream `url` into `out`, refusing more than `max` bytes, its progress
+/// counted under `meter` when one is named.
 ///
 /// A transient failure before the body starts — a dropped connection, 408,
 /// 429, 5xx — is retried with jittered exponential backoff, honouring
 /// Retry-After, within `http`'s retry budget. Nothing has been written to
 /// `out` by then, so a retry cannot corrupt it; a failure mid-body is final.
-fn copy_capped(http: &Http, url: &str, max: u64, out: &mut impl Write) -> Result<()> {
+fn copy_capped(
+    http: &Http,
+    url: &str,
+    max: u64,
+    meter: Option<&'static str>,
+    out: &mut impl Write,
+) -> Result<()> {
     tracing::debug!(url, "fetching");
     let _span = tracing::info_span!("bundle_fetch", url).entered();
     let resp = crate::retry::send("bundle fetch", http.retry, |_| http.client.get(url))
         .and_then(reqwest::blocking::Response::error_for_status)
         .with_context(|| format!("GET {url}"))?;
-    let copied =
-        io::copy(&mut resp.take(max + 1), out).with_context(|| format!("reading {url}"))?;
+    let size = resp.content_length();
+    let mut body = resp.take(max + 1);
+    let copied = match meter {
+        Some(bundle) => io::copy(
+            &mut body,
+            &mut Metered {
+                out,
+                transfer: crate::transfer::Transfer::begin(bundle, size),
+            },
+        ),
+        None => io::copy(&mut body, out),
+    }
+    .with_context(|| format!("reading {url}"))?;
     if copied > max {
         bail!("{url} is larger than {max} bytes");
     }
     Ok(())
+}
+
+/// A writer that counts what passes through it toward its download's progress.
+struct Metered<'a, W> {
+    out: &'a mut W,
+    transfer: crate::transfer::Transfer,
+}
+
+impl<W: Write> Write for Metered<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.transfer.advance(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
 }
 
 /// A writer that hashes what passes through it.

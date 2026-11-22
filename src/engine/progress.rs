@@ -507,7 +507,7 @@ impl Drop for Progress {
     clippy::cast_sign_loss,
     reason = "`secs` is a positive, finite ETA; minutes fit a u32 for any real scan"
 )]
-fn format_eta(secs: f64) -> String {
+pub(crate) fn format_eta(secs: f64) -> String {
     if secs < 1.0 {
         "<1s".to_string()
     } else if secs < 60.0 {

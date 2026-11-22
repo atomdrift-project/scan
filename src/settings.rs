@@ -20,6 +20,8 @@ pub struct Settings {
     pub cache_dir: Option<PathBuf>,
     /// The terminal theme; `None` is dark.
     pub theme: Option<crate::output::Theme>,
+    /// `--offline`: nothing is downloaded, not even a missing model bundle.
+    pub offline: bool,
 }
 
 /// A ceiling on what one execution fetches.

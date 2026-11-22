@@ -114,7 +114,7 @@ impl Replay {
         Self {
             at: now(),
             expires: config.fetch_policy().enabled()
-                || crate::remote::mode() != crate::remote::Analyze::Local,
+                || crate::remote::mode() != crate::remote::Uplink::Off,
             sha256: result.sha256.clone(),
             label: label.to_string(),
             class: result.classification,
@@ -122,6 +122,29 @@ impl Replay {
             dependency_gaps: result.dependency_attention.gaps,
             flagged_candidates: result.dependency_attention.flagged_candidates,
             notes,
+            output,
+        }
+    }
+
+    /// The replay of Uplink's verdict on the bytes `sha256`, shown as `label`
+    /// as `class`, which wrote `output`. The service may change its mind, so
+    /// it expires as a followed scan does.
+    pub(super) fn remote(
+        sha256: &str,
+        label: &str,
+        class: Classification,
+        output: Option<String>,
+    ) -> Self {
+        Self {
+            at: now(),
+            expires: true,
+            sha256: sha256.to_string(),
+            label: label.to_string(),
+            class,
+            severe: false,
+            dependency_gaps: 0,
+            flagged_candidates: 0,
+            notes: String::new(),
             output,
         }
     }
@@ -613,6 +636,36 @@ mod tests {
         keep(&paths[1]);
         assert_eq!(find(&paths[0]), Some(tiny(&paths[0])), "still its own");
         assert_eq!(find(&paths[1]), Some(tiny(&paths[1])));
+    }
+
+    /// Uplink's answer for a file is kept like a local scan: the next scan of
+    /// the same bytes replays it, under its own name, asking nobody, until it
+    /// expires as a followed scan does.
+    #[test]
+    fn an_uplink_answer_is_replayed_by_the_next_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ScanConfig::new(dir.path(), OutputFormat::Json, None).expect("config");
+        let sha256 = "e".repeat(64);
+        let shown = |label: &str| format!("{{\"path\":\"{label}\",\"source\":\"uplink\"}}\n");
+        let first = dir.path().join("big.dmg").display().to_string();
+        let copy = dir.path().join("big (1).dmg").display().to_string();
+        Replay::remote(
+            &sha256,
+            &first,
+            Classification::Hostile,
+            Some(shown(&first)),
+        )
+        .store(Role::Found, &config);
+        for label in [&first, &copy] {
+            let replay = Replay::find(&sha256, label, Role::Found, &config).expect("kept");
+            assert_eq!(replay.class, Classification::Hostile);
+            assert_eq!(replay.output, Some(shown(label)), "{label}");
+            assert!(replay.notes.is_empty());
+        }
+        let kept = Replay::remote(&sha256, &first, Classification::Benign, None);
+        assert!(kept.expires, "the service may change its mind");
+        assert!(kept.fresh(kept.at + RESOLUTION_TTL.as_secs()));
+        assert!(!kept.fresh(kept.at + RESOLUTION_TTL.as_secs() + 1));
     }
 
     /// A batch finds each file's replay in the files' own order, and reads no

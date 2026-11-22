@@ -74,6 +74,8 @@ impl Fixture {
             .env("CLEAVE_TRAITS_DIR", &self.traits)
             .env("CLEAVE_CACHE_DIR", self.root.path().join("cleave-cache"))
             .env("SCAN_NO_UPDATE_CHECK", "1")
+            // No test asks Atomdrift Uplink about anything.
+            .env("ATOMDRIFT_UPLINK", "false")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             // Never refresh rules in the background; `update-rules` still does.
@@ -287,7 +289,7 @@ traits:
         (ENTRY, true, Some("--follow-depth=2"), true),
         (CLEAN, true, Some("--follow-depth=2"), false),
     ] {
-        let mut args = vec!["--analyze", "local", "-f", "json"];
+        let mut args = vec!["--uplink", "false", "-f", "json"];
         args.extend(depth);
         if remote {
             args.push("url");
@@ -314,7 +316,7 @@ traits:
         (&missing, Some("--follow=none"), false),
         (&image, None, false),
     ] {
-        let mut args = vec!["--analyze", "local", "-f", "json-full"];
+        let mut args = vec!["--uplink", "false", "-f", "json-full"];
         args.extend(follow);
         args.push(target.to_str().unwrap());
         let mut cmd = offline_command(&args);
@@ -368,8 +370,8 @@ traits:
     fs::write(&sample, "const marker = 'atomscan-replay-test';\n").unwrap();
     let scan_as = |path: &Path, format: &str, cached: bool| {
         let mut cmd = f.command(&[
-            "--analyze",
-            "local",
+            "--uplink",
+            "false",
             "-f",
             format,
             "path",
@@ -464,8 +466,8 @@ traits:
     fs::write(dir.join("plain.js"), "const marker = 'nothing of note';\n").unwrap();
     let scan = |target: &Path| {
         let mut cmd = f.command(&[
-            "--analyze",
-            "local",
+            "--uplink",
+            "false",
             "-f",
             "json",
             "path",
@@ -652,6 +654,26 @@ fn purl_rejects_an_invalid_coordinate() {
     let fixture = Fixture::new();
     let output = fixture.smoke(&["purl", "not-a-purl", "--mode", "slow"], 1);
     assert!(String::from_utf8_lossy(&output.stderr).contains("not a package URL"));
+}
+
+/// `--offline` refuses every command that exists to reach the network, before
+/// it reaches it, and cannot be combined with a forced update.
+#[test]
+fn offline_refuses_what_needs_the_network() {
+    let fixture = Fixture::new();
+    for args in [
+        &["--offline", "url", "https://example.com/x.js"][..],
+        &["--offline", "purl", "pkg:npm/left-pad@1.3.0"],
+        &["--offline", "update-rules"],
+        &["--offline", "feed", "supporter"],
+    ] {
+        let output = fixture.smoke(args, 1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--offline forbids"), "{args:?}: {stderr}");
+    }
+    let output = fixture.smoke(&["--offline", "-u", "version"], 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
 }
 
 #[test]

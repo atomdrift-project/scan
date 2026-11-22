@@ -12,6 +12,7 @@ does not parse is a startup error, not a silent default.
 | `SCAN_HOPPER` | `--hopper` |
 | `SCAN_FOLLOW` | `--follow` |
 | `SCAN_REGISTRY_MAP` | `--registry-map` |
+| `ATOMDRIFT_UPLINK` | `--uplink`: whether to ask Atomdrift Uplink before analyzing (`true`, `false`, or `always`). |
 | `ATOMDRIFT_FEED` | `--feed`: the rule feed for this run (`zero-day`, `supporter`, or `oss-delayed`), overriding the one saved by `atomscan feed`. Shared with cleave. |
 
 ## LLM second opinion
