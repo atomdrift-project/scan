@@ -33,7 +33,10 @@ fn saved_interpret_keeps_bytes_and_rewrites_annotation_authority() {
     .unwrap();
     let loaded = cleave::report_input::decode(&serde_json::to_vec(&report).unwrap()).unwrap();
     let rendered = render_saved_interpret(&loaded).unwrap();
-    assert!(rendered.starts_with("== PRIMARY payload.js ==\nprovenance="));
+    // A local artifact carries no fetch record or registry identity, so its
+    // provenance line (path and hash only) is left out.
+    assert!(rendered.starts_with("== PRIMARY payload.js ==\n"));
+    assert!(!rendered.contains("provenance="));
     assert!(rendered.contains("Possible process/interpreter"));
     assert!(!rendered.contains("// N "));
     assert!(rendered.contains("eval(data)"));

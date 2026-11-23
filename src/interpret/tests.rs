@@ -267,6 +267,7 @@ fn finding_severity_reports_every_axis_independently() {
     ];
     let sev = FindingSeverity::from_findings(&both);
     assert!(sev.hostile && sev.gate_trait);
+    assert!(sev.suspicious, "a hostile finding is suspicious-or-above");
 
     let gated_only = [finding(
         "micro-behaviors/communications/http/cookie-store::document-cookie-split-iterate",
@@ -274,14 +275,17 @@ fn finding_severity_reports_every_axis_independently() {
     )];
     let sev = FindingSeverity::from_findings(&gated_only);
     assert!(sev.gate_trait && !sev.hostile);
+    assert!(!sev.suspicious, "a notable finding is not suspicious");
 
-    // A suspicious finding is not hostile, and it is not an admission.
+    // A suspicious finding is not hostile, and it is not an admission, but it
+    // is what keeps a benign read from clearing a verdict outright.
     let suspicious = [finding(
         "objectives/evasion/masquerade::config-insert",
         cleave::Criticality::Suspicious,
     )];
     let sev = FindingSeverity::from_findings(&suspicious);
     assert!(!sev.hostile && !sev.gate_trait && !sev.strong_trait);
+    assert!(sev.suspicious);
 }
 
 const OLD_GATE_IDS: [&str; 4] = [
@@ -980,6 +984,7 @@ fn admit_returns_the_tier_and_the_admitted_verdict() {
     assert_eq!(admitted.tier, LlmAdmission::Required);
     assert_eq!(admitted.ml_class, Classification::Benign);
     assert!(admitted.hostile_finding);
+    assert!(admitted.suspicious_finding);
     assert_eq!(
         admits(&hostile, 0.1),
         Some(admitted.tier),
@@ -1287,6 +1292,8 @@ fn interpretation_bytes_are_pinned() {
             lvl: Level::Clean,
         },
         corroborated: true,
+        suspicious_finding: false,
+        readable: true,
         may_soften: false,
         cached: true,
     };

@@ -118,6 +118,7 @@ fn build_listed(
         every: !listed.is_empty(),
         listed,
         records,
+        root_purl: None,
         level: Some(25),
     })
     .expect("a report with files yields a document");
@@ -438,6 +439,41 @@ fn refs_carry_the_resolved_version_and_the_request() {
 }
 
 #[test]
+fn dependencies_omit_only_references_to_the_scanned_artifact() {
+    let mut pkg = package();
+    pkg.files[1].refs = serde_json::from_value(serde_json::json!([
+        {"to": "pkg:github/example/project@master", "kind": "dependency", "off": 10},
+        {"to": "pkg:github/example/project@v1", "kind": "dependency", "off": 20},
+        {"to": "pkg:github/other/project@master", "kind": "dependency", "off": 30},
+        {"to": "pkg:github/example/mirror@master", "kind": "dependency", "off": 40}
+    ]))
+    .unwrap();
+    let own = own_nodes(&pkg.files, &parents(&pkg.files));
+    let root = Purl::parse("pkg:github/example/project@master").unwrap();
+    let landed = |offset, locator, sha256| {
+        record(serde_json::json!({
+            "source_sha256": sha('b'), "source_offset": offset, "kind": "dependency",
+            "locator": locator, "content_sha256": sha256, "outcome": "ok"
+        }))
+    };
+    let mirror = landed(40, "pkg:github/example/mirror@master", sha('a'));
+    let filtered = refs(&pkg.files, &own, std::slice::from_ref(&mirror), Some(&root));
+    assert_eq!(
+        serde_json::to_value(&filtered).unwrap(),
+        serde_json::json!([
+            {"kind": "dependency", "name": "pkg:github/example/project", "version": "v1"},
+            {"kind": "dependency", "name": "pkg:github/other/project", "requested": "master"}
+        ])
+    );
+    assert_eq!(refs(&pkg.files, &own, &[], None).len(), 4);
+    let moved = landed(10, "pkg:github/example/project@master", sha('e'));
+    assert_eq!(
+        refs(&pkg.files, &own, &[mirror, moved], Some(&root)).len(),
+        3
+    );
+}
+
+#[test]
 fn free_text_is_cut_to_fit_on_a_character_boundary() {
     let reason = "é".repeat(2000);
     let judged = Judged {
@@ -477,6 +513,8 @@ fn an_llm_that_moves_the_verdict_decides_it() {
         grade: crate::interpret::LlmGrade::Suspicious,
         outcome: Classification::Suspicious,
         corroborated: false,
+        suspicious_finding: false,
+        readable: true,
         may_soften: false,
         blended: 0.7,
         interpretation: "Fetches and runs a remote script.".to_string(),
@@ -601,6 +639,8 @@ fn no_object_carries_a_nul() {
         grade: crate::interpret::LlmGrade::Hostile,
         outcome: Classification::Hostile,
         corroborated: false,
+        suspicious_finding: false,
+        readable: true,
         may_soften: false,
         blended: 0.9,
         interpretation: "runs\0 a shell".to_string(),

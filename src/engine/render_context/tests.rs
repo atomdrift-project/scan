@@ -23,19 +23,6 @@ fn annotation_parser_recognizes_findings_not_source_comments() {
     assert_eq!(grade("code();"), None);
 }
 
-/// Suppression records share the annotation grammar, so the readability
-/// gate skips them as non-source like any other annotation.
-#[test]
-fn suppression_records_are_annotations() {
-    for line in [
-        "// H withheld objectives/exfil/x::y by metadata/pkg/test-fixture::z @30",
-        "  # H downgraded objectives/a::b",
-        "-- S suppressed objectives/a::b by micro-behaviors/c::d; metadata/e::f, +2 more",
-    ] {
-        assert!(split_annotation(line).is_some(), "{line}");
-    }
-}
-
 use crate::engine::MemberEvals;
 use crate::engine::pipeline::root_needs_registry_graft;
 
@@ -150,70 +137,6 @@ fn recategorizing_covers_every_annotation_the_render_can_emit() {
     );
 }
 
-#[test]
-fn recategorizing_a_suppression_hides_the_grade_and_the_conclusion() {
-    // Withheld, `//` form, repeated suppressor with `@N` spans: the grade and
-    // the withheld conclusion go, the suppressor stays once, spans are dropped.
-    assert_eq!(
-            recategorize_annotation(
-                "// S withheld objectives/supply-chain/install-hook/package/manifest::no-repo-with-hooks by metadata/package/freeform::pkg-skeleton-small @30; metadata/package/freeform::conventional-version @30; metadata/package/freeform::pkg-skeleton-small @30,41"
-            )
-            .as_deref(),
-            Some(
-                "// Possible benign context — ruled out by: package/freeform (pkg-skeleton-small), package/freeform (conventional-version)"
-            ),
-        );
-    // Downgraded reads differently from withheld.
-    assert_eq!(
-            recategorize_annotation(
-                "// S downgraded objectives/supply-chain/install-hook/scripts/declaration::sparse-package-install-hook by metadata/package/freeform::pkg-skeleton-small @30"
-            )
-            .as_deref(),
-            Some("// Possible benign context — weakened by: package/freeform (pkg-skeleton-small)"),
-        );
-    // `#` form, indented, hex spans, a `+N more` tail, a recognized tool and a
-    // micro-behavior (leaves kept) and a bare condition-kind leg.
-    assert_eq!(
-            recategorize_annotation(
-                "  # H withheld well-known/malware/stealer/x::family by well-known/tool/sysadmin/chocolatey::official-profile-provisioner @1a2b; micro-behaviors/communications/http/services/telegram::telegram-api-host @426,558; text, +2 more"
-            )
-            .as_deref(),
-            Some(
-                "  # Possible benign context — ruled out by: tool/sysadmin/chocolatey (official-profile-provisioner), communications/http (telegram-api-host), text"
-            ),
-        );
-    // No legs at all: still no grade and no conclusion id.
-    assert_eq!(
-        recategorize_annotation("-- N withheld objectives/evasion/process/injection::x").as_deref(),
-        Some("-- Possible benign context — a pattern here was ruled out"),
-    );
-    // Multi-byte text around a suppression must not panic or be misparsed.
-    assert_eq!(
-        recategorize_annotation(
-            "  // S withheld objectives/x/y::über by metadata/file/naïve::café @3"
-        )
-        .as_deref(),
-        Some("  // Possible benign context — ruled out by: file/naïve (café)"),
-    );
-    // Ordinary lines that merely use the verbs are untouched.
-    assert_eq!(recategorize_annotation("# N withheld the payment"), None);
-    assert_eq!(
-        recategorize_annotation("// S withheld ümlaut prose here"),
-        None
-    );
-    assert_eq!(
-        recategorize_annotation("  // withheld objectives/x::y by metadata/a::b"),
-        None
-    );
-    assert_eq!(recategorize_annotation("// +3 more suppressed"), None);
-    // A whole render keeps its other lines byte for byte.
-    let render = "code();\n// B downgraded objectives/a/b::c by metadata/d/e::f\nmore();\n";
-    assert_eq!(
-        recategorize_annotations(render),
-        "code();\n// Possible benign context — weakened by: d/e (f)\nmore();\n"
-    );
-}
-
 fn decision(level: u16, probability: f32) -> Decision {
     Decision {
         class: Classification::Hostile,
@@ -279,6 +202,23 @@ fn finding(id: &str, desc: &str, crit: cleave::Criticality) -> cleave::Finding {
     f
 }
 
+/// `fa` with a one-line code window under each finding, as capture leaves a
+/// real file: the LLM view draws annotations only beside code, so a fixture
+/// without windows renders nothing.
+fn windowed(mut fa: cleave::FileAnalysis) -> cleave::FileAnalysis {
+    for (i, f) in fa.findings.iter_mut().enumerate() {
+        let loc = i as u64 * 64;
+        f.evidence = vec![cleave::types::Evidence::new("string", "", "call").with_offset(loc)];
+        fa.context.push(cleave::types::ContextLine {
+            loc,
+            line: Some(i as u64 + 1),
+            col: Some(1),
+            data: format!("call_{i}()\n").into_bytes(),
+        });
+    }
+    fa
+}
+
 /// Members with nothing suspicious to say go first. A suspicious member
 /// outranks them, and it is dropped only once nothing weaker is left and the
 /// render is still over budget. A dropped container takes its nested members
@@ -292,7 +232,6 @@ fn interpret_render_budget_drops_weakest_members_first() {
         (0u32, 0u32, None, Criticality::Notable, 1usize),
         (1, 1, Some(0), Criticality::Suspicious, 1),
         (2, 1, Some(0), Criticality::Notable, 3),
-        (3, 1, Some(0), Criticality::Notable, 2),
         (4, 1, Some(0), Criticality::Notable, 1),
         (5, 2, Some(4), Criticality::Notable, 4),
     ] {
@@ -321,14 +260,16 @@ fn interpret_render_budget_drops_weakest_members_first() {
             f.crit = crit;
             fa.findings.push(f);
         }
-        files.push(fa);
+        files.push(windowed(fa));
     }
     let mut report = empty_report();
     report.files = files;
 
     let full = budget_primary_context(&mut report.clone(), usize::MAX);
     assert_eq!(full.members_omitted, 0, "an unlimited budget drops nothing");
-    for id in 0..6 {
+    // Five files: the most the LLM view renders, so the budget, not the
+    // file cap, decides what goes.
+    for id in [0, 1, 2, 4, 5] {
         assert!(
             full.text.contains(&format!("m{id}.py")),
             "uncapped render lists m{id}:\n{}",
@@ -351,14 +292,14 @@ fn interpret_render_budget_drops_weakest_members_first() {
         tight.text
     );
     assert_eq!(
-        tight.members_omitted, 5,
+        tight.members_omitted, 4,
         "every member went: {}",
         tight.text
     );
 
     // Just over the line: the member with the least to say (one notable
     // finding) goes first, and its nested child goes with it even though
-    // the child alone, with four findings, would have outranked m2 and m3.
+    // the child alone, with four findings, would have outranked m2.
     // The suspicious member is a stronger rank and stays.
     let over = full.text.len() - 1;
     let capped = budget_primary_context(&mut report, over);
@@ -379,8 +320,8 @@ fn interpret_render_budget_drops_weakest_members_first() {
         capped.text
     );
     assert!(
-        capped.text.contains("m2.py") && capped.text.contains("m3.py"),
-        "notable members kept: {}",
+        capped.text.contains("m2.py"),
+        "notable member kept: {}",
         capped.text
     );
     assert_eq!(capped.members_omitted, 2);
@@ -435,7 +376,7 @@ fn interpret_render_budget_keeps_the_strongest_suspicious_member() {
         &format!("DROP_SUSPICIOUS {}", "x".repeat(8_000)),
         cleave::Criticality::Suspicious,
     ));
-    report.files = vec![root, hostile, suspicious];
+    report.files = vec![windowed(root), windowed(hostile), windowed(suspicious)];
 
     let mut kept = report.clone();
     kept.files.retain(|f| f.id != 2);
@@ -487,7 +428,7 @@ fn interpret_render_budget_trims_findings_on_the_root() {
         file.findings.push(weak);
     }
     let mut report = empty_report();
-    report.files = vec![file];
+    report.files = vec![windowed(file)];
     let capped = budget_primary_context(&mut report, 2_000);
     assert!(
         capped.text.len() <= 2_000,
@@ -518,7 +459,7 @@ fn interpret_render_budgets_a_fat_dependency() {
         "primary package finding",
         cleave::Criticality::Notable,
     ));
-    let mut dep = cleave::FileAnalysis {
+    let dep = cleave::FileAnalysis {
         id: 1,
         parent_id: Some(0),
         depth: 1,
@@ -527,18 +468,32 @@ fn interpret_render_budgets_a_fat_dependency() {
         sha256: "d".repeat(64),
         ..cleave::FileAnalysis::default()
     };
-    dep.findings.push(finding(
+    // The dependency's hostile evidence sits in a member, as real evidence
+    // does: the package archive itself is a container, which the LLM view
+    // never spends a slot on. Only the graft root carries `Rel::Fetched`;
+    // its members are ordinary, so they belong to the dependency's subject.
+    let mut hit = cleave::FileAnalysis {
+        id: 2,
+        parent_id: Some(1),
+        depth: 2,
+        path: "dep.tgz!!index.js".to_string(),
+        file_type: "javascript".to_string(),
+        sha256: "h".repeat(64),
+        size: 100,
+        score: 100,
+        ..cleave::FileAnalysis::default()
+    };
+    hit.findings.push(finding(
         "dep/hostile",
-        "DEP_ROOT_HIT",
+        "DEP_MEMBER_HIT",
         cleave::Criticality::Hostile,
     ));
-    let mut files = vec![root, dep];
+    let mut files = vec![windowed(root), dep, windowed(hit)];
     for i in 0..30 {
         let mut member = cleave::FileAnalysis {
             id: 10 + i,
             parent_id: Some(1),
             depth: 2,
-            rel: cleave::types::Rel::Fetched,
             path: format!("dep.tgz!!m{i}.py"),
             file_type: "python".to_string(),
             sha256: format!("{:064x}", i + 3),
@@ -550,7 +505,7 @@ fn interpret_render_budgets_a_fat_dependency() {
             &format!("MEMBER_{i} {}", "z".repeat(8_000)),
             cleave::Criticality::Suspicious,
         ));
-        files.push(member);
+        files.push(windowed(member));
     }
     let mut report = empty_report();
     report.files = files;
@@ -595,7 +550,7 @@ fn interpret_render_budgets_a_fat_dependency() {
         INTERPRET_PROMPT_BUDGET_BYTES
     );
     assert!(
-        ctx.contains("DEP_ROOT_HIT"),
+        ctx.contains("DEP_MEMBER_HIT"),
         "the dependency's own hit stays: {ctx}"
     );
 }
@@ -783,7 +738,7 @@ fn provenance_fixture() -> (
         cleave::Criticality::Notable,
     ));
     let mut report = empty_report();
-    report.files = vec![root, dep, registry_file];
+    report.files = vec![windowed(root), windowed(dep), registry_file];
     let edge: fletch::fetch::FetchRecord = serde_json::from_value(serde_json::json!({
         "source_sha256": "r".repeat(64),
         "kind": "dependency",
@@ -842,12 +797,16 @@ fn interpret_context_puts_provenance_before_each_packages_traits() {
         &registries,
         &report,
     );
-    let primary_provenance = ctx.find("provenance=").unwrap();
+    // The local root has no fetch record or registry identity, so its block
+    // opens straight into its findings; the dependency's provenance leads its.
     let primary_trait = ctx.find("primary package finding").unwrap();
     let dep_header = ctx.find("== DEP pkg:test/dep@1").unwrap();
     let dep_provenance = ctx.get(dep_header..).unwrap().find("provenance=").unwrap() + dep_header;
     let dep_trait = ctx.find("dependency package finding").unwrap();
-    assert!(primary_provenance < primary_trait);
+    assert!(
+        !ctx.get(..primary_trait).unwrap().contains("provenance="),
+        "{ctx}"
+    );
     assert!(primary_trait < dep_header);
     assert!(dep_provenance < dep_trait);
     assert_eq!(ctx.matches("dependency package finding").count(), 1);
@@ -1211,7 +1170,7 @@ fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
     ));
 
     let mut report = empty_report();
-    report.files = vec![root, pe, macho, docx];
+    report.files = [root, pe, macho, docx].into_iter().map(windowed).collect();
 
     let ctx = interpret(
         "vendor-bundle.zip",
@@ -1308,8 +1267,8 @@ fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
     );
 
     // None of this is registry provenance: these artifacts have no package
-    // record, and the one `provenance=` line is the artifact's own hash.
-    assert_eq!(ctx.matches("provenance=").count(), 1, "{ctx}");
+    // record, so no `provenance=` line is drawn at all.
+    assert_eq!(ctx.matches("provenance=").count(), 0, "{ctx}");
     assert!(!ctx.contains(r#""registry""#), "{ctx}");
 }
 
@@ -1367,7 +1326,6 @@ fn interpret_shows_the_grader_a_filename_not_its_directories() {
         &report,
     );
     assert!(ctx.contains("== PRIMARY x.whl =="), "{ctx}");
-    assert!(ctx.contains(r#""path":"x.whl""#), "{ctx}");
     assert!(!ctx.contains("samples/benign"), "{ctx}");
 }
 

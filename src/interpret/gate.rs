@@ -316,6 +316,9 @@ fn trait_declared(dir: &Path, pattern: &str, recursive: bool) -> bool {
 pub struct FindingSeverity {
     /// cleave surfaced a hostile-criticality finding.
     pub hostile: bool,
+    /// cleave surfaced a suspicious-or-above finding. Not an admission (see
+    /// [`admit`]); it decides where an L0 verdict the LLM clears lands.
+    pub suspicious: bool,
     /// cleave surfaced a notable-or-above finding under a gate prefix.
     ///
     /// Separate from `hostile` because it answers a different question: not
@@ -354,6 +357,9 @@ impl FindingSeverity {
         for finding in findings {
             if finding.crit >= cleave::Criticality::Hostile {
                 out.hostile = true;
+            }
+            if finding.crit >= cleave::Criticality::Suspicious {
+                out.suspicious = true;
             }
             // Notable is the floor: below it sit baseline noise and the
             // component legs of composites, which fire on ordinary packages and
@@ -411,6 +417,8 @@ pub struct Admitted {
     pub(super) levels: LevelContext,
     /// cleave's report carries a hostile finding.
     pub(super) hostile_finding: bool,
+    /// cleave's report carries a suspicious-or-above finding.
+    pub(super) suspicious_finding: bool,
 }
 
 /// The LLM gate: whether a sample gets a second opinion, answered without
@@ -540,5 +548,6 @@ pub fn admit(
         ml_prob,
         levels,
         hostile_finding: hostile,
+        suspicious_finding: findings.suspicious,
     })
 }

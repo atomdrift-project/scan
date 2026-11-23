@@ -75,6 +75,14 @@ pub struct Graded {
     /// hostile boundary than the middle of the band.
     #[serde(skip)]
     pub corroborated: bool,
+    /// Whether cleave surfaced a suspicious-or-above finding. Without one, a
+    /// trusted benign read clears the verdict outright.
+    #[serde(skip)]
+    pub suspicious_finding: bool,
+    /// Whether the render was mostly readable source. With `analyzer_directed`,
+    /// what lets a benign read cost a hostile-finding L0 verdict its depth.
+    #[serde(skip)]
+    pub readable: bool,
     /// Whether this read was trusted to soften: a readable render, no text
     /// aimed at the grader, no cleave hostile finding. Carried out so every
     /// downstream use of a clearing grade obeys the same gate as the blend.
@@ -293,6 +301,9 @@ pub(super) struct Evidence {
     pub(super) analyzer_directed: bool,
     /// cleave independently surfaced a hostile (`H`) finding.
     pub(super) hostile_finding: bool,
+    /// cleave surfaced a suspicious-or-above (`S`) finding. Implied by
+    /// `hostile_finding`.
+    pub(super) suspicious_finding: bool,
     /// Where ML placed the file on the calibrated FP axis.
     pub(super) levels: LevelContext,
 }
@@ -345,8 +356,9 @@ impl Evidence {
         // The step lands on *suspicious*, never benign, so a real threat the LLM
         // wrongly clears is routed for review rather than released, and how far
         // into the suspicious band it lands scales with how deep ML fired (see
-        // `crate::engine::softened_level`). `L0` is the exception: nothing one
-        // fallible opinion says moves a file off the tightest budget the grid has.
+        // `crate::engine::softened_level`). `L0` is the exception: no suspicious
+        // or hostile opinion moves a file off the tightest budget the grid has.
+        // A trusted benign read may (see [`blend`]).
         self.levels.fired != Level::At(0)
     }
 }
@@ -391,7 +403,10 @@ pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Cla
 /// - **They agree** → steer toward the pole the verdict already sits at:
 ///   corroborated malice raises the score, a corroborated clean file lowers it.
 /// - **LLM less severe** → step one rung down and steer the score down, but only
-///   when its read is trustworthy. Two things make it untrustworthy, and either
+///   when its read is trustworthy. A trusted *benign* read may leave an L0
+///   hostile too, which no other opinion may, and when cleave found nothing
+///   suspicious it clears the verdict outright: two readers against ML, the
+///   mirror of a corroborated escalation. Two things make it untrustworthy, and either
 ///   discards the clear outright, leaving the ML verdict exactly as it was (a
 ///   third, a cleave hostile finding, is below):
 ///   an **opaque render** (packed/escaped bytes — a text model cannot clear what
@@ -452,6 +467,19 @@ pub(super) fn blend(
         Ordering::Equal if ml != Classification::Benign => (ml, steer(p, true)),
         // …and toward 0.0 for a clean one, which is a softening like any other.
         Ordering::Equal => (ml, if may_soften { steer(p, false) } else { p }),
+        // A trusted benign read and a cleave report with nothing suspicious in
+        // it are two readers against ML, so the verdict clears outright, the
+        // way a hostile read and a hostile finding escalate it. An untrusted
+        // read never gets here (`may_soften`).
+        Ordering::Less if may_soften && llm == LlmGrade::Benign && !ev.suspicious_finding => {
+            (Classification::Benign, steer(p, false))
+        }
+        // With a suspicious finding, a trusted benign read steps one rung, even
+        // off L0: `may_soften` has already ruled out a hostile finding. A
+        // suspicious read still cannot move L0 (`may_cross`).
+        Ordering::Less if may_soften && llm == LlmGrade::Benign => {
+            (one_step_toward(ml, target), steer(p, false))
+        }
         Ordering::Less if may_soften => stepped(false),
         Ordering::Less => (ml, p),
     }
@@ -482,6 +510,8 @@ pub(super) fn blended(
             lvl: ev.levels.fired,
         },
         corroborated: ev.hostile_finding,
+        suspicious_finding: ev.suspicious_finding,
+        readable: ev.readable,
         may_soften: ev.may_soften(),
         cached,
     })

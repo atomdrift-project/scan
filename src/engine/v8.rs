@@ -14,7 +14,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use cleave::Criticality;
 use cleave::types::{CompactFile, CompactReport, CompactTrait};
 use filefacts::RefKind;
-use fletch::fetch::FetchRecord;
+use fletch::fetch::{FetchRecord, Outcome};
+use fletch::purl::Purl;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -113,6 +114,8 @@ pub(super) struct Inputs<'a> {
     /// The scan's fetch records, which say what a ranged reference resolved
     /// to and what a URL served.
     pub records: &'a [FetchRecord],
+    /// The acquisition coordinate, when known for the artifact's bytes.
+    pub root_purl: Option<&'a Purl>,
     /// The deploy level every class is graded at; `None` under manual
     /// thresholds.
     pub level: Option<u16>,
@@ -461,7 +464,7 @@ impl UploadDoc {
                 .clone()
                 .unwrap_or_else(crate::analysis_cache::ruleset_version),
             files: Vec::new(),
-            refs: refs(nodes, &own, inputs.records),
+            refs: refs(nodes, &own, inputs.records, inputs.root_purl),
             report_nodes: HashMap::new(),
             shas: nodes.iter().map(|n| (n.id, n.sha.clone())).collect(),
             drift: Vec::new(),
@@ -1138,8 +1141,16 @@ fn top(findings: &[CompactTrait]) -> Vec<Finding> {
 
 /// The artifact's references: the union of what its own files declare, one
 /// per distinct (`kind`, `name`, `version`), in that order.
-fn refs(nodes: &[CompactFile], own: &[bool], records: &[FetchRecord]) -> Vec<Ref> {
-    let mut at: HashMap<(&str, u64), &FetchRecord> = HashMap::new();
+fn refs(
+    nodes: &[CompactFile],
+    own: &[bool],
+    records: &[FetchRecord],
+    root_purl: Option<&Purl>,
+) -> Vec<Ref> {
+    let Some(root) = nodes.first() else {
+        return Vec::new();
+    };
+    let mut at: HashMap<(&str, &'static str, u64), &FetchRecord> = HashMap::new();
     let mut named: HashMap<(&str, &'static str, String), &FetchRecord> = HashMap::new();
     for record in records {
         let (Some(source), Some(kind)) = (record.source_sha256.as_deref(), kind_name(record.kind))
@@ -1147,7 +1158,7 @@ fn refs(nodes: &[CompactFile], own: &[bool], records: &[FetchRecord]) -> Vec<Ref
             continue;
         };
         if let Some(offset) = record.source_offset {
-            at.entry((source, offset)).or_insert(record);
+            at.entry((source, kind, offset)).or_insert(record);
         }
         if let Some(name) = bare_name(&record.locator) {
             named.entry((source, kind, name)).or_insert(record);
@@ -1165,17 +1176,48 @@ fn refs(nodes: &[CompactFile], own: &[bool], records: &[FetchRecord]) -> Vec<Ref
                 "url_fetch" => "url_fetch",
                 _ => return None,
             };
-            let record = declared
+            let name = bare_name(&declared.locator)?;
+            let cited = declared
                 .offset
-                .and_then(|off| at.get(&(node.sha.as_str(), off)))
-                .or_else(|| named.get(&(node.sha.as_str(), kind, bare_name(&declared.locator)?)))
+                .and_then(|off| at.get(&(node.sha.as_str(), kind, off)))
                 .copied();
+            let resolved = cited.filter(|r| bare_name(&r.locator).as_ref() == Some(&name));
+            let record = cited.or_else(|| named.get(&(node.sha.as_str(), kind, name)).copied());
+            let resolved = resolved.or_else(|| record.filter(|r| r.locator == declared.locator));
+            if kind == "dependency"
+                && self_dependency(&declared.locator, &root.sha, root_purl, resolved)
+            {
+                return None;
+            }
             reference(kind, &declared.locator, record)
         })
         .collect();
     refs.sort();
     refs.dedup_by(|a, b| (a.kind, &a.name, &a.version) == (b.kind, &b.name, &b.version));
     refs
+}
+
+/// A matching digest settles the question even when the locator differs.
+/// Without a fetch, require the same explicit coordinate or GitHub archive ref.
+fn self_dependency(
+    locator: &str,
+    root_sha: &str,
+    root_purl: Option<&Purl>,
+    fetch: Option<&FetchRecord>,
+) -> bool {
+    if let Some(fetch) = fetch
+        && let Some(sha) = fetch.content_sha256.as_deref()
+    {
+        return matches!(fetch.outcome, Outcome::Ok | Outcome::Skipped)
+            && !root_sha.is_empty()
+            && sha == root_sha;
+    }
+    root_purl.is_some_and(|root| {
+        root.version().is_some()
+            && (root.typ() == "github" || root.pins_exact_version())
+            && root.qualifiers().is_empty()
+            && Purl::parse(locator).is_ok_and(|declared| &declared == root)
+    })
 }
 
 /// One reference, or `None` when it names neither a package nor a URL or
@@ -1615,6 +1657,7 @@ pub(crate) fn fixture_result(sha256: &str, report: &CompactReport) -> super::Sca
         every: false,
         listed: &[],
         records: &[],
+        root_purl: None,
         level: Some(25),
     });
     if let Some(doc) = &mut doc {

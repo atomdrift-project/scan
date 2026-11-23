@@ -445,6 +445,23 @@ impl Precheck {
         }
     }
 
+    /// Read the acquisition coordinate stored for these exact bytes in Hopper.
+    pub(crate) fn artifact_purl(&self, sha: &str) -> Option<fletch::purl::Purl> {
+        let base = self.lookup_url.strip_suffix("/v1/lookup")?;
+        if self.is_uplink() || !self.breaker.allows(crate::civil::now_secs()) {
+            return None;
+        }
+        let request = self
+            .http()?
+            .get(format!("{base}/v1/files/{sha}/provenance"))
+            .timeout(self.timeout());
+        let response = self
+            .send(request, "artifact provenance")?
+            .error_for_status()
+            .ok()?;
+        crate::provenance::artifact_purl(&response.bytes().ok()?, sha)
+    }
+
     /// Whether to read this answer at all. Every non-200 means "analyze it".
     /// From Uplink it also means "stop asking": a spent quota until the
     /// `retry_after` seconds it named have passed, a refusal or a failing

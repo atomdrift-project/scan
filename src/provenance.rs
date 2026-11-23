@@ -23,6 +23,41 @@ const SCHEMA_VERSION: &str = "1.0";
 /// same trim hopper's `Sidecar.Finalize` performs on receipt.
 const MAX_RAW_BYTES: usize = 256 << 10;
 
+/// Recover the coordinate of the bytes identified by a saved Hopper sidecar.
+pub(crate) fn artifact_purl(document: &[u8], sha: &str) -> Option<fletch::purl::Purl> {
+    #[derive(Deserialize)]
+    struct Sidecar {
+        artifact: Artifact,
+        package: Option<Package>,
+        fetch: Option<Fetch>,
+    }
+
+    #[derive(Deserialize)]
+    struct Artifact {
+        sha256: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Package {
+        purl: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Fetch {
+        url: Option<String>,
+    }
+
+    let sidecar: Sidecar = serde_json::from_slice(document).ok()?;
+    if sidecar.artifact.sha256 != sha {
+        return None;
+    }
+    sidecar
+        .package
+        .and_then(|package| fletch::purl::Purl::parse(&package.purl?).ok())
+        .filter(|purl| purl.version().is_some())
+        .or_else(|| fletch::purl::Purl::from_url(&sidecar.fetch?.url?))
+}
+
 /// The facts every sidecar states about the bytes it travels with: which bytes,
 /// who pushed them, and where they came from. `purl` is the package's
 /// canonical PURL, `None` for a scanned root file or a plain-URL fetch.
@@ -390,6 +425,15 @@ impl ProvenanceDocument {
 }
 
 impl RegistryProvenance {
+    /// Return the package coordinate if this provenance was saved with the bytes.
+    pub(crate) fn artifact_purl(&self, sha: &str) -> Option<fletch::purl::Purl> {
+        if matches!(&self.document, ProvenanceDocument::Plain(_)) {
+            self.document.with_bytes(|bytes| artifact_purl(bytes, sha))
+        } else {
+            None
+        }
+    }
+
     /// Preserve a provenance byte buffer and recover its normalized record
     /// without materializing ignored raw provider fields. Accepts any of three
     /// shapes:
@@ -683,7 +727,23 @@ pub fn registry_map(json: &[u8]) -> Result<HashMap<String, RegistryProvenance>, 
 
 #[cfg(test)]
 mod tests {
-    use super::{RegistryProvenance, registry_map};
+    use super::{RegistryProvenance, artifact_purl, registry_map};
+
+    #[test]
+    fn artifact_purl_requires_matching_bytes_even_without_a_registry_record() {
+        let digest = "ab".repeat(32);
+        let sidecar = serde_json::json!({
+            "artifact": {"sha256": digest},
+            "package": {"purl": "pkg:github/example/project@master"},
+            "fetch": {"url": "https://codeload.github.com/example/project/tar.gz/master"}
+        });
+        let json = sidecar.to_string();
+        assert_eq!(
+            artifact_purl(json.as_bytes(), &digest).map(|purl| purl.to_string()),
+            Some("pkg:github/example/project@master".into())
+        );
+        assert!(artifact_purl(json.as_bytes(), &"cd".repeat(32)).is_none());
+    }
 
     // A minimal normalized record — the shape `fletch registry` emits under
     // `record`. Only a few identifying fields are asserted.

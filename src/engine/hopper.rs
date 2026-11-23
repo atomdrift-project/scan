@@ -190,7 +190,7 @@ fn fetched_purl(root_fetch: Option<&FetchRecord>) -> Option<&str> {
 ///
 /// Feeds both the sidecar's package slot — which hopper projects into its
 /// queryable `purl_base` column — and the identity the uploader logs.
-fn artifact_purl(root_fetch: Option<&FetchRecord>) -> Option<String> {
+pub(super) fn artifact_purl(root_fetch: Option<&FetchRecord>) -> Option<String> {
     if let Some(purl) = fetched_purl(root_fetch) {
         return Some(purl.to_string());
     }

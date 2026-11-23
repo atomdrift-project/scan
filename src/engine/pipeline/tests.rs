@@ -290,6 +290,7 @@ fn dependency_upload_grades_every_member() {
         every: false,
         listed: &[],
         records: &[],
+        root_purl: None,
         level: model.active_level(),
     })
     .expect("a dependency with files yields a document");
@@ -648,4 +649,102 @@ fn clean_report_has_zero_integrity_counts() {
     );
     let integ = validate_report_references("test", &report);
     assert_eq!(integ, super::ReportIntegrity::default());
+}
+
+/// A benign second opinion as `interpret::blend` hands it over: `outcome` is
+/// the class the blend decided, `suspicious`/`hostile` what cleave found.
+fn benign_read(
+    outcome: Classification,
+    ml: Classification,
+    fired: Level,
+    suspicious: bool,
+    hostile: bool,
+) -> Graded {
+    Graded {
+        grade: LlmGrade::Benign,
+        outcome,
+        corroborated: hostile,
+        suspicious_finding: suspicious || hostile,
+        readable: true,
+        may_soften: !hostile,
+        blended: 0.4,
+        interpretation: "Legitimate Kubernetes source code".to_owned(),
+        model: "m".to_owned(),
+        analyzer_directed: false,
+        cached: false,
+        before: crate::interpret::MlVerdict {
+            class: ml,
+            prob: 0.47,
+            lvl: fired,
+        },
+    }
+}
+
+/// Fold `graded` into a verdict ML reached at `fired`, on the shipped `-l 25`.
+fn fold(
+    graded: &Graded,
+    ml: Classification,
+    fired: Level,
+) -> (Classification, Level, Option<Blend>) {
+    let (mut class, mut prob, mut lvl) = (ml, 0.47, fired);
+    let moved = blend(Some(25), 25_000, graded, &mut class, &mut prob, &mut lvl);
+    (class, lvl, moved)
+}
+
+/// The k8s.io/kubernetes v1.27.3 case and its neighbours: nothing suspicious
+/// from cleave, so a benign read clears to just past the suspicious band, by
+/// ML's own level.
+#[test]
+fn a_clean_benign_read_lands_past_the_suspicious_band_by_ml_level() {
+    use Classification::{Benign, Hostile, Suspicious};
+    for (ml, fired, want) in [
+        (Hostile, Level::At(0), 2501),
+        (Hostile, Level::At(12), 2513),
+        (Suspicious, Level::At(500), 3001),
+    ] {
+        let read = benign_read(Benign, ml, fired, false, false);
+        let (class, lvl, moved) = fold(&read, ml, fired);
+        assert_eq!((class, lvl), (Benign, Level::At(want)), "{ml:?} at {fired}");
+        assert!(matches!(moved, Some(Blend::Shifted { from }) if from == ml));
+    }
+}
+
+/// With a suspicious finding, a benign read clears an L0 one rung, a quarter of
+/// the way into the suspicious band; a cleared suspicious keeps the clean rung.
+#[test]
+fn a_suspicious_finding_keeps_a_benign_read_to_one_rung() {
+    use Classification::{Benign, Hostile, Suspicious};
+    let read = benign_read(Suspicious, Hostile, Level::At(0), true, false);
+    let (class, lvl, _) = fold(&read, Hostile, Level::At(0));
+    assert_eq!((class, lvl), (Suspicious, Level::At(81)));
+
+    let read = benign_read(Benign, Suspicious, Level::At(500), true, false);
+    let (class, lvl, _) = fold(&read, Suspicious, Level::At(500));
+    assert_eq!((class, lvl), (Benign, Level::Clean));
+}
+
+/// With a hostile finding, a credible benign read costs an L0 its depth and
+/// nothing more; an untrusted one costs it nothing.
+#[test]
+fn a_hostile_finding_keeps_a_benign_read_l0_on_the_deploy_level() {
+    use Classification::Hostile;
+    let read = benign_read(Hostile, Hostile, Level::At(0), true, true);
+    let (class, lvl, moved) = fold(&read, Hostile, Level::At(0));
+    assert_eq!((class, lvl), (Hostile, Level::At(25)));
+    assert!(matches!(moved, Some(Blend::Held { to: Level::At(25) })));
+
+    for untrusted in [
+        Graded {
+            readable: false,
+            ..read.clone()
+        },
+        Graded {
+            analyzer_directed: true,
+            ..read.clone()
+        },
+    ] {
+        let (class, lvl, moved) = fold(&untrusted, Hostile, Level::At(0));
+        assert_eq!((class, lvl), (Hostile, Level::At(0)));
+        assert!(moved.is_none());
+    }
 }

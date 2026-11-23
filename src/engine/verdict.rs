@@ -84,20 +84,50 @@ pub(crate) fn level_confidence(level: Level) -> Option<u8> {
 /// Geometric, for the same reason as [`interpreted_level`] — the axis is. At the
 /// shipped `-l 25` an ML `L1` lands at `L31`, an `L12` at `L233`.
 ///
-/// `L0` never reaches here: `interpret::Evidence::may_cross` refuses the
-/// crossing outright.
+/// `L0` has no depth to scale by. Only a trusted benign read moves it, and only
+/// with a suspicious but not hostile finding (with none, [`cleared_level`]
+/// applies), so it lands a quarter of the way in: `L81` at `-l 25`.
 pub(super) fn softened_level(ml_level: Level, active_level: Option<u16>, grid_max: u16) -> Level {
     let Some(active) = active_level else {
         return Level::Manual;
     };
-    // ML placed nowhere to scale by (clean, or L0) falls back to the midpoint.
     let fraction = match ml_level {
         Level::At(lvl) if lvl > 0 && active > 0 => {
             (f64::from(lvl) / f64::from(active)).clamp(0.0, 1.0)
         }
+        Level::At(0) => 0.25,
+        // ML never placed it: the midpoint.
         _ => 0.5,
     };
     suspicious_band_level(active, grid_max, fraction)
+}
+
+/// Where a verdict lands when a trusted benign read clears it and cleave found
+/// nothing suspicious: just past the suspicious band, as far past its edge as
+/// ML's own level, so the order ML put files in survives the clearing. At the
+/// shipped `-l 25` an ML `L0` lands at `L2501`, an `L25` at `L2526`, a
+/// suspicious `L500` at `L3001`.
+///
+/// Measured from the wider of this deploy's band and the reference one, for the
+/// reason [`suspicious_band_level`] gives: readers decode `ml.lvl` at their own
+/// level, usually the default, and past both edges it reads benign to either.
+/// [`Level::Clean`] in manual-threshold mode, or when the grid leaves no room
+/// past the band.
+pub(super) fn cleared_level(ml_level: Level, active_level: Option<u16>, grid_max: u16) -> Level {
+    use crate::model::{DEFAULT_SEVERITY_LEVEL, suspicious_ceiling};
+    let Some(active) = active_level else {
+        return Level::Clean;
+    };
+    let edge = suspicious_ceiling(active, grid_max)
+        .max(suspicious_ceiling(DEFAULT_SEVERITY_LEVEL, grid_max));
+    if edge >= grid_max {
+        return Level::Clean;
+    }
+    let depth = match ml_level {
+        Level::At(lvl) => lvl,
+        Level::Clean | Level::Manual => 0,
+    };
+    Level::At(edge.saturating_add(1).saturating_add(depth).min(grid_max))
 }
 
 /// The rung `fraction` of the way, geometrically, across the *reference*
@@ -1251,6 +1281,61 @@ mod tests {
             previous = got;
         }
         assert!(CONFIDENCE_LADDER.is_sorted_by_key(|&(top, _)| top));
+    }
+
+    /// A clean clearing lands just past the suspicious band, as far past it as
+    /// ML's own level, so ML's order survives: at `-l 25` the band ends at L2500.
+    #[test]
+    fn cleared_level_lands_past_the_band_by_ml_level() {
+        use crate::model::verdict_for_level;
+        for (ml, want) in [
+            (Level::At(0), 2501),
+            (Level::At(12), 2513),
+            (Level::At(25), 2526),
+            (Level::At(500), 3001),
+            (Level::At(2500), 5001),
+            (Level::Clean, 2501),
+        ] {
+            let got = cleared_level(ml, Some(25), 25_000);
+            assert_eq!(got, Level::At(want), "{ml}");
+            assert_eq!(verdict_for_level(want, 25, 25_000), Classification::Benign);
+        }
+        // A tighter deploy measures from the reference band too, so a default
+        // reader decodes it as benign as well.
+        assert_eq!(
+            cleared_level(Level::At(5), Some(5), 25_000),
+            Level::At(2506)
+        );
+        // Clamped to the grid; no room past the band, or no grid, is Clean.
+        assert_eq!(
+            cleared_level(Level::At(15_000), Some(200), 25_000),
+            Level::At(25_000)
+        );
+        assert_eq!(cleared_level(Level::At(0), Some(250), 25_000), Level::Clean);
+        assert_eq!(cleared_level(Level::At(3), None, 25_000), Level::Clean);
+    }
+
+    /// A cleared hostile is placed by depth; an L0, which has none, a quarter
+    /// of the way in.
+    #[test]
+    fn softened_level_places_an_l0_a_quarter_in() {
+        assert_eq!(
+            softened_level(Level::At(0), Some(25), 25_000),
+            Level::At(81)
+        );
+        assert_eq!(
+            softened_level(Level::At(1), Some(25), 25_000),
+            Level::At(31)
+        );
+        assert_eq!(
+            softened_level(Level::At(12), Some(25), 25_000),
+            Level::At(233)
+        );
+        assert_eq!(
+            softened_level(Level::Clean, Some(25), 25_000),
+            Level::At(255)
+        );
+        assert_eq!(softened_level(Level::At(0), None, 25_000), Level::Manual);
     }
 
     #[test]

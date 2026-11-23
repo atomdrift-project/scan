@@ -22,6 +22,7 @@ fn ev_at(fired: Level) -> Evidence {
         readable: true,
         analyzer_directed: false,
         hostile_finding: false,
+        suspicious_finding: false,
         levels: levels(fired),
     }
 }
@@ -34,6 +35,7 @@ fn ev_open(readable: bool, analyzer_directed: bool) -> Evidence {
         readable,
         analyzer_directed,
         hostile_finding: false,
+        suspicious_finding: false,
         levels: LevelContext {
             fired: Level::Manual,
             active: None,
@@ -67,12 +69,15 @@ fn all_blend_inputs() -> impl Iterator<Item = (Classification, LlmGrade, Evidenc
         ACTIVE.into_iter().flat_map(move |active| {
             [true, false].into_iter().flat_map(move |readable| {
                 [true, false].into_iter().flat_map(move |directed| {
-                    [true, false]
+                    // No finding, a suspicious one, a hostile one (which is
+                    // suspicious-or-above too).
+                    [(false, false), (true, false), (true, true)]
                         .into_iter()
-                        .map(move |hostile_finding| Evidence {
+                        .map(move |(suspicious_finding, hostile_finding)| Evidence {
                             readable,
                             analyzer_directed: directed,
                             hostile_finding,
+                            suspicious_finding,
                             levels: LevelContext {
                                 fired,
                                 active,
@@ -244,13 +249,16 @@ fn blend_de_escalation_is_capped_and_guarded() {
     );
     assert_eq!(out, Classification::Benign);
     assert!((conf - 0.7 * (1.0 - MAX_STEER)).abs() < 1e-6);
-    // A confident ML hostile the LLM calls benign drops one step at most, even
-    // on readable source — never straight to benign.
+    // A confident ML hostile the LLM calls benign drops one step at most when
+    // cleave found something suspicious, even on readable source.
     let (out2, _) = blend(
         Classification::Hostile,
         0.9,
         LlmGrade::Benign,
-        ev_open(true, false),
+        Evidence {
+            suspicious_finding: true,
+            ..ev_open(true, false)
+        },
     );
     assert_eq!(out2, Classification::Suspicious);
     // Opaque render → the clear is discarded entirely; ML stands untouched.
@@ -300,10 +308,14 @@ fn blend_never_moves_more_than_one_step_or_a_third_of_the_range() {
             && ev.hostile_finding;
         let max_up = if corroborated_escalation { 2 } else { 1 };
         assert!(step <= max_up, "{ctx}: moved up to {out:?}");
-        // Softening is capped at one rung, always and without exception: the
-        // relaxation above is escalation-only, so nothing a sample carries can
-        // buy it a two-rung clearing.
-        assert!(step >= -1, "{ctx}: moved down to {out:?}");
+        // Softening is capped at one rung, except its mirror: a trusted benign
+        // read with nothing suspicious from cleave, two readers against ML.
+        let clean_clearing = out == Classification::Benign
+            && g == LlmGrade::Benign
+            && ev.may_soften()
+            && !ev.suspicious_finding;
+        let max_down = if clean_clearing { 2 } else { 1 };
+        assert!(step >= -max_down, "{ctx}: moved down to {out:?}");
         // Confidence moves at most MAX_STEER of the distance to the bound it
         // moved toward — the defensibility claim, stated as an assertion.
         let moved = conf - p;
@@ -481,31 +493,90 @@ fn readability_is_judged_per_member_not_per_line() {
 }
 
 #[test]
-fn only_the_strictest_rung_cannot_be_talked_down() {
-    // A hostile verdict the LLM clears steps to *suspicious* — never benign —
-    // wherever inside the band ML fired, so the sample is routed for review
-    // rather than released. Depth decides where in the suspicious band it
+fn only_a_benign_read_moves_the_strictest_rung() {
+    // A hostile verdict a suspicious read disputes steps to *suspicious*
+    // wherever inside the band ML fired. Depth decides where in the band it
     // lands (`engine::softened_level`), not whether it may move at all.
     for fired in [Level::At(20), Level::At(5), Level::At(1)] {
         let (out, conf) = blend(
             Classification::Hostile,
             0.99,
-            LlmGrade::Benign,
+            LlmGrade::Suspicious,
             ev_at(fired),
         );
         assert_eq!(out, Classification::Suspicious, "{fired} should step down");
         assert!((conf - steer(0.99, false)).abs() < 1e-6);
     }
-    // L0 is the exception: the tightest budget the grid has does not move on
-    // one fallible opinion, however confident its prose.
+    // L0 does not move on a suspicious read, however confident its prose.
     let (held, conf) = blend(
         Classification::Hostile,
         0.99,
-        LlmGrade::Benign,
+        LlmGrade::Suspicious,
         ev_at(Level::At(0)),
     );
     assert_eq!(held, Classification::Hostile);
     assert!((conf - steer(0.99, false)).abs() < 1e-6);
+    // A trusted benign read moves it one rung when cleave found something
+    // suspicious…
+    let suspicious = Evidence {
+        suspicious_finding: true,
+        ..ev_at(Level::At(0))
+    };
+    let (stepped, conf) = blend(Classification::Hostile, 0.99, LlmGrade::Benign, suspicious);
+    assert_eq!(stepped, Classification::Suspicious);
+    assert!((conf - steer(0.99, false)).abs() < 1e-6);
+    // …and not at all when it found something hostile.
+    let hostile = Evidence {
+        hostile_finding: true,
+        ..suspicious
+    };
+    let (kept, conf) = blend(Classification::Hostile, 0.99, LlmGrade::Benign, hostile);
+    assert_eq!(kept, Classification::Hostile);
+    assert!((conf - 0.99).abs() < 1e-6);
+}
+
+/// The k8s.io/kubernetes v1.27.3 case: ML hostile at L0, a trusted benign
+/// read, and nothing suspicious from cleave. Two readers against ML clear the
+/// verdict outright, from any rung of either flagged band.
+#[test]
+fn a_clean_benign_read_clears_the_verdict_outright() {
+    for (ml, fired) in [
+        (Classification::Hostile, Level::At(0)),
+        (Classification::Hostile, Level::At(12)),
+        (Classification::Hostile, Level::At(25)),
+        (Classification::Suspicious, Level::At(500)),
+        (Classification::Suspicious, Level::At(3000)),
+    ] {
+        let (out, conf) = blend(ml, 0.47, LlmGrade::Benign, ev_at(fired));
+        assert_eq!(out, Classification::Benign, "{ml:?} at {fired}");
+        assert!(
+            (conf - steer(0.47, false)).abs() < 1e-6,
+            "{ml:?} at {fired}"
+        );
+    }
+    // Only a benign read: a suspicious one still moves a hostile one rung.
+    let (out, _) = blend(
+        Classification::Hostile,
+        0.47,
+        LlmGrade::Suspicious,
+        ev_at(Level::At(12)),
+    );
+    assert_eq!(out, Classification::Suspicious);
+    // Only a trusted read: an opaque or grader-directed render clears nothing.
+    for ev in [
+        Evidence {
+            readable: false,
+            ..ev_at(Level::At(0))
+        },
+        Evidence {
+            analyzer_directed: true,
+            ..ev_at(Level::At(0))
+        },
+    ] {
+        let (out, conf) = blend(Classification::Hostile, 0.47, LlmGrade::Benign, ev);
+        assert_eq!(out, Classification::Hostile, "{ev:?}");
+        assert!((conf - 0.47).abs() < 1e-6, "{ev:?}");
+    }
 }
 
 #[test]
@@ -567,24 +638,38 @@ fn a_hostile_finding_vetoes_every_softening() {
 }
 
 #[test]
-fn decision_reason_explains_why_a_benign_grade_kept_a_block() {
-    let Interpretation::Graded(graded) = blended(
-        "model".to_owned(),
-        Classification::Hostile,
-        0.6,
-        LlmGrade::Benign,
-        "Security test fixtures".to_owned(),
-        ev_at(Level::At(0)),
-        false,
-    ) else {
-        panic!("expected a grade");
+fn decision_reason_explains_why_a_softer_grade_kept_a_block() {
+    let reason = |grade, ev| {
+        let Interpretation::Graded(graded) = blended(
+            "model".to_owned(),
+            Classification::Hostile,
+            0.6,
+            grade,
+            "Security test fixtures".to_owned(),
+            ev,
+            false,
+        ) else {
+            panic!("expected a grade");
+        };
+        assert_eq!(graded.outcome, Classification::Hostile);
+        assert_eq!(graded.interpretation, "Security test fixtures");
+        graded.decision_reason()
     };
-    assert_eq!(graded.outcome, Classification::Hostile);
-    assert_eq!(graded.interpretation, "Security test fixtures");
     assert_eq!(
-        graded.decision_reason().as_deref(),
+        reason(LlmGrade::Suspicious, ev_at(Level::At(0))).as_deref(),
         Some(
-            "Kept hostile despite a benign LLM grade because the initial verdict reached L0, the strictest calibrated level."
+            "Kept hostile despite a suspicious LLM grade because the initial verdict reached L0, the strictest calibrated level."
+        )
+    );
+    let hostile = Evidence {
+        hostile_finding: true,
+        suspicious_finding: true,
+        ..ev_at(Level::At(0))
+    };
+    assert_eq!(
+        reason(LlmGrade::Benign, hostile).as_deref(),
+        Some(
+            "Kept hostile despite a benign LLM grade because static analysis reported a hostile finding."
         )
     );
 }
@@ -635,10 +720,14 @@ fn only_structured_findings_admit() {
 fn every_class_move_was_permitted_by_the_gate() {
     // The crossing rule stated as an invariant: no band changes without the
     // gate having allowed that exact move.
+    // A trusted benign read is the one opinion `may_cross` does not speak for:
+    // it may leave L0, and clears outright with nothing suspicious from cleave
+    // (see `blend`). It only ever lowers the class.
     for (ml, g, ev, p) in all_blend_inputs() {
         let (out, _) = blend(ml, p, g, ev);
+        let benign_clear = g == LlmGrade::Benign && ev.may_soften() && out < ml;
         assert!(
-            out == ml || ev.may_cross(ml, out),
+            out == ml || ev.may_cross(ml, out) || benign_clear,
             "{ml:?} + {g:?} @ {p} {ev:?} → {out:?} without permission",
         );
     }

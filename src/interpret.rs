@@ -501,6 +501,7 @@ pub fn interpret_admitted(
         ml_prob,
         levels,
         hostile_finding,
+        suspicious_finding,
         ..
     } = *admitted;
     let (user_view, truncated) = crate::engine::interpret_user_message(context);
@@ -516,6 +517,7 @@ pub fn interpret_admitted(
         readable: !truncated && render_mostly_readable(context),
         analyzer_directed: addresses_the_analyzer(context),
         hostile_finding,
+        suspicious_finding,
         levels,
     };
     if ev.analyzer_directed {

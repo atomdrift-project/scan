@@ -107,9 +107,48 @@ def drop_hex_windows(text):
 def _categorize(text):
     return transform(text, "categorized")
 
+# ── shortening arms: how little of the render still grades right ────────────
+# Each is one mechanical rule over every render, so a winner maps onto a render
+# change (cleave's window sizing, annotation drawing) rather than a hand edit.
+FINDING = re.compile(r'^\s*(//|#|--) (\S+ )?Possible ')
+IDENTITY = ("claims ", "signer ", "about ", "links ", "ids ")
+
+def _keeps(line):
+    """Lines every shortening keeps: subject and file headers, identity rows."""
+    return (line.startswith("== ") or line.startswith("provenance=")
+            or ("\t" in line and not FINDING.match(line))
+            or line.strip().startswith(IDENTITY))
+
+def hits(text, annotations=True):
+    """`hits`: each finding's annotation lines and the one code line they point
+    at; the windows' surrounding lines go. `hitsonly`: the code lines alone."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        if _keeps(lines[i]):
+            out.append(lines[i]); i += 1; continue
+        if FINDING.match(lines[i]):
+            j = i
+            while j < len(lines) and FINDING.match(lines[j]):
+                j += 1
+            if annotations:
+                out.extend(lines[i:j])
+            if j < len(lines) and lines[j].strip() and not _keeps(lines[j]):
+                out.append(lines[j])
+            i = j + 1; continue
+        i += 1
+    return "\n".join(out)
+
+def no_annotations(text):
+    """`noann`: the render with every finding annotation removed."""
+    return "\n".join(l for l in text.split("\n") if not FINDING.match(l))
+
 SIZE_ARMS = {"noraw": lambda t: _categorize(drop_raw_provenance(t)),
              "nohex": lambda t: _categorize(drop_hex_windows(t)),
-             "slim": lambda t: _categorize(drop_hex_windows(drop_raw_provenance(t)))}
+             "slim": lambda t: _categorize(drop_hex_windows(drop_raw_provenance(t))),
+             "hits": hits,
+             "hitsonly": lambda t: hits(t, annotations=False),
+             "noann": no_annotations,
+             "hitstrim": lambda t: "\n".join(l.strip()[:160] for l in hits(t, annotations=False).split("\n"))}
 
 def transform(text, template):
     if template in SIZE_ARMS:
@@ -257,7 +296,7 @@ def load_renders(dump_dir, corpus):
 
 def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     """Render every corpus file the way a live `--llm` query would, caching
-    each under its content hash. `--follow=none`: a fetched dependency is network
+    each under its content hash. `--follow-depth 0`: a fetched dependency is network
     state, so its render differs run to run — the exact thing an A/B must hold
     fixed. Registry provenance (`--registry-map`) changes the render materially —
     package age, publish cadence, name/repository agreement — so supply-chain
@@ -266,8 +305,8 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     os.makedirs(dump_dir, exist_ok=True)
     renders, failed = {}, 0
     for rel, path in corpus_files(corpus):
-        cmd = [bin_path, "--no-update", "--analyze=local", "--mode=slow",
-               "--follow=none", "-f", "interpret", "path"]
+        cmd = [bin_path, "path", "--no-update", "--uplink", "false",
+               "--follow-depth", "0", "-f", "interpret"]
         if registry_map:
             cmd += ["--registry-map", os.path.abspath(registry_map)]
         try:
@@ -289,6 +328,9 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     return renders
 
 # ── LLM ────────────────────────────────────────────────────────────────────────
+# A generic client name: some endpoints' front ends refuse Python's default.
+USER_AGENT = "scan-interpret-tune"
+
 def llm_key():
     """Bearer token for the endpoint, the same way atomscan resolves it.
 
@@ -311,7 +353,7 @@ def count_tokens(endpoint, model, text, key=None):
     """Prompt tokens via the server's own tokenizer (CPU only). None if the
     endpoint has no /tokenize (OpenRouter), so the size column is just blank."""
     body = json.dumps({"model": model, "prompt": text}).encode()
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if key:
         headers["Authorization"] = "Bearer " + key
     try:
@@ -324,7 +366,7 @@ def ask(endpoint, model, system, user, timeout, key=None):
     body = json.dumps({"model": model, "messages": [{"role": "system", "content": system},
                        {"role": "user", "content": user}], "temperature": 0.0, "max_tokens": 64,
                        "stream": False, "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if key:
         headers["Authorization"] = "Bearer " + key
     req = urllib.request.Request(endpoint.rstrip("/") + "/chat/completions", body, headers)
@@ -353,6 +395,12 @@ def main():
                     help="grade the renders already in --dump-dir instead of rescanning the corpus")
     ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>.interpret-renders)")
     ap.add_argument("--emit-labels", action="store_true", help="print a labels template for --corpus and exit")
+    ap.add_argument("--system", type=Path,
+                    help="use this system prompt for every arm, so render arms and prompt are tuned together")
+    ap.add_argument("--only", action="append", default=[],
+                    help="grade only corpus files whose path contains this (repeatable)")
+    ap.add_argument("--print", dest="print_arms", action="store_true",
+                    help="print each arm's prompt for the selected files and exit, calling no LLM")
     args = ap.parse_args()
 
     if args.emit_labels:
@@ -366,6 +414,9 @@ def main():
         prompts = {t: system_prompt(t) for t in templates}
     except KeyError as exc:
         ap.error(f"unknown template {exc.args[0]!r}")
+    if args.system:
+        override = args.system.read_text(encoding="utf-8").rstrip()
+        prompts = {t: override for t in prompts}
     if args.candidate_prompt:
         candidate = args.candidate_prompt.read_text(encoding="utf-8").rstrip()
         if not candidate.strip():
@@ -390,7 +441,14 @@ def main():
         print(f"# captured {len(renders)} renders", file=sys.stderr)
 
     labels = load_labels(args.labels) if args.labels else {}
-    keys = sorted(renders)
+    keys = sorted(r for r in renders if not args.only or any(o in r for o in args.only))
+    if args.print_arms:
+        for rel in keys:
+            for t in templates:
+                text = transform(renders[rel], t)
+                print(f"===== {rel} [{t}] {len(prompts[t])}B system + {len(text)}B user =====")
+                print(text)
+        return
 
     # jobs: (rel, template, run)
     jobs = [(rel, t, run) for rel in keys for t in templates for run in range(args.runs)]

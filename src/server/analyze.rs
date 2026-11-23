@@ -751,6 +751,8 @@ mod tests {
                     lvl: crate::model::Level::Manual,
                 },
                 corroborated: false,
+                suspicious_finding: false,
+                readable: true,
                 may_soften: true,
                 cached,
             })

@@ -513,7 +513,15 @@ pub(super) fn render_interpret_context(
         });
     let mut head = String::new();
     let _ = writeln!(head, "== PRIMARY {shown} ==");
-    let _ = writeln!(head, "provenance={provenance}");
+    // A local file's provenance is only its path, already in the header, and
+    // a SHA-256 the grader can do nothing with. The line exists to carry a
+    // fetch record or a registry identity; without one it is noise.
+    let artifact_only = provenance
+        .as_object()
+        .is_some_and(|fields| fields.keys().all(|k| k == "artifact"));
+    if !artifact_only {
+        let _ = writeln!(head, "provenance={provenance}");
+    }
     let context_budget = budget.saturating_sub(
         dep_reserve + head.len() + identity.as_ref().map_or(0, String::len) + BUDGET_NOTE,
     );
@@ -734,9 +742,6 @@ pub(crate) fn split_annotation(line: &str) -> Option<(&str, &'static str, char, 
 /// One annotation line, or `None` when the line is not one.
 fn recategorize_annotation(line: &str) -> Option<String> {
     let (indent, comment, _grade, rest) = split_annotation(line)?;
-    if let Some(body) = recategorize_suppression(rest) {
-        return Some(format!("{indent}{comment} {body}"));
-    }
     // A third-party signature carries no prose: the id *is* the body, unwrapped —
     // `// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix`. Naming
     // its category is the whole rewrite; there is no description to keep.
@@ -782,73 +787,6 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     Some(format!(
         "{indent}{comment} {loc}Possible {category} — {desc}"
     ))
-}
-
-/// The body of a suppression line, rewritten to name only what did the
-/// suppressing; `None` when `rest` (the text after `SEV `) is not one.
-///
-/// cleave lists the conclusions it matched but withheld or demoted as
-/// `withheld <id> by <leg> @spans; <leg>…[, +N more]`. There is no trailing
-/// parenthesized id, so the category rewrite does not see these lines. Left
-/// alone, both the grade and the suppressed conclusion's id reach the grader
-/// verbatim, which is enough to grade a benign package suspicious for
-/// "postinstall hook without repository", echoing the withheld
-/// `…::no-repo-with-hooks`. The suppressed id
-/// is dropped outright; the legs survive, because that a pattern was ruled out,
-/// and by what, is benign counterweight the grader should weigh. Byte spans are
-/// internal and go too.
-fn recategorize_suppression(rest: &str) -> Option<String> {
-    let (verb, rest) = rest.split_once(' ')?;
-    let outcome = match verb {
-        "withheld" | "suppressed" => "ruled out",
-        "downgraded" => "weakened",
-        _ => return None,
-    };
-    let (id, legs) = match rest.split_once(' ') {
-        Some((id, tail)) => (id, tail.strip_prefix("by ")?),
-        None => (rest, ""),
-    };
-    if !id.contains('/') {
-        return None;
-    }
-    let mut named: Vec<String> = Vec::new();
-    for leg in legs.split(';') {
-        // A leg is `<id>[ @spans]`; the last may trail `, +N more`.
-        let Some(leg_id) = leg.split_whitespace().next() else {
-            continue;
-        };
-        let leg_id = leg_id.trim_end_matches(',');
-        if leg_id.is_empty() {
-            continue;
-        }
-        // The leaf is kept only where the namespace is descriptive rather than a
-        // conclusion: `metadata/` facts, `micro-behaviors/` observations and
-        // recognized tools, apps and libraries are the benign context itself,
-        // whereas an `objectives/` leaf would name a verdict all over again. A
-        // bare `communications/http` says too little to weigh as context.
-        let descriptive = leg_id.starts_with("metadata/")
-            || leg_id.starts_with("micro-behaviors/")
-            || leg_id
-                .strip_prefix("well-known/")
-                .and_then(|r| r.split_once('/'))
-                .is_some_and(|(kind, _)| matches!(kind, "tool" | "app" | "lib"));
-        let category = trait_category(leg_id);
-        let label = match leg_id.split_once("::") {
-            Some((_, leaf)) if descriptive && !leaf.is_empty() => format!("{category} ({leaf})"),
-            _ => category,
-        };
-        if !named.contains(&label) {
-            named.push(label);
-        }
-    }
-    Some(if named.is_empty() {
-        format!("Possible benign context — a pattern here was {outcome}")
-    } else {
-        format!(
-            "Possible benign context — {outcome} by: {}",
-            named.join(", ")
-        )
-    })
 }
 
 /// The family a trait belongs to: the two path components below its namespace,

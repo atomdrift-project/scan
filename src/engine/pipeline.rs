@@ -26,8 +26,8 @@ use super::retention::{apply_report_retention, kept_members};
 use super::score_memo::{ScoreTable, Stored};
 use super::v8::{Inputs as UploadInputs, Listed, OwnReading, UploadDoc};
 use super::verdict::{
-    apply_trait_floor, decision_outranks, graver, interpreted_level, softened_level, worst_member,
-    worst_member_floor, worst_member_model,
+    apply_trait_floor, cleared_level, decision_outranks, graver, interpreted_level, softened_level,
+    worst_member, worst_member_floor, worst_member_model,
 };
 use super::{
     ARCHIVE_DELIMITER, DepResult, EmbeddedFile, FindingCounts, FloorDecision, HopperRoute,
@@ -300,6 +300,25 @@ pub(crate) fn classify_report(
     // The upload reads the complete report too: every member's reading is
     // folded into its containers before retention drops any of them.
     let mut upload = if needs.upload {
+        let root_purl = super::hopper::artifact_purl(req.root_fetch)
+            .and_then(|locator| fletch::purl::Purl::parse(&locator).ok())
+            .or_else(|| req.root_registry?.artifact_purl(&sha256))
+            .or_else(|| {
+                // A local source archive can contain an absolute GitHub Actions
+                // reference to itself. Its on-disk filename does not establish
+                // its origin; Hopper may have the acquisition record by digest.
+                let has_github_dependency = compact.files.iter().any(|file| {
+                    file.refs.iter().any(|reference| {
+                        reference.kind == "dependency"
+                            && reference.locator.starts_with("pkg:github/")
+                    })
+                });
+                if has_github_dependency {
+                    crate::corpus_precheck::armed()?.artifact_purl(&sha256)
+                } else {
+                    None
+                }
+            });
         UploadDoc::new(&UploadInputs {
             report: &compact,
             root: scored.root,
@@ -310,6 +329,7 @@ pub(crate) fn classify_report(
             every: needs.all_members,
             listed: &prepared.listed,
             records: &prepared.fetch.records,
+            root_purl: root_purl.as_ref(),
             level: req.model.active_level(),
         })
     } else {
@@ -948,6 +968,9 @@ fn grade_dependencies(
                         .as_ref()
                         .filter(|_| upload)
                         .and_then(|g| {
+                            let root_purl = fletch::purl::Purl::parse(&dep.locator)
+                                .ok()
+                                .or_else(|| fletch::purl::Purl::from_url(&dep.locator));
                             UploadDoc::new(&UploadInputs {
                                 report: &report,
                                 root: g.root,
@@ -958,6 +981,7 @@ fn grade_dependencies(
                                 every: false,
                                 listed: &[],
                                 records: &[],
+                                root_purl: root_purl.as_ref(),
                                 level: model.active_level(),
                             })
                         });
@@ -1410,7 +1434,14 @@ fn blend_interpretation(
     // not a fault. (It also kept surfacing as the last stderr line a caller
     // grabbed when a slow run was externally killed, making a benign shift look
     // like a crash cause.)
-    match blend(model, graded, class, probability, lvl) {
+    match blend(
+        model.active_level(),
+        model.grid_max(),
+        graded,
+        class,
+        probability,
+        lvl,
+    ) {
         Some(Blend::Shifted { from }) => tracing::info!(
             path = %label,
             ml = ?from,
@@ -1443,7 +1474,8 @@ fn blend_interpretation(
 fn blend_upload(doc: &mut UploadDoc, model: &Model, graded: &Graded) {
     doc.blend(|d| {
         blend(
-            model,
+            model.active_level(),
+            model.grid_max(),
             graded,
             &mut d.class,
             &mut d.probability,
@@ -1458,16 +1490,19 @@ fn blend_upload(doc: &mut UploadDoc, model: &Model, graded: &Graded) {
 enum Blend {
     /// It changed the class, which was `from`.
     Shifted { from: Classification },
-    /// It cleared an L0 hostile, which stays hostile on rung `to`.
+    /// It cleared an L0 hostile cleave flagged hostile, which stays hostile on
+    /// rung `to`.
     Held { to: Level },
     /// It agreed hostile, which moved the verdict deeper into the band.
     Deepened { from: u16, to: u16 },
 }
 
-/// The three ways a second opinion may move class, probability and level.
-/// `None` when it moves nothing.
+/// The three ways a second opinion may move class, probability and level on a
+/// deploy at `active_level` over a grid reaching `grid_max`. `None` when it
+/// moves nothing.
 fn blend(
-    model: &Model,
+    active_level: Option<u16>,
+    grid_max: u16,
     graded: &Graded,
     class: &mut Classification,
     probability: &mut f32,
@@ -1476,39 +1511,39 @@ fn blend(
     // Adopt the blended verdict as the effective one when the LLM out-read ML
     // (escalating a missed threat, or clearing an ML false positive). The `ml`
     // section reflects scan's final answer; the LLM's raw grade + rationale
-    // stay in the `llm` section. The interpreted level is pinned to the target
-    // band's loosest rung (see `interpreted_level`): the active hostile level for
-    // an escalation, the suspicious ceiling for a hold/downgrade, clean for benign.
+    // stay in the `llm` section. A clean clearing lands past the suspicious
+    // band by ML's own level (`cleared_level`), a cleared hostile inside it by
+    // depth (`softened_level`), and anything else on its band's loosest rung
+    // (`interpreted_level`).
     if graded.outcome != *class {
         let from = *class;
         let ml_level = *lvl;
         *class = graded.outcome;
         *probability = graded.blended;
-        *lvl = if from == Classification::Hostile && graded.outcome == Classification::Suspicious {
+        *lvl = if graded.outcome == Classification::Benign && !graded.suspicious_finding {
+            cleared_level(ml_level, active_level, grid_max)
+        } else if from == Classification::Hostile && graded.outcome == Classification::Suspicious {
             // A cleared hostile is placed by how deep ML fired, not pinned to the
             // band's edge: the level ML reached is the budget for how far one
             // contrary opinion may move it.
-            softened_level(ml_level, model.active_level(), model.grid_max())
+            softened_level(ml_level, active_level, grid_max)
         } else {
-            interpreted_level(
-                model.active_level(),
-                model.grid_max(),
-                graded.outcome,
-                graded.corroborated,
-            )
+            interpreted_level(active_level, grid_max, graded.outcome, graded.corroborated)
         };
         return Some(Blend::Shifted { from });
     }
     if graded.grade == LlmGrade::Benign
-        && graded.may_soften
+        && graded.corroborated
+        && graded.readable
+        && !graded.analyzer_directed
         && *class == Classification::Hostile
         && *lvl == Level::At(0)
     {
-        // `may_cross` refused to move a verdict off the grid's tightest budget on
-        // one contrary opinion, and that stands — but the disagreement is still
-        // evidence, so the verdict gives up the depth it cannot justify and sits
-        // on the weakest hostile rung instead. Still blocked, still reviewed.
-        let to = model.active_level().map_or(Level::Manual, Level::At);
+        // A hostile finding keeps a benign read from clearing L0, and that
+        // stands, but a credible disagreement is still evidence: the verdict
+        // gives up the depth it cannot justify and sits on the weakest hostile
+        // rung instead. Still blocked, still reviewed.
+        let to = active_level.map_or(Level::Manual, Level::At);
         *lvl = to;
         return Some(Blend::Held { to });
     }
