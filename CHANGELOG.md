@@ -2,7 +2,7 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 3.0.0-beta.3 (2026-11-22)
+## 3.0.0-beta.3 (2026-11-23)
 
 ### Features
 
@@ -16,10 +16,17 @@ All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions foll
 - A few reviewed traits now convict hostile on their own, without waiting for the model to agree.
 - VS Code extensions whose hard dependencies or VSIX downloads vanished from the gallery now count as evidence.
 - Uplink verdicts get a full terminal card marked ⚡, so nobody mistakes them for local analysis.
+- Uplink now second-guesses flagged files, but its verdict stands only when reached under traits no older than ours.
 - LLM prompts are capped at 96 KiB, and a truncated prompt is never allowed to soften the verdict.
+- The LLM now grades like a defender who found the sample on an endpoint, and stops calling vendor telemetry exfiltration.
 
 ### Fixes
 
+- ML alone flagged clean projects like Kubernetes; a credible benign LLM read now clears them when cleave finds nothing suspicious.
+- A package citing its own release, as GitHub Actions repos do, no longer lists itself as a dependency.
+- GitHub workflow `run:` steps, analyzed as shell, slipped the CI exemption and fetched their downloads; no more.
+- Scan went chasing `github.com/username/repo` out of READMEs; placeholder and unexpanded URLs are dropped now.
+- The terminal stopped listing dependency coverage gaps, which said nothing about whether the scanned file is safe.
 - Zero-byte files were sent through the model on their filename alone; they keep their static verdict now.
 - JSON output dropped cross-file composite findings, sometimes the only hostile evidence; they are kept now.
 - Hopper writes went to read replicas first, earning refusals or extra hops; they go to the primary.
