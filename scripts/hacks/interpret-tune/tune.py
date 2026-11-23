@@ -294,7 +294,7 @@ def load_renders(dump_dir, corpus):
             renders[rel] = Path(rp).read_text(encoding="utf-8", errors="replace")
     return renders
 
-def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
+def capture(corpus, dump_dir, bin_path, timeout, registry_map=None, fmt="interpret"):
     """Render every corpus file the way a live `--llm` query would, caching
     each under its content hash. `--follow-depth 0`: a fetched dependency is network
     state, so its render differs run to run — the exact thing an A/B must hold
@@ -306,7 +306,7 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None):
     renders, failed = {}, 0
     for rel, path in corpus_files(corpus):
         cmd = [bin_path, "path", "--no-update", "--uplink", "false",
-               "--follow-depth", "0", "-f", "interpret"]
+               "--follow-depth", "0", "-f", fmt]
         if registry_map:
             cmd += ["--registry-map", os.path.abspath(registry_map)]
         try:
@@ -391,6 +391,8 @@ def main():
     ap.add_argument("--capture-timeout", type=int, default=1800,
                     help="seconds before one file's capture scan is killed")
     ap.add_argument("--registry-map", default=None, help="registry provenance map passed to the capture scan")
+    ap.add_argument("--capture-format", default="interpret",
+                    help="scan output format to capture (`tiny` keeps severity letters for shrink.py)")
     ap.add_argument("--reuse-renders", action="store_true",
                     help="grade the renders already in --dump-dir instead of rescanning the corpus")
     ap.add_argument("--dump-dir", default=None, help="render cache dir (default: <corpus>.interpret-renders)")
@@ -437,7 +439,8 @@ def main():
     else:
         bin_path = args.bin or find_bin()
         print(f"# capturing renders via {bin_path} -f interpret …", file=sys.stderr)
-        renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map)
+        renders = capture(args.corpus, dump_dir, bin_path, args.capture_timeout, args.registry_map,
+                          args.capture_format)
         print(f"# captured {len(renders)} renders", file=sys.stderr)
 
     labels = load_labels(args.labels) if args.labels else {}
