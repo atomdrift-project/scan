@@ -132,9 +132,10 @@ they found it on an endpoint they defend. A hostile sample graded suspicious is
 a failure, not a near miss; dual-use tooling and malware emulation grade
 suspicious; adware that hijacks the browser grades hostile.
 
-First run `tests/llm_fixtures.rs` (`cargo test --test llm_fixtures --
---nocapture`). It grades `testdata/llm/` — at least 20 hostile and 20 benign
-small samples across the formats gauntlet sees, labelled in
+First run `tests/llm_fixtures.rs` (`make test-llm`; it is `#[ignore]`d so
+`make test` never reaches the live endpoint). It grades `testdata/llm/` — at
+least 20 hostile and 20 benign small samples across the formats gauntlet sees,
+labelled in
 `testdata/llm/MANIFEST.tsv` — through the live render and endpoint, and prints
 each sample's grades and prompt bytes. It needs `~/.tok/llm` and skips without
 it. `SCAN_LLM_SYSTEM_PROMPT_FILE` grades with a candidate prompt and

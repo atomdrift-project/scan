@@ -190,6 +190,11 @@ fn finish(
             )
         },
     )?;
+    if let Some(p) = analysis.phase {
+        for (part, spent) in cr.phase.parts() {
+            p.add_part(part, spent);
+        }
+    }
     Ok(cr.into_scan_result(analysis.label.to_string(), &r.model, true))
 }
 
@@ -202,6 +207,9 @@ fn finish(
 /// milliseconds per phase, repeats summed). That is what turns a latency
 /// percentile into an attribution: fetch-bound, registry-bound or
 /// analysis-bound, per request, without a profiler attached.
+///
+/// A phase can also be broken into parts ([`RequestPhase::add_part`]):
+/// `classify:report` lists where its time went inside the report pipeline.
 #[derive(Clone)]
 pub struct RequestPhase(Arc<RequestPhaseInner>);
 
@@ -211,6 +219,8 @@ struct RequestPhaseInner {
     started: Instant,
     /// `(phase, offset from `started`)` in the order the phases were entered.
     marks: Mutex<Vec<(String, Duration)>>,
+    /// `(index into marks, part, time spent)`: what a phase's time went to.
+    parts: Mutex<Vec<(usize, &'static str, Duration)>>,
 }
 
 /// More marks than this and the request is looping, not progressing; keep the
@@ -223,6 +233,7 @@ impl RequestPhase {
             tracker: cleave::PhaseTracker::with_label(label),
             started: Instant::now(),
             marks: Mutex::new(Vec::new()),
+            parts: Mutex::new(Vec::new()),
         }))
     }
 
@@ -252,14 +263,45 @@ impl RequestPhase {
         &self.0.tracker
     }
 
-    /// Milliseconds spent in each phase, first-entered order, as
-    /// `name=ms name=ms …`. Time before the first mark is `pre`, so the
-    /// figures sum to the request's elapsed time.
-    pub fn timeline(&self) -> String {
+    /// Attribute `spent` of the phase entered last to `part`, which the
+    /// timeline lists right after that phase. Parts are named in code, so the
+    /// set of names stays fixed. Ignored before any phase is entered.
+    pub fn add_part(&self, part: &'static str, spent: Duration) {
+        let Some(phase) = self
+            .0
+            .marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            .checked_sub(1)
+        else {
+            return;
+        };
+        let mut parts = self
+            .0
+            .parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if parts.len() < PHASE_MARKS_MAX {
+            parts.push((phase, part, spent));
+        }
+    }
+
+    /// Milliseconds spent in each phase, first-entered order. Time before
+    /// the first mark is `pre`, so the phases sum to the request's elapsed
+    /// time. A phase with parts is followed by them and by `other`, the rest
+    /// of its time, so its parts sum to it exactly.
+    #[must_use]
+    pub fn timeline(&self) -> Timeline {
         let now = self.0.started.elapsed();
         let marks = self
             .0
             .marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parts = self
+            .0
+            .parts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pre = marks
@@ -272,22 +314,67 @@ impl RequestPhase {
             .zip(ends)
             .map(|((name, at), end)| (name.as_str(), end.saturating_sub(*at)));
         // At most PHASE_MARKS_MAX + 1 names: a linear scan beats hashing.
-        let mut spent: Vec<(&str, u128)> = Vec::new();
+        let mut spent: Vec<(&str, u64)> = Vec::new();
         for (name, dur) in pre.into_iter().chain(phases) {
             match spent.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, ms)) => *ms += dur.as_millis(),
-                None => spent.push((name, dur.as_millis())),
+                Some((_, ms)) => *ms += crate::duration_ms(dur),
+                None => spent.push((name, crate::duration_ms(dur))),
             }
         }
-        let mut line = String::new();
+        let mut line = Vec::with_capacity(spent.len() + parts.len() + 1);
         for (name, ms) in spent {
-            if !line.is_empty() {
-                line.push(' ');
+            line.push((name.to_owned(), ms));
+            // Summed as durations and floored once, so the parts never
+            // exceed the phase they divide.
+            let mut split: Vec<(&str, Duration)> = Vec::new();
+            for &(_, part, dur) in parts
+                .iter()
+                .filter(|(i, _, _)| marks.get(*i).is_some_and(|(n, _)| n == name))
+            {
+                match split.iter_mut().find(|(n, _)| *n == part) {
+                    Some((_, d)) => *d += dur,
+                    None => split.push((part, dur)),
+                }
             }
-            let _ = write!(line, "{name}={ms}");
+            if split.is_empty() {
+                continue;
+            }
+            let mut rest = ms;
+            for (part, dur) in split {
+                let part_ms = crate::duration_ms(dur);
+                rest = rest.saturating_sub(part_ms);
+                line.push((part.to_owned(), part_ms));
+            }
+            line.push(("other".to_owned(), rest));
         }
+        drop(parts);
         drop(marks);
-        line
+        Timeline(line)
+    }
+}
+
+/// Where a request's wall time went: milliseconds per phase, in the order
+/// [`RequestPhase::timeline`] lists them. Displays as `name=ms name=ms …`, the
+/// completion log's `phases` field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Timeline(Vec<(String, u64)>);
+
+impl Timeline {
+    /// Each phase (and part) with its milliseconds.
+    pub fn phases(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.0.iter().map(|(name, ms)| (name.as_str(), *ms))
+    }
+}
+
+impl std::fmt::Display for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (name, ms)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_char(' ')?;
+            }
+            write!(f, "{name}={ms}")?;
+        }
+        Ok(())
     }
 }
 
@@ -583,13 +670,63 @@ mod request_phase_tests {
         for name in ["fetch", "analyze", "fetch", "classify"] {
             phase.set(name);
         }
-        let timeline = phase.timeline();
+        let timeline = phase.timeline().to_string();
         let names: Vec<&str> = timeline
             .split(' ')
             .filter_map(|field| field.split_once('=').map(|(name, _)| name))
             .filter(|&name| name != "pre")
             .collect();
         assert_eq!(names, ["fetch", "analyze", "classify"], "{timeline}");
+    }
+
+    /// A phase's parts follow it, and with `other` they sum to it exactly:
+    /// the breakdown of `classify:report` reconciles with its total.
+    #[test]
+    fn parts_follow_their_phase_and_reconcile() {
+        use std::time::Duration;
+        let phase = super::RequestPhase::with_label("t");
+        phase.add_part("ignored", Duration::from_secs(1));
+        phase.set("cleave:analyze");
+        phase.set("classify:report");
+        std::thread::sleep(Duration::from_millis(30));
+        phase.add_part("fetch+graft", Duration::from_micros(10_900));
+        phase.add_part("interpret", Duration::from_micros(4_600));
+        phase.add_part("fetch+graft", Duration::from_micros(100));
+        let timeline = phase.timeline();
+        let names: Vec<&str> = timeline
+            .phases()
+            .map(|(name, _)| name)
+            .filter(|&name| name != "pre")
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cleave:analyze",
+                "classify:report",
+                "fetch+graft",
+                "interpret",
+                "other"
+            ],
+            "{timeline}"
+        );
+        let ms = |want: &str| {
+            timeline
+                .phases()
+                .find_map(|(name, ms)| (name == want).then_some(ms))
+                .unwrap_or_default()
+        };
+        assert!(ms("classify:report") >= 30, "{timeline}");
+        assert_eq!(ms("fetch+graft"), 11, "repeats are summed: {timeline}");
+        assert_eq!(ms("interpret"), 4, "{timeline}");
+        assert_eq!(
+            ms("fetch+graft") + ms("interpret") + ms("other"),
+            ms("classify:report"),
+            "{timeline}"
+        );
+        assert!(
+            timeline.to_string().contains(" classify:report="),
+            "{timeline}"
+        );
     }
 }
 

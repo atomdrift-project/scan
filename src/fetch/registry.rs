@@ -101,6 +101,10 @@ impl Fetch for FetchAttempt<'_> {
     fn allows_oci(&self) -> bool {
         self.net.allows_oci()
     }
+
+    fn has_github_token(&self) -> bool {
+        self.net.has_github_token()
+    }
 }
 
 pub(super) fn fetch_one_record(
@@ -293,12 +297,35 @@ pub(super) fn registry_memo() -> &'static RwLock<lru::LruCache<String, Memoized>
 }
 
 /// One registry memo entry: the un-aged record (or the final "none"), and the
-/// scan clock when it was looked up.
+/// scan clock when it was looked up. `unavailable` marks a registry that could
+/// not be reached or refused (a 403/429 rate limit): no record, held only for
+/// [`UNAVAILABLE_MEMO_TTL_SECS`] so the registry is asked again soon.
 #[derive(Clone)]
 pub(super) struct Memoized {
     pub(super) at: u64,
     pub(super) record: Option<Registry>,
+    pub(super) unavailable: bool,
 }
+
+impl Memoized {
+    /// Whether this entry still stands in for a lookup at `now`.
+    fn fresh(&self, now: u64) -> bool {
+        let ttl = if self.unavailable {
+            UNAVAILABLE_MEMO_TTL_SECS
+        } else {
+            REGISTRY_MEMO_TTL_SECS
+        };
+        now.saturating_sub(self.at) <= ttl
+    }
+}
+
+/// How long an unavailable registry's miss is remembered. Without it every
+/// file naming the dependency asked again: on 2026-11-26 a rate-limited
+/// registry drew ~7,600 refusals a day, up to 108 in one second, the same
+/// locator up to 300 times — each a log line and a round trip (or a refusal
+/// from the transport's per-host hold). Short, because the answer may come
+/// back at any moment: it is a pause, not a verdict.
+pub(super) const UNAVAILABLE_MEMO_TTL_SECS: u64 = 5 * 60;
 
 /// How long a memo entry stands in for the blob cache. The memo exists to
 /// spare a burst of scans naming the same dependencies the disk read and the
@@ -352,10 +379,7 @@ pub(super) fn lookup_registries(
             if r.kind != RefKind::Dependency && !is_package_import(r) {
                 continue;
             }
-            match memo
-                .peek(locator(r))
-                .filter(|hit| now.saturating_sub(hit.at) <= REGISTRY_MEMO_TTL_SECS)
-            {
+            match memo.peek(locator(r)).filter(|hit| hit.fresh(now)) {
                 // Stored un-aged; stamp the age signals from this scan's clock.
                 Some(hit) => {
                     found[i] = hit.record.clone().map(|record| Lookup {
@@ -388,20 +412,31 @@ pub(super) fn lookup_registries(
             .collect()
     };
 
-    let mut writes: Vec<(String, Option<Registry>)> = Vec::with_capacity(fresh.len());
+    let mut writes: Vec<(String, Memoized)> = Vec::with_capacity(fresh.len());
+    let entry = |record: Option<Registry>, unavailable: bool| Memoized {
+        at: now,
+        record,
+        unavailable,
+    };
     for (i, lookup) in fresh {
         let key = locator(&selected[i]).to_owned();
         let Lookup { record, sources } = match lookup {
             Ok(lookup) => lookup,
-            // A registry that could not be reached may answer next time, so
-            // the miss is not remembered; every other answer is final.
+            // A registry that could not be reached may answer soon, so the
+            // miss is remembered only briefly; every other answer is final.
             Err(fletch::RegistryError::Unavailable(error)) => {
-                tracing::warn!(locator = %key, %error, "registry unavailable; not caching the miss");
+                tracing::warn!(
+                    locator = %key,
+                    %error,
+                    retry_after_secs = UNAVAILABLE_MEMO_TTL_SECS,
+                    "registry unavailable; holding the miss briefly"
+                );
+                writes.push((key, entry(None, true)));
                 continue;
             }
             Err(error) => {
                 tracing::debug!(locator = %key, %error, "no registry record");
-                writes.push((key, None));
+                writes.push((key, entry(None, false)));
                 continue;
             }
         };
@@ -413,7 +448,7 @@ pub(super) fn lookup_registries(
         memoized
             .release_times
             .retain(|&t| now.saturating_sub(t) <= RELEASE_CADENCE_WINDOW_SECS);
-        writes.push((key, Some(memoized)));
+        writes.push((key, entry(Some(memoized), false)));
         found[i] = Some(Lookup {
             record: record.with_age(now),
             sources,
@@ -424,8 +459,8 @@ pub(super) fn lookup_registries(
         let mut memo = registry_memo()
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        for (key, record) in writes {
-            memo.put(key, Memoized { at: now, record });
+        for (key, memoized) in writes {
+            memo.put(key, memoized);
         }
     }
     found

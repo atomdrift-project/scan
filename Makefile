@@ -450,6 +450,12 @@ test:
 		$(CARGO) test $(LOCKED) --workspace; \
 	fi
 
+# Grades testdata/llm/ against the live LLM endpoint (needs ~/.tok/llm). Kept
+# out of `make test`, which must never send traffic to our endpoints.
+.PHONY: test-llm
+test-llm:
+	$(CARGO) test --locked --test llm_fixtures -- --ignored --nocapture
+
 .PHONY: test-cli
 test-cli:
 	$(CARGO) test --locked --test cli_smoke

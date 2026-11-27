@@ -9,8 +9,10 @@
 //! as a wrong grade, and the summary reports the prompt bytes each sample
 //! cost, so a smaller render can be shown to grade as well.
 //!
-//! It needs the network, installed rules and models, and `~/.tok/llm`, so it
-//! skips (and says so) when the token file is absent. The endpoint defaults to
+//! It sends live traffic to our LLM endpoint, so it is `#[ignore]`d and never
+//! runs under `make test`; `make test-llm` runs it. It needs the network,
+//! installed rules and models, and `~/.tok/llm`, and skips (and says so) when
+//! the token file is absent. The endpoint defaults to
 //! `https://llm.isotope13.ai/v1`; `SCAN_LLM` overrides it, as it does for scan.
 //! `SCAN_LLM_FIXTURES_DIR` grades another directory laid out the same way (a
 //! `MANIFEST.tsv` beside xz-compressed samples) — a held-out set, or goldens
@@ -188,6 +190,7 @@ fn judge(cfg: &scan::interpret::InterpretConfig, fixture: &Fixture, scratch: &Pa
 }
 
 #[test]
+#[ignore = "sends live traffic to the LLM endpoint; run with `make test-llm`"]
 fn llm_grades_every_fixture_as_labelled() {
     let Some(token) = dirs::home_dir().map(|h| h.join(".tok/llm")) else {
         return;

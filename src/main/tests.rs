@@ -58,7 +58,7 @@ fn follow_defaults_to_references_and_dependencies() -> Result<()> {
         policy.max_file_fetches,
         scan::fetch::DEFAULT_MAX_FILE_FETCHES
     );
-    assert_eq!(policy.max_file_fetches, 100);
+    assert_eq!(policy.max_file_fetches, 32);
     assert_eq!(policy.max_url_fetches, scan::fetch::DEFAULT_MAX_URL_FETCHES);
     assert_eq!(policy.max_url_fetches, 4);
     Ok(())

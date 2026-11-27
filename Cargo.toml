@@ -205,7 +205,8 @@ tree-sitter = "0.28"
 backtrace = { version = "0.3", optional = true }
 
 # Keep this target list in lockstep with the `cfg` on the jemalloc
-# `mod allocator` in src/main.rs, and with its negation on the fallback one.
+# `mod allocator` in src/main.rs, with its negation on the fallback one, and
+# with the `tree_sitter_allocator!` macro's `cfg`.
 [target.'cfg(all(unix, not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", target_os = "illumos", target_os = "solaris"))))'.dependencies]
 tikv-jemallocator = "0.7"
 # Already in the graph beneath tikv-jemallocator; named directly only for its

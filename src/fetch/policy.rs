@@ -70,10 +70,13 @@ pub fn default_service_follow_policy() -> FetchPolicy {
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Default ceiling on *live* non-URL fetches triggered by a single scanned
-/// file. Cache hits don't count, so a warm re-run is
-/// never throttled; this bounds the dependency/package fan-out one crafted file
-/// can trigger.
-pub const DEFAULT_MAX_FILE_FETCHES: usize = 100;
+/// file: dependencies and packages not already in the cache or corpus. Cache
+/// hits don't count, so a warm re-run is never throttled; this bounds the
+/// dependency/package fan-out one crafted file can trigger. 32 covers a
+/// typical manifest's uncached tail; a wider tree is reached over later scans
+/// as the shared cache fills, and every reference past the cap is recorded as
+/// `BudgetExceeded`, never dropped silently.
+pub const DEFAULT_MAX_FILE_FETCHES: usize = 32;
 
 /// Default ceiling on *live* opportunistic URL fetches triggered by a single
 /// scanned file. Cache hits don't count, so a warm re-run is never throttled.

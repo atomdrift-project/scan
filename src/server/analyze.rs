@@ -283,7 +283,7 @@ fn record(
     request_id: u64,
     key: &FlightKey,
     elapsed_ms: u64,
-    phases: &str,
+    phases: &crate::analysis::Timeline,
     outcome: AnalysisOutcome,
 ) -> Result<Box<ScanResult>, ApiError> {
     match outcome {

@@ -15,6 +15,23 @@
 /// exhaustion. Passing that through would turn memory pressure while parsing a
 /// hostile file into a wild write, so the shims abort, as tree-sitter's own
 /// defaults do.
+///
+/// Compiled only where a `mod allocator` below invokes it: the targets on
+/// jemalloc or mimalloc. Native-allocator targets leave tree-sitter alone.
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        ))
+    )
+))]
 macro_rules! tree_sitter_allocator {
     ($malloc:path, $calloc:path, $realloc:path, $free:path) => {
         /// Route tree-sitter's C-core allocations through this allocator.

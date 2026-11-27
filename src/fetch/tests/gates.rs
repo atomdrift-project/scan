@@ -576,6 +576,7 @@ fn remember_release(reference: &Reference, ecosystem: &str, version: &str, now: 
             Memoized {
                 at: now,
                 record: Some(record),
+                unavailable: false,
             },
         );
 }

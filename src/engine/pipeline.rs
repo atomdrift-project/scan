@@ -135,12 +135,44 @@ pub(crate) struct OutputNeeds {
 /// Logged per root file on the CLI path so a slow scan is self-diagnosing:
 /// usually the LLM `interpret` time when an endpoint is contended, or `fetch`
 /// on a wide `--follow`.
+///
+/// Measured between consecutive checkpoints, so the phases sum to `total`
+/// exactly: nothing `classify_report` does goes unattributed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PhaseTimings {
+    /// cleave's finalize and what is read before it clears the report.
+    pub finalize: Duration,
+    /// Reference fetching, payload analysis and grafting.
     pub fetch: Duration,
+    /// Compaction, featurization, the model, dependency grading, and the LLM
+    /// context render.
+    pub features: Duration,
+    /// The LLM round trip and blending its grade in.
     pub interpret: Duration,
+    /// The uplink second opinion on a flagged verdict.
+    pub uplink: Duration,
+    /// The terminal/tiny context render.
     pub render: Duration,
+    /// Building the hopper body and the retained report.
+    pub store: Duration,
     pub total: Duration,
+}
+
+impl PhaseTimings {
+    /// Each phase under its stable name, in the order they run. They sum to
+    /// `total`. `fetch+graft`, `features+model` and `interpret` are the names
+    /// the phase tracker shows while each runs.
+    pub(crate) fn parts(&self) -> [(&'static str, Duration); 7] {
+        [
+            ("finalize", self.finalize),
+            ("fetch+graft", self.fetch),
+            ("features+model", self.features),
+            ("interpret", self.interpret),
+            ("uplink", self.uplink),
+            ("render", self.render),
+            ("store", self.store),
+        ]
+    }
 }
 
 /// What `classify_report` produced: the result, and where its time went.
@@ -196,29 +228,8 @@ pub(crate) fn classify_report(
     // Fetch discovery is finished; release the retained input before inference
     // and the potentially slow LLM round trip.
     drop(req.root_bytes.take());
+    let (mut scored, dependency_results) = score_and_grade(&mut prepared, &req)?;
     let index = ReportIndex::new(&prepared.typed);
-    // The dependencies are graded on their own reports while the root is
-    // scored on its own: neither reads the other, and each has a serial
-    // stretch (a large report's parse, a route's first load) the other fills.
-    let dependencies = std::mem::take(&mut prepared.fetch.dependencies);
-    let (scored, dependency_results) = std::thread::scope(|scope| {
-        let (registries, model, cancellation, upload) = (
-            &prepared.fetch.registries,
-            req.model,
-            req.cancellation,
-            needs.upload,
-        );
-        let grading = scope.spawn(move || {
-            grade_dependencies(dependencies, registries, model, cancellation, upload)
-        });
-        let scored = score(&prepared, &req);
-        let graded = grading
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (scored, graded)
-    });
-    let mut scored = scored?;
-    let dependency_results = dependency_results?;
     // Pinned only now, after featurization: a backref is a conclusion about
     // *another* artifact, and fed as a feature of this one it would teach the
     // model that declaring dependencies is itself malicious.
@@ -234,6 +245,7 @@ pub(crate) fn classify_report(
         registries: &prepared.fetch.registries,
     };
     let mut decision = scored.decision;
+    let interpret_started = Instant::now();
     let llm = interpret(
         &prepared.typed,
         &index,
@@ -254,6 +266,7 @@ pub(crate) fn classify_report(
         );
     }
 
+    let uplink_started = Instant::now();
     let (uplink, uplink_reason) = uplink_opinion(&sha256, decision.class, &req);
 
     let render_started = Instant::now();
@@ -280,7 +293,7 @@ pub(crate) fn classify_report(
     } else {
         String::new()
     };
-    let render_time = render_started.elapsed();
+    let store_started = Instant::now();
 
     let root = prepared.compact.files.first();
     let file_type = root.map_or_else(|| "unknown".to_string(), |f| f.file_type.clone());
@@ -300,25 +313,7 @@ pub(crate) fn classify_report(
     // The upload reads the complete report too: every member's reading is
     // folded into its containers before retention drops any of them.
     let mut upload = if needs.upload {
-        let root_purl = super::hopper::artifact_purl(req.root_fetch)
-            .and_then(|locator| fletch::purl::Purl::parse(&locator).ok())
-            .or_else(|| req.root_registry?.artifact_purl(&sha256))
-            .or_else(|| {
-                // A local source archive can contain an absolute GitHub Actions
-                // reference to itself. Its on-disk filename does not establish
-                // its origin; Hopper may have the acquisition record by digest.
-                let has_github_dependency = compact.files.iter().any(|file| {
-                    file.refs.iter().any(|reference| {
-                        reference.kind == "dependency"
-                            && reference.locator.starts_with("pkg:github/")
-                    })
-                });
-                if has_github_dependency {
-                    crate::corpus_precheck::armed()?.artifact_purl(&sha256)
-                } else {
-                    None
-                }
-            });
+        let root_purl = root_purl(&req, &compact, &sha256);
         UploadDoc::new(&UploadInputs {
             report: &compact,
             root: scored.root,
@@ -355,11 +350,16 @@ pub(crate) fn classify_report(
     }
     drop(compact);
 
+    let ended = Instant::now();
     let phase = PhaseTimings {
-        fetch: prepared.fetch_time,
-        interpret: llm.elapsed,
-        render: render_time,
-        total: started.elapsed(),
+        finalize: prepared.fetch_started.duration_since(started),
+        fetch: prepared.fetch_ended.duration_since(prepared.fetch_started),
+        features: interpret_started.duration_since(prepared.fetch_ended),
+        interpret: uplink_started.duration_since(interpret_started),
+        uplink: render_started.duration_since(uplink_started),
+        render: store_started.duration_since(render_started),
+        store: ended.duration_since(store_started),
+        total: ended.duration_since(started),
     };
     Ok(ClassifiedReport {
         phase,
@@ -401,6 +401,61 @@ pub(crate) fn classify_report(
             upload,
         },
     })
+}
+
+/// Score the root and grade its fetched dependencies, concurrently: each is
+/// read from its own report, neither reads the other, and each has a serial
+/// stretch (a large report's parse, a route's first load) the other fills.
+fn score_and_grade(
+    prepared: &mut Prepared,
+    req: &ClassifyRequest<'_>,
+) -> Result<(Scored, Vec<DepResult>)> {
+    let dependencies = std::mem::take(&mut prepared.fetch.dependencies);
+    let prepared = &*prepared;
+    let (scored, graded) = std::thread::scope(|scope| {
+        let (registries, model, cancellation, upload) = (
+            &prepared.fetch.registries,
+            req.model,
+            req.cancellation,
+            req.needs.upload,
+        );
+        let grading = scope.spawn(move || {
+            grade_dependencies(dependencies, registries, model, cancellation, upload)
+        });
+        let scored = score(prepared, req);
+        let graded = grading
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (scored, graded)
+    });
+    Ok((scored?, graded?))
+}
+
+/// The root artifact's package URL for its hopper body: from how it was
+/// fetched, else its registry record, else what hopper knows of its digest.
+fn root_purl(
+    req: &ClassifyRequest<'_>,
+    compact: &CompactReport,
+    sha256: &str,
+) -> Option<fletch::purl::Purl> {
+    super::hopper::artifact_purl(req.root_fetch)
+        .and_then(|locator| fletch::purl::Purl::parse(&locator).ok())
+        .or_else(|| req.root_registry?.artifact_purl(sha256))
+        .or_else(|| {
+            // A local source archive can contain an absolute GitHub Actions
+            // reference to itself. Its on-disk filename does not establish
+            // its origin; Hopper may have the acquisition record by digest.
+            let has_github_dependency = compact.files.iter().any(|file| {
+                file.refs.iter().any(|reference| {
+                    reference.kind == "dependency" && reference.locator.starts_with("pkg:github/")
+                })
+            });
+            if has_github_dependency {
+                crate::corpus_precheck::armed()?.artifact_purl(sha256)
+            } else {
+                None
+            }
+        })
 }
 
 /// Whether another run over the same bytes and the same resolved
@@ -493,7 +548,9 @@ struct Prepared {
     ref_lengths: Vec<u64>,
     /// `--all-members`: every member cleave listed, analyzed or not.
     listed: Vec<Listed>,
-    fetch_time: Duration,
+    /// When reference fetching began and ended: the `fetch+graft` phase.
+    fetch_started: Instant,
+    fetch_ended: Instant,
     /// Whether cleave replayed this analysis from its cache.
     analysis_cached: bool,
 }
@@ -557,7 +614,7 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
             cancellation: req.cancellation,
         },
     );
-    let fetch_time = fetch_started.elapsed();
+    let fetch_ended = Instant::now();
     if let Some(fetched) = req.fetched {
         fetched();
     }
@@ -627,7 +684,8 @@ fn prepare(mut report: AnalysisReport, req: &ClassifyRequest<'_>) -> Prepared {
         fetch,
         ref_lengths,
         listed,
-        fetch_time,
+        fetch_started,
+        fetch_ended,
         analysis_cached,
     }
 }

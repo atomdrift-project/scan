@@ -506,6 +506,10 @@ impl Fetch for AsClient<'_> {
     fn allows_oci(&self) -> bool {
         self.net.allows_oci()
     }
+
+    fn has_github_token(&self) -> bool {
+        self.net.has_github_token()
+    }
 }
 
 /// [`Reference::source`] for a URL that a fetched redirect page names as its
