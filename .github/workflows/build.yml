@@ -111,9 +111,9 @@ jobs:
   #
   # Every native build waits for all of training, so the ceiling is the
   # longest any release waits on a profile. The instrumented build peaks at
-  # ~11 GB in one rustc: the 7 GB macOS runner swaps but finishes. Under fat
-  # LTO it peaked at 23 GB, took 107 min on macOS and killed the arm64 Linux
-  # runner outright (v3.0.0-beta.1, beta.3).
+  # ~11 GB in one rustc (measured locally), still more than a 7 GB macOS
+  # runner holds. Under fat LTO it peaked at 23 GB, took 107 min on macOS and
+  # killed the arm64 Linux runner outright (v3.0.0-beta.1, beta.3).
   pgo-train:
     name: PGO profile ${{ matrix.target }}
     if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
