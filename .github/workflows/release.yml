@@ -17,7 +17,7 @@
 #     gh workflow run release.yml --ref main -f tag=v2.5.0 -f publish=true \
 #       -f target=x86_64-unknown-openbsd
 #
-# A dry run does everything a real one does — fat-LTO builds, whatever signing
+# A dry run does everything a real one does — LTO builds, whatever signing
 # the inputs below ask for, packaging, checksums — and stops short of attesting
 # or creating the release, leaving the assembled set as a downloadable artifact.
 # That matters because the release-only surface (the `release-lto` profile, the
@@ -309,8 +309,9 @@ jobs:
       # the reusable workflow definition itself may come from a newer commit.
       ref: ${{ needs.verify.outputs.tag }}
       target: ${{ inputs.target || '' }}
-      # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
-      # binary people download rather than rebuild.
+      # Thin LTO + one codegen unit per crate: a few percent faster than
+      # `release`, worth the extra build minutes for a binary people
+      # download rather than rebuild.
       wave: fast
       profile: release-lto
       # Release binaries are Developer ID signed and submitted to Apple's
@@ -342,8 +343,9 @@ jobs:
       # the reusable workflow definition itself may come from a newer commit.
       ref: ${{ needs.verify.outputs.tag }}
       target: ${{ inputs.target || '' }}
-      # Fat LTO + one codegen unit. Multi-minute links, and worth it for a
-      # binary people download rather than rebuild.
+      # Thin LTO + one codegen unit per crate: a few percent faster than
+      # `release`, worth the extra build minutes for a binary people
+      # download rather than rebuild.
       wave: slow
       profile: release-lto
       # Release binaries are Developer ID signed and submitted to Apple's

@@ -46,20 +46,29 @@ pub fn upload_collector() -> &'static str {
 /// exists before its verdict lands. Blocking (reads sidecars from disk); callers
 /// on an async runtime must run it off the executor.
 fn upload_scan_result(uploader: &Uploader, origin: Origin<'_>, mut result: ScanResult) {
-    uploader.submit_artifacts(collect_upload_artifacts(
-        origin.path,
-        &result.sha256,
-        result.size_bytes,
-        upload_collector(),
-        origin.registry,
-        origin.fetch,
-    ));
+    // A CLI run is nobody's request: hopper names it by the User-Agent.
+    uploader.submit_artifacts(
+        collect_upload_artifacts(
+            origin.path,
+            &result.sha256,
+            result.size_bytes,
+            upload_collector(),
+            origin.registry,
+            origin.fetch,
+        ),
+        None,
+    );
     // Each fetched dependency, mirrored into hopper as its own sample: bytes (only
     // if missing) + provenance + the verdict scan computed for it. Queued before
     // the root verdict so a dependency's row exists before its own verdict lands.
     let dependency_results = std::mem::take(&mut result.dependency_results);
     if !dependency_results.is_empty() {
-        uploader.submit_dependencies(dependency_results, &result.version, &result.analyzed_at);
+        uploader.submit_dependencies(
+            dependency_results,
+            &result.version,
+            &result.analyzed_at,
+            None,
+        );
     }
     // `scan purl` names a package outright and a registry URL still identifies
     // one; a local path or an arbitrary URL identifies nothing, and the
@@ -112,7 +121,7 @@ fn registry_fallback_route(
         .and_then(|n| n.to_str())
         .unwrap_or("file");
     if let Some(artifact) = registry_fallback_artifact(name, &real_sha, purl, origin.registry) {
-        uploader.submit_artifacts(vec![artifact]);
+        uploader.submit_artifacts(vec![artifact], None);
     }
     HopperRoute::Redirect(real_sha)
 }
@@ -153,6 +162,7 @@ pub fn registry_fallback_artifact(
         bytes: ArtifactBytes::None,
         sidecar,
         backfill: true,
+        origin: None,
     })
 }
 
@@ -271,6 +281,7 @@ pub fn collect_upload_artifacts(
         // Registry data or a PURL identity is worth backfilling onto a sample
         // hopper already has; a plain local file's thin sidecar is not.
         backfill: root_provenance.is_some() || purl.is_some(),
+        origin: None,
     }]
 }
 

@@ -148,14 +148,18 @@ fn slow_hopper_spools_overflow_then_flushes_every_verdict_in_order() {
             std::fs::write(&path, &data).unwrap();
             let sha = format!("{i:064x}");
             uploader
-                .submit_artifacts_durable(vec![UploadArtifact {
-                    sha256: sha.clone(),
-                    size: data.len() as u64,
-                    filename: format!("{i}.txt"),
-                    bytes: ArtifactBytes::File(path),
-                    sidecar: b"{}".to_vec(),
-                    backfill: false,
-                }])
+                .submit_artifacts_durable(
+                    vec![UploadArtifact {
+                        sha256: sha.clone(),
+                        size: data.len() as u64,
+                        filename: format!("{i}.txt"),
+                        bytes: ArtifactBytes::File(path),
+                        sidecar: b"{}".to_vec(),
+                        backfill: false,
+                        origin: None,
+                    }],
+                    None,
+                )
                 .expect("stage and enqueue artifact");
             uploader.submit(sha.clone(), None, &result(&sha));
         }

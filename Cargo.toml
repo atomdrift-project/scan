@@ -254,12 +254,14 @@ strip = "debuginfo"
 lto = "thin"
 codegen-units = 16
 
-# Distribution profile: fat LTO + single codegen unit. Squeezes out the
-# last few percent of runtime at the cost of multi-minute link times.
-# Used by `make release-lto` and distribution builds.
+# Distribution profile: thin LTO + one codegen unit per crate. Used by
+# `make release-lto` and the release workflow (which adds PGO). Measured
+# 2026-11-27 with PGO on a cold ~/Downloads scan (Apple silicon): 3.3% fewer
+# instructions than `release`, and level with fat LTO + one codegen unit,
+# whose instrumented build took 2.8x as long and peaked at 23 GB in one
+# rustc (10.7 GB here) -- more than three times a GitHub macOS runner's RAM.
 [profile.release-lto]
 inherits = "release"
-lto = "fat"
 codegen-units = 1
 
 [profile.profiling]

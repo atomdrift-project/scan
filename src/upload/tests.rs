@@ -171,6 +171,7 @@ fn artifact(sha: &str, size: u64, bytes: ArtifactBytes) -> UploadArtifact {
         bytes,
         sidecar: br#"{"schema_version":"1.0"}"#.to_vec(),
         backfill: false,
+        origin: None,
     }
 }
 
@@ -356,6 +357,118 @@ fn upload_sends_configured_bearer_token() {
     );
 }
 
+/// An upload names who it is on behalf of, so hopper records it as
+/// `upload:<origin>` rather than under the uploader's own User-Agent; one
+/// nobody asked for sends no origin at all.
+#[test]
+fn upload_sends_its_origin() {
+    let send = |origin: Option<Origin>| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+        let server = serve_one(listener, NO_CONTENT);
+        let hopper = hopper_at(&format!("http://{addr}"));
+        let mut art = artifact(&"a".repeat(64), 1, ArtifactBytes::File(PathBuf::new()));
+        art.origin = origin;
+        assert!(hopper.upload(&art, None));
+        String::from_utf8_lossy(&server.join().expect("server thread")).to_ascii_lowercase()
+    };
+    let request = send(Origin::new("poppy"));
+    assert!(
+        request.starts_with("post /v1/intake/upload "),
+        "request: {request}"
+    );
+    assert!(
+        request.contains("\r\natomdrift-origin: poppy\r\n"),
+        "request headers: {request}"
+    );
+    let request = send(None);
+    assert!(
+        !request.contains("atomdrift-origin"),
+        "request headers: {request}"
+    );
+}
+
+/// An uploader that can only spool: every job it accepts goes to disk.
+fn spooling_uploader() -> (Uploader, queue::Receiver<Job>) {
+    let (tx, jobs) = queue::channel::<Job>(0);
+    let uploader = Uploader {
+        tx: Some(tx),
+        worker: None,
+        worker_name: "test".to_owned(),
+        pending: Arc::default(),
+        tally: Arc::default(),
+    };
+    (uploader, jobs)
+}
+
+/// The origin is staged with the artifact it belongs to: an upload that
+/// waits on the disk spool behind other jobs still names who asked for it
+/// when it is finally sent.
+#[test]
+fn a_durable_artifact_keeps_its_origin_through_the_spool() {
+    let (uploader, mut jobs) = spooling_uploader();
+    let origin = Origin::new("poppy").expect("valid origin");
+    let art = artifact(&"f".repeat(64), 5, ArtifactBytes::None);
+    uploader
+        .submit_artifact_bytes_durable(art, b"bytes", Some(&origin))
+        .expect("staged");
+    let Some(Ok(Job::Artifacts {
+        artifacts,
+        cleanup_dirs,
+    })) = jobs.next()
+    else {
+        panic!("expected one spooled artifact job");
+    };
+    assert_eq!(artifacts[0].origin.as_ref(), Some(&origin));
+    let ArtifactBytes::File(staged) = &artifacts[0].bytes else {
+        panic!("bytes were not staged to a file");
+    };
+    assert_eq!(std::fs::read(staged).expect("staged bytes"), b"bytes");
+    cleanup_upload_dirs(cleanup_dirs);
+
+    let source = tempfile::tempdir().expect("tempdir");
+    let path = source.path().join("x.bin");
+    std::fs::write(&path, b"file").expect("write");
+    uploader
+        .submit_artifacts_durable(
+            vec![artifact(&"0".repeat(64), 4, ArtifactBytes::File(path))],
+            Some(&origin),
+        )
+        .expect("staged");
+    let Some(Ok(Job::Artifacts {
+        artifacts,
+        cleanup_dirs,
+    })) = jobs.next()
+    else {
+        panic!("expected one spooled artifact job");
+    };
+    assert_eq!(artifacts[0].origin.as_ref(), Some(&origin));
+    cleanup_upload_dirs(cleanup_dirs);
+}
+
+/// A dependency the request fetched is filed on that request's behalf.
+#[test]
+fn a_dependency_carries_the_requests_origin() {
+    let (uploader, mut jobs) = spooling_uploader();
+    let origin = Origin::new("beamline").expect("valid origin");
+    let dep = crate::engine::DepResult {
+        sha256: "c".repeat(64),
+        locator: "pkg:npm/x@1".to_string(),
+        url: "https://example/x-1.tgz".to_string(),
+        size: 1,
+        provenance: None,
+        verdict: None,
+        members: crate::engine::MemberEvals::new(),
+        upload: None,
+    };
+    uploader.submit_dependencies(vec![dep], "v", "t", Some(&origin));
+    let Some(Ok(Job::Dependencies { deps })) = jobs.next() else {
+        panic!("expected one spooled dependency job");
+    };
+    let art = deps[0].artifact.as_ref().expect("dependency artifact");
+    assert_eq!(art.origin.as_ref(), Some(&origin));
+}
+
 /// A file-backed artifact streams from disk with its length declared up
 /// front, behind the provenance part hopper's handler reads first.
 #[test]
@@ -449,12 +562,15 @@ fn a_refused_job_does_not_leak_the_pending_count() {
         members: crate::engine::MemberEvals::new(),
         upload: None,
     };
-    uploader.submit_dependencies(vec![dep], "v", "t");
-    uploader.submit_artifacts(vec![artifact(
-        &"e".repeat(64),
-        1,
-        ArtifactBytes::File(PathBuf::new()),
-    )]);
+    uploader.submit_dependencies(vec![dep], "v", "t", None);
+    uploader.submit_artifacts(
+        vec![artifact(
+            &"e".repeat(64),
+            1,
+            ArtifactBytes::File(PathBuf::new()),
+        )],
+        None,
+    );
     assert_eq!(uploader.stats().pending, 0);
 }
 

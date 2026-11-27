@@ -123,6 +123,7 @@ async fn a_pending_analysis_streams_progress_before_its_decision() -> anyhow::Re
         purl: Some((purl.into(), purl.into())),
         url: None,
         path: None,
+        origin: None,
     };
     let named = Named::Purl {
         key: purl.into(),
@@ -196,6 +197,7 @@ async fn a_pending_full_result_streams_progress_then_its_body() -> anyhow::Resul
         purl: Some((purl.into(), purl.into())),
         url: None,
         path: None,
+        origin: None,
     };
     let named = Named::Purl {
         key: purl.into(),

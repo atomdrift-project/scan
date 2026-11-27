@@ -10,7 +10,7 @@
 #
 #   -p PROFILE   cargo profile to instrument (`release` or `release-lto`). The
 #                optimized build the profile is applied to must use the same
-#                one: a thin-LTO profile applied to the fat-LTO build measured
+#                one: a thin-LTO profile applied to a fat-LTO build measured
 #                slower than no profile at all.
 #   -o PROFDATA  where the merged profile goes; its directory is created, and
 #                the raw counters live beside it in raw-PROFILE/ while

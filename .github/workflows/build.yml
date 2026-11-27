@@ -1,6 +1,6 @@
 # Reusable build matrix — the single definition of "what platforms we ship and
 # how". Called by ci.yml (thin LTO, ad-hoc macOS signature, no PGO) and by
-# release.yml (fat LTO, profile-guided, plus whatever signing the
+# release.yml (thin LTO + one codegen unit, profile-guided, plus whatever signing the
 # `sign`/`notarize` inputs ask for). Keeping one matrix means CI and release
 # can't drift into building different things.
 #
@@ -35,13 +35,13 @@ on:
       profile:
         description: >-
           Cargo profile: `release` (thin LTO, everyday CI) or `release-lto`
-          (fat LTO + one codegen unit, distribution builds).
+          (thin LTO + one codegen unit per crate, distribution builds).
         type: string
         default: release
       pgo:
         description: >-
           Profile-guided optimization for the targets built on their own
-          architecture (x86_64 Linux, macOS arm64, Windows): an instrumented build
+          architecture (Linux, macOS arm64, Windows): an instrumented build
           scans the public rules testdata and the real build uses the
           profile, as `make release PGO=1` does. Measured 2026-11-01: CPU
           -7% to -10% on scan corpora. Training runs in its own job (see
@@ -109,16 +109,17 @@ jobs:
   # The cargo cache is restored, never saved, so this job cannot poison what
   # the signing jobs restore. A failure here only costs the profile.
   #
-  # aarch64-unknown-linux-gnu is not trained: on ubuntu-24.04-arm the
-  # instrumented fat-LTO link of atomscan takes the runner down ("The runner
-  # has received a shutdown signal") every time it has been tried (v3.0.0-beta.1
-  # and beta.3), so it only ever cost twenty minutes and a red job.
+  # Every native build waits for all of training, so the ceiling is the
+  # longest any release waits on a profile. The instrumented build peaks at
+  # ~11 GB in one rustc: the 7 GB macOS runner swaps but finishes. Under fat
+  # LTO it peaked at 23 GB, took 107 min on macOS and killed the arm64 Linux
+  # runner outright (v3.0.0-beta.1, beta.3).
   pgo-train:
     name: PGO profile ${{ matrix.target }}
-    if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
+    if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
     # Same runner image as the job that applies the profile.
-    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-26' || matrix.target == 'x86_64-pc-windows-msvc' && 'windows-2025' || matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'ubuntu-22.04' }}
-    timeout-minutes: 120
+    runs-on: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-24.04-arm' || matrix.target == 'aarch64-apple-darwin' && 'macos-26' || matrix.target == 'x86_64-pc-windows-msvc' && 'windows-2025' || matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 60
     continue-on-error: true
     permissions:
       contents: read
@@ -126,7 +127,7 @@ jobs:
       fail-fast: false
       matrix:
         # Windows ARM64 trains only when dispatched by name, like its build.
-        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-pc-windows-msvc"]') }}
+        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-pc-windows-msvc"]') }}
     defaults:
       run:
         shell: bash
@@ -213,6 +214,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             native: true
+            pgo: true
 
           - target: aarch64-apple-darwin
             os: macos-26
@@ -807,7 +809,7 @@ jobs:
             # dies in the linker rather than on anything meaningful.
             # The image's root login class has a 4 GiB hard data limit even
             # though the VM has 12 GiB. LLVM needs more than that for this
-            # graph's final fat-LTO link. This shell runs as root, which may
+            # graph's final LTO link. This shell runs as root, which may
             # raise its own hard limit up to the kernel maximum.
             ulimit -d unlimited
             echo "datasize soft=$(ulimit -Sd) hard=$(ulimit -Hd)"
@@ -1027,7 +1029,7 @@ jobs:
           cpu: "4"
           mem: "12288"
           usesh: true
-          # Keep Cargo's registry and fat-LTO output on the host-backed mount;
+          # Keep Cargo's registry and LTO output on the host-backed mount;
           # the Hurd guest image does not have enough disk for both.
           sync: nfs
           envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE BUILD_PROFILE"
@@ -1111,7 +1113,7 @@ jobs:
               developer/gcc14
             # illumos does not overcommit: fork() reserves backing store for
             # the child's whole address space, so forking the linker out of a
-            # multi-GB rustc during fat LTO fails with ENOMEM ("Not enough
+            # multi-GB rustc during the LTO link fails with ENOMEM ("Not enough
             # space", os error 12) while RAM is still free. The cross-compiled
             # illumos build does not hit this because it forks on Linux, which
             # does overcommit. Back the reservation with swap; it is reserved,

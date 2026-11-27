@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 
+mod origin;
 mod queue;
+
+pub use origin::{ORIGIN_HEADER, Origin};
 
 use crate::engine::{ScanResult, UploadDoc, UploadStamp};
 use crate::hopper::{bearer, error_chain, worker_endpoint};
@@ -196,6 +199,12 @@ pub struct UploadArtifact {
     /// map-backed roots carrying registry data, false for a plain local root
     /// whose sidecar contains only artifact + fetch identity.
     pub backfill: bool,
+    /// Who the upload is on behalf of, sent as [`ORIGIN_HEADER`]. Set by the
+    /// `submit_*` call that queues the artifact, and kept with it — through the
+    /// disk spool too — until its upload is sent. `None` for work nobody asked
+    /// for: hopper then names the uploader by its User-Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 /// An artifact's bytes in a form every upload attempt can send without copying
@@ -330,6 +339,7 @@ fn prepare_dependencies(
     deps: Vec<crate::engine::DepResult>,
     version: &str,
     analyzed_at: &str,
+    origin: Option<&Origin>,
     tally: &Tally,
 ) -> Vec<PreparedDependency> {
     let collector = format!("scan+{worker}");
@@ -342,7 +352,10 @@ fn prepare_dependencies(
     };
     deps.into_iter()
         .map(|dep| {
-            let artifact = dep_artifact(&dep, &collector, analyzed_at);
+            let artifact = dep_artifact(&dep, &collector, analyzed_at).map(|mut artifact| {
+                artifact.origin = origin.cloned();
+                artifact
+            });
             // No body without a verdict: scan posts none it did not compute.
             let result = dep
                 .verdict
@@ -532,10 +545,14 @@ impl Uploader {
     /// Queue artifacts (the scanned file and any fetched dependency archives) for
     /// content reconciliation: hopper is asked which it lacks, and only those are
     /// uploaded with their provenance. Submit before the matching [`Self::submit`] so a
-    /// new top-level file's row exists before its verdict lands.
-    pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>) {
-        if !self.enqueue_artifacts(artifacts, Vec::new()) {
-            tracing::error!("upload: could not queue artifacts for hopper");
+    /// new top-level file's row exists before its verdict lands. Each upload
+    /// names `origin` as who it is on behalf of.
+    pub fn submit_artifacts(&self, artifacts: Vec<UploadArtifact>, origin: Option<&Origin>) {
+        if !self.enqueue_artifacts(stamp(artifacts, origin), Vec::new()) {
+            tracing::error!(
+                origin = origin.map(Origin::as_str),
+                "upload: could not queue artifacts for hopper"
+            );
         }
     }
 
@@ -547,17 +564,20 @@ impl Uploader {
     /// verdict is ready, while this uploader may still be waiting behind other
     /// jobs. Keeping an independent on-disk copy makes the handoff reliable
     /// without retaining a potentially large upload in memory or reading it
-    /// before `/v1/intake/held` says hopper needs it.
+    /// before `/v1/intake/held` says hopper needs it. `origin` is staged with
+    /// each artifact and sent with its upload.
     ///
     /// # Errors
     /// Returns an error when staging fails or the uploader has stopped.
     pub fn submit_artifacts_durable(
         &self,
-        mut artifacts: Vec<UploadArtifact>,
+        artifacts: Vec<UploadArtifact>,
+        origin: Option<&Origin>,
     ) -> Result<(), StageError> {
         if artifacts.is_empty() {
             return Ok(());
         }
+        let mut artifacts = stamp(artifacts, origin);
 
         let staging = tempfile::Builder::new()
             .prefix("scan-upload-")
@@ -593,7 +613,8 @@ impl Uploader {
     /// Persist one already-built artifact from bytes supplied by the caller,
     /// then queue it for reconciliation. This is used when Scan has a local
     /// verdict and can answer immediately, but Hopper may not yet have the
-    /// artifact row that the verdict belongs to.
+    /// artifact row that the verdict belongs to. `origin` is staged with the
+    /// artifact and sent with its upload.
     ///
     /// # Errors
     /// Returns an error when staging fails or the uploader has stopped.
@@ -601,7 +622,9 @@ impl Uploader {
         &self,
         mut artifact: UploadArtifact,
         bytes: &[u8],
+        origin: Option<&Origin>,
     ) -> Result<(), StageError> {
+        artifact.origin = origin.cloned();
         let staging = tempfile::Builder::new()
             .prefix("scan-upload-")
             .tempdir()
@@ -622,18 +645,27 @@ impl Uploader {
     /// bytes (only if hopper lacks them) + provenance, then each dependency's
     /// verdict. Submit after the root [`Self::submit_artifacts`] and before the root
     /// [`Self::submit`] so the dependencies' rows exist before any verdict — the root's
-    /// or their own — lands.
+    /// or their own — lands. Each dependency's upload names `origin`: the
+    /// request that fetched it is what brought it to hopper.
     pub fn submit_dependencies(
         &self,
         deps: Vec<crate::engine::DepResult>,
         version: &str,
         analyzed_at: &str,
+        origin: Option<&Origin>,
     ) {
         if deps.is_empty() {
             return;
         }
         let job = Job::Dependencies {
-            deps: prepare_dependencies(&self.worker_name, deps, version, analyzed_at, &self.tally),
+            deps: prepare_dependencies(
+                &self.worker_name,
+                deps,
+                version,
+                analyzed_at,
+                origin,
+                &self.tally,
+            ),
         };
         if let Err(Job::Dependencies { deps, .. }) = self.enqueue(job) {
             self.tally.failed.fetch_add(
@@ -1046,6 +1078,7 @@ impl Hopper {
         } else {
             "provenance backfill"
         };
+        let origin = art.origin.as_ref().map(Origin::as_str);
         let mut retry_after = None;
         for (attempt, timeout) in UPLOAD_ATTEMPT_TIMEOUTS.into_iter().enumerate() {
             if attempt > 0 {
@@ -1058,13 +1091,16 @@ impl Hopper {
                     return false;
                 }
             };
-            let request = bearer(self.http.post(&self.upload), self.token)
+            let mut request = bearer(self.http.post(&self.upload), self.token)
                 .timeout(timeout)
                 .multipart(form);
+            if let Some(origin) = &art.origin {
+                request = request.header(ORIGIN_HEADER, origin.as_str());
+            }
             retry_after = None;
             match request.send() {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::info!(sha256 = %art.sha256, kind, file = %art.filename, size = art.size, "upload: stored on hopper");
+                    tracing::info!(sha256 = %art.sha256, kind, file = %art.filename, size = art.size, origin, "upload: stored on hopper");
                     return true;
                 }
                 Ok(resp) => {
@@ -1074,6 +1110,7 @@ impl Hopper {
                         tracing::error!(
                             sha256 = %art.sha256,
                             kind,
+                            origin,
                             %status,
                             body = %body_excerpt(&body),
                             provenance = %body_excerpt(&String::from_utf8_lossy(&art.sidecar)),
@@ -1089,7 +1126,7 @@ impl Hopper {
                 }
             }
         }
-        tracing::error!(sha256 = %art.sha256, kind, attempts = UPLOAD_ATTEMPT_TIMEOUTS.len(), "upload: failed to write artifact to hopper; giving up after retries");
+        tracing::error!(sha256 = %art.sha256, kind, origin, attempts = UPLOAD_ATTEMPT_TIMEOUTS.len(), "upload: failed to write artifact to hopper; giving up after retries");
         false
     }
 
@@ -1191,6 +1228,14 @@ fn cleanup_upload_dirs(dirs: Vec<PathBuf>) {
     }
 }
 
+/// `artifacts`, each naming `origin` as who its upload is on behalf of.
+fn stamp(mut artifacts: Vec<UploadArtifact>, origin: Option<&Origin>) -> Vec<UploadArtifact> {
+    for artifact in &mut artifacts {
+        artifact.origin = origin.cloned();
+    }
+    artifacts
+}
+
 /// Mirror a result's fetched dependencies into a hopper instance from a caller
 /// that has no [`Uploader`] (a pull-based queue worker). Dedups within this call,
 /// and reconciles bytes + provenance before posting each verdict. Best-effort:
@@ -1210,7 +1255,15 @@ pub fn sync_result_dependencies(
     }
     // Standalone reconciliation: nothing is watching the tally here.
     let hopper = Hopper::new(client.clone(), base_url, worker.to_owned(), Arc::default());
-    let deps = prepare_dependencies(&hopper.worker, deps, version, analyzed_at, &hopper.tally);
+    // A pull worker's dependencies were asked for by nobody: no origin.
+    let deps = prepare_dependencies(
+        &hopper.worker,
+        deps,
+        version,
+        analyzed_at,
+        None,
+        &hopper.tally,
+    );
     hopper.sync_prepared_dependencies(cache, &mut HashSet::new(), deps, &|job| {
         hopper.renew_encoded(&job.sha256, job.purl.as_deref(), job.body);
     });
@@ -1254,6 +1307,7 @@ fn dep_artifact(
             locator: dep.locator.clone(),
         },
         backfill: true,
+        origin: None,
     })
 }
 

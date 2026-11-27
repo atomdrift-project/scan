@@ -17,7 +17,7 @@ use super::flight::{Flight, FlightKey, Outcome};
 use super::{AnalysisOutcome, AnalysisPermit, AppState, InFlightRequest, RequestGuard};
 use crate::analysis::{Analysis, ModelResources, RequestPhase};
 use crate::engine::{HopperRoute, ScanResult};
-use crate::upload::Uploader;
+use crate::upload::{Origin, Uploader};
 
 /// Request-scoped traversal and storage behavior.
 #[derive(Clone, Copy)]
@@ -134,12 +134,17 @@ fn acquire(state: &AppState) -> Result<AnalysisPermit, ApiError> {
 ///
 /// The analysis is server-owned work, not part of the request: the leader
 /// hanging up does not abandon its followers, and shutdown drains it.
+///
+/// `origin` is who the leader asked on behalf of; every artifact the analysis
+/// files in hopper names it. A follower's origin is not recorded: the bytes
+/// are filed once, for whoever asked first.
 pub(super) fn lead(
     state: &Arc<AppState>,
     request_id: u64,
     flight: &Arc<Flight>,
     job: Job,
     follow: RequestFollow,
+    origin: Option<Origin>,
 ) {
     let publisher = state.flights.publisher(flight);
     let (resources, permit) = match admit(state, request_id, flight.key()) {
@@ -151,6 +156,7 @@ pub(super) fn lead(
         request_id,
         flight: Arc::clone(flight),
         follow,
+        origin,
     };
     state.tasks.spawn(async move {
         let outcome = leader.run(job, resources, permit).await;
@@ -164,6 +170,7 @@ struct Leader {
     request_id: u64,
     flight: Arc<Flight>,
     follow: RequestFollow,
+    origin: Option<Origin>,
 }
 
 impl Leader {
@@ -182,6 +189,7 @@ impl Leader {
         let slow_rule_ms = self.state.config.slow_rule_ms;
         let policy = self.follow.policy;
         let uploader = self.state.uploader.clone();
+        let origin = self.origin.clone();
         let corpus = self.state.corpus.clone();
         // Captured here, on the runtime, for the one corpus call the PURL
         // fallback makes from the blocking thread.
@@ -215,20 +223,23 @@ impl Leader {
                 deps_for_upload: uploader.is_some(),
                 ..Analysis::new("", &resources, slow_rule_ms)
             };
+            let hopper = uploader
+                .as_deref()
+                .map(|uploader| (uploader, origin.as_ref()));
             match job {
                 Job::Bytes { filename, bytes } => {
                     let upload = Upload::stage(&filename, &bytes)
                         .map_err(|e| anyhow::anyhow!("staging the upload: {e}"))?;
                     drop(bytes);
-                    classify_upload(&upload, analysis, uploader.as_deref())
+                    classify_upload(&upload, analysis, hopper)
                 }
                 Job::Purl(purl) => classify_purl(
                     &purl,
                     analysis,
-                    uploader.as_deref(),
+                    hopper,
                     corpus.as_deref().map(|corpus| (corpus, &runtime)),
                 ),
-                Job::Url(url) => classify_url(&url, analysis, uploader.as_deref()),
+                Job::Url(url) => classify_url(&url, analysis, hopper),
             }
         };
         let outcome = RequestGuard::new(&self.state, self.request_id, entry, permit)
@@ -258,10 +269,11 @@ impl Leader {
         let purl = self.flight.key().purl().map(str::to_owned);
         let url = self.flight.key().url().map(str::to_owned);
         let refresh = self.follow.refresh;
+        let origin = self.origin.clone();
         let filed = tokio::task::spawn_blocking(move || {
             index_verdict(&result, purl.as_deref(), url.as_deref(), refresh);
             if let Some(uploader) = &state.uploader {
-                renew(uploader, &mut result, purl);
+                renew(uploader, &mut result, purl, origin.as_ref());
             }
             result
         })
@@ -396,11 +408,16 @@ pub(super) async fn index_query<T: Send + 'static>(
 /// Fetched dependencies go first, so each one's row exists before its own
 /// verdict lands, then the result — under its own sha256, unless
 /// `classify_purl`'s registry fallback redirected or suppressed it (see
-/// [`HopperRoute`]).
-fn renew(uploader: &Uploader, result: &mut ScanResult, purl: Option<String>) {
+/// [`HopperRoute`]). Each dependency's upload names `origin`.
+fn renew(
+    uploader: &Uploader,
+    result: &mut ScanResult,
+    purl: Option<String>,
+    origin: Option<&Origin>,
+) {
     let deps = std::mem::take(&mut result.dependency_results);
     if !deps.is_empty() {
-        uploader.submit_dependencies(deps, &result.version, &result.analyzed_at);
+        uploader.submit_dependencies(deps, &result.version, &result.analyzed_at, origin);
     }
     let sha = match &result.hopper_route {
         HopperRoute::Suppress => return,
@@ -417,10 +434,13 @@ fn renew(uploader: &Uploader, result: &mut ScanResult, purl: Option<String>) {
 /// its queue; and durably, because the caller deletes the staged directory,
 /// on this same blocking thread, once this returns. A failure to stage the
 /// offer is logged: the verdict stands.
+///
+/// `hopper` is the uploader and who the request is on behalf of, when there
+/// is a hopper to offer to.
 fn classify_upload(
     upload: &Upload,
     template: Analysis<'_>,
-    uploader: Option<&Uploader>,
+    hopper: Option<(&Uploader, Option<&Origin>)>,
 ) -> anyhow::Result<ScanResult> {
     let result = crate::analysis::classify_file(
         &upload.path,
@@ -429,20 +449,23 @@ fn classify_upload(
             ..template
         },
     )?;
-    if let Some(uploader) = uploader
-        && let Err(error) =
-            uploader.submit_artifacts_durable(crate::engine::collect_upload_artifacts(
+    if let Some((uploader, origin)) = hopper
+        && let Err(error) = uploader.submit_artifacts_durable(
+            crate::engine::collect_upload_artifacts(
                 &upload.path,
                 &result.sha256,
                 result.size_bytes,
                 crate::engine::upload_collector(),
                 None,
                 None,
-            ))
+            ),
+            origin,
+        )
     {
         tracing::error!(
             sha256 = %result.sha256,
             file = %upload.filename,
+            origin = origin.map(Origin::as_str),
             %error,
             "upload: could not stage artifact for hopper; the verdict stands",
         );
@@ -458,7 +481,7 @@ fn classify_upload(
 fn classify_purl(
     purl: &str,
     template: Analysis<'_>,
-    uploader: Option<&Uploader>,
+    hopper: Option<(&Uploader, Option<&Origin>)>,
     corpus: Option<(&Corpus, &Handle)>,
 ) -> anyhow::Result<ScanResult> {
     use fletch::RefLocator;
@@ -521,7 +544,7 @@ fn classify_purl(
         }
         mark("purl:registry-document");
         let hopper_route =
-            offer_registry_fallback(corpus, uploader, purl, &name, registry_provenance.as_ref());
+            offer_registry_fallback(corpus, hopper, purl, &name, registry_provenance.as_ref());
         let mut result = crate::analysis::classify_bytes(
             bytes::Bytes::from(bytes),
             Analysis {
@@ -554,15 +577,18 @@ fn classify_purl(
     // never ingested, so the verdict alone lands nowhere either — queuing
     // artifacts then result keeps the row unclaimable for only the width of
     // the queue, not the width of an analysis.
-    if let Some(uploader) = uploader {
-        uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
-            Path::new(&name),
-            &result.sha256,
-            result.size_bytes,
-            crate::engine::upload_collector(),
-            registry_provenance.as_ref(),
-            Some(&rec),
-        ));
+    if let Some((uploader, origin)) = hopper {
+        uploader.submit_artifacts(
+            crate::engine::collect_upload_artifacts(
+                Path::new(&name),
+                &result.sha256,
+                result.size_bytes,
+                crate::engine::upload_collector(),
+                registry_provenance.as_ref(),
+                Some(&rec),
+            ),
+            origin,
+        );
     }
     Ok(result)
 }
@@ -572,7 +598,7 @@ fn classify_purl(
 fn classify_url(
     url: &str,
     template: Analysis<'_>,
-    uploader: Option<&Uploader>,
+    hopper: Option<(&Uploader, Option<&Origin>)>,
 ) -> anyhow::Result<ScanResult> {
     use fletch::RefLocator;
 
@@ -591,15 +617,18 @@ fn classify_url(
         },
     )?;
     // See `classify_purl` on why this waits for the verdict.
-    if let Some(uploader) = uploader {
-        uploader.submit_artifacts(crate::engine::collect_upload_artifacts(
-            Path::new(&name),
-            &result.sha256,
-            result.size_bytes,
-            crate::engine::upload_collector(),
-            None,
-            Some(&rec),
-        ));
+    if let Some((uploader, origin)) = hopper {
+        uploader.submit_artifacts(
+            crate::engine::collect_upload_artifacts(
+                Path::new(&name),
+                &result.sha256,
+                result.size_bytes,
+                crate::engine::upload_collector(),
+                None,
+                Some(&rec),
+            ),
+            origin,
+        );
     }
     Ok(result)
 }
@@ -624,7 +653,7 @@ fn classify_url(
 /// handle it was given.
 fn offer_registry_fallback(
     corpus: Option<(&Corpus, &Handle)>,
-    uploader: Option<&Uploader>,
+    hopper: Option<(&Uploader, Option<&Origin>)>,
     purl: &str,
     name: &str,
     registry_provenance: Option<&crate::provenance::RegistryProvenance>,
@@ -640,11 +669,11 @@ fn offer_registry_fallback(
     let Some(real_sha) = record.sha256 else {
         return HopperRoute::Suppress;
     };
-    if let Some(uploader) = uploader
+    if let Some((uploader, origin)) = hopper
         && let Some(artifact) =
             crate::engine::registry_fallback_artifact(name, &real_sha, purl, registry_provenance)
     {
-        uploader.submit_artifacts(vec![artifact]);
+        uploader.submit_artifacts(vec![artifact], origin);
     }
     HopperRoute::Redirect(real_sha)
 }

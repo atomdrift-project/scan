@@ -129,7 +129,7 @@ check-cargo:
 # later one reuses it until `make pgo-train` runs again; it cuts CPU and wall
 # time by roughly 6-10% with identical findings. The profile must
 # come from an instrumented build of the SAME cargo profile it is applied to
-# -- a thin-LTO profile applied to the fat-LTO build measured slower than no
+# -- a thin-LTO profile applied to a fat-LTO build measured slower than no
 # profile at all -- so each cargo profile keeps its own file,
 # $(PGO_DIR)/atomscan-<profile>.profdata (untracked: ~100 MB, host-generated).
 #
@@ -191,8 +191,8 @@ endef
 release: check-cargo $(OUT_DIR)
 	$(call pgo_build,release)
 
-# Fat LTO + single codegen unit. Multi-minute link, marginal runtime win
-# over the default release profile. Use for container/tarball builds.
+# Thin LTO + one codegen unit per crate: a few percent faster than the
+# default release profile, at about 1.7x its build time. What releases ship.
 release-lto: check-cargo $(OUT_DIR)
 	$(call pgo_build,release-lto)
 
