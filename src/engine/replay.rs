@@ -32,6 +32,7 @@
 //! Only a settled scan is kept (see `ClassifiedReport::settled`): never one
 //! cut short by a deadline or built on a fetch that failed by accident.
 
+use std::borrow::Cow;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -189,11 +190,12 @@ impl Replay {
         if self.label == label {
             return Some(self);
         }
-        let mentions = self.mentions(format).filter(|_| plain(label))?;
+        let mentions = self.mentions(format).filter(|_| plain(label, format))?;
         if let Some(output) = &mut self.output {
+            let (was, is) = (spelled(&self.label, format), spelled(label, format));
             // Last first, so the offsets before it still hold.
             for at in mentions.into_iter().rev() {
-                output.replace_range(at..at + self.label.len(), label);
+                output.replace_range(at..at + was.len(), &is);
             }
         }
         self.label = label.to_string();
@@ -208,11 +210,11 @@ impl Replay {
         let name = Path::new(&self.label)
             .file_name()
             .and_then(|name| name.to_str())
-            .filter(|name| plain(&self.label) && !self.notes.contains(name))?;
+            .filter(|name| plain(&self.label, format) && !self.notes.contains(name))?;
         mentions(
             self.output.as_deref().unwrap_or_default(),
-            &self.label,
-            name,
+            &spelled(&self.label, format),
+            &spelled(name, format),
             format,
         )
     }
@@ -262,7 +264,8 @@ impl Replay {
 }
 
 /// The offset of each mention of the path `label`, whose file name is `name`,
-/// in `output` written as `format`. `None` when `name` is spelled anywhere
+/// in `output` written as `format`, both [`spelled`] as that output spells
+/// them. `None` when `name` is spelled anywhere
 /// else: output that cannot be shown under another name.
 ///
 /// A renderer names the file by its path, whole. A decision carries it as
@@ -291,13 +294,29 @@ fn mentions(output: &str, label: &str, name: &str, format: OutputFormat) -> Opti
     (whole && output.matches(name).count() == found.len()).then_some(found)
 }
 
-/// Whether `label` is written the same in every output: a terminal shows it
-/// unescaped, and so does a JSON string.
-fn plain(label: &str) -> bool {
+/// Whether output written as `format` spells `label` as [`spelled`] does. A
+/// terminal escapes every [`tty_hostile`](crate::output::tty_hostile)
+/// character, so a label holding one is never spelled as it is. A JSON
+/// string escapes only `"`, `\` and control characters, so the rest is
+/// exact there. The text formats are not known to leave `"` and `\` alone,
+/// so there a label holding either stays with its path.
+fn plain(label: &str, format: OutputFormat) -> bool {
     !label.is_empty()
-        && !label
-            .chars()
-            .any(|c| crate::output::tty_hostile(c) || matches!(c, '"' | '\\'))
+        && !label.chars().any(|c| {
+            crate::output::tty_hostile(c)
+                || (format != OutputFormat::Json && matches!(c, '"' | '\\'))
+        })
+}
+
+/// `text` as output written as `format` spells it: escaped as inside a JSON
+/// string for a decision, as it is anywhere else. Only for [`plain`] text,
+/// which holds no control character for JSON to escape.
+fn spelled(text: &str, format: OutputFormat) -> Cow<'_, str> {
+    if format == OutputFormat::Json && text.contains(['"', '\\']) {
+        Cow::Owned(text.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 fn now() -> u64 {
@@ -488,6 +507,40 @@ mod tests {
         );
     }
 
+    /// A decision spells a path as a JSON string does: a Windows path's
+    /// separators and any quote are escaped, both where the first path is
+    /// found and where the copy's is written.
+    #[test]
+    fn a_copy_of_an_escaped_path_is_shown_under_its_own_name() {
+        let decision = |label: &str| {
+            let line = serde_json::json!({
+                "path": label,
+                "findings": [{"file": label}, {"file": format!("{label}!!App.app/main.js")}],
+            });
+            format!("{line}\n")
+        };
+        for (first, copy) in [
+            (
+                r"C:\Users\me\Downloads\setup.exe",
+                r"C:\Users\me\Desktop\setup (1).exe",
+            ),
+            ("/dl/say \"hi\".sh", "/dl/say \"hi\" (1).sh"),
+        ] {
+            let kept = shown(first, "", Some(&decision(first)));
+            let copied = kept
+                .shown_as(copy, OutputFormat::Json)
+                .expect("the same bytes");
+            assert_eq!(copied.output, Some(decision(copy)));
+            assert_eq!(copied.label, copy);
+        }
+        for text in [r"C:\dl\a.dmg", "/dl/a\"b\".dmg", "/dl/a.dmg"] {
+            let quoted = serde_json::to_string(text).expect("a string");
+            let inner = quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"'));
+            assert_eq!(Some(spelled(text, OutputFormat::Json).as_ref()), inner);
+            assert_eq!(spelled(text, OutputFormat::Terminal), text);
+        }
+    }
+
     /// Output that does not name the file is the same for every copy: a
     /// benign file a terminal scan shows nothing of, the full document whose
     /// paths start at the archive's root.
@@ -571,7 +624,7 @@ mod tests {
                 Terminal,
                 shown(first, "  fetched for installer.dmg\n", None),
             ),
-            // A path a terminal or a JSON string writes otherwise.
+            // A path a terminal writes otherwise, or a text format may.
             (
                 Terminal,
                 shown(
@@ -580,7 +633,15 @@ mod tests {
                     Some("HOSTILE /dl/a\\u{1b}[2K.dmg\n"),
                 ),
             ),
-            (Json, shown("/dl/a\"b.dmg", "", None)),
+            (
+                Terminal,
+                shown(
+                    r"C:\dl\installer.dmg",
+                    "",
+                    Some("HOSTILE C:\\dl\\installer.dmg\n"),
+                ),
+            ),
+            (Tiny, shown("/dl/a\"b.dmg", "", None)),
             (Terminal, shown("", "", None)),
         ];
         for (format, kept) in bound {

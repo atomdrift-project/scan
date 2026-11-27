@@ -364,6 +364,11 @@ jobs:
   publish:
     name: publish
     needs: [verify, build-fast]
+    # Ship whatever the fast wave built. A macOS runner GitHub never hands
+    # out, or one platform's failing test, must not hold back every other
+    # platform: publish-assets names each missing target, the run still ends
+    # red, and a recovery dispatch with `-f target=<triple>` adds it later.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.build-fast.result != 'skipped' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Add `environment: release` here to gate the upload on a human approval.

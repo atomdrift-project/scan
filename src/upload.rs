@@ -709,9 +709,9 @@ impl Hopper {
         tally: Arc<Tally>,
     ) -> Self {
         // Every call here is a write (the held probe is a POST on the
-        // intake path), so all of them go to the primary: the last address
-        // `--hopper` names. A replica ahead of it serves reads; sending it
-        // writes only adds a hop, or a refusal when it runs no relay.
+        // intake path), so all of them go to the primary address chosen at
+        // startup. A replica serves reads; sending it writes only adds a hop,
+        // or a refusal when it runs no relay.
         let primary = worker_endpoint(hopper_url).unwrap_or_default();
         Self {
             http,

@@ -284,28 +284,46 @@ fn default_worker_name_is_valid_for_hopper() {
     assert!(name.chars().all(|c| c.is_ascii_graphic()));
 }
 
-/// Uploads are writes, so they go to the primary — the last `--hopper`
-/// address — and never to the replica ahead of it. A replica that cannot take
-/// a write (one running no relay, or an older build) answers with a refusal
-/// the uploader treats as final, which dropped every upload on a host that
-/// listed its replica first.
+/// Uploads are writes, so they go to the primary and never to the replica
+/// ahead of it. A replica that cannot take a write (one running no relay, or an
+/// older build) answers with a refusal the uploader treats as final, which
+/// dropped every upload on a host that listed its replica first. The replica is
+/// asked only what it is, once, and gets no write.
 #[test]
 fn writes_go_to_the_primary_not_the_replica() {
-    // Bound but never accepted: any request to the replica would connect
-    // here, which the accept() below catches.
     let replica = TcpListener::bind("127.0.0.1:0").expect("bind replica");
     let replica_addr = replica.local_addr().expect("replica address");
-    replica.set_nonblocking(true).expect("nonblocking replica");
+    let replica_server = serve_one(
+        replica,
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+          Content-Length: 16\r\nConnection: close\r\n\r\n{\"replica\":true}",
+    );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("server address");
-    let server = serve_one(
-        listener,
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-          Content-Length: 16\r\nConnection: close\r\n\r\n{\"known\":[\"aa\"]}",
-    );
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+              Content-Length: 17\r\nConnection: close\r\n\r\n{\"replica\":false}"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+              Content-Length: 16\r\nConnection: close\r\n\r\n{\"known\":[\"aa\"]}"[..],
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            requests.push(read_request(&mut stream));
+            stream.write_all(response).expect("respond");
+        }
+        requests
+    });
     let hopper = hopper_at(&format!("http://{replica_addr},http://{addr}"));
     let known = hopper.known(&["aa", "bb"]);
-    server.join().expect("server thread");
+    let requests = server.join().expect("server thread");
+    let probe =
+        String::from_utf8_lossy(&replica_server.join().expect("replica thread")).into_owned();
+    assert!(probe.starts_with("GET /_/replica "), "{probe}");
+    assert!(
+        String::from_utf8_lossy(&requests[0]).starts_with("GET /_/replica "),
+        "the primary was not asked its role first"
+    );
     assert!(known.contains("aa"), "the primary's answer was discarded");
     assert!(!known.contains("bb"), "hopper did not claim to hold bb");
     assert!(
@@ -318,11 +336,6 @@ fn writes_go_to_the_primary_not_the_replica() {
         "{}",
         hopper.result
     );
-    match replica.accept() {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        Ok(_) => panic!("a write reached the replica"),
-        Err(e) => panic!("unexpected accept error: {e}"),
-    }
 }
 
 #[test]

@@ -41,7 +41,7 @@ on:
       pgo:
         description: >-
           Profile-guided optimization for the targets built on their own
-          architecture (Linux, macOS arm64, Windows): an instrumented build
+          architecture (x86_64 Linux, macOS arm64, Windows): an instrumented build
           scans the public rules testdata and the real build uses the
           profile, as `make release PGO=1` does. Measured 2026-11-01: CPU
           -7% to -10% on scan corpora. Training runs in its own job (see
@@ -108,11 +108,16 @@ jobs:
   # read. The building jobs receive nothing from it but the merged .profdata.
   # The cargo cache is restored, never saved, so this job cannot poison what
   # the signing jobs restore. A failure here only costs the profile.
+  #
+  # aarch64-unknown-linux-gnu is not trained: on ubuntu-24.04-arm the
+  # instrumented fat-LTO link of atomscan takes the runner down ("The runner
+  # has received a shutdown signal") every time it has been tried (v3.0.0-beta.1
+  # and beta.3), so it only ever cost twenty minutes and a red job.
   pgo-train:
     name: PGO profile ${{ matrix.target }}
-    if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
+    if: ${{ inputs.pgo && (inputs.wave == '' || inputs.wave == 'fast') && (inputs.target == '' || contains(' x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc ', format(' {0} ', inputs.target))) }}
     # Same runner image as the job that applies the profile.
-    runs-on: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-24.04-arm' || matrix.target == 'aarch64-apple-darwin' && 'macos-26' || matrix.target == 'x86_64-pc-windows-msvc' && 'windows-2025' || matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'ubuntu-22.04' }}
+    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-26' || matrix.target == 'x86_64-pc-windows-msvc' && 'windows-2025' || matrix.target == 'aarch64-pc-windows-msvc' && 'windows-11-arm' || 'ubuntu-22.04' }}
     timeout-minutes: 120
     continue-on-error: true
     permissions:
@@ -121,7 +126,7 @@ jobs:
       fail-fast: false
       matrix:
         # Windows ARM64 trains only when dispatched by name, like its build.
-        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-pc-windows-msvc"]') }}
+        target: ${{ fromJSON(inputs.target != '' && format('["{0}"]', inputs.target) || '["x86_64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-pc-windows-msvc"]') }}
     defaults:
       run:
         shell: bash
@@ -202,6 +207,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             native: true
+            pgo: true
             test: true
 
           - target: aarch64-unknown-linux-gnu
@@ -211,6 +217,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-26
             native: true
+            pgo: true
             test: true
 
           # Cross-built on the arm64 runner: the macOS SDK carries both slices,
@@ -261,7 +268,7 @@ jobs:
       # hash-mismatch noise from it and nothing else.
       - name: Download PGO profile
         id: pgo
-        if: inputs.pgo && matrix.native
+        if: inputs.pgo && matrix.pgo
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -269,7 +276,7 @@ jobs:
           path: ${{ runner.temp }}/pgo
 
       - name: Use PGO profile
-        if: inputs.pgo && matrix.native
+        if: inputs.pgo && matrix.pgo
         env:
           PROFILE: ${{ inputs.profile }}
         run: |
@@ -597,47 +604,6 @@ jobs:
         with:
           name: atomscan-${{ matrix.target }}
           path: atomscan-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
-  # The notices every release archive carries: the project's LICENSE and
-  # THIRD_PARTY_LICENSES, the license texts of everything linked into the
-  # binary (see about.toml). One file covers every target. publish-assets adds
-  # both to each archive, so the build jobs package the binary alone. Runs in
-  # CI too, so a dependency under an unaccepted license fails before a release.
-  notices:
-    name: license notices
-    if: ${{ inputs.wave == '' || inputs.wave == 'fast' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      CARGO_ABOUT_VERSION: "0.9.3"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Install toolchain and cargo-about
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
-          rustup default "$RUST_TOOLCHAIN"
-          cargo install --locked "cargo-about@$CARGO_ABOUT_VERSION"
-
-      - name: Generate THIRD_PARTY_LICENSES
-        run: |
-          set -eu
-          mkdir notices
-          cargo about generate about.hbs -o notices/THIRD_PARTY_LICENSES
-          cp LICENSE notices/LICENSE
-          grep -q 'UnRAR source code may be used' notices/THIRD_PARTY_LICENSES
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-notices
-          path: notices
           if-no-files-found: error
           retention-days: 14
 

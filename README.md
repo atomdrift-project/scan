@@ -228,12 +228,11 @@ needs a good match. Slow mode continues to analyze all inputs.
 
 Atomdrift Scan is available under the [Apache License 2.0](LICENSE).
 
-Release binaries also bundle third-party code under its own licenses, listed in
-the `THIRD_PARTY_LICENSES` file inside every release archive. That includes
-UnRAR (compiled in through the `unrar-ng-sys` crate), which is distributed
-under the UnRAR license: its source may be used to handle RAR archives, but
-not to develop a RAR-compatible archiver or to re-create the RAR compression
-algorithm.
+Release binaries also bundle third-party code under its own licenses. That
+includes UnRAR (compiled in through the `unrar-ng-sys` crate), which is
+distributed under the UnRAR license: its source may be used to handle RAR
+archives, but not to develop a RAR-compatible archiver or to re-create the RAR
+compression algorithm.
 
 ## Contributing
 

@@ -7,8 +7,9 @@
 //! server's corpus reader answers lookups the local index cannot; all three
 //! reach hopper through what is here.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -72,9 +73,10 @@ pub fn http() -> Option<&'static reqwest::blocking::Client> {
 /// Split `--hopper` into the endpoints to try, in preference order.
 ///
 /// One address is the ordinary case. Several, comma-separated, name the same
-/// hopper reached two ways: put the replica first and the primary last, and a
-/// replica outage costs a lookup a retry rather than an answer. Only reads walk
-/// this list; every write goes to the primary alone ([`worker_endpoint`]).
+/// hopper reached more than one way: put the replica first and the primary
+/// behind it, and a replica outage costs a lookup a retry rather than an
+/// answer. Only reads walk this list; writes go to one primary address, chosen
+/// once at startup ([`worker_endpoint`]).
 #[must_use]
 pub fn endpoints(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -116,19 +118,111 @@ pub fn warn_if_cleartext(raw: &str) {
     }
 }
 
-/// The one address writes go to: the primary, which [`endpoints`] puts last.
+/// The one address writes go to: the first `--hopper` address that says it is
+/// the primary.
 ///
 /// Queue polls, results, renewals and uploads all land here. A replica serves
 /// reads; a write sent to it either costs an extra hop through its relay or,
 /// without one, is refused outright, and it refuses the work queue even with a
-/// relay. So there is nothing to fail over to: the replica is not another way to
-/// reach the same answer, the primary is the only one.
+/// relay. So writes skip every replica in the list.
 ///
-/// Returns `None` for an empty or blank `--hopper`, which is how the deploy
-/// says "do not file results anywhere".
+/// The list may name the primary more than one way, a LAN address ahead of a
+/// public one, and writes then take the first that answers. That is decided
+/// once, at the first call for this list: each address is asked
+/// `GET /_/replica` in turn, so one that cannot be reached costs a single
+/// `ROLE_PROBE_TIMEOUT` at startup rather than a timeout on every write. The
+/// choice holds until the process restarts. When no address answers as the
+/// primary (hopper is down or still starting), writes go to the last address,
+/// the primary by the ordering [`endpoints`] asks for.
+///
+/// A single address is used as given, without asking. Returns `None` for an
+/// empty or blank `--hopper`, which is how the deploy says "do not file results
+/// anywhere".
 #[must_use]
 pub fn worker_endpoint(raw: &str) -> Option<String> {
-    endpoints(raw).pop()
+    let mut endpoints = endpoints(raw);
+    if endpoints.len() <= 1 {
+        return endpoints.pop();
+    }
+    static CHOSEN: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+    // Held across the probe so concurrent first callers ask once, not each.
+    let mut chosen = CHOSEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(primary) = chosen.get(raw) {
+        return Some(primary.clone());
+    }
+    // On a thread of its own: the blocking client panics when it is built or
+    // used on an async runtime's thread, and a caller may be on one.
+    let primary = std::thread::scope(|s| s.spawn(|| choose_primary(&endpoints, probe_role)).join())
+        .ok()
+        .or_else(|| endpoints.last().cloned())?;
+    chosen.insert(raw.to_owned(), primary.clone());
+    drop(chosen);
+    Some(primary)
+}
+
+/// How long the startup check may spend asking one address what it is.
+const ROLE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What one `--hopper` address said it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Role {
+    Primary,
+    Replica,
+    /// No answer that names a role: unreachable, refused, or still starting.
+    Unknown(String),
+}
+
+/// The first of `endpoints` that `role` calls the primary, else the last.
+fn choose_primary(endpoints: &[String], role: impl Fn(&str) -> Role) -> String {
+    for endpoint in endpoints {
+        match role(endpoint) {
+            Role::Primary => {
+                tracing::info!(hopper = %endpoint, "hopper writes go to this address");
+                return endpoint.clone();
+            }
+            Role::Replica => {
+                tracing::info!(hopper = %endpoint, "hopper address is a replica; writes skip it");
+            }
+            Role::Unknown(reason) => {
+                tracing::warn!(hopper = %endpoint, reason = %reason, "hopper address did not say it is the primary; writes skip it");
+            }
+        }
+    }
+    let fallback = endpoints.last().cloned().unwrap_or_default();
+    tracing::warn!(
+        hopper = %fallback,
+        "no hopper address answered as the primary; writes go to the last address until restart",
+    );
+    fallback
+}
+
+/// Ask `endpoint` whether it is a replica.
+fn probe_role(endpoint: &str) -> Role {
+    #[derive(serde::Deserialize)]
+    struct Status {
+        replica: bool,
+    }
+    let Some(http) = http() else {
+        return Role::Unknown("no HTTP client".into());
+    };
+    let request = http
+        .get(format!("{endpoint}/_/replica"))
+        .timeout(ROLE_PROBE_TIMEOUT);
+    let response = match bearer(request, token()).send() {
+        Ok(response) => response,
+        Err(e) => return Role::Unknown(error_chain(&e)),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Role::Unknown(format!("HTTP {status}"));
+    }
+    match response.json::<Status>() {
+        Ok(Status { replica: true }) => Role::Replica,
+        Ok(Status { replica: false }) => Role::Primary,
+        Err(e) => Role::Unknown(error_chain(&e)),
+    }
 }
 
 /// Point this process at `hopper_url`: report where the bearer token came
@@ -361,12 +455,12 @@ pub struct Finding {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
-    /// `--hopper` may name the same corpus twice: the replica first, the
-    /// primary behind it. Reads and writes take the same list, because routing
-    /// them apart is a topology this process would have to know and hopper's
-    /// write relay exists so that it does not.
+    /// `--hopper` may name the same corpus more than once: the replica first,
+    /// the primary behind it. Reads walk the list in order.
     #[test]
     fn hopper_endpoints_are_a_preference_order() {
         assert_eq!(endpoints("https://ro/"), vec!["https://ro"]);
@@ -379,21 +473,12 @@ mod tests {
     }
 
     /// Queue polling is the exception: hopper refuses `/v1/work/next` on a replica
-    /// with a 403 whether or not its relay is on, so a worker takes the primary
-    /// — the last address — and nothing else. Handing it the raw string would
-    /// put the commas inside a hostname and fail every poll with
-    /// `invalid dns name`.
+    /// with a 403 whether or not its relay is on, so a worker takes one primary
+    /// address and nothing else. Handing it the raw string would put the commas
+    /// inside a hostname and fail every poll with `invalid dns name`.
     #[test]
-    fn a_worker_polls_the_primary_only() {
-        assert_eq!(
-            worker_endpoint("https://ro,https://rw").as_deref(),
-            Some("https://rw"),
-        );
-        assert_eq!(
-            worker_endpoint(" https://ro/ , https://rw/ ").as_deref(),
-            Some("https://rw"),
-        );
-        // The ordinary single-address case is unchanged.
+    fn a_worker_polls_one_address() {
+        // The ordinary single-address case is used as given, without asking.
         assert_eq!(
             worker_endpoint("https://rw/").as_deref(),
             Some("https://rw")
@@ -401,14 +486,102 @@ mod tests {
         // Nowhere to file results is a valid deploy, not an address.
         assert_eq!(worker_endpoint(""), None);
         assert_eq!(worker_endpoint(" , , "), None);
-        // Whatever a worker polls, it is one address — never a list.
-        for raw in ["https://ro,https://rw", "https://rw", " a , b , c "] {
-            let picked = worker_endpoint(raw).expect("an address");
-            assert!(
-                !picked.contains(','),
-                "a worker was handed a list: {picked}"
-            );
+    }
+
+    fn roles<'a>(table: &'a [(&'a str, Role)]) -> impl Fn(&str) -> Role + 'a {
+        move |endpoint| {
+            table
+                .iter()
+                .find(|(name, _)| *name == endpoint)
+                .map_or(Role::Unknown("not in the table".into()), |(_, role)| {
+                    role.clone()
+                })
         }
+    }
+
+    fn list(raw: &str) -> Vec<String> {
+        endpoints(raw)
+    }
+
+    /// Public replica first, then the primary on the LAN, then the same
+    /// primary through the public tunnel: writes take the LAN.
+    #[test]
+    fn writes_take_the_first_address_that_is_the_primary() {
+        let table = [
+            ("https://ro", Role::Replica),
+            ("http://lan", Role::Primary),
+            ("https://rw", Role::Primary),
+        ];
+        assert_eq!(
+            choose_primary(&list("https://ro,http://lan,https://rw"), roles(&table)),
+            "http://lan",
+        );
+    }
+
+    /// The LAN path is down at startup: writes take the public address.
+    #[test]
+    fn an_unreachable_primary_address_falls_through_to_the_next() {
+        let table = [
+            ("https://ro", Role::Replica),
+            ("http://lan", Role::Unknown("connection refused".into())),
+            ("https://rw", Role::Primary),
+        ];
+        assert_eq!(
+            choose_primary(&list("https://ro,http://lan,https://rw"), roles(&table)),
+            "https://rw",
+        );
+    }
+
+    /// Hopper down or starting: nothing answers, and writes go to the last
+    /// address, as they did before the check.
+    #[test]
+    fn with_no_answer_writes_go_to_the_last_address() {
+        let table = [("https://ro", Role::Replica)];
+        assert_eq!(
+            choose_primary(&list("https://ro,http://lan,https://rw"), roles(&table)),
+            "https://rw",
+        );
+    }
+
+    /// Answer every connection on `listener` with `body`, counting them.
+    fn answer_role(body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, asked)
+    }
+
+    /// End to end over HTTP: the replica and an unreachable address are
+    /// skipped, the primary is chosen, and a second call asks nobody.
+    #[test]
+    fn the_primary_is_found_once_per_process() {
+        let (replica, replica_asked) = answer_role(r#"{"replica":true,"lag_seconds":0}"#);
+        let (primary, primary_asked) = answer_role(r#"{"replica":false,"lag_seconds":null}"#);
+        // Bound then dropped: nothing listens there, so the probe is refused.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!("http://{}", listener.local_addr().expect("address"))
+        };
+        let raw = format!("{replica},{dead},{primary}");
+        assert_eq!(worker_endpoint(&raw), Some(primary.clone()));
+        assert_eq!(worker_endpoint(&raw), Some(primary));
+        assert_eq!(replica_asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(primary_asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// 408 and 429 ask to be retried; every other 4xx is final.

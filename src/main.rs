@@ -596,10 +596,11 @@ struct ServeArgs {
     ///
     /// Several addresses may be given, comma-separated, in preference order:
     /// put a read replica first and the primary behind it. Reads try them in
-    /// that order, and a retried write walks down the list, so a replica that
-    /// stops answering costs one attempt rather than a lost verdict.
+    /// that order. Writes go to the first address that says it is the
+    /// primary, asked once at startup, so the primary may be listed twice, a
+    /// LAN address ahead of a public one.
     ///
-    /// `--hopper https://hopper-replica.example.com,https://hopper.example.com`
+    /// `--hopper https://hopper-replica.example.com,http://hopper.lan:8081,https://hopper.example.com`
     ///
     /// Upload failures are reported as errors, but never make the scan
     /// fatal. Also settable via the `SCAN_HOPPER` env var. Authenticates
