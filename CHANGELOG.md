@@ -2,6 +2,36 @@
 
 All notable changes to Atomdrift Scan (atomscan, formerly litmus). Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.0.0-beta.4 (2026-11-27)
+
+### Features
+
+- breaking: `atomscan login` replaces the feed subcommand, and --feed now defaults to auto, the best your plan opens.
+- breaking: `--local` replaces --uplink and its upload mode; no Uplink, hopper, or off-machine LLM sees your files.
+- breaking: the environment variables are now SCAN_FEED, SCAN_LOCAL and `SCAN_TOKEN`; the ATOMDRIFT_ names are gone.
+- Large benign packages are no longer withheld from the LLM, because that is exactly where compromised releases hide.
+- The LLM sees bare line-and-category annotations beside source, so it reads the code instead of parroting our descriptions.
+- JSON verdicts carry `llm_admission`, recording what the LLM gate decided even when no LLM ran.
+- Workers without an LLM store the pending pass in hopper, so another host finishes it without reanalyzing.
+- serve forwards the `Atomdrift-Origin` header, so hopper records who really asked for each upload, not the last relay.
+- serve sends hopper writes to the first address that answers as primary, so a LAN path beats the tunnel.
+- serve's completion log now splits classify time into fetch, model, LLM, render and upload phases.
+
+### Fixes
+
+- A half-installed or mismatched model bundle is now reinstalled once, instead of failing every scan until someone notices.
+- A rate-limited registry drew 7,600 refusals a day from repeat lookups; misses are now remembered briefly.
+- Relabelled same-SHA copies mangled Windows paths and quotes in JSON output; they are escaped properly now.
+- One crafted file may now trigger 32 uncached fetches, not 100, and the overflow is recorded, never dropped.
+- Confidence percents now follow one log-scale curve, so a level reads the same whatever deploy level scanned it.
+- One platform's failed build no longer blocks a release; the rest ship and stragglers are added later.
+
+### Optimizations
+
+- Releases use thin LTO with PGO: as fast as fat LTO, without a 23 GB compiler process.
+- tree-sitter now allocates through jemalloc or mimalloc, so its memory is budgeted and returned like everything else.
+- The LLM payload drops column numbers and caps rows at 200 columns, without losing a single fixture grade.
+
 ## 3.0.0-beta.3 (2026-11-23)
 
 ### Features
