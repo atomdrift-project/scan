@@ -164,9 +164,15 @@ jobs:
             echo "dry run at $GITHUB_REF (version $VERSION) - nothing will be published"
           fi
 
-  # Check both Apple credential sets before starting the expensive release
-  # matrix. This job deliberately checks out no repository code: the signing
-  # key only enters a short-lived keychain used for a tiny probe signature.
+  # Check both Apple credential sets within minutes, beside the build matrix
+  # rather than ahead of it: no build waits for it. It needs a macOS runner,
+  # and a 2026-11-27 dry run held every platform for 32 minutes waiting for
+  # one. A failure here (v3.0.0-beta.2: an expired Apple developer agreement)
+  # means the macOS jobs will fail at signing; every other platform still
+  # publishes, and the macOS targets can be recovered with `-f target=` once
+  # the credentials are fixed. This job deliberately checks out no repository
+  # code: the signing key only enters a short-lived keychain used for a tiny
+  # probe signature.
   signing-preflight:
     name: signing preflight
     needs: verify
@@ -297,7 +303,7 @@ jobs:
   # remaining platforms and rewrites SHA256SUMS to describe the full set.
   build-fast:
     name: build (fast)
-    needs: [verify, signing-preflight]
+    needs: verify
     uses: ./.github/workflows/build.yml
     # Ceiling for build.yml's jobs — see the same note in ci.yml. Checkout is
     # all they need; the release token stays in `publish`.
@@ -315,8 +321,8 @@ jobs:
       wave: fast
       profile: release-lto
       # Release binaries are Developer ID signed and submitted to Apple's
-      # notary service. The preflight above validates both credential sets
-      # before this expensive matrix starts.
+      # notary service. The preflight above checks both credential sets
+      # while this matrix builds.
       sign: true
       notarize: true
       require-notarization: ${{ needs.verify.outputs.publish == 'true' }}
@@ -331,7 +337,7 @@ jobs:
 
   build-slow:
     name: build (slow)
-    needs: [verify, signing-preflight]
+    needs: verify
     uses: ./.github/workflows/build.yml
     # Ceiling for build.yml's jobs — see the same note in ci.yml. Checkout is
     # all they need; the release token stays in `publish`.
@@ -349,8 +355,8 @@ jobs:
       wave: slow
       profile: release-lto
       # Release binaries are Developer ID signed and submitted to Apple's
-      # notary service. The preflight above validates both credential sets
-      # before this expensive matrix starts.
+      # notary service. The preflight above checks both credential sets
+      # while this matrix builds.
       sign: true
       notarize: true
       require-notarization: ${{ needs.verify.outputs.publish == 'true' }}

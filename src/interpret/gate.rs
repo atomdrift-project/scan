@@ -96,39 +96,15 @@ pub(super) const LLM_GATE_PREFIXES: &[&[&str]] = &[
 /// no malicious one the gate did not already reach.
 pub(super) const LLM_GATE_SYNTHESIZED_PREFIXES: &[&str] = &["metadata/encoded-payload/url"];
 
-/// Notable-or-above findings above which an ML-benign sample with no hostile
-/// finding is *not* sent to the LLM, whatever else admitted it. `0` disables
-/// the veto.
-///
-/// The admissions above all fire on volume: a large legitimate package
-/// accumulates notable findings until it crosses the probability floor or
-/// carries one of the gate prefixes — and the LLM then reads a long prompt to
-/// move nothing. Scored by whether each call moved
-/// the outcome in the right direction, the calls that correct a verdict sit on
-/// small samples and the wasted benign calls on large ones. This cap keeps
-/// nearly every correction and drops most of the wasted calls; a lower one
-/// starts losing corrections, a higher one keeps benign calls that correct
-/// nothing.
-///
-/// A count of findings rather than prompt tokens: the token proxy lost more
-/// corrections at the same benign volume. Level-placed samples are never
-/// vetoed — an interpretation is wanted for everything on the grid.
-pub const DEFAULT_LLM_BENIGN_NOTABLE_CAP: usize = 300;
-
-/// Gate prefixes that override the size veto ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]).
-///
-/// The ordinary gate prefixes were chosen for coverage and several of them
-/// (`*curl*` uploads, encoded-payload URLs) sit on exactly the big benign
-/// packages the veto exists to skip, so the veto has to outrank them. These
-/// are the prefixes with, as near as a labeled corpus can show, no benign
-/// carrier at all, so a sample carrying one is worth a read however large it
-/// is. Some are here for corrections the bare veto lost: a large package that
+/// Gate prefixes with, as near as a labeled corpus can show, no benign carrier
+/// at all: a notable finding under one admits a sample to the LLM on its own
+/// (`strong-trait`), however large the sample is. Among them: a package that
 /// decodes a payload to a file from a shell command, and an agent skill that
 /// points the agent at an off-vendor API base URL.
 ///
 /// Prefer families and narrow globs where their whole match set is useful.
 /// The encrypted-member trait moved into a broad family, so its exact leaf keeps
-/// unrelated archive findings out of this override. Off-vendor URL assignments
+/// unrelated archive findings out of this list. Off-vendor URL assignments
 /// are atomic traits under a shared family; the narrow glob covers their
 /// provider-specific ids without admitting other URL configuration findings.
 /// [`validate_gate_prefixes`] checks these entries against installed traits.
@@ -328,11 +304,10 @@ pub struct FindingSeverity {
     /// single notable finding — and it is why the probability floor
     /// ([`DEFAULT_LLM_MIN_PROB`]) can sit as high as it does.
     pub gate_trait: bool,
-    /// cleave surfaced a notable-or-above finding under a strong gate prefix:
-    /// admitted past the size veto.
+    /// cleave surfaced a notable-or-above finding under a strong gate prefix.
     pub strong_trait: bool,
     /// Notable-or-above findings across the whole report — every member file,
-    /// duplicates included. The size the veto reads.
+    /// duplicates included. Logged with each gate decision.
     pub notable: usize,
 }
 
@@ -390,13 +365,12 @@ impl FindingSeverity {
 ///
 /// `Required` is every admission that can change a verdict: a hostile cleave
 /// finding, a finding under a gate prefix, a non-benign ML class, or a
-/// raw score above the probability floor — unless the size veto
-/// ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]) withholds it. `Optional` is the routine
+/// raw score above the probability floor. `Optional` is the routine
 /// case — ML placed the file on its grid but nothing else says so — where the
 /// second opinion is context for the reader rather than a correction. Under
 /// load such a caller serves `Required` first and skips `Optional`; unloaded,
 /// both run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LlmAdmission {
     /// Can change the verdict: never skipped.
     Required,
@@ -408,7 +382,10 @@ pub enum LlmAdmission {
 /// evidence it was admitted on. [`interpret_admitted`](super::interpret_admitted)
 /// consumes it, so a caller
 /// that defers the LLM call does not run the gate a second time.
-#[derive(Debug, Clone, Copy)]
+///
+/// Serializable, so a caller that cannot run the call itself can hand it to
+/// one that can ([`LlmInput`](crate::engine::LlmInput)).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Admitted {
     /// Whether the endpoint may skip this sample under load.
     pub tier: LlmAdmission,
@@ -419,6 +396,15 @@ pub struct Admitted {
     pub(super) hostile_finding: bool,
     /// cleave's report carries a suspicious-or-above finding.
     pub(super) suspicious_finding: bool,
+}
+
+impl Admitted {
+    /// Where ML placed the sample, and the deploy level and grid it was
+    /// placed on: the model facts a grade is blended against.
+    #[must_use]
+    pub const fn levels(&self) -> LevelContext {
+        self.levels
+    }
 }
 
 /// The LLM gate: whether a sample gets a second opinion, answered without
@@ -433,9 +419,8 @@ pub struct Admitted {
 /// notable-or-above finding under a gate prefix; one under a strong gate
 /// prefix; and a non-benign verdict class, which catches a container carrying
 /// a member's hostile class on its own near-zero score. Any of them makes the
-/// sample [`LlmAdmission::Required`] unless the size veto
-/// ([`DEFAULT_LLM_BENIGN_NOTABLE_CAP`]) withholds it; a level placement alone
-/// makes it [`LlmAdmission::Optional`].
+/// sample [`LlmAdmission::Required`], however large it is; a level placement
+/// alone makes it [`LlmAdmission::Optional`].
 #[must_use]
 pub fn admit(
     cfg: &InterpretConfig,
@@ -502,26 +487,21 @@ pub fn admit(
         reasons.push("class");
     }
     let placed = levels.ml_admits(cfg.min_level);
-    // The size veto: see `DEFAULT_LLM_BENIGN_NOTABLE_CAP`. Only the Required
-    // tier is subject to it; a level placement below is never withheld.
-    let vetoed = cfg.benign_notable_cap > 0
-        && benign_class
-        && !hostile
-        && !findings.strong_trait
-        && findings.notable > cfg.benign_notable_cap;
-    let decision = if !reasons.is_empty() && !vetoed {
+    // No size veto: a large sample that admitted itself is read like any
+    // other. The veto (an ML-benign sample with no hostile finding and over
+    // 300 notable findings was not sent) was removed 2026-11-27; it rejected
+    // exactly the big packages a compromised release hides in.
+    let decision = if !reasons.is_empty() {
         Some(LlmAdmission::Required)
     } else if placed {
         Some(LlmAdmission::Optional)
     } else {
         None
     };
-    let why = match (decision, vetoed) {
-        (Some(LlmAdmission::Required), _) => "admitted",
-        (Some(LlmAdmission::Optional), true) => "vetoed by size, kept for its level placement",
-        (Some(LlmAdmission::Optional), false) => "level placement only",
-        (None, true) => "vetoed by size",
-        (None, false) => "no admission fired",
+    let why = match decision {
+        Some(LlmAdmission::Required) => "admitted",
+        Some(LlmAdmission::Optional) => "level placement only",
+        None => "no admission fired",
     };
     tracing::info!(
         subject,
@@ -539,7 +519,6 @@ pub fn admit(
         gate_trait = findings.gate_trait,
         strong_trait = findings.strong_trait,
         notable_findings = findings.notable,
-        notable_cap = cfg.benign_notable_cap,
         "LLM gate"
     );
     decision.map(|tier| Admitted {

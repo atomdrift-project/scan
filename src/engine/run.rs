@@ -26,7 +26,6 @@ use crate::explain::ShapImportance;
 use crate::model::{Classification, Model};
 use crate::output::{BloomMark, BloomVerdict};
 use crate::provenance::RegistryProvenance;
-use crate::remote::Uplink;
 use crate::{Mode, OutputFormat};
 
 /// Run a scan against a file or directory tree.
@@ -72,7 +71,7 @@ pub(crate) fn run_with(
 
 /// The model and SHAP table `config` names.
 fn load_model(config: &ScanConfig) -> Result<(Model, Option<ShapImportance>)> {
-    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let model = crate::models_repo::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load_or_warn(config.model_dir());
     Ok((model, shap))
 }
@@ -537,28 +536,15 @@ pub(crate) fn run_bytes(fetched: Fetched<'_>, config: &ScanConfig) -> Result<Sca
     // to guard against. Directory paths still prefetch (they do fan out).
     let (model, shap) = load_model(config)?;
     let session = Session::start(config, &model, shap.as_ref());
-    // Atomdrift Uplink first: by digest when asking, by upload under
-    // `always`. A registry document standing in for an unfetchable package is
-    // never asked about — its bytes differ on every fetch.
-    if fallback_purl.is_none() {
-        match crate::remote::mode() {
-            Uplink::Ask => {
-                if let Some((sha, verdict)) = crate::remote::known_bytes(&bytes) {
-                    session.record_remote(label, &sha, None, &verdict, None);
-                    return session.finish();
-                }
-            }
-            Uplink::Always => {
-                match crate::remote::analyze(crate::remote::Upload::Bytes(bytes)) {
-                    Ok((sha, verdict)) => {
-                        session.record_remote(label, &sha, None, &verdict, None);
-                    }
-                    Err(error) => session.report_error(Path::new(label), &error),
-                }
-                return session.finish();
-            }
-            Uplink::Off => {}
-        }
+    // Atomdrift Uplink first, by digest. A registry document standing in
+    // for an unfetchable package is never asked about — its bytes differ on
+    // every fetch.
+    if fallback_purl.is_none()
+        && crate::remote::asking()
+        && let Some((sha, verdict)) = crate::remote::known_bytes(&bytes)
+    {
+        session.record_remote(label, &sha, None, &verdict, None);
+        return session.finish();
     }
     // No bloom short-circuit here: a `url`/`purl` scan names the one artifact
     // the operator asked about, so its config carries no filters (see
@@ -890,8 +876,8 @@ impl<'a> Session<'a> {
     }
 
     /// Hand files to Atomdrift Uplink, and return the ones left to analyze
-    /// here. Asking answers the files it already judges; `always` sends every
-    /// file and leaves none; off keeps them all. `shas` holds the digests
+    /// here: it answers the files it already judges, and a run that does not
+    /// ask (`--local`) keeps them all. `shas` holds the digests
     /// already taken, `limit` (when not zero) the largest file asked about,
     /// and `role` what the files are to the scan, which an answer is kept
     /// under for the next one.
@@ -902,57 +888,32 @@ impl<'a> Session<'a> {
         limit: u64,
         role: Role,
     ) -> Vec<PathBuf> {
-        match crate::remote::mode() {
-            Uplink::Off => files,
-            Uplink::Ask => {
-                // A walked file the bloom filters let the walk pass over is
-                // settled here; a named one is always analyzed.
-                let lookup = self.config.bloom().filter(|_| role == Role::Found);
-                let fast = self.config.mode() == Mode::Fast;
-                let passed_over = |path: &Path, sha: &str| {
-                    lookup.is_some_and(|lookup| bloom_passes_over(lookup, fast, sha, path).2)
-                };
-                let mark = |sha: &str| {
-                    let lookup = self.config.bloom()?;
-                    let digest = burton::parse_sha256_hex(sha)?;
-                    BloomMark::from_decision(lookup.decide_sha256(&digest))
-                };
-                let known_bad = |sha: &str| mark(sha).is_some_and(BloomMark::is_known_bad);
-                let (answered, rest) =
-                    crate::remote::answer_known(files, shas, limit, passed_over, known_bad);
-                for (path, sha, verdict) in &answered {
-                    // A known-bad file keeps its mark, and is shown, whatever
-                    // Uplink says.
-                    self.advance();
-                    let label = path.display().to_string();
-                    self.account_remote(&label, sha, None, verdict, Some(role), mark(sha));
-                }
-                rest
-            }
-            Uplink::Always => {
-                for path in &files {
-                    if self.cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match crate::remote::analyze(crate::remote::Upload::File(path)) {
-                        Ok((sha, verdict)) => {
-                            self.record_remote(
-                                &path.display().to_string(),
-                                &sha,
-                                None,
-                                &verdict,
-                                Some(role),
-                            );
-                        }
-                        Err(error) => {
-                            self.advance();
-                            self.report_error(path, &error);
-                        }
-                    }
-                }
-                Vec::new()
-            }
+        if !crate::remote::asking() {
+            return files;
         }
+        // A walked file the bloom filters let the walk pass over is settled
+        // here; a named one is always analyzed.
+        let lookup = self.config.bloom().filter(|_| role == Role::Found);
+        let fast = self.config.mode() == Mode::Fast;
+        let passed_over = |path: &Path, sha: &str| {
+            lookup.is_some_and(|lookup| bloom_passes_over(lookup, fast, sha, path).2)
+        };
+        let mark = |sha: &str| {
+            let lookup = self.config.bloom()?;
+            let digest = burton::parse_sha256_hex(sha)?;
+            BloomMark::from_decision(lookup.decide_sha256(&digest))
+        };
+        let known_bad = |sha: &str| mark(sha).is_some_and(BloomMark::is_known_bad);
+        let (answered, rest) =
+            crate::remote::answer_known(files, shas, limit, passed_over, known_bad);
+        for (path, sha, verdict) in &answered {
+            // A known-bad file keeps its mark, and is shown, whatever Uplink
+            // says.
+            self.advance();
+            let label = path.display().to_string();
+            self.account_remote(&label, sha, None, verdict, Some(role), mark(sha));
+        }
+        rest
     }
 
     /// Account for one artifact Uplink judged, as [`Self::report`] does for
@@ -1332,7 +1293,7 @@ impl Classifier<'_> {
                 shap: self.shap,
                 cancellation: self.cancel,
                 fetched: self.fetched,
-                tiny_opts: tiny_opts_for(config),
+                terminal_card: wants_terminal_card(config),
                 interpret: config.interpret(),
                 fetch: config.fetch_policy(),
                 zip_passwords: config.zip_passwords(),
@@ -1437,35 +1398,13 @@ fn write_error_record(file_path: &Path, msg: &str) -> io::Result<()> {
     out.write_all(b"\n")
 }
 
-/// Cleave context density for machine/LLM output. The primary terminal artifact
-/// and its fetched appendix use Scan's own global three-trait cards.
-pub(crate) fn tiny_opts_for(config: &ScanConfig) -> cleave::output::TinyOpts {
-    if matches!(
+/// Whether text output is the terminal card. The machine formats (`tiny`,
+/// `interpret`) print the plain payload view instead.
+pub(crate) fn wants_terminal_card(config: &ScanConfig) -> bool {
+    !matches!(
         config.format(),
         OutputFormat::Tiny | OutputFormat::Interpret
-    ) {
-        cleave::output::TinyOpts::tiny()
-    } else {
-        cleave::output::TinyOpts {
-            // Keep five findings per file in machine-facing compact output.
-            top_n: 5,
-            always_crit: None,
-            // Focus on suspicious+ (plus their composite legs) whenever any
-            // fired; a merged capture window renders only selected rows, and a
-            // suspicious+ hit keeps one trailing row/line of context — the
-            // continuation tends to carry the payoff. Unremarkable dependency
-            // files fall back to their notable top-five.
-            focus_crit: Some(cleave::Criticality::Suspicious),
-            // Card layout keeps the compact render headerless.
-            card: true,
-            // Only the hit lines/rows — no surrounding context, no `⋯` gap
-            // markers, no padding rows in the hex view.
-            context_lines: Some(1),
-            full_context: false,
-            header: cleave::output::HeaderStyle::Rich,
-            ..cleave::output::TinyOpts::terminal()
-        }
-    }
+    )
 }
 
 /// Apply a bloom-filter decision before any expensive analysis. Hands a

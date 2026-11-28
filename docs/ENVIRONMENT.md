@@ -12,8 +12,9 @@ does not parse is a startup error, not a silent default.
 | `SCAN_HOPPER` | `--hopper` |
 | `SCAN_FOLLOW` | `--follow` |
 | `SCAN_REGISTRY_MAP` | `--registry-map` |
-| `ATOMDRIFT_UPLINK` | `--uplink`: whether to ask Atomdrift Uplink before analyzing (`true`, `false`, or `always`). |
-| `ATOMDRIFT_FEED` | `--feed`: the rule feed for this run (`zero-day`, `supporter`, or `oss-delayed`), overriding the one saved by `atomscan feed`. Shared with cleave. |
+| `SCAN_TOKEN` | An Atomdrift sign-in token, in place of `atomscan login`: how CI reaches the paid feeds and Uplink with no saved sign-in. |
+| `SCAN_LOCAL` | `--local`: keep analysis on this machine — no Atomdrift Uplink, no hopper, no LLM off this machine. Rules still update. |
+| `SCAN_FEED` | `--feed`: the rule feed for this run (`auto`, the default, or `zero-day`, `supporter`, `oss`). |
 
 ## LLM second opinion
 

@@ -5,24 +5,41 @@ answer moves a verdict — and how to check a change to any of that before
 shipping it. The code is in `src/interpret/` (gate, prompt, blend, client);
 the system prompt is `interpret::SYSTEM_PROMPT`.
 
-## What is sent: the render, descriptions kept and hedged
+## What is sent: code, categories, and descriptions only over bytes
 
-The user message is cleave's sanitized context render: findings as
-`# LOC Possible <category> — <desc>`, the source lines or byte windows around them, and the file's
-identity and registry provenance. `atomscan -f interpret` prints exactly this
-message, without the system prompt, and contacts no LLM.
+The user message is the sanitized context render: each finding as a comment
+above the row it matched, the source rows or byte windows around it, and the
+file's identity and registry provenance. `atomscan -f interpret` prints exactly
+this message, without the system prompt, and contacts no LLM.
 
-Taken at face value, the finding descriptions get parroted: a donations list
+```text
+// 261 communications/http                              beside source
+// @4096 binary/packer — UPX-packed section             over raw bytes
+```
+
+Taken at face value, finding descriptions get parroted: a donations list
 becomes "hardcoded Bitcoin address", an install hook "data exfiltration", and
-reassuring descriptions talk a real dropper down. Removing them is worse: on
-packed or stripped binaries the render is escaped bytes, and cleave's
-description is the only readable signal. So the descriptions stay, and the
-system prompt frames them as the analyzer's interpretation of a pattern — what
-the code *could* be doing — to verify against the source and discount when it
-does not hold up.
+reassuring descriptions talk a real dropper down. Beside source the row under
+the annotation already says what the code does, so the annotation is only a
+line number and a category. On packed or stripped binaries the render is escaped
+bytes and the description is the only readable signal, so there it stays, and
+the system prompt frames every finding as the analyzer's fallible
+interpretation to verify against the evidence.
 
 Some deliberate choices in the render:
 
+- **One row each side of a finding, and the file's leading comment.** Wider
+  context changed no grade. No context lost three; so did a row on one side
+  only. The leading comment or docstring is kept whole because it states
+  intent: without it an exploit proof of concept lost "authorized testing
+  only" and a password-reuse guard lost "only a salted hash is kept".
+- **200 columns of a long row.** Of ten widths from 104 to 200, the ones that
+  held every fixture were 120, 168, 184 and 200; each width between lost a
+  sample, and not the same one. 200 is the narrowest with nothing failing
+  above it, plus 16. 512 held nothing 200 did not.
+- **Line numbers stay, columns go.** A column costs about a twentieth of the
+  tokens and held no grade. Dropping the line number too lost one in every
+  variant tried.
 - **The request fits in 96 KiB.** The budget keeps evidence around the strongest
   findings and drops weaker members and findings first. If the request is
   still too large after sanitizing and rewriting it, the final message marks
@@ -60,11 +77,11 @@ sample is sent when any of these holds:
 - the scan's own class is non-benign — a container elevated by a member must
   reach the LLM even when its own score is low.
 
-A size veto drops benign samples with more than
-`DEFAULT_LLM_BENIGN_NOTABLE_CAP` notable findings, which are almost always
-large legitimate packages, unless a hostile finding or one of
-`LLM_GATE_STRONG_PREFIXES` is present. A sample placed on the grid is never
-withheld by the veto.
+There is no size veto. Until 2026-11-27 a benign sample with more than 300
+notable findings was not sent unless a hostile finding or one of
+`LLM_GATE_STRONG_PREFIXES` was present; it was removed because skipping large
+packages is not a trade worth making — a compromised release can sit inside
+one.
 
 Trait selectors can cover a whole family, a specific leaf (`family::leaf`),
 or a leaf anywhere in a family subtree (`family/**::leaf`). Leaf names can
@@ -82,9 +99,14 @@ ML decides; the LLM steers (`interpret::blend`):
    becomes suspicious at most. The cap is a fraction of the remaining range,
    so ML's ranking is preserved.
 2. **The hostile boundary is earned.** Escalating across it
-   requires ML to already sit within one steer of it
-   (`within_one_steer_of_hostile_boundary`), measured in the confidence space
-   `level_confidence` maps levels into. The one relaxation is an escalation corroborated by a
+   requires ML to already sit near it in level space
+   (`near_hostile_boundary`): within `CROSSING_BELOW` below and
+   `CROSSING_ABOVE` above the deploy level, L6..L60 at L25. The upper factor
+   prices LLM escalations in false positives: with `p` the share of borderline
+   benigns the LLM wrongly grades hostile and `s` the overspend allowed on the
+   hostile budget, keep `CROSSING_ABOVE <= 1 + s / p`. The current values
+   reproduce the window the gate had before it moved to level space and have
+   not been retuned from a measured `p`. The one relaxation is an escalation corroborated by a
    cleave hostile finding. An L0 hostile verdict remains hostile even with a
    trusted benign grade. That grade moves the verdict to the active hostile
    threshold. The suspicious boundary is ungated: it routes a file
@@ -177,8 +199,6 @@ verdicts, and `SCAN_LLM_SYSTEM_PROMPT_FILE` runs a candidate prompt without a
 rebuild. Both Scan and the harness read the shipped prompt from
 `src/interpret/system_prompt.txt`.
 
-To re-measure `DEFAULT_LLM_MIN_PROB` or `DEFAULT_LLM_BENIGN_NOTABLE_CAP`, use
-the same sets and the `LLM gate` log line, which names every admission that
-fired for each sample: pick the floor where malicious admissions stop rising
-while benign ones keep climbing, and the cap that keeps the calls that changed
-a verdict while dropping the benign ones that changed nothing.
+To re-measure `DEFAULT_LLM_MIN_PROB`, use the same sets and the `LLM gate`
+log line, which names every admission that fired for each sample: pick the
+floor where malicious admissions stop rising while benign ones keep climbing.

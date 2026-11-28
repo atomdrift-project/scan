@@ -235,13 +235,12 @@ impl FeatureSpec {
 
         if !(MIN_LOADABLE_SPEC_VERSION..=EXPECTED_SPEC_VERSION).contains(&spec.version) {
             anyhow::bail!(
-                "feature spec version mismatch: this installed model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}. \
-                 The model is incompatible with this build. Run 'atomscan update-rules' to install a matching model bundle.",
+                "feature spec version mismatch: this model uses spec v{}, but this Atomdrift Scan build accepts v{MIN_LOADABLE_SPEC_VERSION}..=v{EXPECTED_SPEC_VERSION}",
                 spec.version,
             );
         }
         // Older-but-loadable specs are normal while an ensemble is retrained
-        // piecemeal; `atomscan version` and `update-rules` surface it as a hint.
+        // piecemeal; `atomscan version` surfaces it as a hint.
         if spec.version < EXPECTED_SPEC_VERSION {
             tracing::debug!(
                 version = spec.version,

@@ -67,20 +67,22 @@ fn recategorizing_an_annotation_survives_multibyte_descriptions() {
     let line = "  // H über-loader resolves imports (objectives/anti-static/obfuscation/string::x)";
     assert_eq!(
         recategorize_annotation(line).as_deref(),
-        Some("  // Possible anti-static/obfuscation — über-loader resolves imports"),
+        Some("  // anti-static/obfuscation — über-loader resolves imports"),
     );
     // Multi-byte content anywhere else is fine too, and a whole render of it
-    // must not panic.
-    let render =
-        "== PRIMARY x ==\n# S 4:2 naïve café résumé (micro-behaviors/data/encode::y)\n  körper\n";
-    assert!(recategorize_annotations(render).contains("Possible data/encode — naïve café résumé"));
+    // must not panic: beside source the description goes, over bytes it stays.
+    let render = "== PRIMARY x ==\n# S 4:2 naïve café résumé (micro-behaviors/data/encode::y)\n  körper\n# S @16 naïve café résumé (micro-behaviors/data/encode::y)\n  00000010  6b c3 b6\n";
+    assert_eq!(
+        recategorize_annotations(render),
+        "== PRIMARY x ==\n# 4 data/encode\n  körper\n# @16 data/encode — naïve café résumé\n  00000010  6b c3 b6\n",
+    );
     // `well-known/` keeps its full depth: the family name is the finding.
     assert_eq!(
             recategorize_annotation(
                 "// S Owhit new-tab wallpaper extension identity (well-known/unwanted/newtab-wallpaper-adware/owhit::identity)"
             )
             .as_deref(),
-            Some("// Possible unwanted/newtab-wallpaper-adware/owhit — Owhit new-tab wallpaper extension identity"),
+            Some("// unwanted/newtab-wallpaper-adware/owhit — Owhit new-tab wallpaper extension identity"),
         );
     // ...while an objectives/ path is still cut to two, so a technique
     // taxonomy does not turn into a wall of near-identical labels.
@@ -109,13 +111,21 @@ fn recategorizing_covers_every_annotation_the_render_can_emit() {
             "-- C .NET set_Item reference (micro-behaviors/data/manipulation::setter)"
         )
         .as_deref(),
-        Some("-- Possible data/manipulation — .NET set_Item reference"),
+        Some("-- data/manipulation — .NET set_Item reference"),
     );
     assert_eq!(
         recategorize_annotation("// F 9:1 packed section (metadata/binary/packer::upx)").as_deref(),
-        // The `line:col` pointer survives ahead of the category — it locates
-        // the finding rather than grading it.
-        Some("// 9:1 Possible binary/packer — packed section"),
+        // The line survives ahead of the category — it locates the finding
+        // rather than grading it. The column and the description do not: the
+        // source row under the annotation shows both.
+        Some("// 9 binary/packer"),
+    );
+    // Over raw bytes there is no readable row, so the description stays. A
+    // packed dropper graded suspicious on categories alone (2026-11-27).
+    assert_eq!(
+        recategorize_annotation("// F @4096 packed section (metadata/binary/packer::upx)")
+            .as_deref(),
+        Some("// @4096 binary/packer — packed section"),
     );
     // A third-party signature has no prose and no parenthesized id: the path
     // *is* the body. Left alone, `// H Detects Quasar RAT (third_party/…)`
@@ -123,12 +133,12 @@ fn recategorizing_covers_every_annotation_the_render_can_emit() {
     assert_eq!(
         recategorize_annotation("// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix")
             .as_deref(),
-        Some("// Possible elastic/Linux_Trojan_Ladvix"),
+        Some("// elastic/Linux_Trojan_Ladvix"),
     );
     assert_eq!(
         recategorize_annotation("// H Detects Quasar RAT (third_party/SigBase/Quasar/RAT)")
             .as_deref(),
-        Some("// Possible SigBase/Quasar — Detects Quasar RAT"),
+        Some("// SigBase/Quasar — Detects Quasar RAT"),
     );
     // A parenthetical that is prose, not a trait id, still leaves the line be.
     assert_eq!(
@@ -1270,25 +1280,6 @@ fn interpret_render_carries_file_identity_for_unregistered_artifacts() {
     // record, so no `provenance=` line is drawn at all.
     assert_eq!(ctx.matches("provenance=").count(), 0, "{ctx}");
     assert!(!ctx.contains(r#""registry""#), "{ctx}");
-}
-
-/// Byte windows are evidence, not hinting: the LLM render must keep the
-/// rows around a hex hit. Dropping them (`full_context: false`) to save size
-/// turns a known-bad PE (`fffmpeg.exe`) from hostile to benign on the shipped
-/// prompt, even though every finding description stays. Size is taken from
-/// the metadata instead (see `registry_provenance`).
-
-#[test]
-fn interpret_render_keeps_byte_windows_as_evidence() {
-    let opts = cleave::output::TinyOpts::tiny();
-    assert!(
-        opts.full_context,
-        "hex hits must render with their surrounding rows"
-    );
-    assert!(
-        opts.context_lines.is_some(),
-        "and a bounded window, not the whole capture"
-    );
 }
 
 #[test]

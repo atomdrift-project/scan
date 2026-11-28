@@ -223,7 +223,7 @@ impl Model {
         let started = Instant::now();
         anyhow::ensure!(
             model_dir.join("general").is_dir(),
-            "model bundle is incomplete: no general/ route in {}. Run 'atomscan update-rules' to refresh the installed models.",
+            "model bundle is incomplete: no general/ route in {}",
             model_dir.display(),
         );
         let model = Self::load_ensemble(model_dir, thresholds, active_level)?;
@@ -281,7 +281,7 @@ impl Model {
             None => {
                 let t = cfg.route_thresholds.get("general").copied().with_context(|| {
                     format!(
-                        "{} has no general-route thresholds at level {diagnostic_level}, so the model cannot classify; reinstall the bundle with 'atomscan update-rules'",
+                        "{} has no general-route thresholds at level {diagnostic_level}, so the model cannot classify",
                         model_dir.join("config.json").display(),
                     )
                 })?;

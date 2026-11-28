@@ -24,7 +24,7 @@ use super::render_context::{
 };
 use super::retention::{apply_report_retention, kept_members};
 use super::score_memo::{ScoreTable, Stored};
-use super::v8::{Inputs as UploadInputs, Listed, OwnReading, UploadDoc};
+use super::v8::{Inputs as UploadInputs, Listed, LlmGate, OwnReading, UploadDoc};
 use super::verdict::{
     apply_trait_floor, cleared_level, decision_outranks, graver, interpreted_level, softened_level,
     worst_member, worst_member_floor, worst_member_model,
@@ -52,7 +52,8 @@ pub(crate) struct ClassifyRequest<'a> {
     pub model: &'a Model,
     pub shap: Option<&'a ShapImportance>,
     pub cancellation: Option<&'a Arc<AtomicBool>>,
-    pub tiny_opts: cleave::output::TinyOpts,
+    /// Render the terminal card rather than the plain payload view.
+    pub terminal_card: bool,
     pub interpret: Option<&'a crate::interpret::InterpretConfig>,
     pub fetch: crate::fetch::FetchPolicy,
     pub zip_passwords: &'a [String],
@@ -86,7 +87,7 @@ impl<'a> ClassifyRequest<'a> {
             model,
             shap: None,
             cancellation: None,
-            tiny_opts: cleave::output::TinyOpts::tiny(),
+            terminal_card: false,
             interpret: None,
             fetch: crate::fetch::FetchPolicy::default(),
             zip_passwords: &[],
@@ -108,7 +109,7 @@ impl<'a> ClassifyRequest<'a> {
 pub(crate) struct OutputNeeds {
     /// Render `rendered_context` as the LLM query payload (`--format
     /// interpret`): byte-for-byte the user message a live `--llm` query
-    /// sends (the sanitized tiny render), without the system prompt.
+    /// sends (the sanitized payload render), without the system prompt.
     /// Independent of `interpret`, which controls actually querying.
     pub llm_view: bool,
     /// Show the live fetch log / dependency tree (interactive terminal only).
@@ -330,6 +331,9 @@ pub(crate) fn classify_report(
     } else {
         None
     };
+    if let (Some(doc), Some(gate)) = (&mut upload, llm.gate) {
+        doc.set_llm_gate(gate);
+    }
     if let (Some(doc), Some(Interpretation::Graded(graded))) = (&mut upload, &llm.interpretation) {
         blend_upload(doc, req.model, graded);
     }
@@ -1316,6 +1320,9 @@ struct Interpreted {
     context: Option<String>,
     interpretation: Option<Interpretation>,
     pending: Option<PendingLlm>,
+    /// What the gate decided, whether or not the LLM then ran; `None` when
+    /// no gate ran.
+    gate: Option<LlmGate>,
     elapsed: Duration,
 }
 
@@ -1332,51 +1339,59 @@ fn interpret(
     cpu_lease: Option<CpuLease>,
 ) -> Interpreted {
     let (label, model) = (req.label, req.model);
-    let context = (req.interpret.is_some() || req.needs.llm_view).then(|| {
-        let primary = Primary {
-            label,
-            sha256,
-            fetch: req.root_fetch,
-            registry: req.root_registry,
-        };
-        let rendered = render_interpret_context(&primary, fetched, typed, index);
-        crate::interpret::sanitize_context(&rendered)
-    });
-    // CPU work is done: featurized, scored, dependencies graded. What follows
-    // is a network wait (the LLM) and light rendering. Give the admission
-    // permit back now so the pool is not idle for the round trip. A caller that
-    // gave a lease owns the tail: it posts the ML verdict now and runs the LLM
-    // step from `pending` afterwards.
+    // A caller that gave a lease owns the tail: it posts the ML verdict now
+    // and runs the LLM step from `pending` afterwards. Without an interpreter
+    // of its own it still gets `pending`, gated on the default configuration,
+    // so it can hand the step to a host that has one.
     let owner_runs_llm = cpu_lease.is_some();
-    if let Some(release) = cpu_lease {
-        release();
-    }
-    let started = Instant::now();
+    let gate = req
+        .interpret
+        .or_else(|| owner_runs_llm.then(|| &*DEFAULT_GATE));
     let levels = crate::interpret::LevelContext {
         fired: decision.level,
         active: model.active_level(),
         grid_max: model.grid_max(),
     };
-    let mut pending = None;
-    let mut interpretation = None;
-    if let (Some(cfg), Some(ctx)) = (req.interpret, context.as_deref()) {
+    let admitted = gate.and_then(|cfg| {
         // cleave's own verdict, read from the structured report rather than
         // re-parsed out of the render it produced. See `FindingSeverity`.
         let findings = crate::interpret::FindingSeverity::from_report(typed);
-        let admitted = crate::interpret::admit(
+        crate::interpret::admit(
             cfg,
             decision.class,
             decision.probability,
             levels,
             findings,
             label,
-        );
+        )
+    });
+    let context =
+        (req.interpret.is_some() || req.needs.llm_view || admitted.is_some()).then(|| {
+            let primary = Primary {
+                label,
+                sha256,
+                fetch: req.root_fetch,
+                registry: req.root_registry,
+            };
+            let rendered = render_interpret_context(&primary, fetched, typed, index);
+            crate::interpret::sanitize_context(&rendered)
+        });
+    // CPU work is done: featurized, scored, dependencies graded. What follows
+    // is a network wait (the LLM) and light rendering. Give the admission
+    // permit back now so the pool is not idle for the round trip.
+    if let Some(release) = cpu_lease {
+        release();
+    }
+    let started = Instant::now();
+    let mut pending = None;
+    let mut interpretation = None;
+    if let (Some(admitted), Some(ctx)) = (admitted, context.as_deref()) {
         if owner_runs_llm {
-            pending = admitted.map(|admitted| PendingLlm {
+            pending = Some(PendingLlm {
                 ctx: ctx.to_string(),
                 admitted,
             });
-        } else if let Some(admitted) = admitted {
+        } else if let Some(cfg) = req.interpret {
             // Census label for the round trip; without it the wait read as
             // "features+model", hiding that the pool was idle for the network.
             if let Some(p) = req.phase {
@@ -1401,6 +1416,7 @@ fn interpret(
         context,
         interpretation,
         pending,
+        gate: gate.map(|_| LlmGate::from(admitted.map(|a| a.tier))),
         // The LLM round trip (queue wait + generation) against a shared
         // endpoint: the usual suspect for a slow run.
         elapsed: started.elapsed(),
@@ -1423,7 +1439,7 @@ fn card_provenance(req: &ClassifyRequest<'_>) -> CardProvenance {
 }
 
 /// The text render the caller's format asks for: the terminal card, the LLM
-/// payload (`--format interpret`), or cleave's context (`--format tiny`).
+/// payload (`--format interpret`), or its unsanitized form (`--format tiny`).
 fn render(
     typed: &AnalysisReport,
     index: &ReportIndex<'_>,
@@ -1444,7 +1460,7 @@ fn render(
         // render.
         return interpret_user_message(llm_context.unwrap_or_default()).0;
     }
-    if req.tiny_opts.header == cleave::output::HeaderStyle::Rich {
+    if req.terminal_card {
         // The terminal card covers the sample's own files; fetched payloads and
         // registry sidecars get their own account below it.
         let registry_ids: HashSet<u32> = fetched.registries.iter().map(|r| r.file_id).collect();
@@ -1464,7 +1480,7 @@ fn render(
     // render states that a verdict was inherited from something the sample
     // merely pointed at — naming each dependency, the locator it came from, its
     // own classification, and its elevated findings.
-    let mut rendered = cleave::output::format_context(typed, &req.tiny_opts);
+    let mut rendered = crate::interpret::payload::render(typed);
     if let Some(appendix) = render_dependency_context(fetched, typed, index) {
         rendered.push_str(&appendix);
     }
@@ -1654,12 +1670,19 @@ fn log_interpretation(file: &str, sha256: &str, graded: &Graded) {
 /// endpoint. `None` for callers with no gate.
 pub type CpuLease = Box<dyn FnOnce() + Send>;
 
+/// The gate a caller that owns the LLM step but has no interpreter admits
+/// samples by: the default configuration, the one an interpreter starts from.
+static DEFAULT_GATE: std::sync::LazyLock<crate::interpret::InterpretConfig> =
+    std::sync::LazyLock::new(crate::interpret::InterpretConfig::default);
+
 /// An LLM second opinion the caller has agreed to run itself, after the
 /// analysis has been posted with its ML verdict. Produced by
 /// `classify_report` instead of calling the model when a `CpuLease` is
 /// given: that caller owns the post-CPU tail and can post the ML result now
 /// and the LLM's amendment later (`apply_pending_interpretation`), so the
-/// endpoint's latency stops sitting on the completion path.
+/// endpoint's latency stops sitting on the completion path. Produced with or
+/// without an interpreter: a caller that cannot run the step persists it with
+/// [`LlmInput::encode`](super::LlmInput::encode) for a host that can.
 #[derive(Debug, Clone)]
 pub struct PendingLlm {
     /// The sanitized render the model reads.

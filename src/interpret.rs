@@ -10,7 +10,8 @@
 //! move the verdict **at most one severity step**, with the score moving at most
 //! `MAX_STEER` of the distance to the bound it argues for; and crossing the
 //! **hostile** boundary additionally requires ML to have already placed the file
-//! within one steer of it. The suspicious boundary is ungated — it routes a file
+//! near it, within a fixed factor of the deploy level. The suspicious boundary
+//! is ungated — it routes a file
 //! to review rather than spending a false-positive budget.
 //!
 //! The render is authored entirely by the party being graded, so a *softening*
@@ -36,14 +37,14 @@ mod blend;
 mod breaker;
 mod client;
 mod gate;
+pub(crate) mod payload;
 mod prompt;
 
 pub use self::blend::{Failed, Graded, Interpretation, LevelContext, LlmGrade, MlVerdict};
 pub(crate) use self::client::cache_base;
 pub use self::client::{chat, discover_model, grade_render};
 pub use self::gate::{
-    Admitted, DEFAULT_LLM_BENIGN_NOTABLE_CAP, DEFAULT_LLM_MIN_PROB, FindingSeverity, LlmAdmission,
-    admit, validate_gate_prefixes,
+    Admitted, DEFAULT_LLM_MIN_PROB, FindingSeverity, LlmAdmission, admit, validate_gate_prefixes,
 };
 pub use self::prompt::sanitize_context;
 
@@ -211,11 +212,6 @@ pub struct InterpretConfig {
     /// never placed ([`Level::Clean`](crate::model::Level::Clean)) but that
     /// still score well above the benign mass. See the gate in [`admit`].
     pub min_prob: f32,
-    /// Size veto: an ML-benign sample with no hostile finding and more than
-    /// this many notable-or-above findings is not sent, unless it carries a
-    /// strong gate-prefix trait or ML placed it on the level grid.
-    /// `0` disables. See [`DEFAULT_LLM_BENIGN_NOTABLE_CAP`].
-    pub benign_notable_cap: usize,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Cap on concurrent in-flight requests (protects a single local GPU).
@@ -386,7 +382,6 @@ impl Default for InterpretConfig {
             api_key: None,
             min_level: None,
             min_prob: DEFAULT_LLM_MIN_PROB,
-            benign_notable_cap: DEFAULT_LLM_BENIGN_NOTABLE_CAP,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_concurrency: default_max_concurrency(),
             background_concurrency: None,

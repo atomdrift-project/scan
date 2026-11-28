@@ -60,7 +60,8 @@ impl Analyzer {
         // is computed and the envelope's `level` is populated. `level` itself is
         // level-independent (the lowest-firing-level sweep), so consumers wanting
         // a different cutoff reinterpret `level` rather than reloading the model.
-        let model = Model::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
+        let model =
+            crate::models_repo::load(&model_dir, None, Some(crate::model::DEFAULT_SEVERITY_LEVEL))?;
         let shap = ShapImportance::load_or_warn(&model_dir);
         // Library callers always get the full result (`OutputFormat::JsonFull`):
         // the cleave report and the version 8 document hopper is sent. Humans
@@ -100,7 +101,7 @@ impl Analyzer {
             Some(thresholds),
         )?
         .with_slow_rule_ms(self.config.slow_rule_ms());
-        self.model = Model::load(&self.model_dir, Some(thresholds), None)?;
+        self.model = crate::models_repo::load(&self.model_dir, Some(thresholds), None)?;
         Ok(self)
     }
 
@@ -121,7 +122,7 @@ impl Analyzer {
     /// Propagates `Model::load` failures.
     pub fn with_level(mut self, level: Option<u16>) -> Result<Self> {
         self.config = self.config.with_level(level);
-        self.model = Model::load(&self.model_dir, self.config.thresholds(), level)?;
+        self.model = crate::models_repo::load(&self.model_dir, self.config.thresholds(), level)?;
         Ok(self)
     }
 

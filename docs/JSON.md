@@ -94,7 +94,11 @@ specified in `JSON_PLAN.md` at the repository root; in short:
   verdict that did not replace the local one: `class`, `fires_at`,
   `reason`, `analyzed_at`, `engine`), `ident` when the file claims an
   identity, `contents` for a container, `refs` on the artifact, and `report`,
-  the sha256 of its report line.
+  the sha256 of its report line. The artifact's `verdict` also says what the
+  LLM gate decided of it, whether or not the LLM then ran: `llm_admission` is
+  `required`, `optional` or `none` (not admitted), and absent when no gate ran
+  (no `--llm` and no deferred pass). Hopper queues an admitted artifact no LLM
+  has described to be described.
 - **Report lines:** each file's cleave findings and facts, with nothing that
   says where the file sat; a source in another file is cited by its sha256.
 
@@ -117,8 +121,9 @@ with or without it.
 `atomscan render report.json --format interpret` reads a saved cleave report
 (or the `raw` report of a JSON line saved by an older scan) and uses the live primary-context budget and
 annotation rewrite. It does not load models, analyze the original files, fetch
-references, or update rules. `--format tiny` and `terminal` render cleave's
-corresponding context views; they do not synthesize an ML verdict. Use `-` as
+references, or update rules. `--format tiny` renders the payload view without
+that budget or rewrite, and `terminal` renders cleave's terminal view; neither
+synthesizes an ML verdict. Use `-` as
 the input path to read one JSON document from stdin.
 
 With `--llm` (and the usual `--llm-model`/`SCAN_LLM*` settings),

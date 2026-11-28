@@ -23,7 +23,7 @@ use crate::output::{self, BloomMark, Ink, TerminalTrait};
 
 /// Write the `--format tiny` view (machine/LLM-facing, never colored): one
 /// ML-verdict line — the gate, the model probability, matched false-positive
-/// level — then cleave's annotated context.
+/// level — then the annotated code context.
 pub(crate) fn write_tiny(out: &mut dyn io::Write, r: &ScanResult) -> io::Result<()> {
     let class = r.classification;
     // The bloom flag rides the machine line as `bloom=known-bad|conflicted` — the

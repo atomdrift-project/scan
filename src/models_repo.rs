@@ -45,7 +45,7 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
 
     if crate::settings::get().offline {
         anyhow::bail!(
-            "no models are installed at {}, and --offline forbids downloading them: run `atomscan update-rules` once while online",
+            "--offline needs models already installed at {}: run once without --offline to install them",
             data_dir.display()
         );
     }
@@ -53,6 +53,59 @@ pub fn ensure_model_dir() -> Result<PathBuf> {
     crate::model_update::update(&data_dir, false, false)
         .with_context(|| format!("failed to install models to {}", data_dir.display()))?;
     Ok(data_dir)
+}
+
+/// Load the model in `dir`, at `thresholds` or `level`.
+///
+/// When `dir` is the installed bundle and it does not load — partly
+/// installed, or built for another release — it is reinstalled, once per
+/// process, and loaded again: nobody should have to repair what the updater
+/// put there. Models named by `SCAN_MODELS_DIR` are used as they are, and
+/// `--offline` downloads nothing, so for those a failure is the error.
+///
+/// # Errors
+/// The model does not load, and either cannot be reinstalled here or still
+/// does not load once reinstalled.
+pub fn load(
+    dir: &Path,
+    thresholds: Option<crate::model::Thresholds>,
+    level: Option<u16>,
+) -> Result<crate::model::Model> {
+    use crate::model::Model;
+    let error = match Model::load(dir, thresholds, level) {
+        Ok(model) => return Ok(model),
+        Err(error) => error,
+    };
+    if crate::env::path(crate::env::SCAN_MODELS_DIR).is_some() {
+        return Err(error.context(format!(
+            "SCAN_MODELS_DIR={} is not a usable model bundle",
+            dir.display()
+        )));
+    }
+    if crate::settings::get().offline || !default_models_dir().is_ok_and(|default| default == dir) {
+        return Err(error);
+    }
+    // Once per process, and every caller waits for it: a server's threads
+    // that all failed to load are answered by one reinstall.
+    static REINSTALLED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    let reinstalled = REINSTALLED.get_or_init(|| {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = format!("{error:#}"),
+            "the installed models do not load; reinstalling them"
+        );
+        crate::model_update::update(dir, true, true)
+            .map(drop)
+            .map_err(|e| format!("{e:#}"))
+    });
+    match reinstalled {
+        Ok(()) => Model::load(dir, thresholds, level)
+            .context("the models do not load even after reinstalling them"),
+        Err(why) => Err(error.context(format!(
+            "the installed models do not load, and reinstalling them failed: {why}"
+        ))),
+    }
 }
 
 /// The installed model commit (short), from the bundle's sidecar.
@@ -191,6 +244,16 @@ fn has_models(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the installed bundle is ever reinstalled: models anywhere else
+    /// (`SCAN_MODELS_DIR`, a caller's own directory) fail as they are.
+    #[test]
+    fn a_bundle_outside_the_install_is_never_reinstalled() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let error = format!("{:#}", load(dir.path(), None, None).expect_err("empty dir"));
+        assert!(error.contains("model bundle is incomplete"), "{error}");
+        assert!(!error.contains("reinstall"), "{error}");
+    }
 
     #[test]
     fn has_models_empty_dir() {

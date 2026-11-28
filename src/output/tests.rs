@@ -335,8 +335,8 @@ fn display_probability_uses_custom_threshold() {
 fn display_confidence_is_absent_for_unflagged_levels() {
     // Every level that is actually on the grid keeps its confidence: 0 is
     // the tightest and most certain, higher levels are looser and less so.
-    assert_eq!(display_confidence(Level::At(0)), Some(100));
-    assert_eq!(display_confidence(Level::At(5)), Some(95));
+    assert_eq!(display_confidence(Level::At(0)), Some(99));
+    assert_eq!(display_confidence(Level::At(5)), Some(78));
     // No level marker at all → no level-derived confidence. Unchanged.
     assert_eq!(display_confidence(Level::Manual), None);
     // A clean level means the sample cleared no calibrated level. The
@@ -367,7 +367,7 @@ fn unflagged_badge_reports_distance_to_cutoff_not_zero() {
     // so the fix does not disturb the flagged path.
     let (flagged, _) = terminal_badge(Classification::Hostile, 0.99, 0.65, Level::At(0));
     assert!(
-        flagged.contains("HOSTILE") && flagged.contains("100%"),
+        flagged.contains("HOSTILE") && flagged.contains("99%"),
         "flagged badge should keep the level-derived confidence, got {flagged:?}"
     );
 }

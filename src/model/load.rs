@@ -203,7 +203,7 @@ pub(super) fn load_bundle(bundle_dir: &Path) -> Result<LoadedBundle> {
     let spec_path = bundle_dir.join("feature_spec.json");
     anyhow::ensure!(
         spec_path.is_file(),
-        "model bundle is incomplete: missing {}. Run 'atomscan update-rules' to refresh the installed models.",
+        "model bundle is incomplete: missing {}",
         spec_path.display(),
     );
     let backend = load_backend(bundle_dir)?;

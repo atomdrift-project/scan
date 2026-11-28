@@ -542,7 +542,7 @@ async fn load_resources(state: Arc<AppState>) {
         let queue_ms = spawned.elapsed().as_millis();
         let t = Instant::now();
         tracing::info!(queue_ms, "loading ONNX model and feature spec");
-        let model = Model::load(&model_dir, thresholds, level)?;
+        let model = crate::models_repo::load(&model_dir, thresholds, level)?;
         tracing::info!(
             queue_ms,
             work_ms = t.elapsed().as_millis(),

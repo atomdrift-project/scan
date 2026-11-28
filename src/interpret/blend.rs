@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Classification, Level};
 
@@ -207,6 +207,32 @@ const fn is_false(value: &bool) -> bool {
 /// them, which a flat replacement constant destroyed.
 pub(super) const MAX_STEER: f32 = 0.33;
 
+/// How far below the hostile cutoff, as a factor of the active level, ML may
+/// have fired and still let the LLM carry a verdict across it. With
+/// [`CROSSING_ABOVE`] this bounds the window
+/// [`LevelContext::near_hostile_boundary`] admits; at the default deploy, L25,
+/// the window is L6..=L60.
+///
+/// Levels are false positives per 100M benigns, so the window has a price. Its
+/// upper edge lets the LLM spend the benigns between L25 and L60: roughly
+/// `active * (CROSSING_ABOVE - 1)` more per 100M, times the share `p` of those
+/// borderline benigns the LLM wrongly grades hostile. To spend at most `s` of
+/// the hostile budget on top of it, `CROSSING_ABOVE <= 1 + s / p`. The lower
+/// edge is the mirror image: it decides which hostile files near the cutoff
+/// are within reach of an LLM escalation from a softened verdict.
+///
+/// Both values reproduce, at L25, the window the gate admitted when it was
+/// measured on scan's former display-confidence table; they have not yet been
+/// retuned from a measured `p`. Retune with the corpus procedure in
+/// `docs/interpret-tuning.md`, and re-measure `p` whenever the LLM, its system
+/// prompt or the render changes.
+const CROSSING_BELOW: f64 = 4.5;
+
+/// How far above the hostile cutoff, as a factor of the active level, ML may
+/// have fired and still let the LLM carry a verdict across it. See
+/// [`CROSSING_BELOW`].
+const CROSSING_ABOVE: f64 = 2.4;
+
 /// Move `p` at most [`MAX_STEER`] of the way toward 1.0 (`toward_severe`) or 0.0.
 /// Monotonic and range-preserving: the result stays in `[0, 1]` and never crosses
 /// the bound it moves toward.
@@ -224,7 +250,7 @@ pub(super) fn steer(p: f32, toward_severe: bool) -> f32 {
 /// filetypes the reported `probability` may be a per-route score or a learned
 /// blend's output, so probability space is not comparable across files. Level
 /// space is, which is why proximity is measured here.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LevelContext {
     /// ML's fired level (`ml.lvl`): the lowest FP level (per 100M benigns) at
     /// which this file's hostile decision fires.
@@ -244,8 +270,8 @@ impl LevelContext {
     /// `None` resolves to [`Self::grid_max`], which makes the default admission
     /// "ML fired at all" — the most inclusive line that still means something,
     /// and the one that cannot drift: a literal ceiling stops meaning *the whole
-    /// grid* the moment the calibrated grid is re-cut (`level_confidence` already
-    /// reserves rungs for an L50000 grid). It also costs almost nothing over a
+    /// grid* the moment the calibrated grid is re-cut (an L50000 grid has been
+    /// planned for). It also costs almost nothing over a
     /// tighter literal, because the benign quantile runs out of tail resolution
     /// long before the ceiling: in a typical bundle more than half the routes
     /// have the same threshold at L10000 and L25000, and most of the rest differ
@@ -260,35 +286,24 @@ impl LevelContext {
         matches!(self.fired, Level::At(fired) if fired <= cutoff)
     }
 
-    /// Whether ML placed this file within a single [`MAX_STEER`] of the hostile
-    /// boundary — the active deploy level — measured in confidence space
-    /// (`level_confidence` is the calibrated, monotone projection of the level
-    /// axis, and the same table that produces `ml.conf`).
+    /// Whether ML fired close enough to the hostile cutoff (the active deploy
+    /// level) for the LLM to carry the verdict across it:
+    /// `active / CROSSING_BELOW <= fired <= active * CROSSING_ABOVE`. Measured
+    /// in level space, the axis the calibration is cut on, so the window means
+    /// the same false-positive price at every deploy level.
     ///
-    /// Symmetric by construction: `min`/`max` means the same expression covers a
-    /// crossing in either direction, because "the gap between ML's position and
-    /// the boundary is no wider than one steer" does not care which side ML is on.
-    ///
-    /// Abstains (returns `true`) in manual-threshold mode: with no level table
-    /// there is no calibrated axis to measure against, so the gate has nothing to
-    /// say and the remaining guards carry the decision.
-    fn within_one_steer_of_hostile_boundary(self) -> bool {
-        let (Level::Clean | Level::At(_), Some(active)) = (self.fired, self.active) else {
-            return true;
-        };
-        let (a, b) = (
-            band_confidence(self.fired),
-            band_confidence(Level::At(active)),
-        );
-        steer(a.min(b), true) >= a.max(b)
+    /// A file that never fires is not near. Manual-threshold mode has no
+    /// calibrated axis, so the gate abstains and the remaining guards decide.
+    pub(super) fn near_hostile_boundary(self) -> bool {
+        match (self.fired, self.active) {
+            (Level::Clean, Some(_)) => false,
+            (Level::At(fired), Some(active)) => {
+                let (fired, active) = (f64::from(fired), f64::from(active));
+                fired * CROSSING_BELOW >= active && fired <= active * CROSSING_ABOVE
+            }
+            (Level::Manual, _) | (_, None) => true,
+        }
     }
-}
-
-/// A level's confidence as a `0.0..=1.0` fraction. `level_confidence` is the
-/// same pessimistic table that produces `ml.conf`, so proximity is measured on
-/// exactly the axis an operator reads.
-fn band_confidence(level: Level) -> f32 {
-    f32::from(crate::engine::level_confidence(level).unwrap_or(0)) / 100.0
 }
 
 /// What the render and the ML verdict jointly permit the LLM to do. Bundled so
@@ -342,7 +357,7 @@ impl Evidence {
             return true;
         }
         if to > from {
-            return self.hostile_finding || self.levels.within_one_steer_of_hostile_boundary();
+            return self.hostile_finding || self.levels.near_hostile_boundary();
         }
         // Leaving hostile is permitted except from the strictest rung there is.
         //
@@ -388,8 +403,9 @@ pub(super) fn one_step_toward(ml: Classification, target: Classification) -> Cla
 /// 1. **The LLM may move the verdict at most one severity step, and the score at
 ///    most [`MAX_STEER`] toward the bound it argues for.**
 /// 2. **A band crossing must be earned**: ML must already have placed the file
-///    within one steer of that boundary on the calibrated FP axis (see
-///    [`Evidence::may_cross`]), or cleave must independently corroborate it.
+///    near that boundary on the calibrated FP axis, within [`CROSSING_BELOW`]
+///    and [`CROSSING_ABOVE`] of it (see [`Evidence::may_cross`]), or cleave
+///    must independently corroborate it.
 ///    Otherwise the score steers but the band holds.
 ///
 /// ML decides; the LLM steers. The second bound is what makes the first

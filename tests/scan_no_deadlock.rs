@@ -65,7 +65,7 @@ fn scan_cli_completes_under_cold_yara_cache() {
         // a non-rayon thread before any rayon analysis fires). Without it,
         // the process hangs.
         .env("CLEAVE_SKIP_YARA_CACHE", "1")
-        .env("ATOMDRIFT_UPLINK", "false")
+        .env("SCAN_LOCAL", "1")
         .env("SCAN_MODELS_DIR", &models_dir)
         .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::null())

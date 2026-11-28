@@ -220,11 +220,11 @@ pub enum OutputFormat {
     #[value(name = "json-full")]
     JsonFull,
     /// Compact, context-centric text for feeding a local LLM: a scan verdict
-    /// line (gate, confidence, matched FP level) followed by cleave's annotated
-    /// context. See `crate::engine::write_tiny`.
+    /// line (gate, confidence, matched FP level) followed by the annotated
+    /// code context. See `crate::engine::write_tiny`.
     Tiny,
     /// The LLM payload: byte-for-byte the user message a live `--llm`
-    /// query sends — cleave's sanitized tiny render, finding annotations
+    /// query sends — the sanitized payload render, finding annotations
     /// included — without the system prompt (which hedges the descriptions as
     /// fallible interpretations; frame them likewise downstream). Binary
     /// windows carry xxd-style offset gutters for addressing. Emits every

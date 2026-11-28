@@ -420,6 +420,17 @@ fn resolve_hopper(hopper: Option<String>) -> Option<String> {
     hopper
 }
 
+/// The hopper a scan reports to: none under `--offline` or `--local`, which
+/// send files nowhere, whatever `--hopper` or `SCAN_HOPPER` says.
+fn local_hopper(global: &GlobalArgs, hopper: Option<String>) -> Option<String> {
+    let hopper = hopper.filter(|_| !global.offline)?;
+    if global.local {
+        tracing::warn!("--local: not reporting to hopper");
+        return None;
+    }
+    Some(hopper)
+}
+
 fn resolve_hopper_value(hopper: Option<String>, env: Option<String>) -> Option<String> {
     hopper.or(env).filter(|url| !url.trim().is_empty())
 }
@@ -524,12 +535,9 @@ enum Commands {
     /// Update models, cleave traits, and the known-file filters
     UpdateRules,
 
-    /// Show the rule feeds, or switch to one (zero-day, supporter, oss-delayed)
-    Feed {
-        /// Feed to switch to; omit to list them
-        #[arg(value_enum)]
-        name: Option<cleave::feed::Feed>,
-    },
+    /// Sign in to Atomdrift, for the zero-day and supporter feeds. Shared
+    /// with cleave and hood.
+    Login,
 
     /// Validate the model bundle and benign fixture corpus
     Validate,
@@ -646,6 +654,8 @@ fn main() -> ExitCode {
     // SAFETY: still the first statements of `main`. No thread has been
     // spawned and nothing has read the environment yet.
     unsafe { scan::runtime::install() };
+    // CI supplies a sign-in as `SCAN_TOKEN`, scan's own variable.
+    cleave::feed::set_token_env(scan::env::SCAN_TOKEN.name);
 
     let cli = Cli::parse_from(with_default_subcommand(std::env::args_os()));
     match run(cli) {
@@ -697,7 +707,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 | Commands::Purl { .. }
                 | Commands::Serve(_)
                 | Commands::UpdateRules
-                | Commands::Feed { name: Some(_) }
+                | Commands::Login
         )
     {
         anyhow::bail!("this command needs the network, which --offline forbids");
@@ -746,12 +756,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Commands::Serve(args) => serve(global, args, interpret, fetch),
         Commands::UpdateRules => Ok(update_rules()),
-        Commands::Feed { name: None } => {
-            print!("{}", cleave::feed::list());
-            Ok(ExitCode::SUCCESS)
-        }
-        Commands::Feed { name: Some(feed) } => {
-            cleave::rule_update::switch(feed)?;
+        Commands::Login => {
+            cleave::rule_update::login()?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Validate => {
@@ -813,8 +819,8 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
         );
     }
 
-    // The rule feed — `--feed`, the saved choice, or what a held token
-    // implies — decided before anything resolves a rules tree.
+    // The rule feed — `--feed`, else the best the login opens — decided
+    // before anything resolves a rules tree.
     cleave::feed::resolve(global.feed)?;
     // Stabilize cleave trait discovery before any cleave shared resources are
     // initialized. This avoids clone-into-existing-directory failures when the
@@ -850,7 +856,7 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
         // cleave installs a missing rules tree on first use; not here. Uplink
         // is never resolved, which leaves it off.
         cleave::traits_repo::try_resolve().context(
-            "--offline forbids downloading rules: run `atomscan update-rules` once while online",
+            "--offline needs rules already installed: run once without --offline to install them",
         )?;
         tracing::info!(
             event = "offline",
@@ -870,7 +876,7 @@ fn bootstrap(global: &GlobalArgs, command: &Commands) -> Result<Option<Interpret
         // token was refused has fallen back, possibly to open source, which
         // asks nothing.
         scan::remote::resolve(
-            global.uplink,
+            global.local,
             cleave::feed::current().needs_token(),
             cleave::traits_repo::try_resolve().ok().as_deref(),
         )?;
@@ -1012,7 +1018,7 @@ fn scan_config(
         .with_interpret(interpret)
         .with_fetch(fetch)
         .with_zip_passwords(global.zip_passwords.clone())
-        .with_hopper(resolve_hopper(hopper).filter(|_| !global.offline))
+        .with_hopper(local_hopper(global, resolve_hopper(hopper)))
         .with_all_members(global.all_members)
 }
 

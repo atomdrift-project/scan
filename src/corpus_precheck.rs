@@ -29,7 +29,7 @@
 //!
 //! # Atomdrift Uplink
 //!
-//! A scan under `--uplink=true` arms the same precheck against Uplink's API
+//! A scan that asks Uplink (any but `--local`) arms the same precheck against Uplink's API
 //! instead (`configure_uplink`): with the subscription token on a paid plan,
 //! with no credential otherwise. The wire is the same `/v1/lookup`; what
 //! changes is whose judgment it is. Hopper is a corpus of other runs, so only
@@ -191,7 +191,7 @@ static ARMED: RwLock<Option<Arc<Precheck>>> = RwLock::new(None);
 const DEFAULT_MAX_AGE: Duration =
     Duration::from_secs(DEFAULT_MAX_AGE_DAYS * crate::civil::SECS_PER_DAY.unsigned_abs());
 
-/// Arm the precheck against Uplink's API, for a scan under `--uplink=true`:
+/// Arm the precheck against Uplink's API, for a scan that asks it:
 /// the subscribers' host with `token`, the open one without. A later
 /// [`configure`] (`--hopper`) replaces it: the hopper a process submits to is
 /// still the one it asks.
@@ -532,7 +532,7 @@ impl Precheck {
                 "* Uplink lookup quota exceeded; falling back to offline mode."
             }
             _ => {
-                "* Anonymous lookup quota exceeded; falling back to offline mode. For faster scans, connect a plan with 'atomscan feed supporter'."
+                "* Anonymous lookup quota exceeded; falling back to offline mode. For faster scans, sign in with 'atomscan login'."
             }
         };
         SAID.call_once(|| crate::engine::print_above_bar(|| eprintln!("{notice}")));
@@ -794,77 +794,6 @@ impl Precheck {
             );
         }
     }
-}
-
-/// Why a `/v1/analyze` answer line is not a verdict.
-#[derive(Debug)]
-pub(crate) enum AnswerError {
-    /// The line is not a JSON record.
-    Unreadable(serde_json::Error),
-    /// The service did not analyze the artifact, or gave it no level.
-    NotAnalyzed {
-        status: Option<Status>,
-        cause: Option<String>,
-    },
-    /// The answer names no SHA-256 digest; what it named instead.
-    NoDigest(String),
-}
-
-impl std::fmt::Display for AnswerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreadable(e) => write!(f, "unreadable analysis answer: {e}"),
-            Self::NotAnalyzed { status, cause } => {
-                write!(
-                    f,
-                    "Uplink could not analyze it ({}",
-                    status.map_or("", Status::as_str)
-                )?;
-                if let Some(cause) = cause {
-                    write!(f, ": {cause}")?;
-                }
-                f.write_str(")")
-            }
-            Self::NoDigest(sha) => write!(f, "analysis answer names no SHA-256 digest ({sha:?})"),
-        }
-    }
-}
-
-impl std::error::Error for AnswerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Unreadable(e) => Some(e),
-            Self::NotAnalyzed { .. } | Self::NoDigest(_) => None,
-        }
-    }
-}
-
-/// The verdict in one `/v1/analyze` answer line, and the digest it names:
-/// Uplink's judgment of an artifact it was asked to analyze, so it stands
-/// as long as it is an analyzed verdict with a level.
-///
-/// # Errors
-/// An unreadable line, or an answer that is not an analyzed verdict.
-pub(crate) fn analyzed_verdict(line: &str) -> Result<(String, Verdict), AnswerError> {
-    #[derive(serde::Deserialize)]
-    struct Answer {
-        cause: Option<String>,
-        #[serde(flatten)]
-        record: Record,
-    }
-    let answer: Answer = serde_json::from_str(line).map_err(AnswerError::Unreadable)?;
-    let mut rec = answer.record;
-    if rec.status != Some(Status::Analyzed) || rec.fires_at == Level::Manual {
-        return Err(AnswerError::NotAnalyzed {
-            status: rec.status,
-            cause: answer.cause,
-        });
-    }
-    let sha = rec.sha256.take().unwrap_or_default().to_ascii_lowercase();
-    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AnswerError::NoDigest(sha));
-    }
-    Ok((sha, rec.into()))
 }
 
 /// One answer as a list of items: several keys answer with a list (hopper's
@@ -1552,30 +1481,6 @@ mod tests {
             precheck
                 .purls(&["pkg:npm/left-pad@1.3.0".to_string()])
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn an_analysis_answer_is_a_verdict_only_when_analyzed() {
-        let sha = "D".repeat(64);
-        let (got, v) = analyzed_verdict(&format!(
-            r#"{{"status":"analyzed","sha256":"{sha}","fires_at":-1,"engine_version":"2.13.0","analyzed_at":"2026-10-22T00:00:00Z","findings":[]}}"#
-        ))
-        .unwrap();
-        assert_eq!(got, sha.to_ascii_lowercase());
-        assert_eq!(v.fires_at, Level::Clean);
-        assert_eq!(v.engine_version.as_deref(), Some("2.13.0"));
-
-        let err = analyzed_verdict(r#"{"status":"unavailable","cause":"no workers"}"#).unwrap_err();
-        assert!(err.to_string().contains("unavailable: no workers"), "{err}");
-        assert!(
-            analyzed_verdict(r#"{"status":"analyzed"}"#).is_err(),
-            "no level"
-        );
-        assert!(analyzed_verdict("not json").is_err());
-        assert!(
-            analyzed_verdict(r#"{"status":"analyzed","fires_at":-1}"#).is_err(),
-            "a verdict about no named bytes is no verdict"
         );
     }
 

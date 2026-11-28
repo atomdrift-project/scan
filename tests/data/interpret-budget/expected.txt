@@ -1,14 +1,14 @@
 == PRIMARY pkg.tgz ==
 pkg.tgz	gzip 100B 0
-// 1:1 Possible package/manifest — ROOT_NOTE
+// 1 package/manifest
 {"name":"pkg","version":"1.0.0"}
 
   keep-suspicious.py	python 100B 0
-  # 1:1 Possible execution/shell — KEEP_SUSPICIOUS
+  # 1 execution/shell
   os.system(cmd)
 
   keep-hostile.py	python 100B 0
-  # 1:1 Possible exfiltration/http — KEEP_HOSTILE
+  # 1 exfiltration/http
   requests.post(url, data=secrets)
 
 members_omitted=2 findings_omitted=0 (prompt budget)

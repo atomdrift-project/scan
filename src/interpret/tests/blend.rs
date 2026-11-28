@@ -6,7 +6,7 @@ use crate::interpret::blend::{MAX_STEER, blend, one_step_toward, steer};
 use crate::interpret::prompt::is_member_header;
 
 /// A deploy level of `-l 25` over a full grid, so the two band boundaries sit
-/// at L25 (suspicious|hostile, conf 92) and L3000 (benign|suspicious, conf 54).
+/// at L25 (suspicious|hostile) and L3000 (benign|suspicious).
 fn levels(fired: Level) -> LevelContext {
     LevelContext {
         fired,
@@ -417,9 +417,9 @@ fn the_proximity_gate_is_asymmetric_by_design() {
 }
 
 #[test]
-fn band_crossing_requires_ml_to_be_within_one_steer() {
-    // Suspicious → hostile, boundary L25 (conf 92). A file firing at L30 sits
-    // just outside the hostile budget, close enough for the LLM to tip it…
+fn band_crossing_requires_ml_to_be_near_the_boundary() {
+    // Suspicious → hostile, boundary L25. A file firing at L30 sits just
+    // outside the hostile budget, close enough for the LLM to tip it…
     let (out, _) = blend(
         Classification::Suspicious,
         0.6,
@@ -427,7 +427,7 @@ fn band_crossing_requires_ml_to_be_within_one_steer() {
         ev_at(Level::At(30)),
     );
     assert_eq!(out, Classification::Hostile);
-    // …while L500 (conf 78) is far outside it. The LLM's opinion is recorded
+    // …while L500 is far outside it. The LLM's opinion is recorded
     // and the score still firms up, but the band holds — ML's own evidence
     // was nowhere near the line, so the crossing was not earned.
     let (held, conf) = blend(
@@ -765,4 +765,22 @@ fn untrusted_read_never_softens_the_verdict() {
         ev_open(true, true),
     );
     assert!((injected - 0.4).abs() < 1e-6, "held at ML's score");
+}
+
+/// The crossing window at the default deploy, L25, is L6..=L60: the window
+/// the gate admitted before it moved to level space. A file that never fires
+/// is never near; with no deploy level the gate abstains.
+#[test]
+fn crossing_window_at_the_default_deploy() {
+    for n in 0..=u16::MAX {
+        let near = levels(Level::At(n)).near_hostile_boundary();
+        assert_eq!(near, (6..=60).contains(&n), "L{n}");
+    }
+    assert!(!levels(Level::Clean).near_hostile_boundary());
+    assert!(levels(Level::Manual).near_hostile_boundary());
+    let manual_deploy = LevelContext {
+        active: None,
+        ..levels(Level::At(5000))
+    };
+    assert!(manual_deploy.near_hostile_boundary());
 }

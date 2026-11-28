@@ -103,7 +103,9 @@ atomscan will never send telemetry data. It will however reach out to the Intern
 - **rule updates**: every 24h; disable with `--no-update`
 - **release check**: once a day, to say a newer atomscan exists; disable with `SCAN_NO_UPDATE_CHECK=1`
 - **following discovered references**: to detect if a benign package depends on or downloads a compromised payload. Set `--follow=none` to analyze only the requested artifact.
-- **Atomdrift Uplink lookups**: to skip analyzing what the service has already judged. A scan asks `api.atomdrift.org` about the SHA-256 of each local file of 1 MiB or more, each known-bad, sighted, suspicious or hostile file, and each downloaded dependency, and about the PURLs of packages on mainstream public registries. A sighted file takes the worse of the two verdicts; another flagged file takes Uplink's only if it is newer than the installed traits. No account is needed and nothing identifying is sent: never a path, a file name, a URL or a file's contents. Off by default when the traits are a git checkout. Disable with `--uplink=false` or `ATOMDRIFT_UPLINK=false`, which is also the reproducible mode. `--uplink=always` uploads files for analysis and needs a paid plan.
+- **Atomdrift Uplink lookups**: to skip analyzing what the service has already judged. A scan asks `api.atomdrift.org` about the SHA-256 of each local file of 1 MiB or more, each known-bad, sighted, suspicious or hostile file, and each downloaded dependency, and about the PURLs of packages on mainstream public registries. A sighted file takes the worse of the two verdicts; another flagged file takes Uplink's only if it is newer than the installed traits. No account is needed and nothing identifying is sent: never a path, a file name, a URL or a file's contents. Off when the traits are a git checkout.
+
+Two flags keep a scan to itself. `--local` (or `SCAN_LOCAL=1`) keeps analysis on this machine: no Uplink lookups, and no files sent to a hopper or to an LLM other than one on this machine, whatever else is configured. Rules and models still update, and following references still fetches what they name. It is also the reproducible mode. `--offline` makes no network connection at all, which implies `--local`; the rules and models must already be installed.
 
 Downloaded dependencies are analyzed under the current rules unless a local
 analysis report or a matching-analyzer corpus verdict can be reused. A recent
@@ -177,17 +179,22 @@ current matrix.
 ## Rule feeds
 
 Scan's rules come from one of three feeds. They carry the same rules and
-differ only in how long a ruleset waits after it passes QA: `oss-delayed` (up
-to 8 days, no account), `supporter` (72 hours, an isotope¹³ Early Supporter
-plan), and `zero-day` (no delay, a Business or Critical plan).
+differ only in how long a ruleset waits after it passes QA: `oss` (up to 8
+days, no account), `supporter` (72 hours, an Atomdrift Early Supporter plan),
+and `zero-day` (no delay, a Business or Critical plan).
 
 ```bash
-atomscan feed               # list the feeds and what's installed
-atomscan feed supporter     # switch; connects this computer if needed
+atomscan login                       # sign this computer in to Atomdrift
+atomscan --feed=supporter fs ~/src   # insist on one feed for this run
 ```
 
-The choice is shared with cleave. `--feed <name>` or `ATOMDRIFT_FEED` picks a
-feed for one run, and CI can supply a token with `ISOTOPE13_TOKEN`.
+`--feed` defaults to `auto`: the best feed your plan opens, or `oss` when this
+computer is not signed in. A named feed is insisted on: without a sign-in it
+shows a link to approve this computer at the Atomdrift console, which takes
+care of the subscription, and one your plan does not include stops the run.
+`SCAN_FEED` sets it from the environment. The sign-in is shared with cleave
+and hood, and CI can supply a token with `SCAN_TOKEN` instead.
+`atomscan version` shows the feed in use.
 
 ## NSRL Modern allowlist
 

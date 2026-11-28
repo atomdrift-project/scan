@@ -113,8 +113,7 @@ impl Replay {
     ) -> Self {
         Self {
             at: now(),
-            expires: config.fetch_policy().enabled()
-                || crate::remote::mode() != crate::remote::Uplink::Off,
+            expires: config.fetch_policy().enabled() || crate::remote::asking(),
             sha256: result.sha256.clone(),
             label: label.to_string(),
             class: result.classification,
@@ -335,8 +334,8 @@ fn key(sha256: &str, named: Option<&str>, role: Role, config: &ScanConfig) -> St
         // A path cannot hold a NUL, so no path reads as "no path".
         named.map_or_else(|| "\0".to_string(), str::to_string),
         format!(
-            "{role:?}|{:?}|{:?}|{}|{}|{}|{}|{}",
-            crate::remote::mode(),
+            "{role:?}|{}|{:?}|{}|{}|{}|{}|{}",
+            crate::remote::asking(),
             crate::settings::get(),
             cleave::output::terminal_width(),
             crate::output::color_enabled(),

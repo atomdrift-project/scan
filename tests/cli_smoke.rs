@@ -8,9 +8,21 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 mod bundle;
+
+/// A turn at the platform data directory. On Windows it is a Known Folder
+/// that no fixture's `HOME` or `XDG_DATA_HOME` redirects, so every test shares
+/// it, and `update-rules` installing bloom and NSRL sets there changes the
+/// analysis cache's namespace under any test that scans twice: its second
+/// scan looks in a new, empty namespace. Tests that install there, or that
+/// compare one scan with the next, take turns.
+fn platform_data_turn() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -75,7 +87,7 @@ impl Fixture {
             .env("CLEAVE_CACHE_DIR", self.root.path().join("cleave-cache"))
             .env("SCAN_NO_UPDATE_CHECK", "1")
             // No test asks Atomdrift Uplink about anything.
-            .env("ATOMDRIFT_UPLINK", "false")
+            .env("SCAN_LOCAL", "1")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             // Never refresh rules in the background; `update-rules` still does.
@@ -275,7 +287,7 @@ traits:
         }
         cmd.env_remove("NO_PROXY")
             .env_remove("no_proxy")
-            .env("ATOMDRIFT_UPLINK", "0")
+            .env("SCAN_LOCAL", "1")
             .env("SCAN_NO_ANALYSIS_CACHE", "1");
         cmd
     };
@@ -289,7 +301,7 @@ traits:
         (ENTRY, true, Some("--follow-depth=2"), true),
         (CLEAN, true, Some("--follow-depth=2"), false),
     ] {
-        let mut args = vec!["--uplink", "false", "-f", "json"];
+        let mut args = vec!["--local", "-f", "json"];
         args.extend(depth);
         if remote {
             args.push("url");
@@ -316,7 +328,7 @@ traits:
         (&missing, Some("--follow=none"), false),
         (&image, None, false),
     ] {
-        let mut args = vec!["--uplink", "false", "-f", "json-full"];
+        let mut args = vec!["--local", "-f", "json-full"];
         args.extend(follow);
         args.push(target.to_str().unwrap());
         let mut cmd = offline_command(&args);
@@ -348,6 +360,7 @@ traits:
 #[test]
 fn a_repeat_scan_of_an_unchanged_file_is_replayed() {
     const REPLAYED: &str = "scan replayed";
+    let _turn = platform_data_turn();
     let f = Fixture::new();
     let rule_dir = f.traits.join("objectives/test");
     fs::create_dir_all(&rule_dir).unwrap();
@@ -369,15 +382,8 @@ traits:
     let sample = f.root.path().join("sample.js");
     fs::write(&sample, "const marker = 'atomscan-replay-test';\n").unwrap();
     let scan_as = |path: &Path, format: &str, cached: bool| {
-        let mut cmd = f.command(&[
-            "--uplink",
-            "false",
-            "-f",
-            format,
-            "path",
-            path.to_str().unwrap(),
-        ]);
-        cmd.env("ATOMDRIFT_UPLINK", "0")
+        let mut cmd = f.command(&["--local", "-f", format, "path", path.to_str().unwrap()]);
+        cmd.env("SCAN_LOCAL", "1")
             .env("RUST_LOG", "scan::engine::run=info");
         if !cached {
             cmd.env("SCAN_NO_ANALYSIS_CACHE", "1");
@@ -440,6 +446,7 @@ traits:
 fn a_repeat_scan_of_a_directory_replays_each_unchanged_file() {
     const REPLAYED: &str = "scan replayed";
     const MARKED: &str = "const marker = 'atomscan-replay-test';\n";
+    let _turn = platform_data_turn();
     let f = Fixture::new();
     let rule_dir = f.traits.join("objectives/test");
     fs::create_dir_all(&rule_dir).unwrap();
@@ -465,15 +472,8 @@ traits:
     fs::write(dir.join("nested/copy.js"), MARKED).unwrap();
     fs::write(dir.join("plain.js"), "const marker = 'nothing of note';\n").unwrap();
     let scan = |target: &Path| {
-        let mut cmd = f.command(&[
-            "--uplink",
-            "false",
-            "-f",
-            "json",
-            "path",
-            target.to_str().unwrap(),
-        ]);
-        cmd.env("ATOMDRIFT_UPLINK", "0")
+        let mut cmd = f.command(&["--local", "-f", "json", "path", target.to_str().unwrap()]);
+        cmd.env("SCAN_LOCAL", "1")
             .env("RUST_LOG", "scan::engine::run=info,scan::bloom_repo=info");
         let output = f.run(&mut cmd, 0, Duration::from_secs(60));
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -503,6 +503,7 @@ traits:
 
     // Each result names its own file, whichever scan it came from.
     let named = |results: &[String], name: &str| {
+        let name = name.replace('/', std::path::MAIN_SEPARATOR_STR);
         let path = serde_json::to_string(dir.join(name).to_str().unwrap()).unwrap();
         results
             .iter()
@@ -548,6 +549,7 @@ traits:
 #[test]
 #[ignore = "downloads the published rules over the network; CI's release builds run it"]
 fn update_rules_installs_models_and_traits() {
+    let _turn = platform_data_turn();
     let fixture = Fixture::new();
     // `SCAN_MODELS_DIR` pins a bundle the updater never touches, so unpinned
     // the models install into the platform data directory. Elsewhere that
@@ -665,7 +667,7 @@ fn offline_refuses_what_needs_the_network() {
         &["--offline", "url", "https://example.com/x.js"][..],
         &["--offline", "purl", "pkg:npm/left-pad@1.3.0"],
         &["--offline", "update-rules"],
-        &["--offline", "feed", "supporter"],
+        &["--offline", "login"],
     ] {
         let output = fixture.smoke(args, 1);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -674,6 +676,56 @@ fn offline_refuses_what_needs_the_network() {
     let output = fixture.smoke(&["--offline", "-u", "version"], 2);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
+/// `--feed` takes `auto` or a feed by its name; the old `oss-delayed`
+/// spelling is not one.
+#[test]
+fn feed_names_are_auto_and_the_three_feeds() {
+    let fixture = Fixture::new();
+    let output = fixture.smoke(&["--feed", "oss-delayed", "version"], 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("auto") && stderr.contains("zero-day") && stderr.contains("oss"),
+        "{stderr}"
+    );
+}
+
+/// A named feed is insisted on, so a traits directory override, which would
+/// quietly replace it, is an error rather than a scan with other rules.
+/// (`auto`, the default, lets the override win, as every other test here
+/// relies on.)
+#[test]
+fn a_named_feed_refuses_a_traits_override() {
+    let fixture = Fixture::new();
+    let output = fixture.smoke(&["--offline", "--feed", "oss", "path", "."], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--feed=oss conflicts with the traits directory override"),
+        "{stderr}"
+    );
+}
+
+/// `--local` sends files to no LLM but one on this machine, whatever else
+/// asks for one: a remote endpoint is dropped, with a warning, before it is
+/// ever contacted — not refused, so a host's `SCAN_LLM` cannot break it.
+#[test]
+fn local_drops_an_llm_endpoint_off_this_machine() {
+    let fixture = Fixture::new();
+    let output = fixture.smoke(
+        &[
+            "--local",
+            "--llm",
+            "https://llm.example.invalid/v1",
+            "version",
+        ],
+        0,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--local: not sending files to an LLM endpoint off this machine"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -685,11 +737,13 @@ fn ps_reports_a_missing_model_bundle() {
     cmd.env("SCAN_MODELS_DIR", &empty);
     let output = fixture.run(&mut cmd, 1, Duration::from_secs(60));
     // A bundle is a routed ensemble: an empty directory lacks its `general/`
-    // route, and the error says so and how to fix it.
+    // route, and the error says so, and names the override that chose it —
+    // models there are used as they are, so nothing reinstalls them.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("incomplete"), "{stderr}");
     assert!(stderr.contains("general/"), "{stderr}");
-    assert!(stderr.contains("update-rules"), "{stderr}");
+    assert!(stderr.contains("SCAN_MODELS_DIR="), "{stderr}");
+    assert!(!stderr.contains("update-rules"), "{stderr}");
 }
 
 #[test]

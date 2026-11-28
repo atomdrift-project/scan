@@ -493,9 +493,10 @@ fn free_text_is_cut_to_fit_on_a_character_boundary() {
             crit: 5,
         })
         .collect();
-    let object = verdict_object(&judged, &top, &reason).expect("fits");
+    let object = verdict_object(&judged, &top, &reason, Some(LlmGate::Required)).expect("fits");
     assert!(object.get().len() <= MAX_OBJECT);
     let value: serde_json::Value = serde_json::from_str(object.get()).unwrap();
+    assert_eq!(value["llm_admission"], "required", "kept whatever is cut");
     let kept = value["reason"].as_str().unwrap_or_default();
     assert!(kept.len() <= MAX_TEXT && kept.chars().all(|c| c == 'é'));
     assert_eq!(bounded("aé", 2), "a", "never splits a character");
@@ -867,6 +868,45 @@ fn scanners_reach_the_artifacts_line_and_leave_the_verdict_alone() {
         doc.set_scanner(Scanner::Clamav, serde_json::json!({"outcome": "skipped"})),
         Err(OpinionError::Outcome)
     );
+}
+
+/// The gate's decision rides on the artifact's verdict object, whether or not
+/// the LLM then ran, so hopper's describe queue can follow it: "required",
+/// "optional", or "none" when the gate admitted nothing. A document no gate
+/// ran for says nothing, which hopper reads as not known. Members never carry
+/// it, and it survives the trip through a stored LLM input.
+#[test]
+fn the_gates_decision_rides_on_the_artifacts_verdict() {
+    let mut doc = build(&package(), &package_members(), &[]);
+    let ungated = lines(&doc, None);
+    for line in &ungated[1..=4] {
+        assert!(
+            line["verdict"].get("llm_admission").is_none(),
+            "no gate ran, so nothing is said: {line}"
+        );
+    }
+    for (tier, word) in [
+        (Some(LlmAdmission::Required), "required"),
+        (Some(LlmAdmission::Optional), "optional"),
+        (None, "none"),
+    ] {
+        doc.set_llm_gate(LlmGate::from(tier));
+        let gated = lines(&doc, None);
+        assert_eq!(gated[1]["verdict"]["llm_admission"], word, "{tier:?}");
+        for member in &gated[2..=4] {
+            assert!(
+                member["verdict"].get("llm_admission").is_none(),
+                "only the artifact's line speaks for the gate: {member}"
+            );
+        }
+        let stored: UploadDoc =
+            serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(lines(&stored, None), gated, "{tier:?} lost in storage");
+    }
+    let mut old = serde_json::to_value(&doc).unwrap();
+    old.as_object_mut().unwrap().remove("llm_gate");
+    let old: UploadDoc = serde_json::from_value(old).expect("a document stored before the field");
+    assert_eq!(lines(&old, None), ungated);
 }
 
 /// Uplink's opinion is the shown result's `uplink` juror, on the scanned

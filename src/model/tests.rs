@@ -121,7 +121,7 @@ fn route_names_parse_and_render_compactly() {
 }
 
 #[test]
-fn load_rejects_missing_feature_spec_with_update_guidance() -> Result<()> {
+fn load_rejects_missing_feature_spec() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("model.json"), b"{}")?;
 
@@ -130,7 +130,9 @@ fn load_rejects_missing_feature_spec_with_update_guidance() -> Result<()> {
     };
     let message = err.to_string();
     assert!(message.contains("model bundle is incomplete"));
-    assert!(message.contains("Run 'atomscan update-rules'"));
+    // Repair is automatic for the installed bundle; nothing to tell anyone
+    // to run.
+    assert!(!message.contains("update-rules"), "{message}");
     Ok(())
 }
 

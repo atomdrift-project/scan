@@ -56,36 +56,27 @@ fn admits_sized(extra: &[cleave::Finding], notable: usize, prob: f32) -> Option<
 }
 
 #[test]
-fn size_veto_withholds_big_benign_samples_unless_something_strong_says_otherwise() {
-    // A big package over the floor: vetoed.
-    assert_eq!(admits_sized(&[], 301, 0.9), None);
-    // The same size at the cap is not.
-    assert_eq!(admits_sized(&[], 300, 0.9), Some(LlmAdmission::Required));
-    // A gate prefix does not outrank the veto (they sit on big benign packages)...
+fn large_samples_are_admitted_like_small_ones() {
+    // The size veto is gone (2026-11-27): a big ML-benign package that admitted
+    // itself goes to the LLM like a small one. Over the old 300-finding cap,
+    // above the probability floor:
+    assert_eq!(admits_sized(&[], 301, 0.9), Some(LlmAdmission::Required));
+    assert_eq!(admits_sized(&[], 5_000, 0.9), Some(LlmAdmission::Required));
+    // An ordinary gate prefix on a big package admits it too (the veto used to
+    // outrank these).
     let curl = finding(
         "micro-behaviors/communications/http/upload::curl-upload-file",
         cleave::Criticality::Notable,
     );
-    assert_eq!(admits_sized(&[curl], 301, 0.0), None);
-    // ...a strong prefix does.
-    let dropper = finding(
-        "micro-behaviors/data/decode/command::base64-decode-to-file",
-        cleave::Criticality::Notable,
-    );
     assert_eq!(
-        admits_sized(&[dropper], 301, 0.0),
+        admits_sized(&[curl], 301, 0.0),
         Some(LlmAdmission::Required)
     );
-    // So does a hostile finding.
-    let hostile = finding(
-        "objectives/exec/install-hook::postinstall-curl-bash",
-        cleave::Criticality::Hostile,
-    );
-    assert_eq!(
-        admits_sized(&[hostile], 301, 0.0),
-        Some(LlmAdmission::Required)
-    );
-    // And a non-benign class.
+    // Size alone still admits nothing: with no admission firing, a big benign
+    // package below the floor is not sent.
+    assert_eq!(admits_sized(&[], 5_000, 0.0), None);
+    // A big level-placed sample above the floor is Required, not demoted to
+    // Optional.
     let big: Vec<cleave::Finding> = (0..301)
         .map(|i| {
             finding(
@@ -94,26 +85,6 @@ fn size_veto_withholds_big_benign_samples_unless_something_strong_says_otherwise
             )
         })
         .collect();
-    let placed = |class| {
-        admit(
-            &InterpretConfig::default(),
-            class,
-            0.0,
-            LevelContext {
-                fired: Level::Clean,
-                active: None,
-                grid_max: 0,
-            },
-            FindingSeverity::from_findings(&big),
-            "t",
-        )
-        .map(|a| a.tier)
-    };
-    assert_eq!(
-        placed(Classification::Suspicious),
-        Some(LlmAdmission::Required)
-    );
-    // A level placement is never vetoed: it drops to Optional, not None.
     let on_grid = admit(
         &InterpretConfig::default(),
         Classification::Benign,
@@ -127,28 +98,7 @@ fn size_veto_withholds_big_benign_samples_unless_something_strong_says_otherwise
         "t",
     )
     .map(|a| a.tier);
-    assert_eq!(on_grid, Some(LlmAdmission::Optional));
-    // `0` disables the veto.
-    let off = InterpretConfig {
-        benign_notable_cap: 0,
-        ..InterpretConfig::default()
-    };
-    assert_eq!(
-        admit(
-            &off,
-            Classification::Benign,
-            0.9,
-            LevelContext {
-                fired: Level::Clean,
-                active: None,
-                grid_max: 0
-            },
-            FindingSeverity::from_findings(&big),
-            "t"
-        )
-        .map(|a| a.tier),
-        Some(LlmAdmission::Required)
-    );
+    assert_eq!(on_grid, Some(LlmAdmission::Required));
 }
 
 /// The prefix matcher, on synthetic ids. Which ids the shipped lists name is
@@ -304,15 +254,15 @@ const CURRENT_GATE_IDS: [&str; 4] = [
 #[test]
 fn gate_admits_legacy_and_current_traits_at_the_same_priority() {
     for ids in [OLD_GATE_IDS, CURRENT_GATE_IDS] {
-        for (i, id) in ids.into_iter().enumerate() {
+        for id in ids {
             let findings = [finding(id, cleave::Criticality::Notable)];
             assert_eq!(admits(&findings, 0.0), Some(LlmAdmission::Required), "{id}");
-            let above_cap = if i == 0 {
-                Some(LlmAdmission::Required)
-            } else {
-                None
-            };
-            assert_eq!(admits_sized(&findings, 301, 0.0), above_cap, "{id}");
+            // No size veto: a gate prefix admits a large package too.
+            assert_eq!(
+                admits_sized(&findings, 301, 0.0),
+                Some(LlmAdmission::Required),
+                "{id}"
+            );
         }
     }
     for id in [
@@ -321,7 +271,11 @@ fn gate_admits_legacy_and_current_traits_at_the_same_priority() {
     ] {
         let findings = [finding(id, cleave::Criticality::Notable)];
         assert_eq!(admits(&findings, 0.0), Some(LlmAdmission::Required), "{id}");
-        assert_eq!(admits_sized(&findings, 301, 0.0), None, "{id}");
+        assert_eq!(
+            admits_sized(&findings, 301, 0.0),
+            Some(LlmAdmission::Required),
+            "{id}"
+        );
     }
     for id in [
         "metadata/archive/encryption::archive-encrypted-member-cluster",
@@ -1421,7 +1375,7 @@ fn prompt_hash_is_deterministic_and_input_sensitive() {
 
 #[test]
 fn sanitize_strips_ansi_and_preserves_paths() {
-    // cleave's `tiny()` already basenames the root and shows members
+    // The payload render already basenames the root and shows members
     // archive-relative; the sanitizer only strips ANSI and must leave those
     // header paths intact (re-basenaming would mangle `a.zip/member`).
     let rendered = "\x1b[1mq6_fw.b00.zst\x1b[0m\telf 1KB 12\n\x1b[31m. # S finding\x1b[0m\nq6_fw.b00.zst/payload\telf 2KB 9\n";
@@ -1440,7 +1394,7 @@ fn sanitize_strips_ansi_and_preserves_paths() {
 
 #[test]
 fn sanitize_normalizes_archive_delimiter() {
-    // The header path arrives `/`-joined from cleave's tiny() view, but
+    // The header path arrives `/`-joined from the payload render, but
     // virtual paths on finding lines still carry the raw `!!`. Collapse them
     // so the model sees one consistent separator.
     let rendered =

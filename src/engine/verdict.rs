@@ -10,67 +10,46 @@ use cleave::types::CompactTrait;
 use super::{EmbeddedFile, MemberEvals, compact_crit};
 use crate::model::{Classification, Decision, Level, Model};
 
-/// The confidence ladder: `(level, percent)` rungs in ascending level order.
-/// A level takes the percent of the first rung at or above it, so a level
-/// between two rungs reads as the looser one — the pessimistic side.
-///
-/// The rungs are the calibrated deploy grid. `25001`/`25002` (and
-/// `50001`/`50002` for an L50000 grid) are the trait floor's former off-grid
-/// markers (`grid_max + 1/2`); nothing places a verdict there now, but they
-/// stay ranked so a stored level reads as it always did. The `49999` rung
-/// holds the levels between the two grids above their own markers.
-const CONFIDENCE_LADDER: [(u16, u8); 34] = [
-    (0, 100),
-    (1, 99),
-    (2, 98),
-    (3, 97),
-    (4, 96),
-    (5, 95),
-    (10, 94),
-    (20, 93),
-    (30, 92),
-    (40, 91),
-    (50, 90),
-    (60, 89),
-    (70, 88),
-    (80, 87),
-    (90, 86),
-    (100, 85),
-    (200, 82),
-    (300, 80),
-    (500, 78),
-    (1000, 75),
-    (2000, 66),
-    (5000, 54),
-    (7500, 49),
-    (10000, 45),
-    (15000, 38),
-    (20000, 33),
-    (25000, 29),
-    (25001, 28),
-    (25002, 27),
-    (49999, 26),
-    (50000, 17),
-    (50001, 16),
-    (50002, 15),
-    (u16::MAX, 15),
-];
+/// The level at which a verdict turns hostile at scan's default deploy, and
+/// the confidence it reads as there.
+const HOSTILE_ANCHOR: (f64, f64) = (25.0, 60.0);
 
-/// Map a level marker (`ml.lvl`) to a pessimistic human-facing confidence percent.
+/// A level's confidence, as a whole percent: how sure a reader should be that
+/// a file placed at `level` is hostile.
 ///
-/// This is a display/export confidence, not the model probability (`ml.prob`) and
-/// not a posterior probability. The ladder is intentionally integer-valued and
-/// strictly separated across the calibrated deploy grid.
+/// This is display confidence, not the model probability (`ml.prob`) and not a
+/// posterior. It is a fixed projection of the level axis, so a file reads the
+/// same percent whatever deploy level scanned it and whichever route scored
+/// it. Two log-scale segments meet at the hostile anchor, because levels grow
+/// geometrically:
+///
+/// - L0 to L25: 99% to 60%, over `ln(1 + L)`, which is finite at L0.
+/// - Above L25: 60% falling 15 points per decade, so the suspicious ceiling,
+///   L2500, reads 30% and L25000 reads 15%.
+///
+/// At scan's default deploy, then, 60% and up is hostile, 30% to 60%
+/// suspicious, and below that benign. Nothing reads 100%: the strictest level
+/// is still a calibration over a finite sample. A level that never fires
+/// reads 0%; manual-threshold mode has no axis and no confidence.
 #[must_use]
-pub(crate) fn level_confidence(level: Level) -> Option<u8> {
-    match level {
-        Level::Manual => None,
-        Level::Clean => Some(0),
-        Level::At(n) => {
-            let rung = CONFIDENCE_LADDER.partition_point(|&(top, _)| top < n);
-            CONFIDENCE_LADDER.get(rung).map(|&(_, percent)| percent)
-        }
-    }
+pub fn level_confidence(level: Level) -> Option<u8> {
+    let n = match level {
+        Level::Manual => return None,
+        Level::Clean => return Some(0),
+        Level::At(n) => f64::from(n),
+    };
+    let (anchor, at_anchor) = HOSTILE_ANCHOR;
+    let percent = if n <= anchor {
+        99.0 - (99.0 - at_anchor) * n.ln_1p() / anchor.ln_1p()
+    } else {
+        at_anchor - 15.0 * (n / anchor).log10()
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 1..=99 first"
+    )]
+    Some(percent.round().clamp(1.0, 99.0) as u8)
 }
 
 /// Where a hostile verdict lands when the LLM clears it.
@@ -213,11 +192,11 @@ pub(super) fn interpreted_level(
             // exists to carry: a sample cleave independently flagged and a sample
             // resting on the LLM's word alone both read as the ceiling.
             //
-            // Geometric, because the axis is: `level_confidence` compresses
-            // 200→82, 1000→75, 2000→66, 5000→54, so a *linear* midpoint of
-            // 26..2500 sits at 1263 and reads as barely-suspicious. The geometric
-            // one lands at 255 (corroborated: 81), which is where the middle of
-            // the band actually is in confidence terms.
+            // Geometric, because the axis is: `level_confidence` falls by a
+            // fixed step per decade across the band, so a *linear* midpoint of
+            // 26..2500 sits at 1263 and reads as barely-suspicious (36%). The
+            // geometric one lands at 255 (corroborated: 81), the middle of the
+            // band in confidence terms (45%; corroborated: 52%).
             //
             // Corroboration moves it a quarter of the way in instead of half —
             // nearer the hostile boundary, because two detectors agreeing is a
@@ -417,7 +396,7 @@ fn trait_floor_counts(findings: &[CompactTrait]) -> TraitFloorCounts<'_> {
 /// The two arms answer different questions — "this is malicious" versus "a
 /// human should look" — and they are reached by different evidence, so a
 /// consumer that reports or meters the floor wants to tell them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FloorArm {
     /// A reviewed trait individually proves the harmful action.
     Reviewed,
@@ -444,7 +423,7 @@ impl FloorArm {
 /// Returned rather than applied, so a caller can record that the floor — not
 /// the model — is what convicted an artifact. `apply_trait_floor` is the
 /// in-place form scan's own paths use.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FloorDecision {
     /// The class the floor raises the verdict to.
     pub class: Classification,
@@ -1180,107 +1159,36 @@ mod tests {
     }
 
     #[test]
-    fn level_confidence_maps_known_grid_and_override_markers() {
+    fn level_confidence_meets_its_anchors() {
         let cases = [
             (Level::Manual, None),
             (Level::Clean, Some(0)),
-            (Level::At(0), Some(100)),
-            (Level::At(1), Some(99)),
-            (Level::At(2), Some(98)),
-            (Level::At(5), Some(95)),
-            (Level::At(50), Some(90)),
-            (Level::At(25000), Some(29)),
-            (Level::At(25001), Some(28)),
-            (Level::At(25002), Some(27)),
-            (Level::At(50000), Some(17)),
-            (Level::At(50001), Some(16)),
-            (Level::At(50002), Some(15)),
+            (Level::At(0), Some(99)),
+            (Level::At(1), Some(91)),
+            (Level::At(10), Some(70)),
+            (Level::At(25), Some(60)),
+            (Level::At(26), Some(60)),
+            (Level::At(250), Some(45)),
+            (Level::At(2500), Some(30)),
+            (Level::At(25000), Some(15)),
+            (Level::At(u16::MAX), Some(9)),
         ];
         for (level, want) in cases {
             assert_eq!(level_confidence(level), want, "level {level:?}");
         }
     }
 
-    /// The match arms the ladder replaced, kept as the reference it must
-    /// reproduce.
-    const fn level_confidence_arms(level: Level) -> Option<u8> {
-        match level {
-            Level::Manual => None,
-            Level::Clean => Some(0),
-            Level::At(0) => Some(100),
-            Level::At(1) => Some(99),
-            Level::At(2) => Some(98),
-            Level::At(3) => Some(97),
-            Level::At(4) => Some(96),
-            Level::At(5) => Some(95),
-            Level::At(10) => Some(94),
-            Level::At(20) => Some(93),
-            Level::At(30) => Some(92),
-            Level::At(40) => Some(91),
-            Level::At(50) => Some(90),
-            Level::At(60) => Some(89),
-            Level::At(70) => Some(88),
-            Level::At(80) => Some(87),
-            Level::At(90) => Some(86),
-            Level::At(100) => Some(85),
-            Level::At(200) => Some(82),
-            Level::At(300) => Some(80),
-            Level::At(500) => Some(78),
-            Level::At(1000) => Some(75),
-            Level::At(2000) => Some(66),
-            Level::At(5000) => Some(54),
-            Level::At(7500) => Some(49),
-            Level::At(10000) => Some(45),
-            Level::At(15000) => Some(38),
-            Level::At(20000) => Some(33),
-            Level::At(25000) => Some(29),
-            Level::At(25001) => Some(28),
-            Level::At(25002) => Some(27),
-            Level::At(50000) => Some(17),
-            Level::At(50001) => Some(16),
-            Level::At(50002) => Some(15),
-            Level::At(n) if n > 50002 => Some(15),
-            Level::At(n) if n > 25002 => Some(26),
-            Level::At(n) if n > 20000 => Some(29),
-            Level::At(n) if n > 15000 => Some(33),
-            Level::At(n) if n > 10000 => Some(38),
-            Level::At(n) if n > 7500 => Some(45),
-            Level::At(n) if n > 5000 => Some(49),
-            Level::At(n) if n > 2000 => Some(54),
-            Level::At(n) if n > 1000 => Some(66),
-            Level::At(n) if n > 500 => Some(75),
-            Level::At(n) if n > 300 => Some(78),
-            Level::At(n) if n > 200 => Some(80),
-            Level::At(n) if n > 100 => Some(82),
-            Level::At(n) if n > 90 => Some(85),
-            Level::At(n) if n > 80 => Some(86),
-            Level::At(n) if n > 70 => Some(87),
-            Level::At(n) if n > 60 => Some(88),
-            Level::At(n) if n > 50 => Some(89),
-            Level::At(n) if n > 40 => Some(90),
-            Level::At(n) if n > 30 => Some(91),
-            Level::At(n) if n > 20 => Some(92),
-            Level::At(n) if n > 10 => Some(93),
-            Level::At(n) if n > 5 => Some(94),
-            Level::At(_) => Some(95),
-        }
-    }
-
-    /// Every level a marker can hold reads exactly as the match arms read it,
-    /// and confidence never rises as the level loosens.
+    /// Confidence never rises as the level loosens, and every placed level
+    /// reads within 1..=99.
     #[test]
-    fn the_ladder_reproduces_the_arms_and_is_monotone() {
-        assert_eq!(level_confidence(Level::Manual), None);
-        assert_eq!(level_confidence(Level::Clean), Some(0));
+    fn level_confidence_is_monotone_and_bounded() {
         let mut previous = u8::MAX;
         for n in 0..=u16::MAX {
-            let got = level_confidence(Level::At(n));
-            assert_eq!(got, level_confidence_arms(Level::At(n)), "level {n}");
-            let got = got.expect("every placed level has a confidence");
+            let got = level_confidence(Level::At(n)).expect("every placed level has a confidence");
+            assert!((1..=99).contains(&got), "level {n} read {got}");
             assert!(got <= previous, "confidence rose at level {n}");
             previous = got;
         }
-        assert!(CONFIDENCE_LADDER.is_sorted_by_key(|&(top, _)| top));
     }
 
     /// A clean clearing lands just past the suspicious band, as far past it as

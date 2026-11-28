@@ -37,8 +37,13 @@ fn saved_interpret_keeps_bytes_and_rewrites_annotation_authority() {
     // provenance line (path and hash only) is left out.
     assert!(rendered.starts_with("== PRIMARY payload.js ==\n"));
     assert!(!rendered.contains("provenance="));
-    assert!(rendered.contains("Possible process/interpreter"));
-    assert!(!rendered.contains("// N "));
+    // The grade letter, the trait id and the description are gone: the
+    // category points at the row, and the row says the rest.
+    assert!(
+        rendered.contains("// 1 process/interpreter\n"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Executes a variable"), "{rendered}");
     assert!(rendered.contains("eval(data)"));
 }
 

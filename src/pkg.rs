@@ -44,20 +44,12 @@ pub fn run_pkg(purl: &str, config: &ScanConfig) -> Result<ScanSummary> {
         anyhow::bail!("not a package URL: {raw} (expected pkg:<type>/<name>[@version])");
     };
     // Atomdrift Uplink first: a package it already judges is answered
-    // without being fetched; under `always` it fetches the package
-    // itself. Anything else goes through the fetch below, whose bytes get a
-    // second chance by digest.
-    match crate::remote::mode() {
-        crate::remote::Uplink::Ask => {
-            if let Some((sha, verdict)) = crate::remote::known_purl(&purl) {
-                return crate::engine::report_remote(config, &purl, &sha, Some(&purl), &verdict);
-            }
-        }
-        crate::remote::Uplink::Always => {
-            let (sha, verdict) = crate::remote::analyze(crate::remote::Upload::Purl(&purl))?;
-            return crate::engine::report_remote(config, &purl, &sha, Some(&purl), &verdict);
-        }
-        crate::remote::Uplink::Off => {}
+    // without being fetched. Anything else goes through the fetch below,
+    // whose bytes get a second chance by digest.
+    if crate::remote::asking()
+        && let Some((sha, verdict)) = crate::remote::known_purl(&purl)
+    {
+        return crate::engine::report_remote(config, &purl, &sha, Some(&purl), &verdict);
     }
     run(RefLocator::Purl(purl), config)
 }

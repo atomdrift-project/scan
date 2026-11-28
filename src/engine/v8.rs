@@ -16,7 +16,7 @@ use cleave::types::{CompactFile, CompactReport, CompactTrait};
 use filefacts::RefKind;
 use fletch::fetch::{FetchRecord, Outcome};
 use fletch::purl::Purl;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use super::retention::{MAX_KEPT_MEMBERS, own_nodes, parents};
 use super::verdict::decision_outranks;
 use super::{ARCHIVE_DELIMITER, ENGINE_VERSION, EmbeddedFile, FloorDecision, MemberEvals};
-use crate::interpret::Interpretation;
+use crate::interpret::{Interpretation, LlmAdmission};
 use crate::model::{Classification, Decision, Level, RouteScore, SkippedRoute};
 
 /// The body version this module writes.
@@ -135,8 +135,10 @@ pub(super) struct Listed {
 /// Everything a version 8 upload of one artifact says.
 ///
 /// Opaque outside the engine: built by the classify pipeline, written by the
-/// uploader.
-#[derive(Debug, Clone)]
+/// uploader. Serializable only so a deferred LLM pass can carry it to another
+/// host ([`LlmInput`](super::LlmInput)); that storage form is not the wire
+/// form, and changing it means bumping [`LLM_INPUT_FORMAT`](super::LLM_INPUT_FORMAT).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadDoc {
     level: Option<u16>,
     ruleset: String,
@@ -144,10 +146,12 @@ pub struct UploadDoc {
     files: Vec<FileEntry>,
     refs: Vec<Ref>,
     /// The node whose report each line carries: the first node of its
-    /// sha256. Consumed by [`Self::attach_reports`].
+    /// sha256. Consumed by [`Self::attach_reports`], so never stored.
+    #[serde(skip)]
     report_nodes: HashMap<u32, usize>,
     /// Every node's sha256, for citing a source that has no line. Consumed by
-    /// [`Self::attach_reports`].
+    /// [`Self::attach_reports`], so never stored.
+    #[serde(skip)]
     shas: HashMap<u32, String>,
     /// The drift jurors' objects, for the artifact's line: set by whoever
     /// builds the upload around scan's ([`Self::set_juror`]).
@@ -155,9 +159,41 @@ pub struct UploadDoc {
     /// Third-party scanners' objects, for the artifact's line
     /// ([`Self::set_scanner`]).
     scanners: BTreeMap<Scanner, Box<RawValue>>,
+    /// What the LLM gate decided of the artifact ([`Self::set_llm_gate`]);
+    /// `None` when no gate ran. Defaulted so an LLM input stored before it
+    /// existed still decodes.
+    #[serde(default)]
+    llm_gate: Option<LlmGate>,
 }
 
-#[derive(Debug, Clone)]
+/// What the LLM gate ([`crate::interpret::admit`]) decided of an artifact,
+/// as the `llm_admission` of its verdict object tells hopper: hopper queues
+/// an admitted artifact no LLM has described to be described, so its describe
+/// queue holds exactly what scan would send to the LLM. Absent from the object
+/// when no gate ran, which hopper reads as "not known".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LlmGate {
+    /// Admitted at [`LlmAdmission::Required`].
+    Required,
+    /// Admitted at [`LlmAdmission::Optional`].
+    Optional,
+    /// The gate ran and admitted nothing.
+    #[serde(rename = "none")]
+    NotAdmitted,
+}
+
+impl From<Option<LlmAdmission>> for LlmGate {
+    fn from(tier: Option<LlmAdmission>) -> Self {
+        match tier {
+            Some(LlmAdmission::Required) => Self::Required,
+            Some(LlmAdmission::Optional) => Self::Optional,
+            None => Self::NotAdmitted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileEntry {
     sha256: String,
     size: u64,
@@ -178,7 +214,7 @@ struct FileEntry {
 }
 
 /// A report line and the sha256 its file line names it by.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Report {
     digest: String,
     text: String,
@@ -187,7 +223,7 @@ struct Report {
 /// What scan concluded about a file and everything in it, and where each
 /// reading came from: the sha256 of the contained file whose own bytes
 /// carried it, when that was not this file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Judged {
     verdict: Decision,
     /// The juror that decided the verdict.
@@ -274,7 +310,7 @@ impl Readings {
 
 /// A juror: one component of atomdrift's verdict that states its own opinion
 /// of a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Juror {
@@ -293,7 +329,7 @@ pub enum Juror {
 
 /// A scanner that is not atomdrift's, reporting beside its jurors: it never
 /// feeds atomdrift's verdict. Hopper knows each by this name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Scanner {
@@ -369,7 +405,7 @@ fn opinion(mut object: Value) -> Result<Box<RawValue>, OpinionError> {
     Ok(raw)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Finding {
     id: String,
     crit: u8,
@@ -382,9 +418,10 @@ struct Contents {
 }
 
 /// Something the artifact points at.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Ref {
-    kind: &'static str,
+    #[serde(deserialize_with = "ref_kind")]
+    kind: StaticStr,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
@@ -469,6 +506,7 @@ impl UploadDoc {
             shas: nodes.iter().map(|n| (n.id, n.sha.clone())).collect(),
             drift: Vec::new(),
             scanners: BTreeMap::new(),
+            llm_gate: None,
         };
         let mut lines: HashMap<&str, usize> = HashMap::new();
         let mut line_of: Vec<Option<usize>> = vec![None; nodes.len()];
@@ -736,6 +774,12 @@ impl UploadDoc {
         }
     }
 
+    /// Record what the LLM gate decided of the artifact, whether or not the
+    /// LLM then ran, for its verdict object's `llm_admission`.
+    pub(super) const fn set_llm_gate(&mut self, gate: LlmGate) {
+        self.llm_gate = Some(gate);
+    }
+
     /// Let a later opinion move the artifact's verdict. `apply` returns
     /// whether it moved it; the verdict is then the LLM's.
     pub(super) fn blend(&mut self, apply: impl FnOnce(&mut Decision) -> bool) {
@@ -919,7 +963,7 @@ impl UploadDoc {
             _ => "",
         };
         let (Some(verdict), Some(ml)) = (
-            verdict_object(judged, &file.top, reason),
+            verdict_object(judged, &file.top, reason, self.llm_gate.filter(|_| i == 0)),
             ml_object(judged, model),
         ) else {
             tracing::error!(
@@ -1288,11 +1332,28 @@ fn bare_name(locator: &str) -> Option<String> {
 
 fn kind_name(kind: RefKind) -> Option<&'static str> {
     match kind {
-        RefKind::Dependency => Some("dependency"),
-        RefKind::Command => Some("command"),
-        RefKind::UrlFetch => Some("url_fetch"),
+        RefKind::Dependency => Some(REF_KINDS[0]),
+        RefKind::Command => Some(REF_KINDS[1]),
+        RefKind::UrlFetch => Some(REF_KINDS[2]),
         _ => None,
     }
+}
+
+/// `&'static str` under a name serde's derive does not take for a borrow
+/// from the input, which would tie every document holding a [`Ref`] to
+/// `'static` input. [`ref_kind`] reads the stored value back instead.
+type StaticStr = &'static str;
+
+/// Every [`Ref::kind`] [`kind_name`] gives.
+const REF_KINDS: [&str; 3] = ["dependency", "command", "url_fetch"];
+
+/// A stored [`Ref::kind`] read back: one of [`REF_KINDS`].
+fn ref_kind<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<&'static str, D::Error> {
+    let kind = String::deserialize(deserializer)?;
+    REF_KINDS
+        .into_iter()
+        .find(|known| *known == kind)
+        .ok_or_else(|| serde::de::Error::unknown_variant(&kind, &REF_KINDS))
 }
 
 /// A file's report: its findings and facts, with nothing that says where it
@@ -1422,13 +1483,21 @@ struct VerdictObject<'a> {
     by: Juror,
     #[serde(rename = "in", skip_serializing_if = "Option::is_none")]
     within: Option<&'a str>,
+    /// The artifact's line only, and only when a gate ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_admission: Option<LlmGate>,
     #[serde(skip_serializing_if = "str::is_empty")]
     reason: &'a str,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     top: &'a [Finding],
 }
 
-fn verdict_object(judged: &Judged, top: &[Finding], reason: &str) -> Option<Box<RawValue>> {
+fn verdict_object(
+    judged: &Judged,
+    top: &[Finding],
+    reason: &str,
+    llm_admission: Option<LlmGate>,
+) -> Option<Box<RawValue>> {
     let reason = without_nul(reason);
     // Shorten the reason first and give up findings only if that is not
     // enough.
@@ -1439,6 +1508,7 @@ fn verdict_object(judged: &Judged, top: &[Finding], reason: &str) -> Option<Box<
             fires_at: judged.verdict.level,
             by: judged.by,
             within: judged.verdict_in.as_deref(),
+            llm_admission,
             reason,
             top: top.get(..keep).unwrap_or_default(),
         })

@@ -79,7 +79,7 @@ impl std::fmt::Display for Classification {
 }
 
 /// One route score from a routed ensemble decision.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouteScore {
     /// Compact model route name, e.g. `az`, `az/native`, `az/elf`.
     #[serde(rename = "rte")]
@@ -99,14 +99,31 @@ pub struct RouteScore {
 }
 
 /// One applicable route that was not scored.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkippedRoute {
     /// Compact model route name, e.g. `az/native`.
     #[serde(rename = "rte")]
     pub model: String,
     /// Short reason the route was not used.
-    #[serde(rename = "why")]
-    pub reason: &'static str,
+    #[serde(rename = "why", deserialize_with = "skip_reason")]
+    pub reason: StaticStr,
+}
+
+/// `&'static str` under a name serde's derive does not take for a borrow from
+/// the input, which would tie every type holding a [`SkippedRoute`] to
+/// `'static` input. [`skip_reason`] reads the stored value back instead.
+type StaticStr = &'static str;
+
+/// A [`SkippedRoute::reason`] read back: one of [`SkippedRoute::REASONS`],
+/// since the field holds only those.
+fn skip_reason<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'static str, D::Error> {
+    let reason = <String as serde::Deserialize>::deserialize(deserializer)?;
+    SkippedRoute::REASONS
+        .into_iter()
+        .find(|known| *known == reason)
+        .ok_or_else(|| serde::de::Error::unknown_variant(&reason, &SkippedRoute::REASONS))
 }
 
 impl SkippedRoute {
@@ -224,7 +241,7 @@ impl Thresholds {
 /// cutoff; `class = Suspicious` iff `probability >= threshold` for the
 /// Suspicious cutoff; `class = Benign` iff `probability < threshold`, where
 /// `threshold` is the Suspicious cutoff the score did not reach.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Decision {
     /// Classification outcome.
     pub class: Classification,

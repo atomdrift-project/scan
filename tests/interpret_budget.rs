@@ -38,6 +38,9 @@ fn render_caps_an_oversized_protected_finding() {
     let input = include_bytes!("data/interpret-budget/input.json");
     let mut loaded = cleave::report_input::decode(input).unwrap();
     loaded.report.files.truncate(1);
+    // A description is sent only over raw bytes; beside source the row speaks
+    // for the finding. So the oversized one sits in a binary.
+    loaded.report.files[0].file_type = "elf".into();
     let finding = &mut loaded.report.files[0].findings[0];
     finding.crit = cleave::Criticality::Hostile;
     finding.desc = format!("Oversized evidence {}", "é".repeat(PROMPT_BUDGET_BYTES)).into();

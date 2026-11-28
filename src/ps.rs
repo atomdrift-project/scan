@@ -146,7 +146,7 @@ pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
     crate::engine::prefetch_cleave_resources();
     // Load the model before hashing every running executable, so a broken
     // bundle is reported at once rather than after the slowest step.
-    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let model = crate::models_repo::load(config.model_dir(), config.thresholds(), config.level())?;
     let shap = ShapImportance::load_or_warn(config.model_dir());
 
     let scan_start = Instant::now();
@@ -343,7 +343,7 @@ fn build_result(
         crate::engine::ClassifyRequest {
             shap,
             cancellation,
-            tiny_opts: crate::engine::tiny_opts_for(config),
+            terminal_card: crate::engine::wants_terminal_card(config),
             interpret: config.interpret(),
             fetch: config.fetch_policy(),
             zip_passwords: config.zip_passwords(),

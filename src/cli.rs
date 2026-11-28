@@ -132,6 +132,20 @@ pub fn operating_level(
     )
 }
 
+/// Whether `url` names this machine: `localhost`, or a loopback address.
+fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// One link of an `--llm` chain, with its key and model, or why it cannot be
 /// used.
 ///
@@ -263,31 +277,37 @@ pub struct GlobalArgs {
     /// Atomdrift Uplink, no following of references, no hopper and no LLM,
     /// whatever other flags and environment variables say. The rules and
     /// models must already be installed. `url`, `purl`, `update-rules`,
-    /// `serve` and switching feeds need the network, and refuse to run.
+    /// `serve` and `login` need the network, and refuse to run. Implies
+    /// `--local`.
     #[arg(long, global = true, conflicts_with = "update")]
     pub offline: bool,
 
-    /// Rule feed for this run: zero-day, supporter, or oss-delayed. Overrides
-    /// the feed saved by `atomscan feed <name>` (shared with cleave). A paid
-    /// feed with no token held connects this computer on a terminal — a code
-    /// to approve at dash.isotope13.io — and a refusal stops the scan instead
-    /// of falling back. Also settable via `ATOMDRIFT_FEED`.
-    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_FEED")]
-    pub feed: Option<cleave::feed::Feed>,
+    /// Keep analysis on this machine: never ask Atomdrift Uplink, and send
+    /// files to no hopper and no LLM but one on this machine, whatever other
+    /// flags and environment variables say. Rules and models still update,
+    /// and following references still fetches what they name. Also settable
+    /// via `SCAN_LOCAL`.
+    #[arg(
+        long,
+        global = true,
+        env = "SCAN_LOCAL",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub local: bool,
 
-    /// Whether to ask Atomdrift Uplink before analyzing. `true` asks for a
-    /// verdict it already holds — sending only the SHA-256 of local files of
-    /// 1 MiB or more and of fetched artifacts, and the PURLs of packages on
-    /// mainstream public registries — and analyzes locally whatever it does
-    /// not know. No account is needed; a paid plan's token is sent when one
-    /// is held. `false` never asks, and is the reproducible mode. `always`
-    /// sends everything to Uplink for analysis, uploading local files'
-    /// contents; it needs a paid plan, and connects this computer if it holds
-    /// no token. Default: `true`, or `false` when the rules in use are a git
-    /// checkout, whose local edits Uplink's verdicts would not reflect. Also
-    /// settable via `ATOMDRIFT_UPLINK`.
-    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_UPLINK")]
-    pub uplink: Option<crate::remote::Uplink>,
+    /// Rule feed: auto (the best your plan opens), zero-day, supporter, or
+    /// oss. A named paid feed asks you to sign in on a terminal when this
+    /// computer is not signed in; one your plan does not include stops the
+    /// scan instead of falling back. Also settable via `SCAN_FEED`.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "SCAN_FEED",
+        default_value_t,
+        value_name = "FEED"
+    )]
+    pub feed: cleave::feed::Choice,
 
     /// Force light-background color theme
     #[arg(long, global = true, conflicts_with = "dark")]
@@ -459,6 +479,27 @@ impl GlobalArgs {
             flag_or(self.llm_model.as_deref(), env.model.as_deref()),
             targets.len(),
         );
+        // `--local`: an endpoint on this machine still answers; files go to
+        // no other.
+        let (targets, pinned): (Vec<_>, Vec<_>) = if self.local {
+            let (kept, dropped): (Vec<_>, Vec<_>) = targets
+                .into_iter()
+                .zip(pinned)
+                .partition(|(base_url, _)| is_loopback_url(base_url));
+            if !dropped.is_empty() {
+                let dropped: Vec<_> = dropped.into_iter().map(|(url, _)| url).collect();
+                tracing::warn!(
+                    dropped = %dropped.join(","),
+                    "--local: not sending files to an LLM endpoint off this machine"
+                );
+            }
+            if kept.is_empty() {
+                return Ok(None);
+            }
+            kept.into_iter().unzip()
+        } else {
+            (targets, pinned)
+        };
         // `SCAN_LLM_KEY` is the operator naming one credential, for the kind
         // of endpoint named first: an OpenRouter key never goes to another
         // host, and another host's key never to OpenRouter, whichever the
@@ -491,11 +532,10 @@ impl GlobalArgs {
             model: primary.model,
             api_key: primary.api_key,
             // The admission gate is not a flag: ML admits anything it placed
-            // on the level grid, and the probability floor and size veto sit
-            // at their measured defaults.
+            // on the level grid, and the probability floor sits at its
+            // measured default.
             min_level: None,
             min_prob: crate::interpret::DEFAULT_LLM_MIN_PROB,
-            benign_notable_cap: crate::interpret::DEFAULT_LLM_BENIGN_NOTABLE_CAP,
             // One budget per hop for every mode: a wedged endpoint is caught
             // by the connect timeout and the breaker, not by this.
             timeout: std::time::Duration::from_secs(crate::interpret::DEFAULT_TIMEOUT_SECS),

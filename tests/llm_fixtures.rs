@@ -132,8 +132,7 @@ fn render(sample: &Path) -> String {
         .args([
             "path",
             "--no-update",
-            "--uplink",
-            "false",
+            "--local",
             "--follow-depth",
             "0",
             "-f",

@@ -3,15 +3,15 @@
 
 use crate::output::strip_ansi;
 
-/// Prepare a cleave tiny render for the LLM by stripping any ANSI escapes (tiny
-/// must never carry color) and normalizing the archive delimiter. Path hygiene —
-/// basenaming the root and showing archive members archive-relative, so the
-/// directory a sample sits in cannot sway the grade — is done by cleave's `tiny()` view
-/// (`basename_root`), so we must not re-strip here: that would mangle a
-/// `a.zip/member` header into a bare `member` when the container section is
-/// omitted.
+/// Prepare a payload render for the LLM by stripping any ANSI escapes (the
+/// payload must never carry color) and normalizing the archive delimiter. Path
+/// hygiene — basenaming the root and showing archive members archive-relative,
+/// so the directory a sample sits in cannot sway the grade — is done by
+/// the payload render when it writes each header, so we must not re-strip
+/// here: that would mangle a `a.zip/member` header into a bare `member` when
+/// the container section is omitted.
 ///
-/// cleave's `tiny()` rewrites `!!` to `/` only in the file *header* path; virtual
+/// The payload rewrites `!!` to `/` only in the file *header* path; virtual
 /// paths on finding/evidence lines (`doc.pdf!!pdf/object5.js`, `!!vba/Module1`,
 /// embedded-extraction sub-views) still carry the raw `!!`. We collapse those too
 /// so the model sees one consistent path syntax — a normal `/` separator it reads

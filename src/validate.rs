@@ -72,7 +72,7 @@ pub fn run(config: &ScanConfig) -> Result<()> {
 /// Load the model and every specialist route, refusing a structurally
 /// incompatible or degraded bundle before any trait corpus is touched.
 fn load_model(config: &ScanConfig) -> Result<Model> {
-    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let model = crate::models_repo::load(config.model_dir(), config.thresholds(), config.level())?;
     model
         .validate_all_routes()
         .context("validating specialist model routes")?;

@@ -305,7 +305,7 @@ def capture(corpus, dump_dir, bin_path, timeout, registry_map=None, fmt="interpr
     os.makedirs(dump_dir, exist_ok=True)
     renders, failed = {}, 0
     for rel, path in corpus_files(corpus):
-        cmd = [bin_path, "path", "--no-update", "--uplink", "false",
+        cmd = [bin_path, "path", "--no-update", "--local",
                "--follow-depth", "0", "-f", fmt]
         if registry_map:
             cmd += ["--registry-map", os.path.abspath(registry_map)]

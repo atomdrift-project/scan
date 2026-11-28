@@ -17,6 +17,7 @@ pub use crate::lookup::Hit;
 
 mod envelope;
 mod hopper;
+mod llm_input;
 mod pipeline;
 mod progress;
 mod render_cards;
@@ -32,6 +33,7 @@ mod verdict;
 pub use self::envelope::{
     DepResult, EmbeddedFile, HopperRoute, MemberEvals, ScanResult, StoredReport, TopFinding,
 };
+pub use self::llm_input::{LLM_INPUT_FORMAT, LLM_INPUT_MAX_BYTES, LlmInput, LlmInputError};
 pub use self::pipeline::PendingLlm;
 pub(crate) use self::run::{Fetched, FetchedKind, report_remote, run_bytes, run_with};
 pub use self::run::{run, run_paths};
@@ -39,8 +41,7 @@ pub use self::v8::Stamp as UploadStamp;
 #[cfg(test)]
 pub(crate) use self::v8::fixture_result;
 pub use self::v8::{Juror, OpinionError, Scanner, UploadDoc};
-pub(crate) use self::verdict::level_confidence;
-pub use self::verdict::{FloorArm, FloorDecision, synthesized_level};
+pub use self::verdict::{FloorArm, FloorDecision, level_confidence, synthesized_level};
 
 pub(crate) use self::hopper::artifact_filename;
 #[doc(hidden)]
@@ -56,7 +57,7 @@ pub(crate) use self::progress::{
 pub(crate) use self::render_context::{interpret_user_message, split_annotation};
 pub(crate) use self::run::{
     DetectionCounts, bloom_gate_fresh, detection_counts, detection_counts_from, emit_result,
-    scan_bytes, scan_file, tiny_opts_for,
+    scan_bytes, scan_file, wants_terminal_card,
 };
 
 /// Terminal display policy for scan verdicts and severe static findings.
@@ -612,7 +613,7 @@ pub fn render_saved_report(
     use cleave::output::{TinyOpts, format_context};
     match format {
         crate::OutputFormat::Terminal => Ok(format_context(&loaded.report, &TinyOpts::terminal())),
-        crate::OutputFormat::Tiny => Ok(format_context(&loaded.report, &TinyOpts::tiny())),
+        crate::OutputFormat::Tiny => Ok(crate::interpret::payload::render(&loaded.report)),
         crate::OutputFormat::Interpret => render_context::render_saved_interpret(loaded),
         crate::OutputFormat::Json | crate::OutputFormat::JsonFull => {
             anyhow::bail!("render supports --format terminal, tiny, or interpret")

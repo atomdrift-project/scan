@@ -6,7 +6,6 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use cleave::output::{TinyOpts, format_context};
 use cleave::types::Rel;
 use cleave::{AnalysisReport, Criticality, FileAnalysis};
 use fletch::fetch::FetchRecord;
@@ -118,7 +117,7 @@ struct BudgetedRender {
 /// converges in a handful of renders, and a batch never crosses into a
 /// stronger rank — the hostile member is not spent to pay for a suspicious one.
 fn budget_primary_context(primary: &mut AnalysisReport, budget: usize) -> BudgetedRender {
-    let mut rendered = format_context(primary, &TinyOpts::tiny());
+    let mut rendered = crate::interpret::payload::render(primary);
     if rendered.len() <= budget {
         return BudgetedRender {
             text: rendered,
@@ -202,7 +201,7 @@ fn shed_members(
         let before = report.files.len();
         report.files.retain(|f| !victims.contains(&f.id));
         dropped += before - report.files.len();
-        *rendered = format_context(report, &TinyOpts::tiny());
+        *rendered = crate::interpret::payload::render(report);
     }
     dropped
 }
@@ -274,7 +273,7 @@ fn shed_findings(report: &mut AnalysisReport, rendered: &mut String, budget: usi
                 });
             }
         }
-        let next = format_context(report, &TinyOpts::tiny());
+        let next = crate::interpret::payload::render(report);
         if next.len() >= rendered.len() {
             for file in &mut report.files {
                 if let Some((_, findings)) = snapshot.iter().find(|(id, _)| *id == file.id) {
@@ -667,17 +666,22 @@ fn render_registry_subject(
 /// under every prompt, provenance and carve-out variant, and benign as soon as
 /// the annotation stops asserting "process-hollowing API chain" outright.
 ///
-/// The rewrite keeps the description and drops the grade:
+/// The rewrite drops the grade and names the finding's category. Beside source
+/// that is the whole annotation, because the row under it says the rest:
+///
+/// ```text
+/// // N 261:131 axios.get() HTTP GET request (micro-behaviors/communications/http/…)
+/// // 261 communications/http
+/// ```
+///
+/// Over raw bytes the description stays, stripped of its authority: on a packed
+/// binary the prose is the only readable signal, and a real dropper graded
+/// suspicious without it (`docs/interpret-tuning.md`).
 ///
 /// ```text
 /// // H Dynamically resolved process-hollowing API chain (objectives/evasion/process/injection/hollowing::…)
-/// // Possible evasion/process — Dynamically resolved process-hollowing API chain
+/// // evasion/process — Dynamically resolved process-hollowing API chain
 /// ```
-///
-/// Dropping the description instead costs recall exactly where
-/// `docs/interpret-tuning.md` predicts: on packed binaries the prose is the only
-/// readable signal, and a real dropper grades benign without it. So the prose
-/// stays and only its authority is removed.
 ///
 /// The terminal view is untouched — this is the machine/LLM render alone.
 fn recategorize_annotations(rendered: &str) -> String {
@@ -696,9 +700,10 @@ fn recategorize_annotations(rendered: &str) -> String {
     out
 }
 
-/// Assemble the exact user message after sanitization. The final cap also
-/// covers a protected finding, header, or source line too large to shed and
-/// accounts for bytes added by rewriting the annotations.
+/// Assemble the exact user message after sanitization. The final cap covers
+/// a protected finding, header, or source line too large to shed. The budget
+/// before it sized the render with its annotations unrewritten, which is the
+/// larger of the two, so it errs toward shedding.
 pub(crate) fn interpret_user_message(context: &str) -> (String, bool) {
     const TRUNCATED: &str = "\n[Context truncated to fit the prompt budget.]\n";
     let mut user = recategorize_annotations(context);
@@ -746,10 +751,7 @@ fn recategorize_annotation(line: &str) -> Option<String> {
     // `// H third_party/elastic/Linux_Trojan_Ladvix/linux/trojan/ladvix`. Naming
     // its category is the whole rewrite; there is no description to keep.
     if !rest.contains('(') && !rest.contains(char::is_whitespace) && rest.contains('/') {
-        return Some(format!(
-            "{indent}{comment} Possible {}",
-            trait_category(rest)
-        ));
+        return Some(format!("{indent}{comment} {}", trait_category(rest)));
     }
     // Otherwise the trait id is the trailing parenthesized group; without one
     // there is no category to name and the line is left alone.
@@ -769,24 +771,20 @@ fn recategorize_annotation(line: &str) -> Option<String> {
         return None;
     }
     let body = rest.get(..open)?;
-    // `LOC ` (a `line:col` or `@offset`) stays; it is a pointer, not a verdict.
-    let (loc, desc) = match body.split_once(' ') {
-        Some((head, tail))
-            if head.starts_with('@')
-                || head.split_once(':').is_some_and(|(a, b)| {
-                    !a.is_empty()
-                        && a.chars().all(|c| c.is_ascii_digit())
-                        && b.chars().all(|c| c.is_ascii_digit())
-                }) =>
-        {
-            (format!("{head} "), tail)
-        }
-        _ => (String::new(), body),
-    };
     let category = trait_category(inner);
-    Some(format!(
-        "{indent}{comment} {loc}Possible {category} — {desc}"
-    ))
+    // The location stays; it is a pointer, not a verdict.
+    let (head, desc) = body.split_once(' ').unwrap_or(("", body));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    Some(match head.split_once(':') {
+        // A `line:col` places the finding beside source, which speaks for
+        // itself: a description would only repeat the row below, and with
+        // the row in view the line number alone locates it.
+        Some((line, col)) if digits(line) && digits(col) => {
+            format!("{indent}{comment} {line} {category}")
+        }
+        _ if head.starts_with('@') => format!("{indent}{comment} {head} {category} — {desc}"),
+        _ => format!("{indent}{comment} {category} — {body}"),
+    })
 }
 
 /// The family a trait belongs to: the two path components below its namespace,

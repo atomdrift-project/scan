@@ -151,7 +151,7 @@ pub fn refresh_if_stale(refresh: Refresh, mode: Mode, terminal: bool) -> anyhow:
         print_checkmark(mode, fetched.as_deref());
     } else if outcome.failed {
         eprint!(
-            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mauto-update failed \u{2014} run `atomscan update-rules` to update\x1b[0m\n",
+            "\r\x1b[2K \x1b[38;2;255;175;55m\u{26a0}\x1b[0m \x1b[38;2;160;160;160mrules update failed \u{2014} scanning with the installed rules; the next run tries again\x1b[0m\n",
         );
         let _ = std::io::stderr().flush();
     } else if live {

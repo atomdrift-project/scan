@@ -22,9 +22,16 @@ pub(super) fn print(format: scan::OutputFormat) -> std::io::Result<()> {
         .as_ref()
         .map_or(0, |m| m.filter.values().map(|e| e.n).sum());
     let rules = info.trait_count as u64 + info.composite_count as u64 + info.yara_rules as u64;
+    // "zero-day feed (auto, Business plan)": which feed, and how this run got it.
+    let edition = match &info.traits_edition {
+        edition @ cleave::traits_repo::Edition::Feed(_) => {
+            format!("{edition} ({})", cleave::feed::describe())
+        }
+        checkout => checkout.to_string(),
+    };
     scan::output::print_version(
         env!("CARGO_PKG_VERSION"),
-        &info.traits_edition.to_string(),
+        &edition,
         bloom_count,
         rules,
         &rows(&info, bloom.as_ref(), nsrl.as_ref()),
